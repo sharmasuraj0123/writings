@@ -5,6 +5,26 @@ arithmetic behind every worked number on the page. Statuses follow the claim led
 **derived** (follows from stated assumptions), **illustrative** (arithmetic chosen to be
 checkable), **open** (untested against production data).
 
+## Prerequisite — §1.6, the environment
+
+Section 1.6 ("How to measure work") is the conceptual precondition for everything below.
+Its claim: **measurement is a property of the environment, not the agent.** Two
+consequences carry into §2 — the boundary of the environment is the boundary of what can
+be measured (limitation 6), and two environments are two instruments, which is why
+cross-organization comparison happens through ratios rather than totals.
+
+An environment is four layers: **runtime** (container, filesystem, network boundary,
+clock — what makes S₀/S₁ capturable) + **agent harness** (tool loop, planning, retries,
+sub-agents, context — the largest non-model lever on cost per quirq) + **skills, prompts,
+memory, tools** (the authored layer that accumulates — the subject of the §2.8 tenure
+claim) + **outputs** (outcomes, artifacts, work done — the captured after-state).
+
+The first three layers are metered into `C_total`; the fourth is scored into `Q`. That
+split is Proposition 7 (meter separation) stated informally. The complication §1.6 names
+openly: the environment is both the instrument and part of the treatment, so any measured
+trend confounds "the agents got better" with "the instrument changed" — which is why
+§2.8's design is a randomized ablation rather than a before-and-after.
+
 ---
 
 ## 2.1 Definitions and verification
@@ -364,16 +384,16 @@ into one.
 
 | # | Content | Status |
 |---|---|---|
-| Fig 7 | Captured state → score flow | Schematic |
-| Fig 8 | Settlement shapes φ(V) + bunching density | Illustrative |
-| Fig 9 | Interactive settlement calculator | Interactive |
-| Fig 10 | Interactive cost stack | Interactive |
-| Fig 11 | Quarterly ledger + trend | Illustrative |
-| Fig 12 | Within / mix / interaction waterfall | Illustrative |
-| Fig 13 | QER with delta-method confidence intervals | Illustrative |
-| Fig 14 | Production V vs gold V scatter + agreement stats | Illustrative |
-| Fig 15 | Memory-ablation decay simulation | Simulated |
-| Fig 16 | Energy bridge | Illustrative |
+| Fig 8 | Captured state → score flow | Schematic |
+| Fig 9 | Settlement shapes φ(V) + bunching density | Illustrative |
+| Fig 10 | Interactive settlement calculator | Interactive |
+| Fig 11 | Interactive cost stack | Interactive |
+| Fig 12 | Quarterly ledger + trend | Illustrative |
+| Fig 13 | Within / mix / interaction waterfall | Illustrative |
+| Fig 14 | QER with delta-method confidence intervals | Illustrative |
+| Fig 15 | Production V vs gold V scatter + agreement stats | Illustrative |
+| Fig 16 | Memory-ablation decay simulation | Simulated |
+| Fig 17 | Energy bridge | Illustrative |
 | Tbl 1 | Cost terms, meters, attribution, error sources | Specification |
 | Tbl 2 | Quarterly quirq ledger | Illustrative |
 | Tbl 3 | Two-class decomposition underlying Tbl 2 | Illustrative |
