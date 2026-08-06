@@ -1,0 +1,2807 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="An extremely detailed guide to the J-space — the verbalizable global workspace found in language models by Anthropic's Jacobian Lens — and a step-by-step construction manual: estimating the averaged Jacobian, composing the lens, sparse decomposition by gradient pursuit, reading, steering, ablating, patching, and validating."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/j-space/" />
+    <meta property="og:title" content="The J-Space: a construction manual" />
+    <meta
+      property="og:description"
+      content="What the Jacobian Lens is, why averaging is the whole trick, and exactly how to build a J-space — with the compute route the paper doesn't spell out."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/j-space/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="The J-Space: a construction manual" />
+    <meta
+      name="twitter:description"
+      content="A detailed reading of the Jacobian Lens, and a step-by-step guide to constructing a J-space."
+    />
+    <title>The J-Space: a construction manual — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+    </style>
+    <style>
+      .sbs {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+      @media (max-width: 760px) {
+        .sbs { grid-template-columns: 1fr; }
+      }
+      .sbs pre { margin: 0; }
+      .sbs h4 {
+        margin: 0 0 8px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+      .prose ol, .prose ul { padding-left: 1.35em; }
+      .prose li { margin-bottom: 0.55em; }
+      .src, .recon {
+        display: inline-block;
+        margin-left: 8px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .eq {
+        margin: 1.5em 0;
+        padding: 20px 24px;
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-soft);
+        max-width: var(--text);
+        font-family: var(--mono);
+        font-size: 14.5px;
+        line-height: 1.75;
+        overflow-x: auto;
+      }
+      .eq .where {
+        display: block;
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-family: var(--sans);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+      .recipe {
+        counter-reset: step;
+        list-style: none;
+        padding-left: 0;
+        max-width: var(--text);
+      }
+      .recipe > li {
+        position: relative;
+        padding-left: 46px;
+        margin-bottom: 1.05em;
+      }
+      .recipe > li::before {
+        counter-increment: step;
+        content: counter(step);
+        position: absolute;
+        left: 0;
+        top: 1px;
+        width: 30px;
+        height: 30px;
+        border: 1px solid var(--line-dark);
+        border-radius: 50%;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 29px;
+        text-align: center;
+      }
+      .part {
+        margin: 3.4em 0 0;
+        padding: 22px 0 0;
+        border-top: 2px solid var(--line-dark);
+        max-width: var(--text);
+      }
+      .part span {
+        display: block;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      .part strong {
+        display: block;
+        margin-top: 6px;
+        font: 500 clamp(24px, 3vw, 32px) / 1.16 var(--serif);
+        letter-spacing: -0.02em;
+      }
+      .part em {
+        display: block;
+        margin-top: 8px;
+        color: var(--ink-soft);
+        font-size: 15px;
+        font-style: normal;
+        line-height: 1.6;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · The claim, and why it needs a new lens</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#claim">01 · The claim, and why it needs a new lens</a>
+        <a class="toc-parent" href="#derivation">02 · Deriving the Jacobian Lens</a>
+        <a class="toc-parent" href="#averaging">03 · Why averaging is the whole trick</a>
+        <a class="toc-parent" href="#vectors">04 · J-lens vectors</a>
+        <a class="toc-parent" href="#space">05 · The J-space itself</a>
+        <a class="toc-parent" href="#relatives">06 · How it differs from its neighbours</a>
+        <a class="toc-parent" href="#build">07 · Building one: the pipeline</a>
+        <a class="toc-parent" href="#corpus">08 · Step 1 — layers, corpus, capture points</a>
+        <a class="toc-parent" href="#jacobian">09 · Step 2 — estimating the averaged Jacobian</a>
+        <a class="toc-parent" href="#compose">10 · Step 3 — composing the lens</a>
+        <a class="toc-parent" href="#read">11 · Step 4 — the three read operations</a>
+        <a class="toc-parent" href="#write">12 · Step 5 — the three write operations</a>
+        <a class="toc-parent" href="#validate">13 · Step 6 — validation</a>
+        <a class="toc-parent" href="#code">14 · A reference implementation</a>
+        <a class="toc-parent" href="#evidence">15 · What the paper found with it</a>
+        <a class="toc-parent" href="#geometry">16 · Sensory, workspace, motor</a>
+        <a class="toc-parent" href="#limits">17 · Limitations and failure modes</a>
+        <a class="toc-parent" href="#transfer">18 · What generalizes</a>
+        <a class="toc-parent" href="#sources">19 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#claim">01 · The claim</a>
+        <a href="#derivation">02 · Deriving the lens</a>
+        <a href="#averaging">03 · Why averaging</a>
+        <a href="#vectors">04 · J-lens vectors</a>
+        <a href="#space">05 · The J-space</a>
+        <a href="#relatives">06 · Vs its neighbours</a>
+        <a href="#build">07 · The pipeline</a>
+        <a href="#corpus">08 · Layers, corpus, capture</a>
+        <a href="#jacobian">09 · Estimating the Jacobian</a>
+        <a href="#compose">10 · Composing the lens</a>
+        <a href="#read">11 · Read operations</a>
+        <a href="#write">12 · Write operations</a>
+        <a href="#validate">13 · Validation</a>
+        <a href="#code">14 · Reference code</a>
+        <a href="#evidence">15 · What the paper found</a>
+        <a href="#geometry">16 · Workspace geometry</a>
+        <a href="#limits">17 · Limits and failures</a>
+        <a href="#transfer">18 · What generalizes</a>
+        <a href="#sources">19 · Sources</a>
+      </nav>
+    </aside>
+
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Interpretability</p>
+        <h1>The J-Space: a construction manual<span class="status-pill">Technical guide</span></h1>
+        <p class="dek">
+          Anthropic's <em>Verbalizable Representations Form a Global Workspace
+          in Language Models</em> reports that a model holds roughly
+          twenty-five concepts at a time in a privileged subspace — less than
+          10% of its activation variance — that it can report on, reason with,
+          and be steered through. The tool that finds it is one averaged
+          Jacobian per layer. This is a close reading of what a J-space is,
+          followed by a step-by-step guide to building one, including the
+          compute route the paper leaves unstated.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 1 August 2026 · Subject: transformer-circuits.pub/2026/workspace</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#claim">The claim, and why it needs a new lens</a></li>
+          <li><a href="#derivation">Deriving the Jacobian Lens</a></li>
+          <li><a href="#averaging">Why averaging is the whole trick</a></li>
+          <li><a href="#vectors">J-lens vectors</a></li>
+          <li><a href="#space">The J-space itself</a></li>
+          <li><a href="#relatives">How it differs from its neighbours</a></li>
+          <li><a href="#build">Building one: the pipeline</a></li>
+          <li><a href="#corpus">Step 1 — layers, corpus, capture points</a></li>
+          <li><a href="#jacobian">Step 2 — estimating the averaged Jacobian</a></li>
+          <li><a href="#compose">Step 3 — composing the lens</a></li>
+          <li><a href="#read">Step 4 — the three read operations</a></li>
+          <li><a href="#write">Step 5 — the three write operations</a></li>
+          <li><a href="#validate">Step 6 — validation</a></li>
+          <li><a href="#code">A reference implementation</a></li>
+          <li><a href="#evidence">What the paper found with it</a></li>
+          <li><a href="#geometry">Sensory, workspace, motor</a></li>
+          <li><a href="#limits">Limitations and failure modes</a></li>
+          <li><a href="#transfer">What generalizes</a></li>
+          <li><a href="#sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              Two kinds of claim appear below and they are not equally
+              reliable. <span class="src">from the paper</span> marks
+              equations, procedures and numbers stated in
+              <em>Verbalizable Representations Form a Global Workspace in
+              Language Models</em>. <span class="recon">reconstruction</span>
+              marks engineering I have worked out to make the method
+              buildable — compute routes, memory budgets, numerical
+              cautions. The paper does not state its implementation strategy
+              or its compute cost, so everything in that category is mine and
+              may differ from what the authors actually did.
+            </p>
+          </div>
+
+          <h2 id="claim"><span class="secnum">01</span>The claim, and why it needs a new lens</h2>
+          <p class="lede">
+            A large model's residual stream at any layer is a vector of several
+            thousand numbers, and almost all of it is inaccessible to the model
+            itself. The paper's claim is that a small, structured slice of that
+            vector is different in kind: it is the part the model can talk
+            about, be asked to focus on, reason over, and have its mind changed
+            about. They call that slice the <strong>J-space</strong>, and they
+            find it with a linear map computed once per layer.
+          </p>
+          <p>
+            The headline numbers give the shape of the finding. The J-space
+            holds on the order of <strong>25 concepts at a time</strong>. It
+            accounts for <strong>less than 10% of activation variance at any
+            layer</strong>. Ablating it leaves tasks like MMLU, SQuAD,
+            sentiment classification and grammaticality judgement essentially
+            untouched, while multi-hop reasoning, translation and summarization
+            fall apart. It is a small channel that carries the flexible part of
+            cognition and almost none of the automatic part.
+          </p>
+          <p>
+            To find something like that you need a way of asking an activation
+            "what concept are you?" — and the two standard answers both fail in
+            instructive ways.
+          </p>
+          <p>
+            The <strong>logit lens</strong> applies the unembedding matrix
+            directly to an intermediate activation: it asks "if the model
+            stopped here, what token would it emit?" That is a fine question
+            near the output and a poor one in the middle of the network, where
+            the residual stream is not yet in output coordinates.
+          </p>
+          <p>
+            The <strong>tuned lens</strong> fits a per-layer linear map trained
+            to match the model's final output distribution. The paper's
+            objection is sharp and worth quoting: "This objective is
+            correlational rather than causal, and we find that on prompts
+            involving unverbalized intermediate computation the tuned lens tends
+            to 'skip ahead' to the output rather than surface those
+            intermediates." <span class="src">from the paper</span> If you train
+            a probe to predict the answer, it will predict the answer — which is
+            precisely the thing you did not want, because you were looking for
+            the working-out.
+          </p>
+          <p>
+            The Jacobian Lens asks a third question, and it is a causal one:
+            <em>if I nudged the model here, what would it say?</em>
+          </p>
+
+          <h2 id="derivation"><span class="secnum">02</span>Deriving the Jacobian Lens</h2>
+          <p>
+            Start from a perturbation. Take the residual stream at layer ℓ,
+            position <em>t</em>, and add a small vector δ. Because of causal
+            masking, that perturbation propagates forward and changes the
+            final-layer residual stream at every position <em>t′ ≥ t</em>. The
+            paper: "A small perturbation to h<sub>ℓ</sub> will propagate through
+            the remaining layers and shift the final-layer residual stream
+            h<sub>final,t′</sub> at every position t′ ≥ t."
+            <span class="src">from the paper</span>
+          </p>
+          <p>
+            To first order that relationship is a matrix — the Jacobian of the
+            final activation with respect to the intermediate one. Compose it
+            with the unembedding and you have the first-order effect of the
+            perturbation on the output logits. Average that matrix over source
+            positions, over all later positions, and over a corpus, and you get
+            a single fixed linear map per layer.
+          </p>
+          <div class="eq">
+            J<sub>ℓ</sub> &nbsp;=&nbsp; 𝔼<sub>&thinsp;t,&thinsp;t′≥t,&thinsp;prompt</sub> [ ∂h<sub>final,t′</sub> / ∂h<sub>ℓ,t</sub> ]
+            <span class="where">
+              <strong>h<sub>ℓ,t</sub></strong> — residual stream at layer ℓ,
+              token position t, in ℝ<sup>d</sup>.
+              <strong>h<sub>final,t′</sub></strong> — residual stream at the
+              last layer, position t′, just before the final normalization and
+              unembedding.
+              <strong>The expectation</strong> runs over the source position t,
+              every subsequent position t′ ≥ t within the context, and a corpus
+              of one thousand prompts sampled from a pretraining-like
+              distribution. <strong>J<sub>ℓ</sub></strong> is therefore a single
+              d × d matrix per layer — constant, context-free, computed once.
+              <span class="src">from the paper</span>
+            </span>
+          </div>
+          <p>
+            The lens itself is then that map, followed by the model's own output
+            head:
+          </p>
+          <div class="eq">
+            lens(h<sub>ℓ</sub>) &nbsp;=&nbsp; softmax( W<sub>U</sub> &thinsp;norm( J<sub>ℓ</sub> h<sub>ℓ</sub> ) )
+            <span class="where">
+              <strong>norm(·)</strong> is the model's final layer
+              normalization; <strong>W<sub>U</sub></strong> is the unembedding.
+              The output is a distribution over the full vocabulary, which the
+              paper reads as a ranked list of the concepts this activation is
+              <em>disposed to verbalize</em>.
+              <span class="src">from the paper</span>
+            </span>
+          </div>
+          <p>
+            Everything else in the paper is a consequence of this one object.
+            And notice its most convenient property: because J<sub>ℓ</sub> is an
+            expectation and not a per-example quantity, it is <em>fixed</em>.
+            Building it is expensive; using it afterwards is a matrix–vector
+            product.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-lens">
+          <div class="figure-head">
+            <span class="figure-label">Figure 1</span>
+            <p class="figure-title">Three lenses, one shape — what changes is the matrix in the middle</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1120 380" role="img" aria-label="Comparison of logit lens, tuned lens and Jacobian lens pipelines">
+              <text class="svg-lane" x="30" y="30">LOGIT LENS</text>
+              <line x1="30" y1="40" x2="1080" y2="40" stroke="#deded9"></line>
+              <g stroke="#3c6f97" stroke-width="1.3" fill="none">
+                <line x1="180" y1="74" x2="240" y2="74"></line>
+                <line x1="380" y1="74" x2="440" y2="74"></line>
+                <line x1="580" y1="74" x2="640" y2="74"></line>
+                <line x1="780" y1="74" x2="840" y2="74"></line>
+              </g>
+              <rect x="60" y="58" width="120" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="120" y="79" text-anchor="middle">h at layer ℓ</text>
+              <rect x="240" y="58" width="140" height="32" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="4 3"></rect>
+              <text class="svg-sub" x="310" y="79" text-anchor="middle">identity  (J = I)</text>
+              <rect x="440" y="58" width="140" height="32" rx="6" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-sub" x="510" y="79" text-anchor="middle">norm</text>
+              <rect x="640" y="58" width="140" height="32" rx="6" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-sub" x="710" y="79" text-anchor="middle">W_U · softmax</text>
+              <text class="svg-note" x="840" y="72">Works near the output.</text>
+              <text class="svg-note" x="840" y="90">Noisy in the middle.</text>
+
+              <text class="svg-lane" x="30" y="146">TUNED LENS</text>
+              <line x1="30" y1="156" x2="1080" y2="156" stroke="#deded9"></line>
+              <g stroke="#3c6f97" stroke-width="1.3" fill="none">
+                <line x1="180" y1="190" x2="240" y2="190"></line>
+                <line x1="380" y1="190" x2="440" y2="190"></line>
+                <line x1="580" y1="190" x2="640" y2="190"></line>
+                <line x1="780" y1="190" x2="840" y2="190"></line>
+              </g>
+              <rect x="60" y="174" width="120" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="120" y="195" text-anchor="middle">h at layer ℓ</text>
+              <rect x="240" y="174" width="140" height="32" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.6"></rect>
+              <text class="svg-sub" x="310" y="195" text-anchor="middle">A_ℓ  (trained)</text>
+              <rect x="440" y="174" width="140" height="32" rx="6" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-sub" x="510" y="195" text-anchor="middle">norm</text>
+              <rect x="640" y="174" width="140" height="32" rx="6" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-sub" x="710" y="195" text-anchor="middle">W_U · softmax</text>
+              <text class="svg-note" x="840" y="188">Trained to match the output —</text>
+              <text class="svg-note" x="840" y="206">so it skips ahead to the answer.</text>
+
+              <text class="svg-lane" x="30" y="262">JACOBIAN LENS</text>
+              <line x1="30" y1="272" x2="1080" y2="272" stroke="#deded9"></line>
+              <g stroke="#3c6f97" stroke-width="1.3" fill="none">
+                <line x1="180" y1="306" x2="240" y2="306"></line>
+                <line x1="380" y1="306" x2="440" y2="306"></line>
+                <line x1="580" y1="306" x2="640" y2="306"></line>
+                <line x1="780" y1="306" x2="840" y2="306"></line>
+              </g>
+              <rect x="60" y="290" width="120" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="120" y="311" text-anchor="middle">h at layer ℓ</text>
+              <rect x="240" y="290" width="140" height="32" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.8"></rect>
+              <text class="svg-sub" x="310" y="311" text-anchor="middle">J_ℓ  (measured)</text>
+              <rect x="440" y="290" width="140" height="32" rx="6" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-sub" x="510" y="311" text-anchor="middle">norm</text>
+              <rect x="640" y="290" width="140" height="32" rx="6" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-sub" x="710" y="311" text-anchor="middle">W_U · softmax</text>
+              <text class="svg-note" x="840" y="304">Averaged causal effect —</text>
+              <text class="svg-note" x="840" y="322">what this activation would say,</text>
+              <text class="svg-note" x="840" y="340">in any context, if nudged.</text>
+
+              <line x1="30" y1="358" x2="1080" y2="358" stroke="#deded9"></line>
+              <text class="svg-note" x="30" y="376">The logit lens is the special case J = I. The tuned lens fits A_ℓ to a correlational objective. The J-lens measures a causal one and never trains anything.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            The paper is generous about its predecessor: "we find the logit lens
+            to be quite useful in practice, and to capture much of the
+            workspace-like structure identified by the J-lens, though with
+            somewhat lower reliability (particularly in earlier layers)." The
+            two "agree closely in the model's last several layers and diverge
+            earlier, with the J-lens recovering interpretable content at depths
+            where the logit lens does not." <span class="src">from the paper</span>
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="averaging"><span class="secnum">03</span>Why averaging is the whole trick</h2>
+          <p>
+            If you take one sentence from this piece, take this one. The
+            expectation in the definition of J<sub>ℓ</sub> is not a variance
+            reduction technique. It is the semantics.
+          </p>
+          <div class="callout">
+            <span class="k">The load-bearing sentence</span>
+            <p>
+              "The averaging step is key, as it distinguishes representations
+              that are verbalizable — poised to be spoken about, should the
+              occasion arise — from those that merely happen to be verbalized in
+              one particular context." <span class="src">from the paper</span>
+            </p>
+          </div>
+          <p>
+            An unaveraged Jacobian, computed for one prompt at one position,
+            tells you what this activation is doing <em>here</em>. That is a
+            factual claim about a single forward pass, and it is contaminated by
+            everything specific to that context. The averaged Jacobian tells you
+            what this activation would tend to do <em>across contexts</em> —
+            which is a modal claim, and it is the one that matches the informal
+            notion of a concept being "available to be reported."
+          </p>
+          <p>
+            This is the same move a good experimentalist makes when they
+            separate a disposition from an event. Salt is soluble whether or not
+            it is currently dissolving. A representation is verbalizable whether
+            or not it is currently being verbalized. Averaging over t′ ≥ t
+            asks "over all the futures this could have," and averaging over a
+            thousand prompts asks "over all the contexts this could be in."
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-avg">
+          <div class="figure-head">
+            <span class="figure-label">Figure 2</span>
+            <p class="figure-title">One Jacobian is a fact about a context; the average is a disposition</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1000 300" role="img" aria-label="Averaging Jacobians over positions and prompts">
+              <text class="svg-lane" x="30" y="30">PER-CONTEXT</text>
+              <line x1="30" y1="40" x2="440" y2="40" stroke="#deded9"></line>
+
+              <rect x="40" y="58" width="24" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-sub" x="80" y="76">prompt 1, t=14, t′=17</text>
+              <rect x="40" y="94" width="24" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-sub" x="80" y="112">prompt 1, t=14, t′=18</text>
+              <rect x="40" y="130" width="24" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-sub" x="80" y="148">prompt 1, t=15, t′=19</text>
+              <rect x="40" y="166" width="24" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-sub" x="80" y="184">prompt 2, t=3,  t′=9</text>
+              <text class="svg-sub" x="80" y="216">⋮</text>
+              <rect x="40" y="226" width="24" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-sub" x="80" y="244">prompt 1000, …</text>
+
+              <text class="svg-note" x="40" y="282">Each one is contaminated by its own context.</text>
+
+              <g stroke="#d98226" stroke-width="1.8" fill="none">
+                <line x1="470" y1="150" x2="590" y2="150"></line>
+                <path d="M590 150 l-9 -5 M590 150 l-9 5"></path>
+              </g>
+              <text class="svg-num" x="478" y="138">average</text>
+
+              <rect x="620" y="96" width="200" height="108" rx="8" fill="#f7e3c8" stroke="#d98226" stroke-width="2"></rect>
+              <text class="svg-step" x="720" y="140" text-anchor="middle">J_ℓ</text>
+              <text class="svg-sub" x="720" y="164" text-anchor="middle">one d × d matrix</text>
+              <text class="svg-sub" x="720" y="182" text-anchor="middle">per layer, fixed</text>
+
+              <text class="svg-note" x="620" y="238">What this direction tends to make the model say,</text>
+              <text class="svg-note" x="620" y="256">across every context it might find itself in.</text>
+              <text class="svg-note" x="620" y="282">Expensive once. Free thereafter.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            Causal masking does some of the work for you: for t′ &lt; t the
+            Jacobian is identically zero, so the sum over source positions at a
+            given readout position automatically restricts to t ≤ t′. §09 turns
+            that observation into a large compute saving.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="vectors"><span class="secnum">04</span>J-lens vectors</h2>
+          <p>
+            The lens gives a distribution over the vocabulary. Reading it
+            backwards gives something more useful: for each token in the
+            vocabulary, the single direction in residual-stream space that most
+            increases that token's logit.
+          </p>
+          <p>
+            The paper defines them exactly: "We refer to the rows of
+            W<sub>U</sub> J<sub>ℓ</sub> as the Jacobian lens (J-lens) vectors at
+            layer ℓ; each J-lens vector is a direction in residual-stream space
+            associated with a single token in the model's vocabulary."
+            <span class="src">from the paper</span>
+          </p>
+          <div class="eq">
+            v<sub>t</sub><sup>(ℓ)</sup> &nbsp;=&nbsp; ( W<sub>U</sub> J<sub>ℓ</sub> )<sub>t,:</sub> &nbsp;∈&nbsp; ℝ<sup>d</sup>
+            <span class="where">
+              One vector per vocabulary token, per layer. There are
+              n<sub>vocab</sub> of them in a d-dimensional space and
+              n<sub>vocab</sub> ≫ d, so the set is <strong>overcomplete</strong>
+              — a frame, not a basis. That is not a defect; it is the premise.
+              Under the superposition hypothesis a model's activations decompose
+              as sparse combinations drawn from an overcomplete set of feature
+              directions, and the J-lens vectors "would then constitute a
+              subframe of this feature frame: a token-indexed subset of the
+              model's feature directions." <span class="src">from the paper</span>
+            </span>
+          </div>
+          <p>
+            It is worth being clear about what these are not. They are not
+            embedding vectors, and they are not "the direction that represents
+            the concept" in any intrinsic sense. They are <em>output-facing</em>
+            directions: the ones that push a specific word out of the model's
+            mouth. That framing is the whole reason the method finds a
+            <em>verbalizable</em> workspace rather than a representational one.
+            A concept the model computes over but has no single-token handle for
+            is, by construction, invisible here.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-shapes">
+          <div class="figure-head">
+            <span class="figure-label">Figure 3</span>
+            <p class="figure-title">Where a J-lens vector comes from, dimensionally</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1000 280" role="img" aria-label="Matrix shapes showing W_U times J_l producing the J-lens vector matrix">
+              <rect x="60" y="60" width="150" height="120" rx="6" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-step" x="135" y="112" text-anchor="middle">W_U</text>
+              <text class="svg-sub" x="135" y="134" text-anchor="middle">n_vocab × d</text>
+              <text class="svg-num" x="135" y="200" text-anchor="middle">the unembedding</text>
+
+              <text class="svg-step" x="240" y="126">×</text>
+
+              <rect x="276" y="60" width="120" height="120" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.8"></rect>
+              <text class="svg-step" x="336" y="112" text-anchor="middle">J_ℓ</text>
+              <text class="svg-sub" x="336" y="134" text-anchor="middle">d × d</text>
+              <text class="svg-num" x="336" y="200" text-anchor="middle">the averaged Jacobian</text>
+
+              <text class="svg-step" x="424" y="126">=</text>
+
+              <rect x="466" y="60" width="150" height="120" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.8"></rect>
+              <text class="svg-step" x="541" y="106" text-anchor="middle">W_U J_ℓ</text>
+              <text class="svg-sub" x="541" y="128" text-anchor="middle">n_vocab × d</text>
+              <line x1="466" y1="148" x2="616" y2="148" stroke="#3c6f97" stroke-width="2.4"></line>
+              <text class="svg-num" x="541" y="200" text-anchor="middle">one row per token</text>
+
+              <g stroke="#3c6f97" stroke-width="1.3" fill="none">
+                <line x1="616" y1="148" x2="700" y2="148"></line>
+                <path d="M700 148 l-8 -4 M700 148 l-8 4"></path>
+              </g>
+              <rect x="704" y="132" width="230" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.8"></rect>
+              <text class="svg-sub" x="819" y="153" text-anchor="middle">v_t — the J-lens vector for token t</text>
+
+              <line x1="60" y1="228" x2="940" y2="228" stroke="#deded9"></line>
+              <text class="svg-note" x="60" y="250">Read a row as: "the residual-stream direction whose first-order causal effect, averaged over contexts, is to raise the logit of token t."</text>
+              <text class="svg-note" x="60" y="270">Because n_vocab &gt; d, these directions cannot be orthogonal — which is exactly why identifying which are active needs sparse decomposition rather than a projection.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            A practical note for anyone implementing this: under RMSNorm the
+            final <code>norm</code> is a positive scalar rescale times a learned
+            diagonal gain. The scalar cannot change the ranking of logits, but
+            the gain can — so fold the gain into the unembedding, W̃<sub>U</sub>
+            = W<sub>U</sub> diag(g), and take the rows of W̃<sub>U</sub>
+            J<sub>ℓ</sub>. Skipping this gives you subtly wrong vectors that
+            still look plausible. <span class="recon">reconstruction</span>
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="space"><span class="secnum">05</span>The J-space itself</h2>
+          <p>
+            Now the object in the title. The J-space is not a linear subspace,
+            and the difference matters.
+          </p>
+          <div class="eq">
+            J-space<sub>k</sub> &nbsp;=&nbsp; { &thinsp;Σ<sub>i=1..k</sub> c<sub>i</sub> v<sub>t<sub>i</sub></sub> &nbsp;:&nbsp; c<sub>i</sub> ≥ 0 &thinsp;}
+            <span class="where">
+              "the set of points expressible as a sparse nonnegative
+              combination of J-lens vectors." For a sparsity level k, "the
+              J-space corresponds to a union of k-dimensional cones, one for
+              each possible set of k J-lens vectors."
+              <span class="src">from the paper</span>
+            </span>
+          </div>
+          <p>
+            Three properties follow, and each one is a design decision:
+          </p>
+          <ul>
+            <li>
+              <strong>Sparse</strong>, so that "what is in the workspace right
+              now" is a short list rather than a dense coordinate vector. k is
+              "typically… no more than 25, which we empirically observed to be
+              the number of J-lens vectors that are meaningfully active at a
+              given time."
+            </li>
+            <li>
+              <strong>Nonnegative</strong>, so that a concept is either present
+              with some strength or absent. Negative coefficients would make
+              "the model is thinking about minus-Paris" expressible, which is
+              not a thing.
+            </li>
+            <li>
+              <strong>A union of cones, not a subspace</strong>, because the
+              vectors are overcomplete. Any point in ℝ<sup>d</sup> is in their
+              linear span; the content of the claim is entirely in the sparsity
+              and nonnegativity constraints.
+            </li>
+          </ul>
+          <p>
+            Given an activation — or a steering vector, or an SAE feature
+            direction — you find its J-space component by solving for the best
+            sparse nonnegative reconstruction: "we solve for a sparse
+            nonnegative combination of k J-lens vectors that approximate it well
+            using gradient pursuit… This combination is our approximation of the
+            activation's J-space component, and the coefficients of these
+            vectors are its local J-space coordinates."
+            <span class="src">from the paper</span>
+          </p>
+          <p>
+            And here is the number that makes the whole paper interesting. That
+            component is <em>tiny</em>: "the J-space component typically accounts
+            for only a small fraction of total activation variance (varying by
+            layer, but never more than 10%)." For concept vectors specifically,
+            "across concepts and workspace layers, the J-space component carries
+            a median of only 6–7% of the concept vector's variance, with the
+            remaining ~93% lying outside the J-space."
+            <span class="src">from the paper</span>
+          </p>
+          <p>
+            Six percent of a vector, and it is the six percent that does the
+            reportable thinking. When they split concept vectors into the
+            J-space part and everything else and used each half to perform a
+            swap, the small part worked on <strong>88%</strong> of trials and
+            the large part on <strong>5%</strong>.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-decomp">
+          <div class="figure-head">
+            <span class="figure-label">Figure 4</span>
+            <p class="figure-title">Six percent of the vector, and nearly all of the leverage</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1000 260" role="img" aria-label="Decomposition of an activation into a small J-space component and a large remainder">
+              <text class="svg-lane" x="30" y="30">ONE CONCEPT VECTOR, DECOMPOSED</text>
+              <line x1="30" y1="40" x2="970" y2="40" stroke="#deded9"></line>
+
+              <rect x="40" y="62" width="880" height="40" rx="6" fill="#f7f7f5" stroke="#deded9"></rect>
+              <rect x="40" y="62" width="62" height="40" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.8"></rect>
+              <text class="svg-sub" x="71" y="87" text-anchor="middle">6–7%</text>
+              <text class="svg-sub" x="500" y="87" text-anchor="middle">the remaining ~93% — outside the J-space</text>
+
+              <text class="svg-num" x="40" y="126">J-space component</text>
+              <text class="svg-sub" x="40" y="146">a sparse nonnegative combination of ≤25 J-lens vectors</text>
+
+              <line x1="40" y1="170" x2="970" y2="170" stroke="#deded9"></line>
+              <text class="svg-lane" x="40" y="196">WHEN USED ALONE TO SWAP AN IMPLANTED CONCEPT</text>
+
+              <rect x="40" y="210" width="360" height="30" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.6"></rect>
+              <text class="svg-sub" x="220" y="230" text-anchor="middle">J-space component — succeeds on 88% of trials</text>
+
+              <rect x="430" y="210" width="60" height="30" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.6"></rect>
+              <text class="svg-sub" x="520" y="230">non-J-space component — 5%</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            This is the paper's central dissociation, and it is why "less than
+            10% of variance" is a headline rather than a caveat. Variance is a
+            measure of how much of the vector something is. It is not a measure
+            of what the vector is for.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="relatives"><span class="secnum">06</span>How it differs from its neighbours</h2>
+          <p>
+            Four comparisons, because knowing what a method is <em>not</em> is
+            most of understanding it.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-compare">
+          <div class="figure-head">
+            <span class="figure-label">Figure 5</span>
+            <p class="figure-title">The J-lens against its relatives</p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr><th>Method</th><th>What it fits</th><th>Objective</th><th>Relation to the J-lens</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Logit lens</strong></td>
+                  <td>nothing — applies W<sub>U</sub> directly</td>
+                  <td>none</td>
+                  <td>Exactly the special case J<sub>ℓ</sub> = I. Agrees closely in the last several layers, diverges earlier; "the J-lens recover[s] interpretable content at depths where the logit lens does not."</td>
+                </tr>
+                <tr>
+                  <td><strong>Tuned lens</strong></td>
+                  <td>a per-layer linear map, trained</td>
+                  <td>match the final output distribution — <em>correlational</em></td>
+                  <td>Optimizes for the wrong thing here: on prompts with unverbalized intermediate computation it "skip[s] ahead to the output rather than surface those intermediates."</td>
+                </tr>
+                <tr>
+                  <td><strong>SAEs</strong></td>
+                  <td>an overcomplete dictionary, trained on activations</td>
+                  <td>reconstruct activations sparsely</td>
+                  <td>Complementary rather than competing. J-lens vectors "would then constitute a subframe of this feature frame: a token-indexed subset of the model's feature directions." An SAE feature can itself be decomposed into J-space coordinates.</td>
+                </tr>
+                <tr>
+                  <td><strong>Concept-vector probing</strong></td>
+                  <td>a direction per concept, from activations</td>
+                  <td>separate concept from baseline</td>
+                  <td>Used <em>inside</em> the paper as material, not as a rival: concept vectors are extracted by "recording the residual stream activation prior to the Assistant's response to the prompt 'Tell me about {concept}', mean-subtracted over a baseline set of 100 other concepts" — then split into J-space and non-J-space halves.</td>
+                </tr>
+                <tr>
+                  <td><strong>Relation Jacobians</strong> (Hernandez et al.)</td>
+                  <td>a linear map per relation</td>
+                  <td>subject → object, e.g. "plays instrument"</td>
+                  <td>Same first-order tool, different target: "The J-lens applies the same first-order approximation to the map from activations to model outputs, rather than to a single relation."</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            The through-line: every other method on this list is fitted to
+            <em>match something</em>. The J-lens is measured. It has no
+            objective, no training set, no hyperparameters except the corpus —
+            which is why its failure modes are approximation errors rather than
+            overfitting. <span class="src">quotations from the paper</span>
+          </p>
+        </figure>
+        <section class="prose">
+          <div class="part">
+            <span>Part II</span>
+            <strong>Building one</strong>
+            <em>
+              The paper states what a J-space is and what it did with it. It
+              does not state how to compute the thing efficiently, and the
+              naive reading of the definition is computationally hopeless.
+              This part is the construction manual — six steps, with the
+              arithmetic worked out. Everything from here to §14 is
+              reconstruction unless badged otherwise.
+            </em>
+          </div>
+
+          <h2 id="build"><span class="secnum">07</span>Building one: the pipeline</h2>
+          <p>
+            Six steps. Two of them are expensive and four of them are cheap,
+            and knowing which is which determines whether this is a weekend
+            project or a cluster booking.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-pipeline">
+          <div class="figure-head">
+            <span class="figure-label">Figure 6</span>
+            <p class="figure-title">The whole build, with its cost profile</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1120 330" role="img" aria-label="Six-step pipeline for constructing a J-space with cost annotations">
+              <text class="svg-lane" x="30" y="28">BUILD ONCE</text>
+              <line x1="30" y1="38" x2="620" y2="38" stroke="#deded9"></line>
+              <text class="svg-lane" x="660" y="28">USE FOREVER</text>
+              <line x1="660" y1="38" x2="1090" y2="38" stroke="#deded9"></line>
+
+              <g stroke="#252525" stroke-width="2" fill="none">
+                <line x1="216" y1="96" x2="256" y2="96"></line>
+                <line x1="442" y1="96" x2="482" y2="96"></line>
+                <line x1="620" y1="96" x2="676" y2="96"></line>
+                <line x1="862" y1="96" x2="902" y2="96"></line>
+                <line x1="780" y1="140" x2="780" y2="186"></line>
+                <line x1="1000" y1="140" x2="1000" y2="186"></line>
+              </g>
+
+              <rect x="36" y="66" width="180" height="60" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-num" x="50" y="86">1</text>
+              <text class="svg-step" x="68" y="86">Corpus &amp; layers</text>
+              <text class="svg-sub" x="50" y="106">1,000 prompts · 25 evenly</text>
+              <text class="svg-sub" x="50" y="120">spaced layers</text>
+
+              <rect x="256" y="66" width="186" height="60" rx="7" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.8"></rect>
+              <text class="svg-num" x="270" y="86">2</text>
+              <text class="svg-step" x="288" y="86">Estimate J_ℓ</text>
+              <text class="svg-sub" x="270" y="106">the expensive step —</text>
+              <text class="svg-sub" x="270" y="120">thousands of passes</text>
+
+              <rect x="482" y="66" width="138" height="60" rx="7" fill="#f7e3c8" stroke="#d98226" stroke-width="1.6"></rect>
+              <text class="svg-num" x="496" y="86">3</text>
+              <text class="svg-step" x="514" y="86">Compose</text>
+              <text class="svg-sub" x="496" y="106">fold the norm gain,</text>
+              <text class="svg-sub" x="496" y="120">store J not W_U J</text>
+
+              <rect x="676" y="66" width="186" height="60" rx="7" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.6"></rect>
+              <text class="svg-num" x="690" y="86">4</text>
+              <text class="svg-step" x="708" y="86">Read</text>
+              <text class="svg-sub" x="690" y="106">rank · probe · sparse</text>
+              <text class="svg-sub" x="690" y="120">decomposition</text>
+
+              <rect x="902" y="66" width="186" height="60" rx="7" fill="#ece6f3" stroke="#765b98" stroke-width="1.6"></rect>
+              <text class="svg-num" x="916" y="86">5</text>
+              <text class="svg-step" x="934" y="86">Write</text>
+              <text class="svg-sub" x="916" y="106">steer · ablate · patch</text>
+
+              <rect x="676" y="186" width="186" height="52" rx="7" fill="#dfede5" stroke="#367f59" stroke-width="1.6"></rect>
+              <text class="svg-num" x="690" y="206">6</text>
+              <text class="svg-step" x="708" y="206">Validate</text>
+              <text class="svg-sub" x="690" y="226">before you believe any of it</text>
+
+              <rect x="902" y="186" width="186" height="52" rx="7" fill="#dfede5" stroke="#367f59" stroke-width="1.6"></rect>
+              <text class="svg-step" x="916" y="206">Validate the writes too</text>
+              <text class="svg-sub" x="916" y="226">a steer that does nothing is data</text>
+
+              <line x1="30" y1="266" x2="1090" y2="266" stroke="#deded9"></line>
+              <text class="svg-note" x="30" y="290">Step 2 dominates everything. Steps 4 and 5 are a matvec and a matmul — once J exists, a full lens readout is cheaper than a single token of generation.</text>
+              <text class="svg-note" x="30" y="312">That asymmetry is the method's best property: you pay once per model, then interrogate it as often as you like.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            The J-lens "operates post-hoc on frozen models without additional
+            training." There is no optimizer anywhere in this pipeline. Step 2
+            is measurement, step 3 is linear algebra, and steps 4–6 are queries.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="corpus"><span class="secnum">08</span>Step 1 — layers, corpus, capture points</h2>
+          <h3 id="corpus-what">The corpus</h3>
+          <p>
+            One thousand prompts sampled from a pretraining-like distribution.
+            <span class="src">from the paper</span> Three things about that
+            choice are worth thinking through before you copy it.
+          </p>
+          <p>
+            <strong>It is deliberately not task data.</strong> The Jacobian is
+            supposed to capture what a direction does <em>in general</em>. If
+            you average over a corpus of arithmetic problems you will get a lens
+            that reads arithmetic well and everything else badly — you will have
+            quietly reintroduced the context-specificity that averaging exists
+            to remove. If your research question is domain-specific, that may
+            be what you want, but then say so: you have built a J-lens
+            <em>for that domain</em>, and its readouts are not comparable to
+            anyone else's. <span class="recon">reconstruction</span>
+          </p>
+          <p>
+            <strong>The estimator's variance depends on it.</strong> A thousand
+            prompts with, say, 500 positions each and all valid t′ ≥ t pairs
+            gives on the order of 10<sup>8</sup> Jacobian terms in the average.
+            That is a lot of averaging, and it is why a matrix this large can be
+            estimated at all. <span class="recon">reconstruction</span>
+          </p>
+          <p>
+            <strong>Chat-formatted models need a decision.</strong> The paper
+            works with Claude models, which are trained with a chat template,
+            but samples "pretraining-like" prompts. If you are reproducing this
+            on an instruction-tuned model, decide explicitly whether your corpus
+            sits inside the chat template or outside it, and hold that decision
+            fixed — the two produce measurably different maps.
+            <span class="recon">reconstruction</span>
+          </p>
+          <h3 id="corpus-layers">The layers</h3>
+          <p>
+            The paper reports "25 evenly spaced layers reindexed to [0–100]," so
+            that layer numbers are percentages of depth and results are
+            comparable across models of different sizes.
+            <span class="src">from the paper</span> Adopt this. It costs
+            nothing, and it is the difference between "L38" meaning something
+            and meaning nothing.
+          </p>
+          <p>
+            Where you capture matters. h<sub>ℓ,t</sub> is the residual stream —
+            the stream itself, not an MLP or attention output — and
+            h<sub>final,t′</sub> is the residual stream at the last layer,
+            <em>before</em> the final normalization and unembedding, because
+            those are applied separately in the lens equation. Get this wrong
+            and you will double-apply a layernorm and spend a day wondering why
+            your columns are scaled strangely.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h2 id="jacobian"><span class="secnum">09</span>Step 2 — estimating the averaged Jacobian</h2>
+          <p>
+            This is the step the paper does not describe, and the naive reading
+            of the definition is a trap. Written literally, J<sub>ℓ</sub> is an
+            average over (prompt, t, t′) triples of a d × d matrix. Materializing
+            even one of those matrices costs d backward passes. With
+            d ≈ 8,000 and 10<sup>8</sup> triples, the literal recipe is off by
+            about eleven orders of magnitude from feasible.
+          </p>
+          <p>
+            The way out is that <strong>you never need any individual Jacobian
+            — only the expectation</strong>, and expectation commutes with the
+            linear operations you use to probe it. There are two routes, and
+            picking the right one is the single most consequential engineering
+            decision in the build.
+          </p>
+          <h3 id="jvp">Route A — forward mode (JVP), one column at a time</h3>
+          <p>
+            Push a tangent vector through the network. A forward-mode
+            derivative with tangent e<sub>j</sub> injected at h<sub>ℓ,t</sub>
+            returns, at each output position, that position's Jacobian applied
+            to e<sub>j</sub> — which is column <em>j</em>.
+          </p>
+          <p>
+            The trick is that you can inject the <em>same</em> tangent at every
+            source position at once. Because attention is causally masked, the
+            derivative read at position t′ is
+          </p>
+          <div class="eq">
+            ∂h<sub>final,t′</sub>/∂ε &nbsp;=&nbsp; Σ<sub>t</sub> ( ∂h<sub>final,t′</sub>/∂h<sub>ℓ,t</sub> ) e<sub>j</sub>
+            &nbsp;=&nbsp; Σ<sub>t ≤ t′</sub> J<sup>(t,t′)</sup> e<sub>j</sub>
+            <span class="where">
+              Terms with t &gt; t′ vanish identically — a later token cannot
+              affect an earlier one. So a single forward pass gives you the sum
+              over exactly the source positions the definition asks for, for
+              free, at every readout position simultaneously. Divide by the
+              number of contributing positions and accumulate.
+              <span class="recon">reconstruction</span>
+            </span>
+          </div>
+          <p>
+            Cost: <strong>d JVPs per layer</strong>, each amortized over the
+            whole corpus. For 25 layers that is 25 d passes — around 200,000
+            corpus-passes for d = 8,192. Feasible on a cluster, painful
+            otherwise.
+          </p>
+          <h3 id="vjp">Route B — reverse mode (VJP), one token at a time</h3>
+          <p>
+            Now run it backwards. What you actually want is not J<sub>ℓ</sub>
+            but its rows composed with the unembedding — the J-lens vectors. And
+            a row is a vector–Jacobian product:
+          </p>
+          <div class="eq">
+            v<sub>t</sub><sup>(ℓ)</sup> &nbsp;=&nbsp; ( W̃<sub>U</sub> J<sub>ℓ</sub> )<sub>t,:</sub>
+            &nbsp;=&nbsp; 𝔼 [ ∂ ( u<sub>t</sub> · h<sub>final</sub> ) / ∂h<sub>ℓ</sub> ] ,
+            &nbsp;&nbsp; u<sub>t</sub> = W̃<sub>U</sub>[t, :]
+            <span class="where">
+              One backward pass, seeded with the unembedding row for token t as
+              the cotangent, yields that token's J-lens vector — and yields it
+              <strong>at every layer and every source position at once</strong>,
+              because a single backward pass computes gradients with respect to
+              every intermediate activation. Seed the cotangent at all readout
+              positions simultaneously and the sum over t′ ≥ t comes for free
+              too. <span class="recon">reconstruction</span>
+            </span>
+          </div>
+          <p>
+            Cost: <strong>one backward pass per token of interest</strong>,
+            covering all layers. If you want the lens for 2,000 concept tokens,
+            that is 2,000 corpus-passes rather than 200,000.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-routes">
+          <div class="figure-head">
+            <span class="figure-label">Figure 7</span>
+            <p class="figure-title">Two routes to the same matrix — pick by what you actually need<span class="recon">reconstruction</span></p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr><th></th><th>Route A — forward mode</th><th>Route B — reverse mode</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><strong>Seed</strong></td><td>tangent e<sub>j</sub> at h<sub>ℓ</sub>, all source positions</td><td>cotangent u<sub>t</sub> = W̃<sub>U</sub>[t,:] at h<sub>final</sub>, all readout positions</td></tr>
+                <tr><td><strong>Yields</strong></td><td>column j of J<sub>ℓ</sub>, one layer</td><td>the J-lens vector for token t, <em>every</em> layer</td></tr>
+                <tr><td><strong>Passes needed</strong></td><td>d per layer → 25 d total</td><td>|S| total, where S is your vocabulary subset</td></tr>
+                <tr><td><strong>For d = 8,192</strong></td><td>≈ 204,800 corpus-passes</td><td>2,000 for a concept set; ≈ n<sub>vocab</sub> for the full lens</td></tr>
+                <tr><td><strong>You get</strong></td><td>the full J<sub>ℓ</sub> — can lens <em>any</em> token, and can apply J to arbitrary vectors</td><td>only the rows you asked for — cannot compute J h for a new h</td></tr>
+                <tr><td><strong>Storage</strong></td><td>d² per layer — 268 MB at fp32, d = 8,192; × 25 layers ≈ 6.7 GB</td><td>|S| × d per layer — 64 MB for |S| = 2,000, all 25 layers</td></tr>
+                <tr><td><strong>Choose when</strong></td><td>you need full ranked readouts over the whole vocabulary, or want to lens arbitrary directions (steering vectors, SAE features)</td><td>you have a fixed concept set and want every layer cheaply — the right default for a first reproduction</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            The asymmetry is worth internalizing: forward mode is priced per
+            <em>input dimension</em>, reverse mode per <em>output dimension</em>.
+            The J-lens has d inputs and n<sub>vocab</sub> outputs, so the answer
+            depends entirely on how much of the vocabulary you need. Almost
+            every first experiment needs a few thousand tokens, which makes
+            Route B roughly a hundred times cheaper.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h3 id="numerics">Numerical cautions</h3>
+          <ul>
+            <li>
+              <strong>Accumulate in fp32 or higher.</strong> You are summing
+              10<sup>8</sup> terms of wildly varying magnitude. bf16
+              accumulation will silently lose the tail, and the tail is where
+              the mid-layer structure lives.
+            </li>
+            <li>
+              <strong>Decide what to do about t′ = t.</strong> The
+              same-position term is the diagonal of the propagation and is far
+              larger than the rest; leaving it in means your average is
+              dominated by "what does this activation do to its own position's
+              logits," which is close to the logit lens. Report whether you
+              included it. This is a genuine free parameter that the paper's
+              notation (t′ ≥ t) resolves in favour of including it.
+            </li>
+            <li>
+              <strong>Choose your position weighting deliberately.</strong>
+              "𝔼<sub>t, t′≥t</sub>" is ambiguous between uniform over valid
+              (t, t′) pairs and uniform over t then uniform over t′. Late
+              positions have many more valid pairs, so the two differ.
+              Either is defensible; only silence is not.
+            </li>
+            <li>
+              <strong>Never materialize W<sub>U</sub> J<sub>ℓ</sub>.</strong>
+              At 200k × 8,192 × 25 layers it is roughly 80 GB in bf16. Store
+              J<sub>ℓ</sub> and evaluate readouts right-to-left as
+              W̃<sub>U</sub> (J<sub>ℓ</sub> h), materializing individual rows
+              only for the candidates a sparse decomposition actually touches.
+            </li>
+            <li>
+              <strong>Split-half your corpus.</strong> Estimate J twice on
+              disjoint halves. If the two disagree, you do not have enough
+              prompts, and no amount of downstream interpretation will fix it.
+            </li>
+          </ul>
+
+          <h2 id="compose"><span class="secnum">10</span>Step 3 — composing the lens</h2>
+          <p>
+            Short step, one subtlety. The lens is
+            softmax(W<sub>U</sub> norm(J<sub>ℓ</sub> h<sub>ℓ</sub>)), and the
+            J-lens vectors are the rows of W<sub>U</sub> J<sub>ℓ</sub>. Those
+            two statements are only consistent if you handle the normalization
+            correctly.
+          </p>
+          <p>
+            Under RMSNorm, norm(x) = (x / ‖x‖<sub>rms</sub>) ⊙ g. The division
+            is by a positive scalar, which rescales all logits uniformly and
+            therefore cannot change their ranking — safe to drop when you only
+            care about order. The learned gain g is a diagonal matrix, and it
+            <em>does</em> change the ranking. So fold it in once:
+          </p>
+          <div class="eq">
+            W̃<sub>U</sub> &nbsp;=&nbsp; W<sub>U</sub> diag(g) &nbsp;&nbsp;&nbsp;
+            v<sub>t</sub><sup>(ℓ)</sup> &nbsp;=&nbsp; ( W̃<sub>U</sub> J<sub>ℓ</sub> )<sub>t,:</sub>
+            <span class="where">
+              With LayerNorm rather than RMSNorm there is also a centering step;
+              fold that in as the projection that removes the all-ones
+              direction, which is standard practice for logit-lens work and
+              carries over unchanged. <span class="recon">reconstruction</span>
+            </span>
+          </div>
+          <p>
+            One more decision: whether to normalize the J-lens vectors to unit
+            length. For <em>ranking</em> readouts, do not — the magnitudes carry
+            the information. For <em>sparse decomposition</em> and for
+            <em>cosine-similarity probing</em>, you must, or the pursuit will
+            select whichever vectors happen to be longest rather than whichever
+            best explain the residual. Keep both versions.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h2 id="read"><span class="secnum">11</span>Step 4 — the three read operations</h2>
+          <p>
+            The paper uses three, and they answer different questions.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-read">
+          <div class="figure-head">
+            <span class="figure-label">Figure 8</span>
+            <p class="figure-title">Reading the workspace<span class="src">formulas from the paper</span></p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr><th>Operation</th><th>Formula</th><th>Answers</th><th>Use when</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Ranked readout</strong></td>
+                  <td><code>softmax(W̃_U norm(J_ℓ h_ℓ))</code>, sorted</td>
+                  <td>"What is this activation disposed to say?"</td>
+                  <td>Exploration. Produces the familiar per-(position, layer) top-k token list, and the heatmaps that track a pinned token's rank across depth.</td>
+                </tr>
+                <tr>
+                  <td><strong>Per-token probe</strong></td>
+                  <td>score or cosine similarity of <code>h_ℓ</code> against a single <code>v_t</code></td>
+                  <td>"Is <em>this specific</em> concept present, above threshold?"</td>
+                  <td>Hypothesis testing — "we read the score… against a single chosen v_t, without ranking the full vocabulary." Cheap enough to run across every position and layer.</td>
+                </tr>
+                <tr>
+                  <td><strong>Sparse decomposition</strong></td>
+                  <td>gradient pursuit for a nonnegative <code>c</code> with ‖c‖₀ ≤ k minimizing <code>‖h_ℓ − Vc‖</code></td>
+                  <td>"What is in the workspace right now, as a discrete set?"</td>
+                  <td>Anything quantitative. Yields the J-space component, its local coordinates, and its share of variance. This is the operation that makes "the J-space" measurable rather than rhetorical.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            Expect the first third of the model to be unreadable. The paper is
+            explicit: "in roughly the first third of the model, the readouts are
+            noisy and largely uninterpretable." If your reproduction produces
+            garbage at layer 15, that is a match, not a bug.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h3 id="pursuit">Gradient pursuit, concretely</h3>
+          <p>
+            The paper names the algorithm and does not specify it. Gradient
+            pursuit is a greedy matching-pursuit family: instead of solving an
+            exact least-squares problem on the active set at each step, it takes
+            a gradient step, which keeps each iteration cheap when the
+            dictionary is enormous. The nonnegative variant clips after each
+            step. Here is a working formulation.
+            <span class="recon">reconstruction</span>
+          </p>
+          <pre><code>V   : (n_vocab, d)  — unit-normalized J-lens vectors at layer ℓ
+h   : (d,)          — the activation to decompose
+k   : sparsity, ≤ 25
+
+r = h                      # residual
+A = []                     # active atom indices
+c = zeros(k)
+
+repeat k times:
+    s = V @ r                     # correlation of every atom with the residual
+    s[A] = -inf                   # don't re-select
+    j = argmax(s)
+    if s[j] &lt;= 0: break           # nothing left that helps, non-negatively
+    A.append(j)
+
+    V_A = V[A]                    # (|A|, d)
+    g   = V_A @ r                 # gradient of ½‖h − V_Aᵀc‖² w.r.t. c
+    step = (g @ g) / ((g @ V_A) @ (g @ V_A))    # exact line search
+    c = maximum(0, c + step * g)  # gradient step, then project to the cone
+    r = h - V_A.T @ c
+
+j_component = V_A.T @ c           # the J-space component of h
+coords      = dict(zip(A, c))     # its local J-space coordinates
+share       = 1 - var(r) / var(h) # the "≤10% of variance" number</code></pre>
+          <p>
+            Three implementation notes. The <code>V @ r</code> line is a
+            200k × 8k matrix–vector product per iteration — trivial on a GPU,
+            fatal in a loop on CPU, so batch your positions. The line-search
+            step is what distinguishes gradient pursuit from plain matching
+            pursuit and is worth keeping; a fixed step size converges visibly
+            worse. And the <code>s[j] &lt;= 0</code> break is not decoration: it
+            is the nonnegativity constraint doing its job, and if it never fires
+            at k = 25 you should suspect your vectors are not normalized.
+          </p>
+          <p>
+            The paper's justification for k is empirical rather than principled
+            — "we typically choose it to be no more than 25, which we
+            empirically observed to be the number of J-lens vectors that are
+            meaningfully active at a given time." <span class="src">from the paper</span>
+            Reproduce that observation before you adopt the number: sweep k,
+            plot marginal variance explained per atom, and look for the knee. If
+            your knee is at 6 or at 60, you have learned something about your
+            model rather than mis-implemented theirs.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h2 id="write"><span class="secnum">12</span>Step 5 — the three write operations</h2>
+          <p>
+            Reading a workspace is suggestive. Writing to it is what makes the
+            claim causal, and all three interventions in the paper are stated
+            precisely enough to implement directly.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-write">
+          <div class="figure-head">
+            <span class="figure-label">Figure 9</span>
+            <p class="figure-title">Writing to the workspace<span class="src">formulas from the paper</span></p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr><th>Operation</th><th>Procedure</th><th>Parameters as used</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Steering</strong></td>
+                  <td><code>h ← h + α v_t</code> — add a J-lens vector at chosen layers and token positions.</td>
+                  <td>α is swept per experiment; results reported "at each condition's most effective injection strength." A "double strength" setting of α = 2 appears in the generalization experiments.</td>
+                </tr>
+                <tr>
+                  <td><strong>Ablation</strong></td>
+                  <td>"At each token position, across a band of layers, we identify the k = 10 most strongly activated J-lens vectors and zero out the residual stream's projection onto each."</td>
+                  <td>k = 10. Three strengths — light, medium, heavy — defined by how wide the layer band is; the battery reported in the paper uses L38–79. Critically, the ablation is <em>not</em> applied to tokens that appear in the top-10 of a clean forward pass, so it removes the workspace without simply deleting the answer.</td>
+                </tr>
+                <tr>
+                  <td><strong>Patching / swapping</strong></td>
+                  <td>"Given a source token s and target token t, we form V = [v_s v_t], read the lens coordinates c = V<sup>†</sup>h (where V<sup>†</sup> is the pseudoinverse), and set h<sub>patched</sub> = h + V(σ(c) − c)" — where σ swaps the two coordinate entries, optionally scaled by α.</td>
+                  <td>The pseudoinverse matters: v_s and v_t are not orthogonal, so a naive subtract-then-add over-corrects. This form exchanges exactly the two coordinates and leaves the orthogonal complement untouched.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            The patch is the most elegant of the three and the one most worth
+            copying into other work. It is a <em>coordinate exchange</em>, not
+            an addition: everything outside the two-dimensional span of
+            {v<sub>s</sub>, v<sub>t</sub>} is preserved bit for bit, which is
+            what makes "the model now thinks it was Paris rather than Rome, and
+            is otherwise unchanged" a defensible description of the
+            intervention.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <p>
+            One warning about ablation that the paper's design already
+            anticipates. Zeroing out projections removes vector norm, and
+            removing norm degrades a model all by itself. Any ablation result
+            therefore needs a <strong>matched-norm control</strong>: perturb by
+            the same magnitude in a direction that is not J-lens-aligned, and
+            show the damage does not follow. The paper runs exactly this
+            control in the experience-reporting experiment, where "matched-norm
+            control perturbations left scores near baseline" while the real
+            ablation moved them dramatically. Without that control, an ablation
+            result is uninterpretable.
+            <span class="src">control from the paper</span>
+          </p>
+
+          <h2 id="validate"><span class="secnum">13</span>Step 6 — validation</h2>
+          <p>
+            You now have a large matrix and a strong temptation. Before
+            interpreting anything, run these. Several are free, and each one
+            fails in a distinctive way.
+            <span class="recon">reconstruction, except where noted</span>
+          </p>
+          <ol class="recipe">
+            <li>
+              <strong>The identity check.</strong> At the final layer,
+              J<sub>ℓ</sub> should be approximately the identity — a
+              perturbation at the last layer <em>is</em> the perturbation at the
+              output. If it is not, your capture point is wrong, almost
+              certainly by one normalization.
+            </li>
+            <li>
+              <strong>The logit-lens agreement check.</strong> In the last
+              several layers the J-lens and logit lens should agree closely
+              <span class="src">stated in the paper</span> and should diverge
+              earlier. Measure it as rank correlation over top-k tokens per
+              layer. A lens that agrees everywhere has collapsed to the logit
+              lens; one that agrees nowhere is broken.
+            </li>
+            <li>
+              <strong>The noise-floor check.</strong> Readouts in roughly the
+              first third of the model should be noisy and largely
+              uninterpretable <span class="src">stated in the paper</span>.
+              This is the check people skip because it looks like failure. It
+              is the expected result.
+            </li>
+            <li>
+              <strong>Split-half stability.</strong> Two J's from disjoint
+              corpus halves. Compare column-wise cosine and top-k readout
+              overlap. This is your only direct evidence that 1,000 prompts was
+              enough for <em>your</em> model.
+            </li>
+            <li>
+              <strong>The variance property.</strong> Decompose real activations
+              and confirm the J-space component sits under ~10% of variance at
+              every layer. Much higher and your dictionary is too permissive —
+              usually unnormalized vectors, or k set far too large.
+            </li>
+            <li>
+              <strong>A steering round-trip.</strong> Add α v<sub>t</sub> at a
+              workspace-region layer and confirm token t rises in the output
+              distribution. This is the minimal proof that your vectors point
+              the way you think they do, and it takes ten minutes.
+            </li>
+            <li>
+              <strong>Reproduce one dissociation.</strong> The cleanest is the
+              language experiment: on one passage, swap Spanish → French in the
+              lens. Under "explicit report" and "flexible inference" framings
+              this should change the output on essentially all trials; under
+              plain continuation and anomaly detection it should do
+              approximately nothing, despite fluent performance.
+              <span class="src">result from the paper</span> If you can
+              reproduce that double dissociation you have a working J-space; if
+              your swap changes everything or nothing, you do not.
+            </li>
+            <li>
+              <strong>Find the onset.</strong> Compute the four structural
+              metrics — top-k next-token accuracy, kurtosis, autocorrelation
+              across layers, and effective dimensionality — and look for the
+              sharp transition. The paper puts it around a third of depth
+              (~L38). A model with no visible transition is telling you
+              something interesting or telling you your J is wrong, and you
+              should find out which.
+            </li>
+          </ol>
+        </section>
+        <section class="prose">
+          <h2 id="code"><span class="secnum">14</span>A reference implementation</h2>
+          <p>
+            Route B, end to end, in enough detail to port. This is the shape I
+            would write for a first reproduction: a fixed concept set, every
+            layer at once, one backward pass per concept.
+            <span class="recon">reconstruction</span>
+          </p>
+          <pre><code># ─── Step 2: estimate the J-lens vectors for a set of tokens ───────────
+#
+# One backward pass per token of interest yields that token's J-lens
+# vector at EVERY layer, summed over readout positions, for one prompt.
+# Average over the corpus.
+
+LAYERS  = evenly_spaced(n_layers, 25)      # capture points on the residual stream
+TOKENS  = concept_token_ids                # the vocabulary subset you care about
+W_tilde = W_U * g_final                    # fold the final norm gain (§10)
+
+acc = {(t, l): zeros(d, float32) for t in TOKENS for l in LAYERS}
+n   = {(t, l): 0 for t in TOKENS for l in LAYERS}
+
+for prompt in corpus:                      # 1,000 pretraining-like prompts
+    h = {}                                 # captured residual streams
+    out = model.forward(prompt, capture=LAYERS, into=h, requires_grad=True)
+    h_final = out.residual_pre_norm        # (seq, d) — BEFORE norm + unembed
+
+    for t in TOKENS:
+        u = W_tilde[t]                            # (d,) cotangent
+        # seed the same cotangent at every readout position: this performs
+        # the sum over t' >= t for free, by causal masking.
+        scalar = (h_final @ u).sum()
+        grads  = autograd.grad(scalar, [h[l] for l in LAYERS], retain_graph=True)
+
+        for l, gr in zip(LAYERS, grads):          # gr : (seq, d)
+            valid = positions_with_at_least_one_successor(prompt)
+            acc[(t, l)] += gr[valid].sum(0).float()
+            n[(t, l)]   += len(valid)
+
+V = {l: stack([acc[(t, l)] / n[(t, l)] for t in TOKENS]) for l in LAYERS}
+V_unit = {l: V[l] / norm(V[l], axis=-1, keepdims=True) for l in LAYERS}
+
+# ─── Step 4: read ──────────────────────────────────────────────────────
+
+def probe(h_l, l, t):                      # "is concept t present?"
+    return cosine(h_l, V_unit[l][index_of[t]])
+
+def decompose(h_l, l, k=25):               # "what is in the workspace?"
+    return gradient_pursuit(V_unit[l], h_l, k=k, nonneg=True)   # §11
+
+# ─── Step 5: write ─────────────────────────────────────────────────────
+
+def steer(h_l, l, t, alpha):
+    return h_l + alpha * V[l][index_of[t]]
+
+def ablate(h_l, l, k=10, protect=()):      # zero the top-k projections
+    coeffs = V_unit[l] @ h_l
+    top    = topk_excluding(coeffs, k, protect)          # protect clean top-10
+    for j in top:
+        v = V_unit[l][j]
+        h_l = h_l - (h_l @ v) * v
+    return h_l
+
+def patch(h_l, l, src, dst, alpha=1.0):    # exchange two coordinates
+    Vst = stack([V[l][index_of[src]], V[l][index_of[dst]]]).T   # (d, 2)
+    c   = pinv(Vst) @ h_l                                       # lens coords
+    return h_l + alpha * (Vst @ (swap(c) - c))</code></pre>
+          <p>
+            Two things this sketch hides that will cost you a day each. The
+            <code>retain_graph=True</code> inner loop over tokens is
+            memory-hungry; in practice you batch the cotangents, which turns
+            |S| backward passes into ⌈|S|/B⌉ batched ones and is the difference
+            between a week and an afternoon. And
+            <code>positions_with_at_least_one_successor</code> is where your
+            position-weighting decision from §09 actually lives — write it
+            explicitly rather than letting a broadcast make the choice for you.
+          </p>
+
+          <div class="part">
+            <span>Part III</span>
+            <strong>What you find, and what to distrust</strong>
+            <em>
+              Back to the paper. Having built the instrument, this is what it
+              reports — and the places its authors say not to lean on it.
+            </em>
+          </div>
+
+          <h2 id="evidence"><span class="secnum">15</span>What the paper found with it</h2>
+          <p>
+            The argument is not "here is a subspace." It is "here is a subspace
+            with five specific functional properties, each of which is what a
+            global workspace is supposed to have." Each property gets its own
+            intervention experiment, and the numbers are what make the case.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-evidence">
+          <div class="figure-head">
+            <span class="figure-label">Figure 10</span>
+            <p class="figure-title">Five properties, and the experiment behind each<span class="src">all results from the paper</span></p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr><th>Property</th><th>Experiment</th><th>Result</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Supports verbal report</strong></td>
+                  <td>Category naming across 14 categories; swap an implanted concept via its lens vector; introspection protocol asking the model to detect implanted thoughts.</td>
+                  <td>Swapping reliably moved the implanted concept to the top of the output distribution. Split by component: the J-space part of a concept vector — 6–7% of its variance — drove successful swaps on <strong>88%</strong> of trials; the remaining ~93% managed <strong>5%</strong>.</td>
+                </tr>
+                <tr>
+                  <td><strong>Subject to directed modulation</strong></td>
+                  <td>Hold a concept in mind while copying text; silently evaluate arithmetic; count line widths while reading; paired questions over identical stimuli.</td>
+                  <td>Target concepts appeared in readouts substantially above baseline under "focus" instructions. "Ignore" instructions sat <em>below</em> focus but <em>above</em> no-instruction baseline. Task-implicit modulation: "past tense" surfaced only when the model was asked about tense, not when merely computing with it.</td>
+                </tr>
+                <tr>
+                  <td><strong>Mediates internal reasoning</strong></td>
+                  <td>Two-hop factual reasoning over 50 prompts (spider legs, rhyming couplets, translation); multi-step arithmetic; swapping the <em>intermediate</em> rather than the answer.</td>
+                  <td>Intermediate swaps succeeded on <strong>54%</strong> of trials for Haiku 4.5 and <strong>70%</strong> for Sonnet and Opus 4.5, and were effective about <strong>17% earlier</strong> in the network than answer swaps. Decomposed probes: the J-space component flipped answers on <strong>61%</strong> of trials, the non-J-space component on <strong>28%</strong>. Arithmetic intermediates surfaced in the correct computational order across layers.</td>
+                </tr>
+                <tr>
+                  <td><strong>Supports flexible generalization</strong></td>
+                  <td>Sixteen function templates across four categories — "capital of France," "language of France" — with the same argument swapped once and reused across functions. 192 trials.</td>
+                  <td>A single lens-vector swap generalized on <strong>76/192</strong> trials (40%) at α = 1 and <strong>101/192</strong> (53%) at α = 2. Success correlated with the concept's workspace loading; country arguments loaded highest and swapped most reliably.</td>
+                </tr>
+                <tr>
+                  <td><strong>Selectively mediates flexible, not automatic, cognition</strong></td>
+                  <td>Same passage, four framings (continuation, anomaly detection, explicit report, flexible inference) with a Spanish → French lens swap; a parallel character-counting design; then a 14-task ablation battery at k = 10 over L38–79.</td>
+                  <td>The sharpest result in the paper. Under explicit report and flexible inference the swap changed the output on <strong>~100%</strong> of trials; under continuation and anomaly detection it had <strong>essentially no effect</strong>, despite fluent performance. Ablation left MMLU, SQuAD, sentiment and CoLA essentially untouched while multi-hop reasoning, translation and summarization fell "well below the level of unablated Haiku 4.5." GSM8K with chain-of-thought was more robust than direct answering.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            The double dissociation in the last row is the load-bearing
+            evidence. A representation that mattered for everything would be
+            unremarkable; a representation that matters for reporting and
+            reasoning and <em>not</em> for fluent continuation is a specific,
+            falsifiable structural claim. Note also the direction of the
+            character-counting result: during automatic linewrapping the number
+            tokens were <em>absent</em> from the lens entirely and swaps did
+            nothing — the model was counting somewhere the workspace could not
+            see.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <p>
+            A sixth line of evidence concerns the model's own reports about its
+            processing. Ablating the J-space during stream-of-consciousness
+            narration "dramatically reduced experiential language score" on
+            Sonnet 4.5, Opus 4.5 and Opus 4.6, while matched-norm control
+            perturbations left the scores near baseline; the token "thinking"
+            appeared in the J-lens top-10 at <strong>58%</strong> of (position,
+            layer) slots during narration. I report this because it is in the
+            paper and it is measured, and I would treat what it means as
+            genuinely open — as the authors do.
+          </p>
+
+          <h2 id="geometry"><span class="secnum">16</span>Sensory, workspace, motor</h2>
+          <p>
+            The structural half of the argument asks a different question: does
+            this thing <em>look</em> like a workspace, geometrically? Four
+            independent statistics — top-k next-token accuracy, kurtosis,
+            autocorrelation across layers, and effective dimensionality — all
+            show a sharp transition at the same depth, about a third of the way
+            through, and the picture that emerges divides the model into three
+            regions.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-regions">
+          <div class="figure-head">
+            <span class="figure-label">Figure 11</span>
+            <p class="figure-title">Three regions, on the paper's 0–100 depth scale<span class="src">boundaries from the paper</span></p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1120 300" role="img" aria-label="A depth bar showing sensory, workspace and motor regions of the model">
+              <rect x="40" y="60" width="404" height="54" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.4"></rect>
+              <rect x="444" y="60" width="572" height="54" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="2"></rect>
+              <rect x="1016" y="60" width="64" height="54" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.4"></rect>
+
+              <text class="svg-step" x="242" y="93" text-anchor="middle">SENSORY</text>
+              <text class="svg-step" x="730" y="93" text-anchor="middle">WORKSPACE</text>
+              <text class="svg-sub" x="1048" y="93" text-anchor="middle">MOTOR</text>
+
+              <line x1="40" y1="130" x2="1080" y2="130" stroke="#deded9"></line>
+              <text class="svg-sub" x="40" y="150">L0</text>
+              <text class="svg-num" x="444" y="150" text-anchor="middle">~L38</text>
+              <text class="svg-num" x="1016" y="150" text-anchor="middle">~L92</text>
+              <text class="svg-sub" x="1080" y="150" text-anchor="end">L100</text>
+
+              <text class="svg-sub" x="40" y="188">Readouts noisy and largely</text>
+              <text class="svg-sub" x="40" y="206">uninterpretable. Ambiguous inputs</text>
+              <text class="svg-sub" x="40" y="224">tracked smoothly — the model has</text>
+              <text class="svg-sub" x="40" y="242">not committed to a reading yet.</text>
+
+              <text class="svg-sub" x="470" y="188">Sharp transition in all four structural metrics at onset. Ambiguous inputs</text>
+              <text class="svg-sub" x="470" y="206">stop tracking smoothly and snap to a binary commitment. J-lens vectors</text>
+              <text class="svg-sub" x="470" y="224">compose with downstream weights more broadly than other directions —</text>
+              <text class="svg-sub" x="470" y="242">the "broadcast" property a workspace is supposed to have. Ablation</text>
+              <text class="svg-sub" x="470" y="260">experiments target L38–79, inside this band.</text>
+
+              <text class="svg-note" x="40" y="290">The J-space carries never more than 10% of activation variance at any layer — the workspace is a narrow channel through a wide network, not a wide one.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            The ambiguous-input experiment is the most elegant of the structural
+            results. Feed a mixed embedding (1−α)e<sub>B</sub> + αe<sub>A</sub>
+            and sweep α from 0 to 1. Early layers track the mixture smoothly, as
+            you would expect of a representation that is still a superposition
+            of readings. From the workspace onset the behaviour changes
+            character: the interpretation snaps. Something between L38 and the
+            layer before it decides what the input <em>is</em>.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="limits"><span class="secnum">17</span>Limitations and failure modes</h2>
+          <p>
+            The paper's own list, which is unusually candid, plus the practical
+            ones you will hit.
+          </p>
+          <p>
+            <strong>Single tokens only.</strong> The J-lens "only identifies
+            vectors associated with concepts that correspond to single tokens."
+            <span class="src">from the paper</span> A great many important
+            concepts do not — every multi-word entity, every phrase-level
+            abstraction. Extensions are mentioned but the base method is
+            vocabulary-shaped, and that shape is inherited by everything it
+            finds. When the lens reports that a concept is absent from the
+            workspace, one live explanation is always "your concept has no
+            single-token handle."
+          </p>
+          <p>
+            <strong>It is an approximation, and says so.</strong> "The Jacobian
+            lens is an imperfect tool, which we believe only approximately and
+            incompletely captures the model's underlying workspace structure."
+            <span class="src">from the paper</span> It is first-order, and the
+            network is not linear. The averaging that gives the method its
+            semantics also discards all context-dependence, which is real.
+          </p>
+          <p>
+            <strong>The early layers are a genuine unknown.</strong> "It remains
+            possible that parts of the model's 'true workspace,' not captured by
+            the J-lens, operate in earlier layers."
+            <span class="src">from the paper</span> The instrument is unreliable
+            in the first third; absence of evidence there is not evidence of
+            absence.
+          </p>
+          <p>
+            <strong>Some computation happens outside the workspace and that is
+            not a bug.</strong> The paper notes the model "may compute over
+            small integers outside the workspace" — the character-counting
+            result is a clean instance. A negative lens result is compatible
+            with "the model is doing this somewhere I cannot see."
+          </p>
+          <p>
+            And three practical failure modes worth naming for anyone
+            reproducing this: <span class="recon">reconstruction</span>
+          </p>
+          <ul>
+            <li>
+              <strong>Corpus leakage.</strong> Estimate J on a corpus that
+              resembles your evaluation and you will find whatever you were
+              looking for. Keep them disjoint and say so.
+            </li>
+            <li>
+              <strong>Unnormalized decomposition.</strong> Gradient pursuit over
+              unnormalized vectors selects long atoms, not explanatory ones. The
+              symptom is a J-space component that explains far more than 10% of
+              variance and a top-k list dominated by high-frequency tokens.
+            </li>
+            <li>
+              <strong>Ablation without a matched-norm control.</strong> Removing
+              norm degrades a model on its own. Any ablation result without the
+              control measures damage, not mechanism.
+            </li>
+          </ul>
+
+          <h2 id="transfer"><span class="secnum">18</span>What generalizes</h2>
+          <p>
+            Set the workspace claim aside for a moment; the methodological move
+            underneath it is portable, and I think under-appreciated.
+          </p>
+          <p>
+            <strong>Prefer a measured causal map to a fitted correlational
+            one.</strong> The standard way to ask "what does this activation
+            represent?" is to train a probe. Probes are cheap, and they learn
+            whatever is decodable — including things the model itself never
+            uses. The J-lens asks instead what a direction <em>does</em>: it is
+            a derivative, not a fit. It has no training set to overfit, no
+            objective to game, and its errors are approximation errors rather
+            than shortcuts. Any time you are about to train a linear probe to
+            interpret an internal state, it is worth asking whether the
+            corresponding Jacobian is computable instead.
+          </p>
+          <p>
+            <strong>Average to convert an event into a disposition.</strong> A
+            per-context derivative tells you what happened. An expectation over
+            contexts tells you what a thing <em>tends to do</em>, and dispositions
+            are usually the object of interest when we say a system
+            "represents," "knows," or "can report" something. That distinction
+            — verbalizable versus verbalized — is doing the philosophical work
+            in this paper, and it is expressed as an expectation operator.
+          </p>
+          <p>
+            <strong>Index your dictionary by outputs when you want to study
+            reportability.</strong> The choice to build a frame out of
+            vocabulary-aligned directions is what makes the discovered structure
+            about <em>saying</em> rather than about representation in general.
+            That constraint is a limitation and a feature at once, and it is the
+            reason a method this simple found something this specific. The
+            general form: if you want to study which internal states are
+            available to some downstream channel, build your dictionary out of
+            that channel's directions.
+          </p>
+          <p>
+            <strong>Variance is not importance.</strong> Six percent of a
+            vector, carrying nearly all of the causal leverage in a swap
+            experiment, is a useful corrective to a habit that runs through a
+            lot of analysis. The size of a component and its function are
+            different questions, and the second one requires an intervention to
+            answer.
+          </p>
+          <p>
+            On the framing the paper leads with, I will echo its own caution
+            rather than add to it. The takeaway is that "language models
+            maintain a small, privileged set of representations that they can
+            report, manipulate, and reason with, amidst a much larger volume of
+            processing that they cannot" — properties that several theories
+            associate with conscious access in humans. The authors then write:
+            "The philosophical implications of this connection are unclear and
+            likely controversial." That seems exactly right, and it is a
+            separate conversation from the one this page is for. What is not in
+            dispute is the practical claim they close on: the workspace "offers
+            a window through which to read, dissect, and shape models'
+            thinking." Building one is the subject of Part II; what to conclude
+            from it is not settled by the construction.
+          </p>
+
+          <h2 id="sources"><span class="secnum">19</span>Sources</h2>
+          <ul>
+            <li>
+              <a href="https://transformer-circuits.pub/2026/workspace/index.html"><em>Verbalizable Representations Form a Global Workspace in Language Models</em></a>
+              — Transformer Circuits, 2026. The subject of this page. Every
+              equation, procedure and number badged
+              <span class="src">from the paper</span> above is from it, with the
+              <a href="https://transformer-circuits.pub/2026/workspace/index.html#methods">Methods section</a>
+              carrying the technical content.
+            </li>
+            <li>
+              nostalgebraist, <em>interpreting GPT: the logit lens</em> — the
+              J = I special case, and still the right first thing to try.
+            </li>
+            <li>
+              Belrose et al., <em>Eliciting Latent Predictions from Transformers
+              with the Tuned Lens</em> — the fitted alternative, and the one the
+              paper argues skips ahead.
+            </li>
+            <li>
+              Blumensath &amp; Davies, <em>Gradient Pursuits</em> (2008) — the
+              sparse-decomposition family named in the Methods, and the source
+              of the line-search step in §11.
+            </li>
+            <li>
+              Hernandez et al., on relation Jacobians — the same first-order
+              tool applied to a single relation rather than to the whole
+              output map.
+            </li>
+          </ul>
+          <p class="footnote">
+            All quotations are from <em>Verbalizable Representations Form a
+            Global Workspace in Language Models</em> (transformer-circuits.pub,
+            2026) unless otherwise attributed, and are marked
+            <span class="src">from the paper</span> inline. Material marked
+            <span class="recon">reconstruction</span> — the compute routes in
+            §09, the cost and storage figures in Figure 7, the numerical
+            cautions, the gradient-pursuit formulation in §11, the validation
+            protocol in §13, and the reference implementation in §14 — is my own
+            engineering and is not endorsed by the authors; the paper does not
+            state its implementation strategy or compute cost, and mine may
+            differ from theirs. I have not run this pipeline against a frontier
+            model, so the cost estimates are analytical, not measured. Errors
+            in the reconstruction are mine.
+          </p>
+        </section>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Writings</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../personal-memory-engine/">Personal memory engine</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../whitepaper/">quirq whitepaper</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,1801 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="A plain-language explanation of the Sea of Nodes, the program representation behind V8's TurboFan compiler: what problem it solves, its three kinds of edges, why instructions float, how the graph becomes a program again, and why V8 eventually left it."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/sea-of-nodes/" />
+    <meta property="og:title" content="The Sea of Nodes, explained simply" />
+    <meta
+      property="og:description"
+      content="What if a compiler stopped writing your program down as a list, and kept only what actually depends on what? That is the Sea of Nodes."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/sea-of-nodes/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="The Sea of Nodes, explained simply" />
+    <meta
+      name="twitter:description"
+      content="A plain-language walk through the program representation behind V8's TurboFan — and why V8 eventually sailed away from it."
+    />
+    <title>The Sea of Nodes, explained simply — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+    </style>
+    <style>
+      .sbs {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+      @media (max-width: 760px) {
+        .sbs { grid-template-columns: 1fr; }
+      }
+      .sbs pre { margin: 0; }
+      .sbs h4 {
+        margin: 0 0 8px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+      .prose ol, .prose ul { padding-left: 1.35em; }
+      .prose li { margin-bottom: 0.5em; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · The one question a compiler must answer</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#question">01 · The one question a compiler must answer</a>
+        <a class="toc-parent" href="#boxes">02 · The usual answer: a list, inside boxes</a>
+        <a class="toc-parent" href="#idea">03 · The idea: keep only what depends on what</a>
+        <a class="toc-parent" href="#edges">04 · Three kinds of edges</a>
+        <a class="toc-parent" href="#effects">05 · Effects, the part people trip on</a>
+        <a class="toc-parent" href="#float">06 · What floats — and why that is the whole trick</a>
+        <a class="toc-parent" href="#free">07 · Three things you get for free</a>
+        <a class="toc-parent" href="#schedule">08 · Turning the sea back into a program</a>
+        <a class="toc-parent" href="#catch">09 · The catch, and why V8 left</a>
+        <a class="toc-parent" href="#more">10 · Where to read more</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#question">01 · The one question</a>
+        <a href="#boxes">02 · A list, inside boxes</a>
+        <a href="#idea">03 · Keep only dependencies</a>
+        <a href="#edges">04 · Three kinds of edges</a>
+        <a href="#effects">05 · Effects</a>
+        <a href="#float">06 · What floats</a>
+        <a href="#free">07 · Three things for free</a>
+        <a href="#schedule">08 · Back into a program</a>
+        <a href="#catch">09 · The catch, why V8 left</a>
+        <a href="#more">10 · Where to read more</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Notes</p>
+        <h1>The Sea of Nodes, explained simply<span class="status-pill">Explainer</span></h1>
+        <p class="dek">
+          Compilers usually write your program down as a list of instructions
+          in boxes. V8's TurboFan did something stranger: it threw the list
+          away and kept only the dependencies. Here is what that means, why it
+          was a good idea, and why V8 eventually sailed back to shore.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 1 August 2026 · Subject: V8 TurboFan · Click &amp; Paleczny, 1995</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#question">The one question a compiler must answer</a></li>
+          <li><a href="#boxes">The usual answer: a list, inside boxes</a></li>
+          <li><a href="#idea">The idea: keep only what depends on what</a></li>
+          <li><a href="#edges">Three kinds of edges</a></li>
+          <li><a href="#effects">Effects, the part people trip on</a></li>
+          <li><a href="#float">What floats — and why that is the whole trick</a></li>
+          <li><a href="#free">Three things you get for free</a></li>
+          <li><a href="#schedule">Turning the sea back into a program</a></li>
+          <li><a href="#catch">The catch, and why V8 left</a></li>
+          <li><a href="#more">Where to read more</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <h2 id="question"><span class="secnum">01</span>The one question a compiler must answer</h2>
+          <p class="lede">
+            When you write a program, you write it in an order. But most of
+            that order is an accident of typing. The compiler's job is to
+            figure out which parts of the order actually matter — and then to
+            take every liberty with the rest.
+          </p>
+          <p>
+            Look at this function.
+          </p>
+          <pre><code>function f(x, y) {
+  const t = x * y;
+  if (x &gt; 0) {
+    return t + 1;
+  }
+  return 0;
+}</code></pre>
+          <p>
+            You wrote <code>const t = x * y</code> on the first line. Does it
+            have to run first? No. It has to run before <code>t + 1</code>,
+            because <code>t + 1</code> needs its answer. That is the only real
+            constraint. In fact, if <code>x</code> is not greater than zero,
+            the multiplication never needs to happen at all — the function
+            returns <code>0</code> and <code>t</code> is never read.
+          </p>
+          <p>
+            So the compiler wants to know: <em>what must happen before what?</em>
+            Everything it can do to make your code faster — moving work out of
+            loops, deleting work nobody needs, computing something once instead
+            of twice — is downstream of that one question.
+          </p>
+          <p>
+            The Sea of Nodes is one answer to it, and it is a very direct one:
+            <strong>store the dependencies, and nothing else.</strong>
+          </p>
+
+          <h2 id="boxes"><span class="secnum">02</span>The usual answer: a list, inside boxes</h2>
+          <p>
+            Nearly every compiler you have heard of uses a
+            <strong>control-flow graph</strong>, or CFG. You chop the program
+            into straight-line runs of instructions — <em>basic blocks</em> —
+            and draw arrows between the blocks to show where control can go
+            next. Inside each block, the instructions are a list, in order.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-cfg">
+          <div class="figure-head">
+            <span class="figure-label">Figure 1</span>
+            <p class="figure-title">The same function as a control-flow graph</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1000 330" role="img" aria-label="A control flow graph with three basic blocks">
+              <rect x="350" y="24" width="300" height="112" rx="8" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-lane" x="366" y="46">BLOCK 0</text>
+              <text class="svg-step" x="366" y="70">t = x * y</text>
+              <text class="svg-step" x="366" y="92">c = x &gt; 0</text>
+              <text class="svg-step" x="366" y="114">branch c</text>
+
+              <line x1="430" y1="136" x2="270" y2="188" stroke="#252525" stroke-width="2"></line>
+              <text class="svg-sub" x="300" y="168">true</text>
+              <line x1="570" y1="136" x2="730" y2="188" stroke="#252525" stroke-width="2"></line>
+              <text class="svg-sub" x="672" y="168">false</text>
+
+              <rect x="120" y="188" width="300" height="82" rx="8" fill="#dfede5" stroke="#367f59"></rect>
+              <text class="svg-lane" x="136" y="210">BLOCK 1</text>
+              <text class="svg-step" x="136" y="236">r = t + 1</text>
+              <text class="svg-step" x="136" y="258">return r</text>
+
+              <rect x="580" y="188" width="300" height="82" rx="8" fill="#f3dfdc" stroke="#ad4b43"></rect>
+              <text class="svg-lane" x="596" y="210">BLOCK 2</text>
+              <text class="svg-step" x="596" y="236">return 0</text>
+
+              <line x1="60" y1="30" x2="60" y2="300" stroke="#deded9"></line>
+              <text class="svg-note" x="80" y="300">Everything in block 0 runs. Always. Including the multiply that block 2 never uses.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            This picture is easy to read, and that is its great virtue. Its
+            vice is that it over-promises: it says <code>t = x * y</code> runs
+            before <code>c = x &gt; 0</code>, which is not true of the program —
+            only of the way we wrote it down. And it pins the multiply into a
+            block that runs on every call, even the ones that never look at
+            the result.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <p>
+            A CFG compiler can still fix both of those. It just has to work
+            for it: run an analysis to prove the two instructions are
+            independent, run another to prove the multiply is safe to move,
+            then move it. The information is recoverable. It simply is not
+            <em>written down</em>.
+          </p>
+
+          <h2 id="idea"><span class="secnum">03</span>The idea: keep only what depends on what</h2>
+          <p>
+            Cliff Click and Michael Paleczny proposed the alternative in 1995,
+            in a paper called <em>A Simple Graph-Based Intermediate
+            Representation</em>. The move is easy to state:
+          </p>
+          <div class="callout">
+            <span class="k">The whole idea</span>
+            <p>
+              Make every single instruction its own node in a graph. Draw an
+              edge from a node to each value it needs. Do not record any other
+              order. An instruction may run at any point where its inputs are
+              ready.
+            </p>
+          </div>
+          <p>
+            No blocks. No lists. Just nodes and the edges between them —
+            hence the name. V8's own description is exactly this: "Nodes in
+            Sea of Nodes are single instructions (rather than basic blocks),
+            and edges represent value uses."
+          </p>
+          <p>
+            Here is our function again, drawn that way.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-son">
+          <div class="figure-head">
+            <span class="figure-label">Figure 2</span>
+            <p class="figure-title">The same function as a sea of nodes</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1000 545" role="img" aria-label="The same function drawn as a sea of nodes graph">
+              <!-- control edges (thick, dark) -->
+              <g stroke="#252525" stroke-width="2.4" fill="none">
+                <polyline points="100,72 100,211 450,211"></polyline>
+                <line x1="490" y1="227" x2="430" y2="265"></line>
+                <line x1="530" y1="227" x2="650" y2="265"></line>
+                <line x1="430" y1="297" x2="430" y2="405"></line>
+                <line x1="650" y1="297" x2="650" y2="405"></line>
+                <line x1="430" y1="437" x2="480" y2="475"></line>
+                <line x1="650" y1="437" x2="530" y2="475"></line>
+              </g>
+              <!-- value edges (thin, blue) -->
+              <g stroke="#3c6f97" stroke-width="1.3" fill="none">
+                <line x1="250" y1="72" x2="290" y2="120"></line>
+                <line x1="390" y1="72" x2="340" y2="120"></line>
+                <line x1="300" y1="72" x2="490" y2="120"></line>
+                <line x1="530" y1="72" x2="520" y2="120"></line>
+                <line x1="510" y1="152" x2="510" y2="195"></line>
+                <line x1="310" y1="152" x2="310" y2="335"></line>
+                <polyline points="680,72 680,100 200,100 200,351 250,351"></polyline>
+                <line x1="330" y1="367" x2="410" y2="405"></line>
+                <polyline points="600,56 860,56 860,421 710,421"></polyline>
+              </g>
+
+              <!-- nodes -->
+              <rect x="40" y="40" width="120" height="32" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.6"></rect>
+              <text class="svg-step" x="100" y="61" text-anchor="middle">Start</text>
+
+              <rect x="200" y="40" width="120" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="260" y="61" text-anchor="middle">Parameter x</text>
+
+              <rect x="340" y="40" width="120" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="400" y="61" text-anchor="middle">Parameter y</text>
+
+              <rect x="480" y="40" width="120" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="540" y="61" text-anchor="middle">Constant 0</text>
+
+              <rect x="620" y="40" width="120" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="680" y="61" text-anchor="middle">Constant 1</text>
+
+              <rect x="250" y="120" width="120" height="32" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.6"></rect>
+              <text class="svg-step" x="310" y="141" text-anchor="middle">Multiply</text>
+
+              <rect x="450" y="120" width="120" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="510" y="141" text-anchor="middle">LessThan</text>
+
+              <rect x="450" y="195" width="120" height="32" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.6"></rect>
+              <text class="svg-step" x="510" y="216" text-anchor="middle">Branch</text>
+
+              <rect x="370" y="265" width="120" height="32" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.6"></rect>
+              <text class="svg-step" x="430" y="286" text-anchor="middle">IfTrue</text>
+
+              <rect x="590" y="265" width="120" height="32" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.6"></rect>
+              <text class="svg-step" x="650" y="286" text-anchor="middle">IfFalse</text>
+
+              <rect x="250" y="335" width="120" height="32" rx="6" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="310" y="356" text-anchor="middle">Add</text>
+
+              <rect x="370" y="405" width="120" height="32" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.6"></rect>
+              <text class="svg-step" x="430" y="426" text-anchor="middle">Return</text>
+
+              <rect x="590" y="405" width="120" height="32" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.6"></rect>
+              <text class="svg-step" x="650" y="426" text-anchor="middle">Return</text>
+
+              <rect x="440" y="475" width="120" height="32" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.6"></rect>
+              <text class="svg-step" x="500" y="496" text-anchor="middle">End</text>
+
+              <!-- annotations -->
+              <text class="svg-note" x="740" y="140">Constant 0 has two users —</text>
+              <text class="svg-note" x="740" y="158">the comparison and the second</text>
+              <text class="svg-note" x="740" y="176">return. One node, shared.</text>
+
+              <text class="svg-note" x="60" y="300">Multiply has no control edge</text>
+              <text class="svg-note" x="60" y="318">at all. Nothing says where it</text>
+              <text class="svg-note" x="60" y="336">runs. It floats.</text>
+
+              <!-- legend -->
+              <line x1="740" y1="250" x2="960" y2="250" stroke="#deded9"></line>
+              <line x1="748" y1="278" x2="788" y2="278" stroke="#3c6f97" stroke-width="1.3"></line>
+              <text class="svg-sub" x="798" y="282">value edge — "I need this answer"</text>
+              <line x1="748" y1="306" x2="788" y2="306" stroke="#252525" stroke-width="2.4"></line>
+              <text class="svg-sub" x="798" y="310">control edge — "run in this order"</text>
+              <line x1="748" y1="334" x2="788" y2="334" stroke="#765b98" stroke-width="1.8" stroke-dasharray="5 4"></line>
+              <text class="svg-sub" x="798" y="338">effect edge — see §05</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            Read the arrows as "needs". <code>Add</code> needs the multiply and
+            the constant 1. <code>Return</code> needs the add. Nowhere does the
+            graph claim the multiply happens before the comparison, because
+            nothing about the program requires that. The order you typed is
+            gone, and only the truth is left.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="edges"><span class="secnum">04</span>Three kinds of edges</h2>
+          <p>
+            Value edges alone are not enough. Two things in a real program have
+            no data dependency and still cannot be shuffled.
+          </p>
+          <p>
+            The first is <strong>control</strong>. A <code>return</code> does
+            not consume the answer of a <code>branch</code>, but it certainly
+            matters which one happens. V8 puts it plainly: control nodes
+            "typically don't have value dependencies between each other… Thus,
+            in order to represent control-flow, we need a new kind of edge,
+            <em>control edges</em>, which impose some ordering on nodes that
+            don't have value dependency."
+          </p>
+          <p>
+            The second is <strong>effects</strong>. Writing to memory, calling
+            a function, throwing — these change the world, and the world has an
+            order. Two stores to the same object do not pass a value between
+            them, but swapping them changes what the program means.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-edges">
+          <div class="figure-head">
+            <span class="figure-label">Figure 3</span>
+            <p class="figure-title">The three edges, and what each one is protecting</p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr><th>Edge</th><th>Reads as</th><th>Exists because</th><th>Example nodes</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Value</strong></td>
+                  <td>"I need your answer"</td>
+                  <td>You cannot add two numbers before you have them.</td>
+                  <td><code>Add</code>, <code>Multiply</code>, <code>Constant</code>, <code>Parameter</code>, <code>Phi</code></td>
+                </tr>
+                <tr>
+                  <td><strong>Control</strong></td>
+                  <td>"I run after you"</td>
+                  <td>Branches and returns must happen in a definite order, even though no value passes between them.</td>
+                  <td><code>Start</code>, <code>Branch</code>, <code>IfTrue</code>, <code>IfFalse</code>, <code>Merge</code>, <code>Return</code>, <code>End</code></td>
+                </tr>
+                <tr>
+                  <td><strong>Effect</strong></td>
+                  <td>"the world was in your state when I ran"</td>
+                  <td>Reads and writes to memory must not be reordered past each other.</td>
+                  <td><code>Store</code>, <code>Load</code>, <code>Call</code>, <code>EffectPhi</code></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            A node can carry all three. A property store has value inputs (the
+            object and the value), a control input (the branch it lives under),
+            and an effect input (the last thing that touched memory). Pure
+            arithmetic has only value inputs — which is exactly what lets it
+            float.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="effects"><span class="secnum">05</span>Effects, the part people trip on</h2>
+          <p>
+            Effect edges are the least intuitive of the three, so here they
+            are on their own. Take:
+          </p>
+          <pre><code>function g(o) {
+  o.x = 1;
+  o.y = 2;
+  return o.x;
+}</code></pre>
+          <p>
+            Three memory operations. No values flow between them —
+            <code>o.y = 2</code> does not consume anything the first store
+            produced. And yet you may not run them in any order you like: if
+            the read of <code>o.x</code> floated above the write to
+            <code>o.x</code>, the function would return the wrong thing.
+          </p>
+          <p>
+            So the compiler threads them onto a chain. Each effectful node
+            takes the previous one as an input, in the order the program
+            demands. V8's phrasing: "Similarly to control nodes, effectful
+            operations often have no value dependencies, but still cannot run
+            in a random order," so "we need a way to impose an order (= a
+            schedule) on effectful operations."
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-effect">
+          <div class="figure-head">
+            <span class="figure-label">Figure 4</span>
+            <p class="figure-title">The effect chain, threaded through three memory operations</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1000 190" role="img" aria-label="An effect chain linking two stores and a load">
+              <g stroke="#765b98" stroke-width="1.8" fill="none" stroke-dasharray="5 4">
+                <line x1="180" y1="76" x2="290" y2="76"></line>
+                <line x1="430" y1="76" x2="540" y2="76"></line>
+                <line x1="680" y1="76" x2="790" y2="76"></line>
+              </g>
+              <rect x="40" y="60" width="140" height="32" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.6"></rect>
+              <text class="svg-step" x="110" y="81" text-anchor="middle">Start (effect)</text>
+
+              <rect x="290" y="60" width="140" height="32" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="1.6"></rect>
+              <text class="svg-step" x="360" y="81" text-anchor="middle">Store o.x = 1</text>
+
+              <rect x="540" y="60" width="140" height="32" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="1.6"></rect>
+              <text class="svg-step" x="610" y="81" text-anchor="middle">Store o.y = 2</text>
+
+              <rect x="790" y="60" width="140" height="32" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="1.6"></rect>
+              <text class="svg-step" x="860" y="81" text-anchor="middle">Load o.x</text>
+
+              <line x1="40" y1="120" x2="960" y2="120" stroke="#deded9"></line>
+              <text class="svg-note" x="40" y="146">The dashed chain is the only thing keeping these three in order — and it is also the thing an optimizer</text>
+              <text class="svg-note" x="40" y="166">attacks. Prove that the load reads a slot the stores did not touch, and you may unhook it from the chain.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            That is what "load elimination" means in a sea of nodes: rewriting
+            the effect chain. Here a smart pass can notice that
+            <code>Load o.x</code> follows a store of <code>1</code> to the very
+            same slot, delete the load, and use the constant directly.
+          </p>
+        </figure>
+        <section class="prose">
+          <h2 id="float"><span class="secnum">06</span>What floats — and why that is the whole trick</h2>
+          <p>
+            Go back to Figure 2 and look at the <code>Multiply</code> node. It
+            has two value edges coming in, and one going out. It has no control
+            edge and no effect edge. Nothing in the graph says where it runs.
+          </p>
+          <p>
+            That is not an oversight. It is the point. A node with only value
+            edges is <strong>pure</strong>: it reads nothing, writes nothing,
+            and always gives the same answer for the same inputs. A pure node
+            is not <em>anywhere</em> in the program. It is available to anyone
+            who wants its answer, and it costs nothing until somebody asks.
+          </p>
+          <p>
+            So the multiply is free to slide. It could run at the top of the
+            function, or inside the true branch, or — if a later pass proves
+            the branch is always taken — anywhere in between. In the CFG
+            picture the compiler would need an analysis and a transformation to
+            move it. In the sea of nodes it never had a home to be moved out
+            of.
+          </p>
+          <div class="callout">
+            <span class="k">The one-sentence version</span>
+            <p>
+              A control-flow graph says <em>where every instruction is</em>, and
+              optimizations work by moving them. A sea of nodes never says
+              where anything is, and optimizations work by deciding — as late
+              as possible — where it should go.
+            </p>
+          </div>
+
+          <h2 id="free"><span class="secnum">07</span>Three things you get for free</h2>
+          <p>
+            "For free" is doing real work in that heading. These are
+            optimizations that a CFG compiler implements as passes, and a sea
+            of nodes gets as properties of the data structure.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-free">
+          <div class="figure-head">
+            <span class="figure-label">Figure 5</span>
+            <p class="figure-title">Three optimizations that stop being passes</p>
+          </div>
+          <div class="figure-body">
+            <div class="tier-grid">
+              <div class="tier-card ep">
+                <div class="sub">Falls out of sharing</div>
+                <h4>Common subexpressions</h4>
+                <p>
+                  Compute <code>x * y</code> twice in a function and both
+                  expressions want a node with the same operation and the same
+                  inputs. Build the graph so that such a node is reused rather
+                  than duplicated, and the second multiply simply never exists.
+                  In a CFG this is a pass called global value numbering.
+                </p>
+              </div>
+              <div class="tier-card se">
+                <div class="sub">Falls out of reachability</div>
+                <h4>Dead code</h4>
+                <p>
+                  A node that nothing points at is dead. Not "detected as
+                  dead" — it is unreachable from the graph's root, so when you
+                  walk from <code>End</code> backwards to emit code, you never
+                  visit it. Deleting dead code becomes not visiting it.
+                </p>
+              </div>
+              <div class="tier-card pr">
+                <div class="sub">Falls out of floating</div>
+                <h4>Code motion</h4>
+                <p>
+                  Hoisting a computation out of a loop, or sinking it into the
+                  one branch that uses it, are the same operation here: a
+                  choice made when the graph is finally laid out. Nothing has
+                  to be lifted, because nothing was pinned down.
+                </p>
+              </div>
+            </div>
+          </div>
+          <p class="figure-caption">
+            The pattern is the same in all three: an optimization that a
+            conventional compiler performs becomes something the
+            representation cannot express the un-optimized version of.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="schedule"><span class="secnum">08</span>Turning the sea back into a program</h2>
+          <p>
+            A CPU will not execute a graph. At some point the compiler has to
+            pick an order, and that pass is called <strong>scheduling</strong>.
+            Its rule is short — V8 states it in one line: "each instruction
+            should be scheduled after its value, control and effect inputs."
+          </p>
+          <p>
+            Everything else is judgment. Among all the legal positions for a
+            floating node, which one is best? Usually: as late as possible, and
+            as shallow as possible. Late, so that work is not done before
+            anyone needs it. Shallow, so that work is not done inside a loop
+            when it could be done outside one.
+          </p>
+          <p>
+            Apply that to our function and something nice happens.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-sched">
+          <div class="figure-head">
+            <span class="figure-label">Figure 6</span>
+            <p class="figure-title">Before and after scheduling — the multiply sinks into the branch that wants it</p>
+          </div>
+          <div class="figure-body">
+            <div class="sbs">
+              <div>
+                <h4>As written</h4>
+                <pre><code>block 0:
+  t = x * y      // always
+  c = x &gt; 0
+  branch c
+
+block 1:          block 2:
+  r = t + 1         return 0
+  return r</code></pre>
+              </div>
+              <div>
+                <h4>As scheduled</h4>
+                <pre><code>block 0:
+  c = x &gt; 0
+  branch c
+
+block 1:          block 2:
+  t = x * y         return 0
+  r = t + 1
+  return r</code></pre>
+              </div>
+            </div>
+          </div>
+          <p class="figure-caption">
+            Calls that take the false branch no longer multiply. Nobody wrote
+            a "sink pure computations into their uses" pass to make this
+            happen — the scheduler simply placed a floating node at its latest
+            legal position, and that position turned out to be inside the
+            branch.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="catch"><span class="secnum">09</span>The catch, and why V8 left</h2>
+          <p>
+            All of the above is true, and V8 spent more than a decade running
+            on it, and in 2025 V8 published a post titled <em>Land ahoy:
+            leaving the Sea of Nodes</em> explaining why they were moving off
+            it. That post is the most useful thing written about the
+            representation, precisely because it is written by people who
+            shipped it.
+          </p>
+          <p>
+            The complaints are worth understanding, because each one is the
+            shadow of a benefit.
+          </p>
+          <p>
+            <strong>You cannot read it.</strong> A graph with no order is a
+            graph with no place to start reading. V8's phrasing is blunt:
+            "Manually/visually inspecting and understanding a Sea of Nodes
+            graph is hard." Effect and control chains have to be maintained by
+            hand, in parallel, and getting one wrong is easy — they describe a
+            bug that went unnoticed for months.
+          </p>
+          <p>
+            <strong>Most nodes don't actually float.</strong> This is the
+            deepest of the objections. Pure arithmetic floats; almost
+            everything in a real JavaScript program is a memory operation, a
+            call, or something that can throw — and all of those are pinned to
+            an effect chain that, in practice, mirrors the control flow you
+            were trying to get away from. The conclusion they reach is
+            devastating in its plainness: in practice, "SoN is just CFG where
+            pure nodes are floating."
+          </p>
+          <p>
+            <strong>It is slow to compile.</strong> A graph with no natural
+            order has no natural traversal order either, so passes revisit
+            nodes — about once every twenty visits, by V8's measurement. And
+            nodes connected by pointers scattered across the heap are murder on
+            a cache: they measured roughly 3× the L1 misses on average, and up
+            to 7× in some phases. For a browser, compile time <em>is</em> user
+            time.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-cost">
+          <div class="figure-head">
+            <span class="figure-label">Figure 7</span>
+            <p class="figure-title">The trade, as V8 measured it</p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr><th>Property</th><th>Sea of nodes</th><th>Turboshaft (a plain CFG)</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>Pure computations</td><td>Float freely; placed by the scheduler</td><td>Pinned to a block; moved by explicit passes</td></tr>
+                <tr><td>Reading the IR</td><td>Hard — no canonical order to follow</td><td>A list of blocks, top to bottom</td></tr>
+                <tr><td>Traversal</td><td>Nodes revisited roughly 1 in 20 visits</td><td>Block order is the traversal order</td></tr>
+                <tr><td>Cache behaviour</td><td>~3× the L1 misses on average, up to 7× in places</td><td>Instructions laid out contiguously</td></tr>
+                <tr><td>Load elimination</td><td>Needed bailouts on large graphs</td><td>Up to 190× faster, better worst case</td></tr>
+                <tr><td>Total compile time</td><td>baseline</td><td>about half</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            All figures are V8's own, from their 2025 write-up. The
+            JavaScript backend and the whole WebAssembly pipeline now run on
+            Turboshaft; the sea of nodes survives in the builtin pipeline and
+            the JavaScript frontend, both of which are being replaced — the
+            frontend by Maglev, which is also a plain control-flow graph.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <p>
+            It would be a mistake to read that as "the sea of nodes was
+            wrong." It was right about something real: the order you write is
+            not the order that matters, and a representation that records only
+            the true constraints gives optimizations to you for free. That
+            insight is now thirty years old and it is not going anywhere.
+          </p>
+          <p>
+            What V8's experience actually shows is a subtler thing — that the
+            insight buys less than it promises for <em>this particular
+            language</em>. JavaScript is mostly effects. If almost every node
+            is chained anyway, you have paid the full price of an
+            unreadable, cache-hostile representation to let a handful of
+            multiplications drift. A compiler for a purer language, with far
+            more pure nodes to float, would run that trade very differently.
+            The representation did not fail; the workload voted.
+          </p>
+
+          <h2 id="more"><span class="secnum">10</span>Where to read more</h2>
+          <ul>
+            <li>
+              <a href="https://v8.dev/docs/turbofan">v8.dev/docs/turbofan</a> —
+              V8's own index page for TurboFan. Short, and mostly a set of
+              doors: design documents, talks, and the deoptimization and
+              register-allocation write-ups.
+            </li>
+            <li>
+              <a href="https://v8.dev/blog/leaving-the-sea-of-nodes">Land ahoy: leaving the Sea of Nodes</a>
+              — the best single explanation of the representation, written as a
+              post-mortem. Every quote in this piece comes from it.
+            </li>
+            <li>
+              <a href="https://www.oracle.com/technetwork/java/javase/tech/c2-ir95-150110.pdf">A Simple Graph-Based Intermediate Representation</a>
+              — Click and Paleczny, IR'95. Fifteen pages, and the origin of the
+              idea. The same representation powers HotSpot's C2 compiler.
+            </li>
+          </ul>
+          <p class="footnote">
+            This is an explainer, not original research. The example function
+            is mine; the architecture, the terminology, and every measurement
+            in Figure 7 are V8's. Quoted sentences are from the V8 blog post
+            linked above. Any error in simplification is mine.
+          </p>
+        </section>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Writings</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../xo-space/">Agent control plane</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../whitepaper/">quirq whitepaper</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>
