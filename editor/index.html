@@ -1,0 +1,2080 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light" />
+<title>Composable-Post Editor</title>
+<style>
+  /* Compact tool chrome. System fonts, light surfaces, one small accent.
+     Deliberately NOT the paper design system. */
+  :root {
+    --bg: #f2f3f5;
+    --panel: #ffffff;
+    --panel-soft: #fafbfc;
+    --line: #d9dde3;
+    --line-soft: #e8ebef;
+    --ink: #1c2128;
+    --ink-soft: #59636e;
+    --ink-faint: #8b949e;
+    --accent: #2456d6;
+    --accent-soft: #e8eefc;
+    --ok: #1a7f37;
+    --ok-soft: #e7f4ea;
+    --warn: #9a6700;
+    --warn-soft: #fff3d6;
+    --err: #b42318;
+    --err-soft: #fdebe9;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  button {
+    font: inherit;
+    color: var(--ink);
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 3px 10px;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--panel-soft); border-color: #c3c9d1; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #1d47b5; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  .appbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    flex: none;
+    flex-wrap: wrap;
+  }
+  .appbar .brand { font-weight: 650; letter-spacing: 0.01em; }
+  .appbar .fmt {
+    font: 10px/1 var(--mono);
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 4px;
+    padding: 3px 6px;
+  }
+  .appbar .spacer { flex: 1; }
+  .appbar .filename { color: var(--ink-soft); font-family: var(--mono); font-size: 11px; }
+  .appbar .dirty-dot { color: var(--accent); font-weight: 700; }
+  .appbar label.toggle {
+    display: inline-flex; align-items: center; gap: 4px;
+    color: var(--ink-soft); user-select: none; cursor: pointer;
+  }
+  .appbar .group { display: inline-flex; gap: 4px; align-items: center; }
+  .appbar .sep { width: 1px; height: 18px; background: var(--line-soft); }
+
+  .workspace { flex: 1; display: flex; min-height: 0; }
+
+  /* ---- outline (left) ---- */
+  .outline {
+    width: 312px;
+    flex: none;
+    background: var(--panel-soft);
+    border-right: 1px solid var(--line);
+    overflow-y: auto;
+    padding-bottom: 24px;
+  }
+  .outline h2 {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-faint);
+    margin: 14px 12px 4px;
+    font-weight: 600;
+  }
+  .o-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px 4px 10px;
+    border-left: 3px solid transparent;
+    position: relative;
+  }
+  .o-row:hover { background: #f0f2f5; }
+  .o-row.selected { border-left-color: var(--accent); background: var(--accent-soft); }
+  .o-row.part { padding-left: 30px; }
+  .o-row.excluded { opacity: 0.55; }
+  .o-row.excluded .o-title { text-decoration: line-through; }
+  .o-row .handle {
+    cursor: grab;
+    color: var(--ink-faint);
+    font-size: 12px;
+    flex: none;
+    user-select: none;
+    padding: 0 2px;
+  }
+  .o-row input[type="checkbox"] { margin: 0; flex: none; accent-color: var(--accent); }
+  .o-row .o-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .o-row .chip {
+    flex: none;
+    font: 9px/1 var(--mono);
+    padding: 2px 5px;
+    border-radius: 8px;
+    background: var(--line-soft);
+    color: var(--ink-soft);
+    max-width: 84px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chip.cat-0 { background: #e5edff; color: #2f4fb0; }
+  .chip.cat-1 { background: #e3f2e6; color: #23682f; }
+  .chip.cat-2 { background: #fdeee0; color: #92500f; }
+  .chip.cat-3 { background: #f1e6fa; color: #6b34a2; }
+  .chip.cat-4 { background: #e2f2f4; color: #17656e; }
+  .chip.pill-complete { background: var(--ok-soft); color: var(--ok); }
+  .chip.pill-placeholder { background: var(--warn-soft); color: var(--warn); }
+  .o-row .mini {
+    flex: none;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 5px;
+    visibility: hidden;
+  }
+  .o-row:hover .mini, .o-row.selected .mini { visibility: visible; }
+  .o-row.drop-before::before {
+    content: "";
+    position: absolute;
+    left: 6px; right: 6px; top: -1px;
+    height: 2px;
+    background: var(--accent);
+    border-radius: 1px;
+  }
+  .drop-end {
+    height: 8px;
+    margin: 0 8px;
+    border-radius: 3px;
+  }
+  .drop-end.drop-before { background: var(--accent-soft); box-shadow: inset 0 2px 0 var(--accent); }
+  .o-infra {
+    display: flex; align-items: center; gap: 6px;
+    padding: 2px 8px 2px 14px;
+    color: var(--ink-soft);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .o-infra:hover { background: #f0f2f5; }
+  .o-infra .kind {
+    font-size: 9px;
+    color: var(--ink-faint);
+    width: 46px;
+    flex: none;
+    text-transform: uppercase;
+  }
+  .o-infra .o-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .o-infra .mini { flex: none; font-size: 10px; padding: 1px 6px; border-radius: 5px; visibility: hidden; }
+  .o-infra:hover .mini { visibility: visible; }
+
+  /* ---- preview (center) ---- */
+  .preview-pane { flex: 1; min-width: 0; position: relative; background: #e9ebee; }
+  .preview-pane iframe { width: 100%; height: 100%; border: 0; background: #fff; display: none; }
+  .empty-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .empty-card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 28px 32px;
+    max-width: 460px;
+    box-shadow: 0 8px 28px rgba(16, 24, 40, 0.06);
+  }
+  .empty-card h1 { font-size: 16px; margin: 0 0 8px; }
+  .empty-card p { color: var(--ink-soft); margin: 8px 0; }
+  .empty-card .refusal {
+    background: var(--err-soft);
+    color: var(--err);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: var(--mono);
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .empty-card code { font-family: var(--mono); font-size: 11px; background: var(--line-soft); padding: 1px 4px; border-radius: 3px; }
+
+  /* ---- drawer (right) ---- */
+  .drawer {
+    width: 440px;
+    flex: none;
+    background: var(--panel);
+    border-left: 1px solid var(--line);
+    display: none;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .drawer.open { display: flex; }
+  .drawer-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .drawer-head .bid { font-family: var(--mono); font-size: 12px; font-weight: 600; flex: 1; }
+  .drawer-meta {
+    padding: 6px 10px;
+    color: var(--ink-soft);
+    font-size: 11px;
+    border-bottom: 1px solid var(--line-soft);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+  }
+  .drawer textarea {
+    flex: 1;
+    min-height: 0;
+    border: 0;
+    resize: none;
+    padding: 10px;
+    font: 11px/1.5 var(--mono);
+    color: var(--ink);
+    white-space: pre;
+    outline: none;
+  }
+  .drawer-foot {
+    border-top: 1px solid var(--line-soft);
+    padding: 8px 10px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .drawer-err {
+    flex: 1;
+    color: var(--err);
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 60px;
+    overflow: auto;
+  }
+
+  /* ---- status bar + issues ---- */
+  .statusbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+  .statusbar .flash { color: var(--ink); }
+  .statusbar .spacer { flex: 1; }
+  .vbadge {
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 2px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    background: var(--ok-soft);
+    color: var(--ok);
+  }
+  .vbadge.bad { background: var(--err-soft); color: var(--err); }
+  .vbadge.warn { background: var(--warn-soft); color: var(--warn); }
+  .issues {
+    flex: none;
+    max-height: 180px;
+    overflow-y: auto;
+    background: #fffefb;
+    border-top: 1px solid var(--line);
+    display: none;
+    padding: 6px 12px;
+  }
+  .issues.open { display: block; }
+  .issue {
+    font: 11px/1.6 var(--mono);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .issue .lvl-error { color: var(--err); font-weight: 600; }
+  .issue .lvl-warn { color: var(--warn); font-weight: 600; }
+  .issue .code { color: var(--ink-faint); }
+
+  .drop-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(36, 86, 214, 0.08);
+    border: 3px dashed var(--accent);
+    border-radius: 12px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    color: var(--accent);
+    pointer-events: none;
+    z-index: 50;
+  }
+  .drop-overlay.on { display: flex; }
+  kbd {
+    font: 10px var(--mono);
+    background: var(--line-soft);
+    border-radius: 3px;
+    padding: 1px 4px;
+    border: 1px solid var(--line);
+  }
+</style>
+</head>
+<body>
+
+<header class="appbar">
+  <span class="brand">Composable-Post Editor</span>
+  <span class="fmt">composable-post/1</span>
+  <span class="sep"></span>
+  <button id="btnOpen" class="primary">Open…</button>
+  <span class="filename" id="fileName"></span>
+  <span class="dirty-dot" id="dirtyDot" hidden>●</span>
+  <span class="spacer"></span>
+  <span class="group">
+    <button id="btnUndo" title="Undo (Ctrl/Cmd+Z)" disabled>Undo</button>
+    <button id="btnRedo" title="Redo (Ctrl/Cmd+Shift+Z)" disabled>Redo</button>
+  </span>
+  <span class="sep"></span>
+  <label class="toggle" title="Click text in the preview to edit it in place">
+    <input type="checkbox" id="tglEdit" checked /> Click-to-edit
+  </label>
+  <label class="toggle" title="On export, drop css:* regions no remaining block needs (conservative, per deps.css)">
+    <input type="checkbox" id="tglPrune" /> Prune CSS on export
+  </label>
+  <span class="sep"></span>
+  <span class="group">
+    <button id="btnDl" disabled title="Download the annotated composable file">Download</button>
+    <button id="btnCp" disabled title="Copy the annotated composable file">Copy</button>
+    <button id="btnDlS" disabled title="Download the stripped plain file (spec §5.6)">Download stripped</button>
+    <button id="btnCpS" disabled title="Copy the stripped plain file">Copy stripped</button>
+  </span>
+</header>
+
+<div class="workspace">
+  <aside class="outline" id="outline" aria-label="Block outline"></aside>
+  <main class="preview-pane">
+    <iframe id="preview" title="Live preview"></iframe>
+    <div class="empty-state" id="emptyState">
+      <div class="empty-card">
+        <h1>Composable-post editor</h1>
+        <p>Drop a <code>composable-post/1</code> HTML file anywhere in this
+        window, or use <b>Open…</b>. When served over http,
+        <code>?src=&lt;relative-path&gt;</code> auto-loads.</p>
+        <p>Files without
+        <code>&lt;meta name="post-format" content="composable-post/1" /&gt;</code>
+        are refused — the editor never guesses.</p>
+        <p id="refusalMsg" class="refusal" hidden></p>
+        <p style="color:var(--ink-faint);font-size:11px">
+          Reorder and include/exclude blocks in the left outline. Click text
+          in the preview to edit it (<kbd>Ctrl/Cmd+Enter</kbd> commit,
+          <kbd>Esc</kbd> cancel). <kbd>Ctrl/Cmd+Z</kbd> undo,
+          <kbd>Ctrl/Cmd+Shift+Z</kbd> redo.</p>
+      </div>
+    </div>
+  </main>
+  <aside class="drawer" id="drawer" aria-label="Block HTML editor">
+    <div class="drawer-head">
+      <span class="bid" id="drawerId"></span>
+      <button id="drawerApply" class="primary">Apply</button>
+      <button id="drawerClose">Close</button>
+    </div>
+    <div class="drawer-meta" id="drawerMeta"></div>
+    <textarea id="drawerText" spellcheck="false" wrap="off"></textarea>
+    <div class="drawer-foot">
+      <div class="drawer-err" id="drawerErr"></div>
+    </div>
+  </aside>
+</div>
+
+<div class="issues" id="issuesPanel"></div>
+<footer class="statusbar">
+  <span id="statusText">No document loaded.</span>
+  <span class="flash" id="statusFlash"></span>
+  <span class="spacer"></span>
+  <button class="vbadge" id="vBadge" hidden>–</button>
+</footer>
+
+<input type="file" id="filePick" accept=".html,.htm,text/html" hidden />
+<div class="drop-overlay" id="dropOverlay">Drop the post here</div>
+
+<!-- ================================================================
+     CPF core — pure string/model functions. ZERO DOM access; the only
+     reference to `window` is the final export line, so node can run
+     this block by defining `window = {}` (see tools/tests/).
+     ================================================================ -->
+<script id="cpf-core">
+(function () {
+  "use strict";
+
+  var FENCE6 = "══════"; // ══════ (6 × U+2550)
+  var FENCE_LINE_RE = /^\s*<!-- ═+ (BLOCK|END) ([a-z]+:[a-z0-9-]+) ═+ -->\s*$/;
+  var META_RE = /<meta\s+name="post-format"\s+content="composable-post\/1"\s*\/?\s*>/;
+  var VOID_TAGS = ["area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr",
+    "polyline", "line", "rect", "circle", "path", "use", "ellipse"];
+  function voidSet() {
+    var s = {};
+    for (var i = 0; i < VOID_TAGS.length; i++) s[VOID_TAGS[i]] = true;
+    return s;
+  }
+  var VOID = voidSet();
+
+  /* ---------- text helpers ---------- */
+
+  function splitKeepNL(text) {
+    var out = [];
+    var i = 0;
+    while (i < text.length) {
+      var j = text.indexOf("\n", i);
+      if (j === -1) { out.push(text.slice(i)); break; }
+      out.push(text.slice(i, j + 1));
+      i = j + 1;
+    }
+    return out;
+  }
+
+  function bareLine(line) {
+    return line.charAt(line.length - 1) === "\n" ? line.slice(0, -1) : line;
+  }
+
+  /* ---------- parse / serialize ---------- */
+
+  // model = { segments: [node], manifest: object|null, manifestError: string|null }
+  // node  = { type:"raw", text } | { type:"block", id, open, inner:[node], close }
+  // Invariant: serialize(parse(text)) === text, byte for byte.
+
+  function parseInner(text, opts) {
+    opts = opts || {};
+    var lines = splitKeepNL(text);
+    var root = { type: "root", inner: [] };
+    var stack = [root];
+    var buf = "";
+    function flush() {
+      if (buf) {
+        stack[stack.length - 1].inner.push({ type: "raw", text: buf });
+        buf = "";
+      }
+    }
+    for (var li = 0; li < lines.length; li++) {
+      var line = lines[li];
+      var m = FENCE_LINE_RE.exec(bareLine(line));
+      if (!m) { buf += line; continue; }
+      if (m[1] === "BLOCK") {
+        flush();
+        var node = { type: "block", id: m[2], open: line, inner: [], close: "" };
+        stack[stack.length - 1].inner.push(node);
+        stack.push(node);
+      } else {
+        flush();
+        var top = stack[stack.length - 1];
+        if (top === root) throw new Error("Unmatched END fence for " + m[2] + " at line " + (li + 1));
+        if (top.id !== m[2]) throw new Error("Fence mismatch at line " + (li + 1) + ": END " + m[2] + " closes BLOCK " + top.id);
+        top.close = line;
+        stack.pop();
+      }
+    }
+    flush();
+    if (stack.length > 1) throw new Error("Unclosed BLOCK fence: " + stack[stack.length - 1].id);
+    return root.inner;
+  }
+
+  function parse(text) {
+    if (!META_RE.test(text)) {
+      var e = new Error('Not a composable-post/1 file: missing <meta name="post-format" content="composable-post/1" />. Refusing to guess.');
+      e.code = "NOT_COMPOSABLE";
+      throw e;
+    }
+    var model = { segments: parseInner(text), manifest: null, manifestError: null };
+    var mf = findNode(model, "data:manifest");
+    if (!mf) {
+      model.manifestError = "data:manifest block not found";
+    } else {
+      var inner = innerOf(mf.node);
+      var mm = /<script[^>]*id="block-manifest"[^>]*>\n([\s\S]*?)\n[ \t]*<\/script>/.exec(inner);
+      if (!mm) {
+        model.manifestError = 'no <script id="block-manifest"> inside data:manifest';
+      } else {
+        try { model.manifest = JSON.parse(mm[1]); }
+        catch (err) { model.manifestError = "manifest JSON invalid: " + err.message; }
+        if (model.manifest && model.manifest.format !== "composable-post/1") {
+          model.manifestError = "manifest format is not composable-post/1";
+          model.manifest = null;
+        }
+      }
+    }
+    return model;
+  }
+
+  function serializeNode(n) {
+    if (n.type === "raw") return n.text;
+    var out = n.open;
+    for (var i = 0; i < n.inner.length; i++) out += serializeNode(n.inner[i]);
+    return out + n.close;
+  }
+
+  function serialize(model) {
+    var out = "";
+    for (var i = 0; i < model.segments.length; i++) out += serializeNode(model.segments[i]);
+    return out;
+  }
+
+  function innerOf(node) {
+    var out = "";
+    for (var i = 0; i < node.inner.length; i++) out += serializeNode(node.inner[i]);
+    return out;
+  }
+
+  /* ---------- model lookups ---------- */
+
+  function findNode(model, id) {
+    function walk(inner, parentBlock) {
+      for (var i = 0; i < inner.length; i++) {
+        var n = inner[i];
+        if (n.type !== "block") continue;
+        if (n.id === id) return { node: n, container: inner, index: i, parentBlock: parentBlock };
+        var r = walk(n.inner, n);
+        if (r) return r;
+      }
+      return null;
+    }
+    return walk(model.segments, null);
+  }
+
+  function docOrder(model) {
+    var out = [];
+    (function walk(inner) {
+      for (var i = 0; i < inner.length; i++) {
+        var n = inner[i];
+        if (n.type !== "block") continue;
+        out.push(n.id);
+        walk(n.inner);
+      }
+    })(model.segments);
+    return out;
+  }
+
+  function blockText(model, id) {
+    var loc = findNode(model, id);
+    if (!loc) throw new Error("unknown block " + id);
+    return serializeNode(loc.node);
+  }
+
+  function requireManifest(model) {
+    if (!model.manifest) throw new Error("manifest unavailable: " + (model.manifestError || "missing"));
+    return model.manifest;
+  }
+
+  function mblock(man, id) {
+    for (var i = 0; i < man.blocks.length; i++) if (man.blocks[i].id === id) return man.blocks[i];
+    return null;
+  }
+
+  /* ---------- manifest sync (order, presence, children, nav.order) ---------- */
+
+  function syncManifest(model) {
+    var man = requireManifest(model);
+    var ids = docOrder(model);
+    var present = {};
+    for (var i = 0; i < ids.length; i++) present[ids[i]] = true;
+    man.blocks = man.blocks.filter(function (b) { return present[b.id]; });
+    var byId = {};
+    man.blocks.forEach(function (b) { byId[b.id] = b; });
+
+    // Permute the chapter/part entries (only) into their existing array slots
+    // so blocks[] order matches document order without shuffling infra rows.
+    var contentDoc = ids.filter(function (id) {
+      var b = byId[id];
+      return b && (b.kind === "chapter" || b.kind === "part");
+    });
+    var slots = [];
+    man.blocks.forEach(function (b, i) {
+      if (b.kind === "chapter" || b.kind === "part") slots.push(i);
+    });
+    contentDoc.forEach(function (id, k) { man.blocks[slots[k]] = byId[id]; });
+
+    // Children arrays for chapters follow the document tree.
+    (function setKids(inner) {
+      for (var i = 0; i < inner.length; i++) {
+        var n = inner[i];
+        if (n.type !== "block") continue;
+        var b = byId[n.id];
+        if (b && b.kind === "chapter") {
+          b.children = n.inner
+            .filter(function (c) { return c.type === "block" && byId[c.id] && byId[c.id].kind === "part"; })
+            .map(function (c) { return c.id; });
+          b.children.forEach(function (k) { byId[k].parent = n.id; });
+        }
+        setKids(n.inner);
+      }
+    })(model.segments);
+
+    man.nav = man.nav || {};
+    man.nav.order = ids.filter(function (id) { return byId[id] && byId[id].kind === "chapter"; });
+    return man;
+  }
+
+  /* ---------- nav regeneration (spec §5.2/§5.5) ---------- */
+
+  function detectIndent(mid, re, fallback) {
+    var m = re.exec(mid);
+    return m ? m[1] : fallback;
+  }
+
+  function detectSubIndent(mid, parentIndent) {
+    var re = /\n([ \t]*)<a href="#/g;
+    var m;
+    while ((m = re.exec(mid))) {
+      if (m[1].length > parentIndent.length) return m[1];
+    }
+    return parentIndent + "  ";
+  }
+
+  // Manifest strings are data; escape them when regenerating nav markup so a
+  // title legally containing & or < cannot break tag balance.
+  function escHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function navEntries(chapters, byId, parentClass, subsClass, pInd, sInd, useRail) {
+    var out = [];
+    chapters.forEach(function (ch) {
+      if (!ch || !ch.anchor) return;
+      var label = useRail ? (ch.railLabel || ch.title) : ch.title;
+      out.push(pInd + '<a class="' + parentClass + '" href="#' + escHtml(ch.anchor) + '" data-for="' + escHtml(ch.anchor) + '">' + escHtml(label) + "</a>");
+      var kids = (ch.children || [])
+        .map(function (k) { return byId[k]; })
+        .filter(function (k) { return k && k.anchor; });
+      if (kids.length) {
+        out.push(pInd + '<div class="' + subsClass + '">');
+        kids.forEach(function (k) {
+          var kl = useRail ? (k.railLabel || k.title) : k.title;
+          out.push(sInd + '<a href="#' + escHtml(k.anchor) + '" data-for="' + escHtml(k.anchor) + '">' + escHtml(kl) + "</a>");
+        });
+        out.push(pInd + "</div>");
+      }
+    });
+    return out;
+  }
+
+  function regenNav(model) {
+    var man = requireManifest(model);
+    var byId = {};
+    man.blocks.forEach(function (b) { byId[b.id] = b; });
+    var chapters = (man.nav && man.nav.order || [])
+      .map(function (id) { return byId[id]; })
+      .filter(Boolean);
+
+    // chrome:floating-toc — seed label + toc-menu entries
+    var ft = findNode(model, "chrome:floating-toc");
+    if (ft) {
+      var t = innerOf(ft.node);
+      if (chapters.length && chapters[0].title) {
+        // Keep the surrounding tag formatting (the source line-wraps the span)
+        // so regenerating an unchanged label is byte-identical.
+        t = t.replace(/(<span class="toc-button-label"[^>]*>)[\s\S]*?(<\/span\s*>)/,
+          function (all, openTag, closeTag) { return openTag + escHtml(chapters[0].title) + closeTag; });
+      }
+      t = t.replace(/(<nav class="toc-menu"[^>]*>)([\s\S]*?)(\n[ \t]*<\/nav>)/,
+        function (all, openTag, mid, closeTag) {
+          var pInd = detectIndent(mid, /\n([ \t]*)<a class="toc-parent"/, "        ");
+          var sInd = detectSubIndent(mid, pInd);
+          var lines = navEntries(chapters, byId, "toc-parent", "toc-subsections", pInd, sInd, false);
+          return openTag + "\n" + lines.join("\n") + closeTag;
+        });
+      ft.node.inner = [{ type: "raw", text: t }];
+    }
+
+    // chrome:contents-rail — rail entries
+    var cr = findNode(model, "chrome:contents-rail");
+    if (cr) {
+      var rt = innerOf(cr.node);
+      rt = rt.replace(/(<nav aria-label="Article contents">)([\s\S]*?)(\n[ \t]*<\/nav>)/,
+        function (all, openTag, mid, closeTag) {
+          var pInd = detectIndent(mid, /\n([ \t]*)<a class="contents-parent"/, "        ");
+          var sInd = detectSubIndent(mid, pInd);
+          var lines = navEntries(chapters, byId, "contents-parent", "contents-subsections", pInd, sInd, true);
+          return openTag + "\n" + lines.join("\n") + closeTag;
+        });
+      cr.node.inner = [{ type: "raw", text: rt }];
+    }
+
+    // data:manifest — rewrite the JSON body between the script tags.
+    var mf = findNode(model, "data:manifest");
+    if (mf) {
+      var mt = innerOf(mf.node);
+      var mm = /^([\s\S]*?<script[^>]*id="block-manifest"[^>]*>\n)[\s\S]*?(\n[ \t]*<\/script>[\s\S]*)$/.exec(mt);
+      if (mm) {
+        mf.node.inner = [{ type: "raw", text: mm[1] + JSON.stringify(man, null, 2) + mm[2] }];
+      }
+    }
+    return model;
+  }
+
+  /* ---------- composition ops ---------- */
+
+  function reorder(model, id, beforeId) {
+    var man = requireManifest(model);
+    var b = mblock(man, id);
+    if (!b) throw new Error("unknown block " + id);
+    if (!b.movable) throw new Error(id + " is not movable");
+    if (beforeId != null) {
+      if (beforeId === id) return model;
+      var tb = mblock(man, beforeId);
+      if (!tb) throw new Error("unknown block " + beforeId);
+      if (tb.parent !== b.parent || tb.kind !== b.kind) {
+        throw new Error(beforeId + " is not a sibling of " + id);
+      }
+    }
+    var loc = findNode(model, id);
+    if (!loc) throw new Error(id + " not present in document");
+    var container = loc.container;
+    var idx = [];
+    container.forEach(function (n, i) {
+      if (n.type !== "block") return;
+      var nb = mblock(man, n.id);
+      if (nb && nb.kind === b.kind && nb.parent === b.parent) idx.push(i);
+    });
+    var nodes = idx.map(function (i) { return container[i]; });
+    var order = nodes.map(function (n) { return n.id; }).filter(function (x) { return x !== id; });
+    if (beforeId == null) order.push(id);
+    else order.splice(order.indexOf(beforeId), 0, id);
+    var nodeById = {};
+    nodes.forEach(function (n) { nodeById[n.id] = n; });
+    order.forEach(function (bid, k) { container[idx[k]] = nodeById[bid]; });
+    syncManifest(model);
+    regenNav(model);
+    return model;
+  }
+
+  function subtreeIds(node) {
+    var out = [];
+    (function walk(n) {
+      out.push(n.id);
+      n.inner.forEach(function (c) { if (c.type === "block") walk(c); });
+    })(node);
+    return out;
+  }
+
+  function danglingHrefs(text) {
+    var ids = {};
+    var m;
+    var idRe = /\bid="([^"]+)"/g;
+    while ((m = idRe.exec(text))) ids[m[1]] = true;
+    var missing = {};
+    var hrefRe = /href="#([^"]+)"/g;
+    while ((m = hrefRe.exec(text))) {
+      if (!ids[m[1]]) missing[m[1]] = (missing[m[1]] || 0) + 1;
+    }
+    return Object.keys(missing).map(function (a) { return { anchor: a, count: missing[a] }; });
+  }
+
+  // remove(model, id) -> { warnings:[issue], removed:{...} }
+  // Refuses optional=false. Fence-to-fence bytes go; nav entries for the
+  // block's anchor and its children's anchors go via regenNav (rebuilt from
+  // the manifest); any in-text href="#…" left dangling is REPORTED, not
+  // silently broken (validate() surfaces the same list).
+  function remove(model, id) {
+    var man = requireManifest(model);
+    var b = mblock(man, id);
+    if (!b) throw new Error("unknown block " + id);
+    if (!b.optional) throw new Error(id + " has optional=false and cannot be removed");
+    var loc = findNode(model, id);
+    if (!loc) throw new Error(id + " not present in document");
+
+    var removedIds = subtreeIds(loc.node);
+    var removedSet = {};
+    removedIds.forEach(function (x) { removedSet[x] = true; });
+
+    // stash info so the UI can re-include the block later
+    var prevBlockId = null, nextBlockId = null, i;
+    for (i = loc.index - 1; i >= 0; i--) {
+      if (loc.container[i].type === "block") { prevBlockId = loc.container[i].id; break; }
+    }
+    for (i = loc.index + 1; i < loc.container.length; i++) {
+      if (loc.container[i].type === "block") { nextBlockId = loc.container[i].id; break; }
+    }
+    var entries = [];
+    man.blocks.forEach(function (x, k) {
+      if (removedSet[x.id]) entries.push({ index: k, block: JSON.parse(JSON.stringify(x)) });
+    });
+    var removedInfo = {
+      id: id,
+      fragText: serializeNode(loc.node),
+      parentId: loc.parentBlock ? loc.parentBlock.id : null,
+      prevBlockId: prevBlockId,
+      nextBlockId: nextBlockId,
+      containerIndex: loc.index, // position fallback when no block neighbor resolves
+      sepAfter: null,            // absorbed blank-line separator (see below)
+      entries: entries
+    };
+
+    loc.container.splice(loc.index, 1);
+    // Absorb the blank-line separator that followed the block (a whole
+    // whitespace-only raw segment, or the leading blank lines of a content
+    // segment) so removal does not leave a doubled blank line and insert()
+    // is byte-inverse of remove().
+    var segAfter = loc.container[loc.index];
+    if (segAfter && segAfter.type === "raw") {
+      if (/^\s*$/.test(segAfter.text)) {
+        removedInfo.sepAfter = segAfter.text;
+        loc.container.splice(loc.index, 1);
+      } else {
+        var blank = /^(?:[ \t]*\n)+/.exec(segAfter.text);
+        if (blank) {
+          removedInfo.sepAfter = blank[0];
+          segAfter.text = segAfter.text.slice(blank[0].length);
+        }
+      }
+    }
+    // Raw segments (if any) still standing between the block's old slot and
+    // its next sibling block; insert() subtracts this so the block returns
+    // BEFORE that raw content (e.g. doc:footer before the `</main>` raw).
+    if (nextBlockId !== null) {
+      var nRaw = 0;
+      for (i = loc.index; i < loc.container.length && loc.container[i].type !== "block"; i++) nRaw++;
+      removedInfo.rawsBeforeNext = nRaw;
+    }
+    man.blocks = man.blocks.filter(function (x) { return !removedSet[x.id]; });
+    man.blocks.forEach(function (x) {
+      if (x.children) x.children = x.children.filter(function (c) { return !removedSet[c]; });
+    });
+    if (man.nav && man.nav.order) {
+      man.nav.order = man.nav.order.filter(function (x) { return !removedSet[x]; });
+    }
+    if (man.shared) man.shared = man.shared.filter(function (x) { return !removedSet[x]; });
+
+    syncManifest(model);
+    regenNav(model);
+
+    var warnings = danglingHrefs(serialize(model)).map(function (d) {
+      return {
+        level: "warn", code: "dangling-href",
+        message: 'after removing ' + id + ', href="#' + d.anchor + '" (' + d.count + " occurrence" + (d.count > 1 ? "s" : "") + ") no longer resolves"
+      };
+    });
+    return { warnings: warnings, removed: removedInfo };
+  }
+
+  // insert(model, removedInfo) — inverse of remove(); used for re-inclusion.
+  function insert(model, info) {
+    var man = requireManifest(model);
+    var frag = parseFragment(info.fragText, null);
+    if (findNode(model, frag.id)) throw new Error(frag.id + " is already present");
+    var container = model.segments;
+    if (info.parentId) {
+      var p = findNode(model, info.parentId);
+      if (!p) throw new Error("parent " + info.parentId + " not present");
+      container = p.node.inner;
+    }
+    // Placement: before the recorded next sibling block if it is still
+    // present; else the recorded container index (exact for blocks whose
+    // neighbors are raw content, e.g. a part embedded mid-chapter or a
+    // trailing doc block); else after the previous sibling; else the end.
+    var at = container.length, i;
+    var found = false;
+    if (info.nextBlockId) {
+      for (i = 0; i < container.length; i++) {
+        if (container[i].type === "block" && container[i].id === info.nextBlockId) {
+          at = Math.max(0, i - (info.rawsBeforeNext || 0));
+          found = true;
+          break;
+        }
+      }
+    }
+    if (!found && typeof info.containerIndex === "number") {
+      at = Math.max(0, Math.min(info.containerIndex, container.length));
+      found = true;
+    }
+    if (!found && info.prevBlockId) {
+      for (i = 0; i < container.length; i++) {
+        if (container[i].type === "block" && container[i].id === info.prevBlockId) { at = i + 1; found = true; break; }
+      }
+    }
+    container.splice(at, 0, frag);
+    // restore the separator absorbed by remove() (byte-inverse re-inclusion)
+    if (info.sepAfter != null) container.splice(at + 1, 0, { type: "raw", text: info.sepAfter });
+    (info.entries || [])
+      .slice()
+      .sort(function (a, b) { return a.index - b.index; })
+      .forEach(function (en) {
+        if (!mblock(man, en.block.id)) {
+          man.blocks.splice(Math.min(en.index, man.blocks.length), 0, en.block);
+        }
+      });
+    syncManifest(model);
+    regenNav(model);
+    return model;
+  }
+
+  /* ---------- block HTML replacement (drawer + click-to-edit) ---------- */
+
+  function parseFragment(text, expectId) {
+    var inner;
+    try { inner = parseInner(text); }
+    catch (e) { throw new Error("fragment does not parse: " + e.message); }
+    var blocks = inner.filter(function (n) { return n.type === "block"; });
+    var raws = inner.filter(function (n) { return n.type === "raw"; });
+    if (blocks.length !== 1) {
+      throw new Error("fragment must contain exactly one top-level BLOCK…END pair (found " + blocks.length + ")");
+    }
+    if (raws.length) {
+      throw new Error("fragment has content outside the fences — it must start at the BLOCK fence and end at the END fence");
+    }
+    if (expectId && blocks[0].id !== expectId) {
+      throw new Error("fragment fences name " + blocks[0].id + ", expected " + expectId);
+    }
+    return blocks[0];
+  }
+
+  function fragFind(frag, id) {
+    var hit = null;
+    (function walk(n) {
+      if (hit) return;
+      if (n.id === id) { hit = n; return; }
+      n.inner.forEach(function (c) { if (c.type === "block") walk(c); });
+    })(frag);
+    return hit;
+  }
+
+  function replaceBlockHtml(model, id, html) {
+    var man = requireManifest(model);
+    var loc = findNode(model, id);
+    if (!loc) throw new Error("unknown block " + id);
+    var text = html;
+    var hadNL = loc.node.close ? loc.node.close.slice(-1) === "\n"
+      : loc.node.open.slice(-1) === "\n";
+    if (hadNL && text.slice(-1) !== "\n") text += "\n";
+    var frag = parseFragment(text, id);
+
+    var b = mblock(man, id);
+    if (b && b.anchor) {
+      var anchorRe = new RegExp('id="' + b.anchor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"');
+      if (!anchorRe.test(text)) {
+        throw new Error('replacement must keep the block anchor id="' + b.anchor + '"');
+      }
+    }
+
+    var warnings = [];
+    var newIds = {}, oldIds = {};
+    subtreeIds(frag).forEach(function (x) { newIds[x] = true; });
+    subtreeIds(loc.node).forEach(function (x) { oldIds[x] = true; });
+
+    Object.keys(oldIds).forEach(function (oid) {
+      if (newIds[oid]) return;
+      man.blocks = man.blocks.filter(function (x) { return x.id !== oid; });
+      man.blocks.forEach(function (x) {
+        if (x.children) x.children = x.children.filter(function (c) { return c !== oid; });
+      });
+      if (man.nav && man.nav.order) man.nav.order = man.nav.order.filter(function (x) { return x !== oid; });
+      warnings.push({ level: "warn", code: "block-dropped", message: oid + " disappeared in the HTML edit; its manifest entry was dropped" });
+    });
+    Object.keys(newIds).forEach(function (nid) {
+      if (oldIds[nid] || mblock(man, nid)) return;
+      var node = fragFind(frag, nid);
+      var ntext = node ? serializeNode(node) : "";
+      var tm = / data-block-title="([^"]*)"/.exec(ntext);
+      var local = nid.split(":")[1];
+      var anchor = new RegExp('id="' + local + '"').test(ntext) ? local : null;
+      var stub = {
+        id: nid, kind: nid.split(":")[0],
+        title: tm ? tm[1] : local, railLabel: null, anchor: anchor,
+        category: b ? b.category : "meta", status: "complete",
+        movable: true, optional: true, parent: id, children: [],
+        deps: { css: [], js: [] }
+      };
+      var pi = -1;
+      man.blocks.forEach(function (x, k) { if (x.id === id) pi = k; });
+      man.blocks.splice(pi + 1, 0, stub);
+      warnings.push({ level: "warn", code: "block-added", message: nid + " is new; a stub manifest entry was created — review its metadata" });
+    });
+
+    loc.container[loc.index] = frag;
+    syncManifest(model);
+    regenNav(model);
+    return warnings;
+  }
+
+  /* ---------- conservative CSS pruning (spec §5.4, off by default) ---------- */
+
+  function pruneCss(model) {
+    var man = requireManifest(model);
+    var keep = {};
+    (man.shared || []).forEach(function (s) { keep[s] = true; });
+    man.blocks.forEach(function (b) {
+      ((b.deps && b.deps.css) || []).forEach(function (c) { keep[c] = true; });
+    });
+    var removed = [];
+    man.blocks.slice().forEach(function (b) {
+      if (b.kind !== "css" || keep[b.id]) return;
+      var loc = findNode(model, b.id);
+      if (!loc) return;
+      loc.container.splice(loc.index, 1);
+      man.blocks = man.blocks.filter(function (x) { return x.id !== b.id; });
+      removed.push(b.id);
+    });
+    if (removed.length) { syncManifest(model); regenNav(model); }
+    return removed;
+  }
+
+  /* ---------- strip (EXACT port of tools/annotate.py strip()) ---------- */
+
+  function strip(text) {
+    var ls = text.split("\n");
+    var r = [];
+    var inAnat = false, inManifest = false;
+    var manifestRe = new RegExp("^<!-- " + FENCE6 + " (BLOCK|END) data:manifest " + FENCE6 + " -->$");
+    var fenceRe = new RegExp("^<!-- " + FENCE6 + " (BLOCK|END) [a-z]+:[a-z0-9-]+ " + FENCE6 + " -->$");
+    var anatPrefix = "<!-- " + FENCE6 + " ANATOMY";
+    for (var i = 0; i < ls.length; i++) {
+      var l = ls[i];
+      var t = l.trim();
+      if (inAnat) {
+        if (t === "-->") inAnat = false;
+        continue;
+      }
+      if (t.indexOf(anatPrefix) === 0) { inAnat = true; continue; }
+      if (manifestRe.test(t)) { inManifest = !inManifest; continue; }
+      if (inManifest) continue;
+      if (fenceRe.test(t)) continue;
+      if (t === '<meta name="post-format" content="composable-post/1" />') continue;
+      l = l.replace(/ data-block(?:-title|-category|-status)?="[^"]*"/g, "");
+      l = l.replace(/ data-block-optional\b/g, "");
+      l = l.replace(/ data-for="[^"]*"/g, "");
+      r.push(l);
+    }
+    return r.join("\n");
+  }
+
+  /* ---------- tolerant source tokenizer (tag balance + source tree) ---------- */
+
+  var TOKEN_RE_SRC = "<!--[\\s\\S]*?-->" +
+    "|<!doctype[^>]*>" +
+    "|<script\\b(?:\"[^\"]*\"|'[^']*'|[^\"'>])*>[\\s\\S]*?<\\/script\\s*>" +
+    "|<style\\b(?:\"[^\"]*\"|'[^']*'|[^\"'>])*>[\\s\\S]*?<\\/style\\s*>" +
+    "|<(\\/?)([a-zA-Z][a-zA-Z0-9-]*)((?:\"[^\"]*\"|'[^']*'|[^\"'>])*)>";
+
+  function tagBalance(text) {
+    var errs = [];
+    var re = new RegExp(TOKEN_RE_SRC, "gi");
+    var stack = [];
+    var m;
+    function lineAt(idx) {
+      var n = 1;
+      for (var i = 0; i < idx; i++) if (text.charCodeAt(i) === 10) n++;
+      return n;
+    }
+    while ((m = re.exec(text))) {
+      var tok = m[0];
+      var lower = tok.toLowerCase();
+      if (lower.indexOf("<!--") === 0 || lower.indexOf("<!doctype") === 0) continue;
+      if (lower.indexOf("<script") === 0 || lower.indexOf("<style") === 0) continue;
+      var tag = (m[2] || "").toLowerCase();
+      if (!tag) continue;
+      if (m[1] === "/") {
+        if (VOID[tag]) continue;
+        if (stack.length && stack[stack.length - 1].tag === tag) { stack.pop(); continue; }
+        errs.push({ message: "unexpected </" + tag + ">", line: lineAt(m.index) });
+        var k = -1;
+        for (var i = stack.length - 1; i >= 0; i--) if (stack[i].tag === tag) { k = i; break; }
+        if (k >= 0) stack.length = k;
+      } else {
+        if (VOID[tag] || /\/>$/.test(tok)) continue;
+        stack.push({ tag: tag, line: lineAt(m.index), idx: m.index });
+      }
+      if (errs.length >= 20) return errs;
+    }
+    stack.slice(0, 20).forEach(function (s) {
+      errs.push({ message: "<" + s.tag + "> never closed", line: s.line });
+    });
+    return errs;
+  }
+
+  // sourceTree(text) -> element tree with byte ranges; element-children
+  // indexes align with DOM `children` (comments/text skipped, voids kept).
+  function sourceTree(text) {
+    var roots = [];
+    var stack = [];
+    var re = new RegExp(TOKEN_RE_SRC, "gi");
+    var m;
+    function add(node) {
+      (stack.length ? stack[stack.length - 1].children : roots).push(node);
+    }
+    while ((m = re.exec(text))) {
+      var tok = m[0];
+      var lower = tok.toLowerCase();
+      var start = m.index, end = m.index + tok.length;
+      if (lower.indexOf("<!--") === 0 || lower.indexOf("<!doctype") === 0) continue;
+      if (lower.indexOf("<script") === 0) { add({ tag: "script", start: start, end: end, children: [] }); continue; }
+      if (lower.indexOf("<style") === 0) { add({ tag: "style", start: start, end: end, children: [] }); continue; }
+      var tag = (m[2] || "").toLowerCase();
+      if (!tag) continue;
+      if (m[1] === "/") {
+        if (VOID[tag]) continue;
+        for (var i = stack.length - 1; i >= 0; i--) {
+          if (stack[i].tag === tag) {
+            for (var j = stack.length - 1; j >= i; j--) { stack[j].end = end; stack.pop(); }
+            break;
+          }
+        }
+      } else if (VOID[tag] || /\/>$/.test(tok)) {
+        add({ tag: tag, start: start, end: end, children: [] });
+      } else {
+        var node = { tag: tag, start: start, end: end, children: [] };
+        add(node);
+        stack.push(node);
+      }
+    }
+    while (stack.length) { stack.pop().end = text.length; }
+    return roots;
+  }
+
+  /* ---------- validation (spec §5.5) ---------- */
+
+  function validate(text) {
+    var issues = [];
+    function push(level, code, message, line) {
+      issues.push({ level: level, code: code, message: message, line: line });
+    }
+
+    if (!META_RE.test(text)) {
+      push("error", "format", 'missing <meta name="post-format" content="composable-post/1" />');
+    }
+
+    // fence pairing (line scan, independent of parse)
+    var lines = text.split("\n");
+    var stack = [];
+    for (var i = 0; i < lines.length; i++) {
+      var fm = FENCE_LINE_RE.exec(lines[i]);
+      if (!fm) continue;
+      if (fm[1] === "BLOCK") stack.push({ id: fm[2], line: i + 1 });
+      else {
+        var top = stack.pop();
+        if (!top) push("error", "fence-pairing", "END " + fm[2] + " without an opening BLOCK", i + 1);
+        else if (top.id !== fm[2]) push("error", "fence-pairing", "END " + fm[2] + " closes BLOCK " + top.id + " (opened line " + top.line + ")", i + 1);
+      }
+    }
+    stack.forEach(function (s) { push("error", "fence-pairing", "BLOCK " + s.id + " never closed", s.line); });
+
+    var model = null;
+    try { model = parse(text); }
+    catch (e) { if (e.code !== "NOT_COMPOSABLE") push("error", "parse", e.message); }
+
+    var man = model && model.manifest;
+    if (model && !man) push("error", "manifest", model.manifestError || "manifest missing");
+
+    if (man) {
+      var ids = docOrder(model);
+      var docSet = {}, manSet = {}, kindOf = {};
+      ids.forEach(function (x) { docSet[x] = true; });
+      man.blocks.forEach(function (b) { manSet[b.id] = true; kindOf[b.id] = b.kind; });
+      ids.forEach(function (x) {
+        if (!manSet[x]) push("error", "manifest-presence", "fenced block " + x + " has no manifest entry");
+      });
+      man.blocks.forEach(function (b) {
+        if (!docSet[b.id]) push("error", "manifest-presence", "manifest lists " + b.id + " but no fence exists");
+      });
+      var contentDoc = ids.filter(function (x) { return kindOf[x] === "chapter" || kindOf[x] === "part"; });
+      var contentMan = man.blocks
+        .filter(function (b) { return (b.kind === "chapter" || b.kind === "part") && docSet[b.id]; })
+        .map(function (b) { return b.id; });
+      if (contentDoc.join("|") !== contentMan.join("|")) {
+        push("error", "manifest-order", "manifest blocks[] order does not match document order for chapters/parts");
+      }
+      var chDoc = ids.filter(function (x) { return kindOf[x] === "chapter"; });
+      if (man.nav && Array.isArray(man.nav.order)) {
+        if (chDoc.join("|") !== man.nav.order.join("|")) {
+          push("error", "nav-order", "manifest nav.order [" + man.nav.order.join(", ") + "] does not match document chapter order [" + chDoc.join(", ") + "]");
+        }
+      } else push("error", "manifest", "manifest nav.order missing");
+      (man.shared || []).forEach(function (s) {
+        if (!docSet[s]) push("error", "shared-missing", "shared block " + s + " is absent from the document");
+      });
+    }
+
+    // anchor resolution on both nav surfaces (anchors must RESOLVE)
+    var allIds = {};
+    var m2, idRe = /\bid="([^"]+)"/g;
+    while ((m2 = idRe.exec(text))) allIds[m2[1]] = true;
+    [["toc-menu", /<nav class="toc-menu"[^>]*>[\s\S]*?<\/nav>/],
+     ["contents-rail", /<aside class="contents-rail"[\s\S]*?<\/aside>/]].forEach(function (pair) {
+      var mm = pair[1].exec(text);
+      if (!mm) { push("error", "nav-missing", pair[0] + " not found"); return; }
+      var seg = mm[0];
+      var linkRe = /<a\b((?:"[^"]*"|'[^']*'|[^"'>])*)>/g;
+      var lm;
+      while ((lm = linkRe.exec(seg))) {
+        var attrs = lm[1];
+        var href = /href="#([^"]+)"/.exec(attrs);
+        if (!href) continue;
+        var dfor = / data-for="([^"]+)"/.exec(attrs);
+        if (!allIds[href[1]]) push("error", "nav-anchor", pair[0] + ': href="#' + href[1] + '" does not resolve to any id');
+        if (!dfor) push("warn", "nav-datafor", pair[0] + ": link to #" + href[1] + " is missing data-for");
+        else if (dfor[1] !== href[1]) push("error", "nav-datafor", pair[0] + ': data-for="' + dfor[1] + '" disagrees with href="#' + href[1] + '"');
+      }
+    });
+
+    // dangling in-text hrefs anywhere (e.g. after a removal)
+    danglingHrefs(text).forEach(function (d) {
+      push("error", "dangling-href", 'href="#' + d.anchor + '" (' + d.count + " occurrence" + (d.count > 1 ? "s" : "") + ") does not resolve to any id");
+    });
+
+    // tag balance
+    tagBalance(text).forEach(function (e2) { push("error", "tag-balance", e2.message, e2.line); });
+
+    return issues;
+  }
+
+  /* ---------- export ---------- */
+
+  window.CPF = {
+    parse: parse,
+    serialize: serialize,
+    reorder: reorder,
+    remove: remove,
+    insert: insert,
+    replaceBlockHtml: replaceBlockHtml,
+    regenNav: regenNav,
+    strip: strip,
+    validate: validate,
+    pruneCss: pruneCss,
+    blockText: blockText,
+    docOrder: docOrder,
+    findNode: findNode,
+    sourceTree: sourceTree,
+    danglingHrefs: danglingHrefs,
+    parseFragment: parseFragment,
+    FENCE_LINE_RE: FENCE_LINE_RE
+  };
+})();
+</script>
+
+<!-- ================================================================
+     UI layer — the only script that touches the DOM.
+     ================================================================ -->
+<script id="cpf-ui">
+(function () {
+  "use strict";
+  var CPF = window.CPF;
+  var $ = function (id) { return document.getElementById(id); };
+
+  var st = {
+    name: null,          // file name
+    text: null,          // current document text (source of truth)
+    model: null,         // parse(text) of the current text
+    loadedText: null,    // as loaded / last downloaded (for dirty flag)
+    history: [],         // undo stack of texts
+    future: [],          // redo stack
+    stash: {},           // id -> removedInfo (excluded optional blocks)
+    stashOrder: [],      // insertion order for outline placement
+    selected: null,      // selected block id
+    drawerId: null,
+    editMode: true,
+    prune: false,
+    issues: [],
+    activeEdit: null     // { el, msg, origOuter, origInner }
+  };
+
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function flash(msg, ms) {
+    $("statusFlash").textContent = msg || "";
+    if (flash._t) clearTimeout(flash._t);
+    if (msg) flash._t = setTimeout(function () { $("statusFlash").textContent = ""; }, ms || 5000);
+  }
+
+  /* ---------------- open / refuse ---------------- */
+
+  function refuse(msg) {
+    var el = $("refusalMsg");
+    el.textContent = msg;
+    el.hidden = false;
+    $("emptyState").style.display = "flex";
+    $("preview").style.display = "none";
+  }
+
+  function openText(text, name) {
+    var model;
+    try { model = CPF.parse(text); }
+    catch (e) {
+      if (e.code === "NOT_COMPOSABLE") {
+        refuse((name ? name + ": " : "") + e.message);
+      } else {
+        refuse((name ? name + ": " : "") + "cannot open: " + e.message);
+      }
+      return;
+    }
+    if (st.activeEdit) teardownEdit(); // stale inline edit (e.g. drag-drop open never blurs the iframe)
+    st.name = name || "untitled.html";
+    st.text = text;
+    st.model = model;
+    st.loadedText = text;
+    st.history = [];
+    st.future = [];
+    st.stash = {};
+    st.stashOrder = [];
+    st.selected = null;
+    st.drawerId = null;
+    $("refusalMsg").hidden = true;
+    $("emptyState").style.display = "none";
+    $("preview").style.display = "block";
+    $("drawer").classList.remove("open");
+    document.title = st.name + " — Composable-Post Editor";
+    renderAll(true);
+    if (model.manifestError) flash("Warning: " + model.manifestError, 9000);
+  }
+
+  function openFile(file) {
+    var reader = new FileReader();
+    reader.onload = function () { openText(String(reader.result), file.name); };
+    reader.readAsText(file);
+  }
+
+  /* ---------------- ops with undo ---------------- */
+
+  // The undo unit is {text, stash, stashOrder} — the include/exclude stash
+  // must travel with the text or the outline desyncs from the document
+  // (a stashed row and its re-inserted manifest row would both render).
+  // Note: applyOp snapshots BEFORE excludeBlock/includeBlock mutate the
+  // stash, so each snapshot pairs the pre-op text with the pre-op stash.
+  function snapshot() {
+    var stashCopy = {};
+    for (var k in st.stash) {
+      if (Object.prototype.hasOwnProperty.call(st.stash, k)) stashCopy[k] = st.stash[k];
+    }
+    return { text: st.text, stash: stashCopy, stashOrder: st.stashOrder.slice() };
+  }
+
+  function restoreSnapshot(snap) {
+    st.model = CPF.parse(snap.text); // parse first: a throw leaves state untouched
+    st.text = snap.text;
+    st.stash = snap.stash;
+    st.stashOrder = snap.stashOrder;
+  }
+
+  // Runs op on a FRESH parse so a mid-op exception cannot corrupt state.
+  function applyOp(fn, label) {
+    if (!st.text) return null;
+    var fresh;
+    try { fresh = CPF.parse(st.text); }
+    catch (e) { flash("internal: reparse failed: " + e.message); return null; }
+    var result;
+    try { result = fn(fresh); }
+    catch (e2) { flash(label + " failed: " + e2.message, 8000); return null; }
+    st.history.push(snapshot());
+    if (st.history.length > 80) st.history.shift();
+    st.future = [];
+    st.model = fresh;
+    st.text = CPF.serialize(fresh);
+    renderAll(false);
+    return { result: result };
+  }
+
+  function undo() {
+    if (!st.history.length) return;
+    st.future.push(snapshot());
+    restoreSnapshot(st.history.pop());
+    renderAll(false);
+    flash("Undo");
+  }
+
+  function redo() {
+    if (!st.future.length) return;
+    st.history.push(snapshot());
+    restoreSnapshot(st.future.pop());
+    renderAll(false);
+    flash("Redo");
+  }
+
+  /* ---------------- outline ---------------- */
+
+  function catIndex(man, cat) {
+    var i = (man.categories || []).findIndex(function (c) { return c.id === cat; });
+    return i < 0 ? 0 : i % 5;
+  }
+
+  function rowHtml(man, b, opts) {
+    var excluded = !!opts.excluded;
+    var cls = "o-row " + (b.kind === "part" ? "part " : "") +
+      (excluded ? "excluded " : "") +
+      (st.selected === b.id ? "selected" : "");
+    var h = '<div class="' + cls + '" data-id="' + esc(b.id) + '" data-group="' + esc(opts.group) + '"' +
+      (b.movable && !excluded ? ' draggable="true"' : "") + ">";
+    h += '<span class="handle" title="' + (b.movable ? "Drag to reorder among siblings" : "Not movable") + '">' +
+      (b.movable ? "&#8942;&#8942;" : "&nbsp;&nbsp;") + "</span>";
+    if (b.optional) {
+      h += '<input type="checkbox" data-act="toggle" ' + (excluded ? "" : "checked") +
+        ' title="Include / exclude this optional block" />';
+    } else {
+      h += '<input type="checkbox" checked disabled title="optional=false — cannot be removed" />';
+    }
+    h += '<span class="o-title" data-act="select" title="' + esc(b.id) + '">' + esc(b.title || b.id) + "</span>";
+    if (b.category) {
+      h += '<span class="chip cat-' + catIndex(man, b.category) + '" title="category: ' + esc(b.category) + '">' + esc(b.category) + "</span>";
+    }
+    if (b.status && b.status !== "n/a") {
+      h += '<span class="chip pill-' + esc(b.status) + '">' + esc(b.status) + "</span>";
+    }
+    h += '<button class="mini" data-act="html" title="Edit this block&#39;s raw fence-to-fence HTML">HTML</button>';
+    h += "</div>";
+    return h;
+  }
+
+  function stashedFor(pred) {
+    return st.stashOrder
+      .map(function (id) { return st.stash[id]; })
+      .filter(function (s) { return s && pred(s); });
+  }
+
+  function renderOutline() {
+    var man = st.model && st.model.manifest;
+    var out = [];
+    if (!man) { $("outline").innerHTML = ""; return; }
+    var byId = {};
+    man.blocks.forEach(function (b) { byId[b.id] = b; });
+    function stashBlock(s) { return s.entries[0] ? s.entries[0].block : null; }
+
+    out.push("<h2>Content</h2>");
+    var emitted = {};
+    function emitStashed(s) {
+      var b = stashBlock(s);
+      if (!b || emitted[b.id]) return;
+      emitted[b.id] = true;
+      out.push(rowHtml(man, b, { group: "x", excluded: true }));
+    }
+    var topStash = stashedFor(function (s) { return !s.parentId && stashBlock(s) && stashBlock(s).kind === "chapter"; });
+    ((man.nav && man.nav.order) || []).forEach(function (chId) {
+      topStash.forEach(function (s) { if (s.nextBlockId === chId) emitStashed(s); });
+      var ch = byId[chId];
+      if (!ch) return;
+      out.push(rowHtml(man, ch, { group: "chapter|" }));
+      var partStash = stashedFor(function (s) { return s.parentId === chId; });
+      (ch.children || []).forEach(function (pid) {
+        partStash.forEach(function (s) { if (s.nextBlockId === pid) emitStashed(s); });
+        var p = byId[pid];
+        if (p) out.push(rowHtml(man, p, { group: "part|" + chId }));
+      });
+      partStash.forEach(emitStashed); // leftovers (removed neighbors etc.)
+      if ((ch.children || []).length) {
+        out.push('<div class="drop-end" data-group="part|' + esc(chId) + '" data-end="1" title="Drop here to move a part to the end"></div>');
+      }
+    });
+    topStash.forEach(emitStashed);
+    out.push('<div class="drop-end" data-group="chapter|" data-end="1" title="Drop here to move a chapter to the end"></div>');
+
+    out.push("<h2>Page furniture</h2>");
+    man.blocks.forEach(function (b) {
+      if (b.kind !== "doc" || b.id === "doc:head") return;
+      out.push(rowHtml(man, b, { group: "doc|" }));
+    });
+    stashedFor(function (s) {
+      var b = stashBlock(s);
+      return b && b.kind === "doc";
+    }).forEach(function (s) {
+      out.push(rowHtml(man, stashBlock(s), { group: "x", excluded: true }));
+    });
+
+    out.push('<h2>Infrastructure (read-only)</h2>');
+    man.blocks.forEach(function (b) {
+      if (["css", "chrome", "script", "data"].indexOf(b.kind) < 0 && b.id !== "doc:head") return;
+      if (b.kind === "doc" && b.id !== "doc:head") return;
+      out.push('<div class="o-infra" data-id="' + esc(b.id) + '">' +
+        '<span class="kind">' + esc(b.kind) + "</span>" +
+        '<span class="o-title" title="' + esc(b.id) + '">' + esc(b.id) + "</span>" +
+        '<button class="mini" data-act="html">HTML</button></div>');
+    });
+
+    var sc = $("outline").scrollTop;
+    $("outline").innerHTML = out.join("");
+    $("outline").scrollTop = sc;
+  }
+
+  /* outline events (delegated) */
+  $("outline").addEventListener("click", function (ev) {
+    var act = ev.target.getAttribute && ev.target.getAttribute("data-act");
+    var row = ev.target.closest("[data-id]");
+    if (!row) return;
+    var id = row.getAttribute("data-id");
+    if (act === "html") { openDrawer(id); return; }
+    if (act === "select") {
+      st.selected = id;
+      renderOutline();
+      scrollPreviewTo(id);
+      return;
+    }
+  });
+
+  $("outline").addEventListener("change", function (ev) {
+    if (ev.target.getAttribute("data-act") !== "toggle") return;
+    var row = ev.target.closest("[data-id]");
+    if (!row) return;
+    var id = row.getAttribute("data-id");
+    if (ev.target.checked) includeBlock(id);
+    else excludeBlock(id);
+  });
+
+  function excludeBlock(id) {
+    var r = applyOp(function (m) { return CPF.remove(m, id); }, "Remove " + id);
+    if (!r) { renderOutline(); return; }
+    st.stash[id] = r.result.removed;
+    st.stashOrder.push(id);
+    if (st.drawerId === id) closeDrawer();
+    var w = r.result.warnings;
+    flash("Excluded " + id + (w.length ? " — " + w.length + " dangling href warning(s), see validation" : ""));
+    renderOutline();
+  }
+
+  function includeBlock(id) {
+    var info = st.stash[id];
+    if (!info) { renderOutline(); return; }
+    var r = applyOp(function (m) { return CPF.insert(m, info); }, "Re-include " + id);
+    if (!r) { renderOutline(); return; }
+    delete st.stash[id];
+    st.stashOrder = st.stashOrder.filter(function (x) { return x !== id; });
+    flash("Re-included " + id);
+    renderOutline();
+  }
+
+  /* drag reorder */
+  var drag = null;
+  $("outline").addEventListener("dragstart", function (ev) {
+    var row = ev.target.closest(".o-row[draggable]");
+    if (!row) { ev.preventDefault(); return; }
+    drag = { id: row.getAttribute("data-id"), group: row.getAttribute("data-group") };
+    ev.dataTransfer.setData("text/plain", drag.id);
+    ev.dataTransfer.effectAllowed = "move";
+  });
+  $("outline").addEventListener("dragover", function (ev) {
+    if (!drag) return;
+    var t = ev.target.closest("[data-group]");
+    if (!t || t.getAttribute("data-group") !== drag.group) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = "move";
+    clearDropMarks();
+    t.classList.add("drop-before");
+  });
+  $("outline").addEventListener("dragleave", function (ev) {
+    var t = ev.target.closest && ev.target.closest("[data-group]");
+    if (t) t.classList.remove("drop-before");
+  });
+  $("outline").addEventListener("drop", function (ev) {
+    if (!drag) return;
+    var t = ev.target.closest("[data-group]");
+    clearDropMarks();
+    if (!t || t.getAttribute("data-group") !== drag.group) { drag = null; return; }
+    ev.preventDefault();
+    var dragId = drag.id;
+    drag = null;
+    var beforeId = t.hasAttribute("data-end") ? null : t.getAttribute("data-id");
+    if (beforeId === dragId) return;
+    var r = applyOp(function (m) { return CPF.reorder(m, dragId, beforeId); }, "Reorder " + dragId);
+    if (r) flash("Moved " + dragId + (beforeId ? " before " + beforeId : " to the end"));
+  });
+  $("outline").addEventListener("dragend", function () { drag = null; clearDropMarks(); });
+  function clearDropMarks() {
+    $("outline").querySelectorAll(".drop-before").forEach(function (el) { el.classList.remove("drop-before"); });
+  }
+
+  /* ---------------- drawer ---------------- */
+
+  function openDrawer(id) {
+    var loc = CPF.findNode(st.model, id);
+    if (!loc) { flash(id + " is not present (excluded?)"); return; }
+    st.drawerId = id;
+    $("drawerId").textContent = id;
+    var b = st.model.manifest ? st.model.manifest.blocks.find(function (x) { return x.id === id; }) : null;
+    $("drawerMeta").innerHTML = b
+      ? ["kind: " + b.kind, "category: " + (b.category || "–"), "status: " + (b.status || "–"),
+         "movable: " + !!b.movable, "optional: " + !!b.optional,
+         "anchor: " + (b.anchor || "–")].map(esc).map(function (s) { return "<span>" + s + "</span>"; }).join("")
+      : "";
+    $("drawerText").value = CPF.blockText(st.model, id);
+    $("drawerErr").textContent = "";
+    $("drawer").classList.add("open");
+  }
+
+  function closeDrawer() {
+    st.drawerId = null;
+    $("drawer").classList.remove("open");
+  }
+
+  $("drawerClose").addEventListener("click", closeDrawer);
+  $("drawerApply").addEventListener("click", function () {
+    if (!st.drawerId) return;
+    var id = st.drawerId;
+    var html = $("drawerText").value;
+    var r = applyOp(function (m) { return CPF.replaceBlockHtml(m, id, html); }, "Apply HTML to " + id);
+    if (!r) {
+      // applyOp flashed the error; surface it in the drawer too
+      $("drawerErr").textContent = $("statusFlash").textContent;
+      return;
+    }
+    $("drawerErr").textContent = "";
+    var warns = r.result || [];
+    flash("Applied HTML to " + id + (warns.length ? " — " + warns.length + " warning(s)" : ""));
+    if (warns.length) $("drawerErr").textContent = warns.map(function (w) { return w.message; }).join("\n");
+    if (CPF.findNode(st.model, id)) $("drawerText").value = CPF.blockText(st.model, id);
+  });
+
+  /* ---------------- preview + click-to-edit ---------------- */
+
+  // Helper injected into the srcdoc. Serialized via toString(), so it must
+  // be fully self-contained (no closure references).
+  function __cpfPreviewHelper() {
+    var FENCE = /^\s*═+\s+(BLOCK|END)\s+([a-z]+:[a-z0-9-]+)\s+═+\s*$/;
+    var SEL = "p,h1,h2,h3,h4,h5,h6,li,figcaption,blockquote,dt,dd,td,th,caption,pre,summary,span,a,code,small,strong,em,label";
+    var css = document.createElement("style");
+    css.textContent = "[contenteditable=\"true\"]{outline:2px solid #2456d6;outline-offset:2px;border-radius:2px;}";
+    document.head.appendChild(css);
+
+    function pathIn(root, el) {
+      var p = [];
+      var n = el;
+      while (n !== root) {
+        var par = n.parentElement;
+        if (!par) return null;
+        p.unshift(Array.prototype.indexOf.call(par.children, n));
+        n = par;
+      }
+      return p;
+    }
+
+    function locate(el) {
+      var db = el.closest("[data-block]");
+      if (db) return { blockId: db.getAttribute("data-block"), method: "attr", rootIndex: 0, root: db };
+      // fall back to fence-comment containment
+      var walker = document.createTreeWalker(document.documentElement, 128); // comments
+      var stack = [], c;
+      while ((c = walker.nextNode())) {
+        var mm = FENCE.exec(c.nodeValue || "");
+        if (!mm) continue;
+        var elFollows = (c.compareDocumentPosition(el) & 4) === 4;
+        if (!elFollows) break;
+        if (mm[1] === "BLOCK") stack.push({ id: mm[2], node: c });
+        else stack.pop();
+      }
+      if (!stack.length) return null;
+      var top = stack[stack.length - 1];
+      var root = el;
+      while (root && root.parentNode !== top.node.parentNode) root = root.parentElement;
+      if (!root) return null;
+      var idx = -1, count = 0, seen = false;
+      var kids = top.node.parentNode.childNodes;
+      for (var i = 0; i < kids.length; i++) {
+        var k = kids[i];
+        if (k === top.node) { seen = true; continue; }
+        if (!seen) continue;
+        if (k.nodeType === 8) {
+          var f = FENCE.exec(k.nodeValue || "");
+          if (f && f[1] === "END" && f[2] === top.id) break;
+          continue;
+        }
+        if (k.nodeType === 1) {
+          if (k === root) { idx = count; break; }
+          count++;
+        }
+      }
+      if (idx < 0) return null;
+      return { blockId: top.id, method: "fence", rootIndex: idx, root: root };
+    }
+
+    document.addEventListener("click", function (ev) {
+      if (window.__cpfEditMode === false) return;
+      if (document.querySelector("[contenteditable=\"true\"]")) return; // an edit is active
+      if (!ev.target.closest) return;
+      var el = ev.target.closest(SEL);
+      if (!el) return;
+      if (el.closest(".floating-toc,.contents-rail")) {
+        // nav labels are generated from the manifest; direct edits would be overwritten
+        ev.preventDefault();
+        parent.postMessage({ cpf: "hint", text: "Nav entries are regenerated from the manifest — edit block titles instead." }, "*");
+        return;
+      }
+      if (el.querySelector("[data-block]")) return;                    // crosses a block boundary
+      if (/═+\s+(BLOCK|END)/.test(el.innerHTML)) return;          // contains a fence
+      var info = locate(el);
+      if (!info) return;                                               // outside any block: not editable
+      var path = pathIn(info.root, el);
+      if (!path) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      parent.postMessage({
+        cpf: "click", blockId: info.blockId, method: info.method,
+        rootIndex: info.rootIndex, path: path, tag: el.tagName
+      }, "*");
+    }, true);
+  }
+
+  function buildSrcdoc() {
+    var helper = "(" + __cpfPreviewHelper.toString() + ")();";
+    var inject = "<scr" + 'ipt>' + helper + "</scr" + "ipt>";
+    var t = st.text;
+    var i = t.lastIndexOf("</body>");
+    return i >= 0 ? t.slice(0, i) + inject + "\n" + t.slice(i) : t + inject;
+  }
+
+  function renderPreview(resetScroll) {
+    var iframe = $("preview");
+    var prevScroll = 0;
+    try { prevScroll = iframe.contentWindow ? iframe.contentWindow.scrollY : 0; } catch (e) { }
+    iframe.onload = function () {
+      try {
+        iframe.contentWindow.__cpfEditMode = st.editMode;
+        if (!resetScroll && prevScroll) iframe.contentWindow.scrollTo(0, prevScroll);
+        iframe.contentDocument.addEventListener("keydown", onGlobalKeys);
+      } catch (e) { }
+    };
+    iframe.srcdoc = buildSrcdoc();
+  }
+
+  function scrollPreviewTo(blockId) {
+    var man = st.model && st.model.manifest;
+    if (!man) return;
+    var b = man.blocks.find(function (x) { return x.id === blockId; });
+    var anchor = b && b.anchor;
+    if (!anchor) return;
+    try {
+      var el = $("preview").contentDocument.getElementById(anchor);
+      if (el) el.scrollIntoView({ block: "start" });
+    } catch (e) { }
+  }
+
+  var FENCE_COMMENT = /^\s*═+\s+(BLOCK|END)\s+([a-z]+:[a-z0-9-]+)\s+═+\s*$/;
+
+  function resolveInIframe(docu, msg) {
+    var root = null;
+    if (msg.method === "attr") {
+      root = docu.querySelector('[data-block="' + msg.blockId + '"]');
+    } else {
+      var walker = docu.createTreeWalker(docu.documentElement, 128);
+      var c, blockC = null;
+      while ((c = walker.nextNode())) {
+        var f = FENCE_COMMENT.exec(c.nodeValue || "");
+        if (f && f[1] === "BLOCK" && f[2] === msg.blockId) { blockC = c; break; }
+      }
+      if (!blockC) return null;
+      var kids = blockC.parentNode.childNodes;
+      var seen = false, count = 0;
+      for (var i = 0; i < kids.length; i++) {
+        var k = kids[i];
+        if (k === blockC) { seen = true; continue; }
+        if (!seen) continue;
+        if (k.nodeType === 8) {
+          var f2 = FENCE_COMMENT.exec(k.nodeValue || "");
+          if (f2 && f2[1] === "END" && f2[2] === msg.blockId) break;
+          continue;
+        }
+        if (k.nodeType === 1) {
+          if (count === msg.rootIndex) { root = k; break; }
+          count++;
+        }
+      }
+    }
+    if (!root) return null;
+    var el = root;
+    for (var j = 0; j < msg.path.length; j++) {
+      el = el.children[msg.path[j]];
+      if (!el) return null;
+    }
+    return el;
+  }
+
+  window.addEventListener("message", function (ev) {
+    try { if (ev.source !== $("preview").contentWindow) return; } catch (e) { return; }
+    var d = ev.data;
+    if (!d || !d.cpf) return;
+    if (d.cpf === "hint") { flash(d.text); return; }
+    if (d.cpf !== "click") return;
+    if (st.activeEdit) return;
+    var docu;
+    try { docu = $("preview").contentDocument; } catch (e) { return; }
+    var el = resolveInIframe(docu, d);
+    if (!el || el.tagName !== d.tag) { flash("Could not resolve the clicked element."); return; }
+    beginEdit(el, d);
+  });
+
+  function beginEdit(el, msg) {
+    st.activeEdit = { el: el, msg: msg, origOuter: el.outerHTML, origInner: el.innerHTML };
+    el.setAttribute("contenteditable", "true");
+    el.focus();
+    el.addEventListener("keydown", onEditKeys);
+    el.addEventListener("blur", onEditBlur);
+    flash("Editing <" + msg.tag.toLowerCase() + "> in " + msg.blockId + " — Ctrl/Cmd+Enter commits, Esc cancels, blur commits.", 8000);
+  }
+
+  function onEditKeys(ev) {
+    if (ev.key === "Escape") { ev.preventDefault(); cancelEdit(); }
+    else if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); ev.target.blur(); }
+  }
+
+  function onEditBlur() { commitEdit(); }
+
+  function teardownEdit() {
+    var a = st.activeEdit;
+    if (!a) return null;
+    a.el.removeEventListener("keydown", onEditKeys);
+    a.el.removeEventListener("blur", onEditBlur);
+    a.el.removeAttribute("contenteditable");
+    st.activeEdit = null;
+    return a;
+  }
+
+  function cancelEdit() {
+    var a = teardownEdit();
+    if (a) a.el.innerHTML = a.origInner;
+    flash("Edit cancelled.");
+  }
+
+  function commitEdit() {
+    var a = teardownEdit();
+    if (!a) return;
+    var newOuter = a.el.outerHTML;
+    if (newOuter === a.origOuter) { flash(""); return; }
+    var msg = a.msg;
+    var mapped = null;
+    try {
+      var bt = CPF.blockText(st.model, msg.blockId);
+      var roots = CPF.sourceTree(bt);
+      var node = roots[msg.rootIndex];
+      for (var i = 0; node && i < msg.path.length; i++) node = node.children[msg.path[i]];
+      if (node && node.tag === msg.tag.toLowerCase()) {
+        mapped = { bt: bt, node: node };
+      }
+    } catch (e) { }
+    if (!mapped) {
+      a.el.outerHTML = a.origOuter;
+      flash("Could not map the edited element back to source (mapping mismatch) — edit reverted. Use the HTML drawer instead.", 9000);
+      return;
+    }
+    var newBlock = mapped.bt.slice(0, mapped.node.start) + newOuter + mapped.bt.slice(mapped.node.end);
+    var r = applyOp(function (m) { return CPF.replaceBlockHtml(m, msg.blockId, newBlock); }, "Inline edit in " + msg.blockId);
+    if (!r) {
+      a.el.outerHTML = a.origOuter;
+      return;
+    }
+    flash("Saved edit into " + msg.blockId + ".");
+  }
+
+  /* ---------------- validation + status ---------------- */
+
+  function renderValidation() {
+    st.issues = st.text ? CPF.validate(st.text) : [];
+    var errs = st.issues.filter(function (i) { return i.level === "error"; }).length;
+    var warns = st.issues.length - errs;
+    var badge = $("vBadge");
+    badge.hidden = !st.text;
+    if (!st.text) return;
+    if (!st.issues.length) {
+      badge.className = "vbadge";
+      badge.textContent = "valid";
+    } else {
+      badge.className = "vbadge " + (errs ? "bad" : "warn");
+      badge.textContent = (errs ? errs + " error" + (errs > 1 ? "s" : "") : "") +
+        (errs && warns ? ", " : "") +
+        (warns ? warns + " warning" + (warns > 1 ? "s" : "") : "");
+    }
+    var panel = $("issuesPanel");
+    panel.innerHTML = st.issues.map(function (i) {
+      return '<div class="issue"><span class="lvl-' + i.level + '">' + i.level + "</span> " +
+        '<span class="code">[' + esc(i.code) + "]</span> " + esc(i.message) +
+        (i.line ? ' <span class="code">(line ' + i.line + ")</span>" : "") + "</div>";
+    }).join("") || '<div class="issue">No issues.</div>';
+  }
+
+  $("vBadge").addEventListener("click", function () {
+    $("issuesPanel").classList.toggle("open");
+  });
+
+  function renderStatus() {
+    var s = $("statusText");
+    if (!st.text) { s.textContent = "No document loaded."; return; }
+    var man = st.model.manifest;
+    var n = man ? man.blocks.length : 0;
+    var ch = (man && man.nav && man.nav.order) ? man.nav.order.length : 0;
+    var excluded = Object.keys(st.stash).length;
+    s.textContent = st.name + " — " + n + " blocks, " + ch + " chapters" +
+      (excluded ? ", " + excluded + " excluded" : "") +
+      " — " + (st.text.length / 1024).toFixed(0) + " KB";
+    $("fileName").textContent = st.name || "";
+    $("dirtyDot").hidden = !(st.text && st.text !== st.loadedText);
+    var loaded = !!st.text;
+    ["btnDl", "btnCp", "btnDlS", "btnCpS"].forEach(function (id) { $(id).disabled = !loaded; });
+    $("btnUndo").disabled = !st.history.length;
+    $("btnRedo").disabled = !st.future.length;
+  }
+
+  function renderAll(resetScroll) {
+    renderOutline();
+    renderPreview(resetScroll);
+    renderValidation();
+    renderStatus();
+    if (st.drawerId && !CPF.findNode(st.model, st.drawerId)) closeDrawer();
+  }
+
+  /* ---------------- export ---------------- */
+
+  function composeExport(stripIt) {
+    var t = st.text;
+    if (st.prune) {
+      var m = CPF.parse(t);
+      var removed = CPF.pruneCss(m);
+      t = CPF.serialize(m);
+      if (removed.length) flash("Pruned unused CSS: " + removed.join(", "), 8000);
+    }
+    return stripIt ? CPF.strip(t) : t;
+  }
+
+  function slugName() {
+    var man = st.model && st.model.manifest;
+    return (man && man.page && man.page.slug) || (st.name || "post").replace(/\.html?$/, "");
+  }
+
+  function download(text, name) {
+    var blob = new Blob([text], { type: "text/html;charset=utf-8" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 400);
+  }
+
+  function copyText(text, label) {
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { }
+      ta.remove();
+      flash(ok ? label + " copied to the clipboard." : "Copy failed — your browser blocked clipboard access.");
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        function () { flash(label + " copied to the clipboard."); },
+        fallback);
+    } else fallback();
+  }
+
+  $("btnDl").addEventListener("click", function () {
+    download(composeExport(false), slugName() + ".html");
+    st.loadedText = st.text;
+    renderStatus();
+  });
+  $("btnCp").addEventListener("click", function () { copyText(composeExport(false), "Annotated file"); });
+  $("btnDlS").addEventListener("click", function () { download(composeExport(true), slugName() + ".plain.html"); });
+  $("btnCpS").addEventListener("click", function () { copyText(composeExport(true), "Stripped file"); });
+
+  /* ---------------- top-level wiring ---------------- */
+
+  $("btnOpen").addEventListener("click", function () { $("filePick").click(); });
+  $("filePick").addEventListener("change", function () {
+    if (this.files && this.files[0]) openFile(this.files[0]);
+    this.value = "";
+  });
+  $("btnUndo").addEventListener("click", undo);
+  $("btnRedo").addEventListener("click", redo);
+  $("tglEdit").addEventListener("change", function () {
+    st.editMode = this.checked;
+    try { $("preview").contentWindow.__cpfEditMode = st.editMode; } catch (e) { }
+  });
+  $("tglPrune").addEventListener("change", function () { st.prune = this.checked; });
+
+  /* drag-drop open */
+  var dragDepth = 0;
+  window.addEventListener("dragenter", function (ev) {
+    if (ev.dataTransfer && Array.prototype.indexOf.call(ev.dataTransfer.types, "Files") >= 0) {
+      dragDepth++;
+      $("dropOverlay").classList.add("on");
+    }
+  });
+  window.addEventListener("dragleave", function () {
+    if (--dragDepth <= 0) { dragDepth = 0; $("dropOverlay").classList.remove("on"); }
+  });
+  window.addEventListener("dragover", function (ev) { ev.preventDefault(); });
+  window.addEventListener("drop", function (ev) {
+    ev.preventDefault();
+    dragDepth = 0;
+    $("dropOverlay").classList.remove("on");
+    if (ev.dataTransfer.files && ev.dataTransfer.files[0]) openFile(ev.dataTransfer.files[0]);
+  });
+
+  /* keyboard */
+  function onGlobalKeys(ev) {
+    var mod = ev.ctrlKey || ev.metaKey;
+    if (!mod) return;
+    // Let text fields (HTML drawer textarea, file inputs) keep their native
+    // undo/redo — same exemption as st.activeEdit for contenteditable.
+    var t = ev.target;
+    if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable)) return;
+    var key = ev.key.toLowerCase();
+    if (key === "z" && !ev.shiftKey) {
+      if (st.activeEdit) return; // let contenteditable handle its own undo
+      ev.preventDefault();
+      undo();
+    } else if ((key === "z" && ev.shiftKey) || key === "y") {
+      if (st.activeEdit) return;
+      ev.preventDefault();
+      redo();
+    }
+  }
+  document.addEventListener("keydown", onGlobalKeys);
+
+  window.addEventListener("beforeunload", function (ev) {
+    if (st.text && st.text !== st.loadedText) {
+      ev.preventDefault();
+      ev.returnValue = "";
+    }
+  });
+
+  /* ?src= auto-load over http(s) */
+  (function () {
+    if (location.protocol !== "http:" && location.protocol !== "https:") return;
+    var src = new URLSearchParams(location.search).get("src");
+    if (!src) return;
+    fetch(src).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.text();
+    }).then(function (t) {
+      openText(t, src.split("/").pop() || src);
+    }).catch(function (e) {
+      refuse("?src=" + src + " failed to load: " + e.message);
+    });
+  })();
+})();
+</script>
+</body>
+</html>

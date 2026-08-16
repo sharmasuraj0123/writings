@@ -1,0 +1,2507 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="An XO Research teardown of xo-space, the local control plane for AI coding agents: the capability loader, agents-as-data manifests, four runtimes with four transports, the SSE turn protocol, the session index that holds no messages, encrypted GitHub-backed backup, and the modularity invariant that holds it together."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/xo-space/" />
+    <meta property="og:title" content="Anatomy of an Agent Control Plane" />
+    <meta
+      property="og:description"
+      content="A component-by-component research breakdown of xo-space — one workspace, many agent runtimes — read from the source, with the constants that make it run."
+    />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/xo-space/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Anatomy of an Agent Control Plane" />
+    <meta
+      name="twitter:description"
+      content="A component-by-component research breakdown of xo-space — the local control plane that brokers Claude Code, OpenClaw, Hermes, and Antigravity behind one API."
+    />
+    <title>Anatomy of an Agent Control Plane — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+          /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+    </style>
+    <style>
+      .cap-y { color: #367f59; font-weight: 700; }
+      .cap-n { color: #b8b8b1; }
+      td.ctr, th.ctr { text-align: center; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · Why dissect a control plane</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#why">01 · Why dissect a control plane</a>
+        <a class="toc-parent" href="#shape">02 · The shape of the system</a>
+        <a class="toc-parent" href="#planes">03 · Two planes, deliberately unmerged</a>
+        <a class="toc-parent" href="#seam">04 · The one seam</a>
+        <a class="toc-parent" href="#manifest">05 · Agents as data</a>
+        <a class="toc-parent" href="#contract">06 · The adapter contract</a>
+        <a class="toc-parent" href="#runtimes">07 · Four runtimes, four transports</a>
+        <a class="toc-parent" href="#turn">08 · A turn, end to end</a>
+        <a class="toc-parent" href="#sse">09 · The streaming layer and its scar tissue</a>
+        <a class="toc-parent" href="#sessions">10 · The index that holds no messages</a>
+        <a class="toc-parent" href="#write">11 · Journey: a claude_code turn, in full</a>
+        <a class="toc-parent" href="#usage">12 · Usage: one shape from four ledgers</a>
+        <a class="toc-parent" href="#projects">13 · The xo-projects model</a>
+        <a class="toc-parent" href="#quirqdir">14 · Machine-local state, and the discipline of not lying</a>
+        <a class="toc-parent" href="#backup">15 · Backup: encrypted, chunked, GitHub-backed</a>
+        <a class="toc-parent" href="#connectors">16 · Connectors</a>
+        <a class="toc-parent" href="#space">17 · Space: the workspace as a graph</a>
+        <a class="toc-parent" href="#invariant">18 · The modularity invariant</a>
+        <a class="toc-parent" href="#stack">19 · The tech stack, completely</a>
+        <a class="toc-parent" href="#gaps">20 · What isn't built yet</a>
+        <a class="toc-parent" href="#quirq">21 · What this means for quirq</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#why">01 · Why a control plane</a>
+        <a href="#shape">02 · The shape of the system</a>
+        <a href="#planes">03 · Two planes</a>
+        <a href="#seam">04 · The one seam</a>
+        <a href="#manifest">05 · Agents as data</a>
+        <a href="#contract">06 · The adapter contract</a>
+        <a href="#runtimes">07 · Four runtimes</a>
+        <a href="#turn">08 · A turn, end to end</a>
+        <a href="#sse">09 · The streaming layer</a>
+        <a href="#sessions">10 · The session index</a>
+        <a href="#write">11 · A claude_code turn</a>
+        <a href="#usage">12 · Usage: four ledgers</a>
+        <a href="#projects">13 · The xo-projects model</a>
+        <a href="#quirqdir">14 · Machine-local state</a>
+        <a href="#backup">15 · Backup</a>
+        <a href="#connectors">16 · Connectors</a>
+        <a href="#space">17 · Space as a graph</a>
+        <a href="#invariant">18 · Modularity invariant</a>
+        <a href="#stack">19 · The tech stack</a>
+        <a href="#gaps">20 · What isn't built yet</a>
+        <a href="#quirq">21 · What it means for quirq</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Applied Agent Research</p>
+        <h1>Anatomy of an Agent Control Plane<span class="status-pill">Research teardown</span></h1>
+        <p class="dek">
+          Every coding agent ships its own session store, its own auth, its
+          own idea of a workspace. xo-space is the FastAPI service that puts
+          one API in front of all of them. This is a component-by-component
+          reading of it — the single seam that resolves an agent, the four
+          transports behind one streaming contract, the session index that
+          deliberately holds no messages, and the invariant that keeps the
+          core from ever learning a backend's name.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 31 July 2026 · Subject: xo-space @ f1fecdd (MIT, quirq-ai/xo-space)</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#why">Why dissect a control plane</a></li>
+          <li><a href="#shape">The shape of the system</a></li>
+          <li><a href="#planes">Two planes, deliberately unmerged</a></li>
+          <li><a href="#seam">The one seam</a></li>
+          <li><a href="#manifest">Agents as data</a></li>
+          <li><a href="#contract">The adapter contract</a></li>
+          <li><a href="#runtimes">Four runtimes, four transports</a></li>
+          <li><a href="#turn">A turn, end to end</a></li>
+          <li><a href="#sse">The streaming layer and its scar tissue</a></li>
+          <li><a href="#sessions">The index that holds no messages</a></li>
+          <li><a href="#write">Journey: a claude_code turn, in full</a></li>
+          <li><a href="#usage">Usage: one shape from four ledgers</a></li>
+          <li><a href="#projects">The xo-projects model</a></li>
+          <li><a href="#quirqdir">Machine-local state</a></li>
+          <li><a href="#backup">Backup: encrypted, chunked, GitHub-backed</a></li>
+          <li><a href="#connectors">Connectors</a></li>
+          <li><a href="#space">Space: the workspace as a graph</a></li>
+          <li><a href="#invariant">The modularity invariant</a></li>
+          <li><a href="#stack">The tech stack, completely</a></li>
+          <li><a href="#gaps">What isn't built yet</a></li>
+          <li><a href="#quirq">What this means for quirq</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <h2 id="why"><span class="secnum">01</span>Why dissect a control plane</h2>
+          <p class="lede">
+            A memory engine answers "what does the environment remember?"
+            A control plane answers a blunter question: <em>where does the
+            work actually happen, and who is watching?</em> If a unit of work
+            needs an owner, a budget, a workspace, and a durable result, then
+            something has to own the workspace and meter the spend. That
+            something is not the agent. It is the layer underneath it.
+          </p>
+          <p>
+            This piece dissects <strong>xo-space</strong>, the FastAPI
+            service that powers an XO Cowork workspace: a local control plane
+            that runs on your machine, brokers chat to whichever coding agent
+            runtime you have installed, and owns the on-disk project model
+            that travels with your work. It does not train, infer, or compete
+            with the agents. It stitches them together and adds the
+            boring-but-critical glue — sessions, files, secrets, OAuth flows,
+            usage reporting — behind one HTTP/SSE surface.
+          </p>
+          <p>
+            The interesting thing about it is architectural rather than
+            algorithmic. Most "multi-provider" software accretes a switch
+            statement: <code>if provider == "openai": … elif …</code>. xo-space
+            makes the opposite bet. It declares an invariant — <em>no core
+            file may name a specific agent</em> — and then pays for that
+            invariant everywhere: a dynamic capability loader instead of a
+            registry dict, JSON manifests instead of hardcoded argv, per-agent
+            route mounting instead of feature flags, capability-absence as a
+            first-class graceful state instead of an error. Reading it is a
+            study in what plugin architecture costs and what it buys.
+          </p>
+          <p>
+            Everything below was read from the source at commit
+            <code>f1fecdd</code> — file paths, constants, and thresholds are
+            cited as they appear in the repo. As with any infrastructure, the
+            behaviour lives in the defaults: how long a reconnect window
+            stays open, how many files the graph builder will walk before it
+            gives up, which environment variables get stripped before a
+            subprocess starts. Those are the numbers a README rounds away.
+          </p>
+
+          <h2 id="shape"><span class="secnum">02</span>The shape of the system</h2>
+          <p>
+            xo-space is one Python process — 42,580 lines across 221 modules,
+            with <code>server.py</code> at 1,072 of them — that mounts roughly
+            169 route decorators and serves a dependency-free browser UI off
+            the same port. Below it sit two worlds it does not own: the agent
+            runtimes' native homes (<code>~/.claude/</code>,
+            <code>~/.openclaw/</code>, <code>~/.hermes/</code>,
+            <code>~/.gemini/</code>) and the portable project folders under
+            <code>~/xo-projects/</code>. Almost every design decision in the
+            codebase is about keeping those two worlds separate.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-stack">
+          <div class="figure-head">
+            <span class="figure-label">Figure 1</span>
+            <p class="figure-title">The layer stack, client to disk</p>
+          </div>
+          <div class="figure-body">
+            <div class="stack">
+              <div class="stack-row">
+                <div class="stack-cell head">Clients</div>
+                <div class="stack-cell">xo-cowork (Tauri desktop UI) · the bundled Space UI at <code>/space/</code> · any HTTP/SSE consumer · <code>curl</code></div>
+              </div>
+              <div class="stack-row">
+                <div class="stack-cell head">Routers</div>
+                <div class="stack-cell hl-orange">42 modules, 8,580 lines — thin handlers only, no agent branching: <code>chat</code> · <code>sessions</code> · <code>files</code> · <code>secrets</code> · <code>usage</code> · <code>connectors/</code> · <code>bff/</code> · <code>legacy/</code></div>
+              </div>
+              <div class="stack-row">
+                <div class="stack-cell head">The seam</div>
+                <div class="stack-cell hl-blue"><code>adapters/loader.py</code> — <code>load_capability(name)</code> resolves <code>AGENT_NAME</code> → a module. Nothing above this line knows which backend answered.</div>
+              </div>
+              <div class="stack-row">
+                <div class="stack-cell head">Adapters</div>
+                <div class="stack-cell hl-purple">Per-agent trees: claude_code (16 modules) · openclaw (17) · hermes (19) · antigravity (15) · codex, cursor (telemetry-only). Each implements only the capabilities it has.</div>
+              </div>
+              <div class="stack-row">
+                <div class="stack-cell head">Services</div>
+                <div class="stack-cell hl-green">183 modules, 30,184 lines: engine (dispatcher, sessions I/O) · registry · connectors · visualizer · xo_projects_sync · project_template</div>
+              </div>
+              <div class="stack-row">
+                <div class="stack-cell head">Disk</div>
+                <div class="stack-cell">Runtime homes (chat content, never touched by core) · <code>~/xo-projects/&lt;id&gt;/</code> (portable metadata) · <code>~/.quirq/</code> (machine-local state) · <code>mcp-tokens.json</code> (connector credentials)</div>
+              </div>
+            </div>
+          </div>
+          <p class="figure-caption">
+            The blue row is the whole architecture. Every agent-specific fact
+            in the system — which binary to spawn, where its sessions live,
+            what its streaming events look like — is reachable only by asking
+            the loader for a capability. Remove that row and the codebase
+            becomes an ordinary switch statement.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="planes"><span class="secnum">03</span>Two planes, deliberately unmerged</h2>
+          <p>
+            Before the interesting part, an honest piece of the map: there
+            are two execution paths in this service and they do not talk to
+            each other. <strong>Plane A</strong> is the original direct-CLI
+            path — <code>/ask_question</code> and
+            <code>/ask_question_streaming</code>, selected by
+            <code>AI_PROVIDER</code>, instantiated once as a module-level
+            <code>ai_client</code> in <code>server.py</code>, backed by
+            <code>config/models/&lt;name&gt;/client.py</code>.
+            <strong>Plane B</strong> is the modular agent system: everything
+            under <code>/api/*</code>, selected by <code>AGENT_NAME</code>,
+            resolved per request through the capability loader.
+          </p>
+          <p>
+            Plane A is frozen. Plane B is where all new work happens. The
+            codebase does not pretend otherwise, and <code>DEVELOPING.md</code>
+            states the rule twice: Plane A never routes through the
+            dispatcher; Plane B never touches <code>/ask_question</code>.
+            Codex exists only as a Plane-A model client and a telemetry
+            reader — it has no Plane-B adapter at all, which is why the README
+            marks it <em>partial</em> rather than listing it with the others.
+          </p>
+          <div class="callout">
+            <span class="k">Why this is the right call</span>
+            <p>
+              Keeping a frozen legacy plane visibly separate is cheaper than
+              a migration that must preserve every response shape. The cost
+              is one paragraph of documentation and two dead-ish files; the
+              alternative cost is a compatibility layer inside the new
+              architecture, which is exactly the kind of thing that erodes an
+              invariant. "Backward compatibility is sacred" appears verbatim
+              in the conventions.
+            </p>
+          </div>
+
+          <h2 id="seam"><span class="secnum">04</span>The one seam</h2>
+          <p>
+            <code>services/cowork_agent/adapters/loader.py</code> is 100 lines
+            and it is the load-bearing wall of the project. A
+            <strong>capability</strong> is nothing more than a module named
+            <code>adapters/&lt;agent&gt;/&lt;capability&gt;.py</code>. Three
+            functions reach them:
+          </p>
+          <pre><code>load_capability("usage")                  # active agent; raises if absent
+try_load_capability("chat")               # returns None if the agent lacks it
+load_capability("usage", agent="hermes")  # target a specific agent
+list_capability_providers("session_telemetry")   # every agent that has it</code></pre>
+          <p>
+            Both the capability name and the agent name are validated with
+            <code>str.isidentifier()</code> before they reach
+            <code>importlib.import_module</code> — a small thing, but it means
+            a hostile <code>AGENT_NAME</code> cannot walk the module path.
+          </p>
+          <p>
+            The subtlest ten lines in the file are inside
+            <code>try_load_capability</code>. Returning <code>None</code> on
+            <code>ModuleNotFoundError</code> is the obvious implementation and
+            it is wrong: an adapter whose <code>usage.py</code> exists but
+            imports a missing third-party package raises the same exception
+            class, and the router would silently report "this agent has no
+            usage" instead of surfacing a real bug. So the handler inspects
+            <code>exc.name</code> and re-raises unless the thing that was not
+            found is <em>exactly</em> the capability module or its package:
+          </p>
+          <pre><code>except ModuleNotFoundError as exc:
+    # A missing optional capability is normal. A missing dependency inside
+    # an otherwise-present capability is a real implementation error and
+    # must not be disguised as "unsupported".
+    if exc.name not in {expected, provider_package}:
+        raise
+    return None</code></pre>
+          <p>
+            <code>list_capability_providers</code> is the deliberate exception
+            to "resolve only the active agent." Space's session telemetry is a
+            host-level view — it should show every runtime installed on the
+            machine at once, not just the one selected for new chats — so it
+            scans the adapters directory for anyone implementing
+            <code>session_telemetry.py</code>. Its docstring notes that a
+            provider does not need an <code>adapter.py</code>, which "permits
+            read-only, telemetry-only integrations without falsely advertising
+            a complete Plane-B chat backend." That is how
+            <code>codex/</code> and <code>cursor/</code> exist as two- and
+            three-module adapters: they can be <em>read</em>, not driven.
+          </p>
+          <p>
+            Which agent is active resolves through a four-step chain in
+            <code>registry/agent_registry.py</code>:
+            <code>AGENT_NAME</code> (runtime override) →
+            <code>DEFAULT_AGENT</code> (baseline, what ships in
+            <code>.env.example</code>) → if exactly one manifest exists, use it
+            → otherwise fall back to <code>openclaw</code> with a
+            <code>warnings.warn</code>. That last step is the one sanctioned
+            agent literal in core code, and it exists so the server boots with
+            no environment configured at all. Everything else raises rather
+            than guesses, including a manifest whose <code>name</code>
+            collides with another.
+          </p>
+
+          <h2 id="manifest"><span class="secnum">05</span>Agents as data</h2>
+          <p>
+            The second half of "no agent names in core" is that argv, paths,
+            and provider recipes are not code either. Each agent ships
+            <code>config/agents/&lt;name&gt;/manifest.json</code>, discovered at
+            startup by scanning subdirectories; a JSON file without a
+            <code>binary</code> field is skipped as "not an agent manifest."
+            The manifest is loaded into a frozen dataclass with paths
+            pre-expanded, and the original JSON is kept under
+            <code>raw</code> so call sites can reach provider and channel
+            recipes without the loader needing to know their shape.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-manifest">
+          <div class="figure-head">
+            <span class="figure-label">Figure 2</span>
+            <p class="figure-title">What one manifest declares — <code>config/agents/claude_code/manifest.json</code></p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr><th>Field</th><th>Value</th><th>What it decides</th></tr>
+              </thead>
+              <tbody>
+                <tr><td><code>binary</code></td><td><code>claude</code></td><td>What gets spawned; injected into every command template as <code>{binary}</code></td></tr>
+                <tr><td><code>home_dir</code></td><td><code>~/.claude</code></td><td>Where credentials, settings, and skills are installed — and which host dir Docker must mount</td></tr>
+                <tr><td><code>agents_dir</code></td><td><code>~/.claude/projects</code></td><td>The native session store the sessions capability reads</td></tr>
+                <tr><td><code>env_file</code></td><td><code>~/.claude/.env</code></td><td>Where the OAuth connect flow writes the token</td></tr>
+                <tr><td><code>cli_timeout_seconds</code></td><td><code>300</code></td><td>Non-streaming subprocess deadline</td></tr>
+                <tr><td><code>model_capabilities</code></td><td>context 200k, output 16,384</td><td>Advertised limits in <code>/api/models</code></td></tr>
+                <tr><td><code>skills</code></td><td><code>code-writer</code> → <code>/code-writer</code></td><td>Prompt prefix injected when a request carries an <code>agent_type</code></td></tr>
+                <tr><td><code>runtime_setup.extra_mounts</code></td><td><code>~/claude-cowork</code></td><td>Additional host paths the installer binds into the container</td></tr>
+                <tr><td><code>runtime_setup.secrets</code></td><td>3 labelled keys</td><td>What the Setup tab offers to collect, with human-readable descriptions</td></tr>
+                <tr><td><code>providers.openrouter</code></td><td>3 env overrides</td><td>A recipe: point <code>ANTHROPIC_BASE_URL</code> at OpenRouter and blank the API key</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            Nothing here is imperative. Adding OpenRouter support to an agent
+            is editing a JSON object; adding a new agent is dropping this file
+            plus an <code>adapter.py</code>. The rendering path is
+            <code>manifest.command(key, **params)</code>, which runs
+            <code>str.format_map</code> over the template and lets
+            <code>KeyError</code> escape on a missing placeholder — so a recipe
+            can never render to half-substituted argv that then reaches a
+            shell.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="contract"><span class="secnum">06</span>The adapter contract</h2>
+          <p>
+            <code>BaseAgentAdapter</code> is deliberately small. Three
+            abstract members — <code>run()</code>, <code>stream()</code>, and
+            an <code>adapter_name</code> property — and three concrete ones an
+            adapter may override: <code>setup()</code>, <code>health()</code>,
+            <code>load_commands()</code>. The streaming contract is one
+            sentence long and it is the only thing the whole SSE layer
+            depends on:
+          </p>
+          <pre><code>Must yield dicts of shape { "type": "token", "token": str }
+and end with exactly one { "done": True, "native_session_id": str | None }.</code></pre>
+          <p>
+            Everything else an agent can provide is a separate capability
+            module, and the matrix of which agent implements what is the
+            honest picture of how uneven real integrations are.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-caps">
+          <div class="figure-head">
+            <span class="figure-label">Figure 3</span>
+            <p class="figure-title">Capability coverage — and what absence does</p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr>
+                  <th>Capability</th><th>Surface</th>
+                  <th class="ctr">claude_code</th><th class="ctr">openclaw</th><th class="ctr">hermes</th><th class="ctr">antigravity</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td><code>adapter</code></td><td>run / stream dispatch</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td></tr>
+                <tr><td><code>usage</code></td><td><code>/api/usage</code></td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td></tr>
+                <tr><td><code>models</code></td><td><code>/api/models</code></td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td></tr>
+                <tr><td><code>sessions</code></td><td>session read / convert</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td></tr>
+                <tr><td><code>models_status</code> · <code>channels_status</code> · <code>providers_status</code></td><td>the three status endpoints</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td></tr>
+                <tr><td><code>visualizer_source</code></td><td>Space feed</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td></tr>
+                <tr><td><code>streaming</code></td><td>SSE shaping</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-n">—</td></tr>
+                <tr><td><code>chat</code></td><td>owns <code>/api/chat/prompt</code></td><td class="ctr cap-n">—</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-n">—</td></tr>
+                <tr><td><code>routes</code></td><td>agent-owned <code>APIRouter</code></td><td class="ctr cap-n">—</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td><td class="ctr cap-y">✓</td></tr>
+                <tr><td><code>session_telemetry</code></td><td>host-level Space view</td><td class="ctr cap-y">✓</td><td class="ctr cap-n">—</td><td class="ctr cap-n">—</td><td class="ctr cap-n">—</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            Every dash is a designed behaviour, not a gap. claude_code has no
+            <code>chat</code> capability <em>on purpose</em> — the router falls
+            through to the shared dispatcher when
+            <code>handle_prompt</code> is absent. A missing
+            <code>routes</code> module means no extra endpoints get mounted,
+            which is why per-agent OpenAPI path counts differ (146 / 149 / 173
+            / 148 for claude_code / openclaw / hermes / antigravity). Two
+            additional providers — <code>codex</code> and <code>cursor</code> —
+            implement <code>session_telemetry</code> and nothing else.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="runtimes"><span class="secnum">07</span>Four runtimes, four transports</h2>
+          <p>
+            The uniform API hides four genuinely different integration
+            problems. It is worth seeing them side by side, because the
+            variance is the point: a plugin architecture that only ever
+            absorbs one shape of backend has not been tested.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-runtimes">
+          <div class="figure-head">
+            <span class="figure-label">Figure 4</span>
+            <p class="figure-title">The same contract, four times over</p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead>
+                <tr><th>Runtime</th><th>Transport</th><th>Session store</th><th>The hard part</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Claude Code</strong></td>
+                  <td><code>claude</code> subprocess, <code>--output-format stream-json</code></td>
+                  <td><code>~/.claude/projects/&lt;encoded-cwd&gt;/&lt;sid&gt;.jsonl</code></td>
+                  <td>The directory name is the absolute cwd with <code>/</code>→<code>-</code>, which is <em>lossy</em> to reverse when a folder contains a hyphen. Resolution is by longest match against real project directories, never by decoding.</td>
+                </tr>
+                <tr>
+                  <td><strong>OpenClaw</strong></td>
+                  <td>HTTP gateway on <code>:18789</code>, OpenAI-compatible SSE</td>
+                  <td><code>~/.openclaw/agents/&lt;a&gt;/sessions/&lt;sid&gt;.jsonl</code></td>
+                  <td>The session id is assigned by the gateway and only observable after the first completion — so a new session is bootstrapped, then polled for up to 20 seconds before the client is told its id.</td>
+                </tr>
+                <tr>
+                  <td><strong>Hermes</strong></td>
+                  <td><code>hermes</code> CLI + per-profile gateway processes</td>
+                  <td>SQLite WAL — <code>~/.hermes/state.db</code> or <code>profiles/&lt;n&gt;/state.db</code></td>
+                  <td>One gateway can only ever write to one profile's database, so xo-space runs a pool: ports 8643–8742, a JSON registry at <code>~/.hermes/.gateway-pool.json</code>, and messaging tokens de-duplicated across profiles so two gateways never race for the same Slack socket.</td>
+                </tr>
+                <tr>
+                  <td><strong>Antigravity</strong></td>
+                  <td><code>agy</code> subprocess — no JSON mode, no auth CLI</td>
+                  <td><code>brain/&lt;cid&gt;/.system_generated/logs/transcript_full.jsonl</code></td>
+                  <td>Everything must be recovered indirectly: login state from the OAuth token file, the conversation id from a <code>--log-file</code> line, and the answer by tailing an event-sourced transcript for the last <code>PLANNER_RESPONSE</code> that has content and no tool calls.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            Two gotchas the antigravity command builder documents from live
+            testing against agy v1.1.2: the CLI <em>ignores</em> its working
+            directory (so the workspace is bound with <code>--add-dir</code>),
+            and a fresh <code>-p</code> always starts a new conversation
+            (resume is <code>--conversation &lt;id&gt;</code>, the analogue of
+            claude_code's <code>--resume</code>). Hermes's read path opens
+            SQLite with <code>mode=ro</code> so it never contends with the
+            gateway's WAL write lock.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="turn"><span class="secnum">08</span>A turn, end to end</h2>
+          <p>
+            The client-facing protocol is two HTTP calls, and the split is
+            load-bearing. <code>POST /api/chat/prompt</code> returns
+            <code>{stream_id, session_id}</code> fast; the browser then opens
+            an <code>EventSource</code> on
+            <code>GET /api/chat/stream/&lt;stream_id&gt;</code>. Between them
+            sits a process-local dictionary, <code>active_streams</code>, whose
+            module docstring is refreshingly blunt about its limits:
+            "Process-local; not persisted. Incompatible with uvicorn
+            <code>--workers &gt; 1</code>."
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-turn">
+          <div class="figure-head">
+            <span class="figure-label">Figure 5</span>
+            <p class="figure-title">One turn — from prompt to <code>done</code>, and every fork on the way</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1120 470" role="img" aria-label="Sequence diagram of a chat turn through xo-space">
+              <text class="svg-lane" x="18" y="26">CLIENT</text>
+              <text class="svg-lane" x="18" y="150">ROUTER</text>
+              <text class="svg-lane" x="18" y="300">ADAPTER</text>
+              <text class="svg-lane" x="18" y="424">DISK</text>
+              <line x1="0" y1="38" x2="1120" y2="38" stroke="#deded9"></line>
+              <line x1="0" y1="162" x2="1120" y2="162" stroke="#deded9"></line>
+              <line x1="0" y1="312" x2="1120" y2="312" stroke="#deded9"></line>
+              <line x1="0" y1="436" x2="1120" y2="436" stroke="#deded9"></line>
+
+              <rect x="100" y="52" width="210" height="60" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-num" x="114" y="72">1</text>
+              <text class="svg-step" x="132" y="72">POST /api/chat/prompt</text>
+              <text class="svg-sub" x="114" y="92">{ text, session_id?, agent_name?,</text>
+              <text class="svg-sub" x="114" y="105">  model?, workspace? }</text>
+
+              <rect x="810" y="52" width="230" height="60" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-num" x="824" y="72">6</text>
+              <text class="svg-step" x="842" y="72">GET /api/chat/stream/&lt;id&gt;</text>
+              <text class="svg-sub" x="824" y="92">EventSource — text-delta ×N,</text>
+              <text class="svg-sub" x="824" y="105">heartbeat, done</text>
+
+              <rect x="100" y="180" width="200" height="74" rx="7" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-num" x="114" y="200">2</text>
+              <text class="svg-step" x="132" y="200">Resolve the backend</text>
+              <text class="svg-sub" x="114" y="220">explicit agent_name, else</text>
+              <text class="svg-sub" x="114" y="234">find_session_backend(sid),</text>
+              <text class="svg-sub" x="114" y="248">else AGENT_NAME</text>
+
+              <rect x="322" y="180" width="196" height="74" rx="7" fill="#f7e3c8" stroke="#d98226"></rect>
+              <text class="svg-num" x="336" y="200">3</text>
+              <text class="svg-step" x="354" y="200">Switch detection</text>
+              <text class="svg-sub" x="336" y="220">session's backend ≠ the</text>
+              <text class="svg-sub" x="336" y="234">selected agent ⇒ drop the</text>
+              <text class="svg-sub" x="336" y="248">session id, start fresh</text>
+
+              <rect x="540" y="180" width="196" height="74" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-num" x="554" y="200">4</text>
+              <text class="svg-step" x="572" y="200">Resolve agent_id</text>
+              <text class="svg-sub" x="554" y="220">explicit → workspace path</text>
+              <text class="svg-sub" x="554" y="234">under xo-projects → the</text>
+              <text class="svg-sub" x="554" y="248">agent's own resolver hook</text>
+
+              <rect x="758" y="180" width="282" height="74" rx="7" fill="#ece6f3" stroke="#765b98"></rect>
+              <text class="svg-num" x="772" y="200">5</text>
+              <text class="svg-step" x="790" y="200">try_load_capability("chat")</text>
+              <text class="svg-sub" x="772" y="220">present ⇒ the adapter owns the whole</text>
+              <text class="svg-sub" x="772" y="234">prompt path. absent ⇒ register the</text>
+              <text class="svg-sub" x="772" y="248">stream and return {stream_id, session_id}</text>
+
+              <rect x="100" y="330" width="270" height="74" rx="7" fill="#dfede5" stroke="#367f59"></rect>
+              <text class="svg-step" x="114" y="350">Shared path — AgentDispatcher</text>
+              <text class="svg-sub" x="114" y="370">load_agent_config → get_adapter → .stream()</text>
+              <text class="svg-sub" x="114" y="384">events pumped into an asyncio.Queue by a</text>
+              <text class="svg-sub" x="114" y="398">producer task; 20 s of silence ⇒ heartbeat</text>
+
+              <rect x="392" y="330" width="256" height="74" rx="7" fill="#ece6f3" stroke="#765b98"></rect>
+              <text class="svg-step" x="406" y="350">Adapter-owned path</text>
+              <text class="svg-sub" x="406" y="370">openclaw: bootstrap the session, poll</text>
+              <text class="svg-sub" x="406" y="384">for its id up to 20×1 s, then replay the</text>
+              <text class="svg-sub" x="406" y="398">buffered answer as simulated deltas</text>
+
+              <rect x="670" y="330" width="370" height="74" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-step" x="684" y="350">Both paths converge on one event vocabulary</text>
+              <text class="svg-sub" x="684" y="370">session-created · text-delta · model-loading · heartbeat</text>
+              <text class="svg-sub" x="684" y="384">agent-error · done — each line carries a monotonic id:</text>
+              <text class="svg-sub" x="684" y="398">so a reconnecting EventSource can be reasoned about</text>
+
+              <text class="svg-step" x="100" y="458">~/xo-projects/&lt;id&gt;/.xo/sessions/sessionslist.json — metadata only</text>
+              <text class="svg-sub" x="620" y="458">…and the runtime's own home gets the messages. Core never writes there.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            Step 3 is the kind of behaviour that only exists because someone
+            hit it: a user with an open chat picks a different agent from the
+            sidebar, and the incoming <code>session_id</code> now belongs to a
+            backend that isn't the one selected. Rather than fail, or worse
+            resume the wrong store, the router logs the switch and treats it as
+            a new session.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="sse"><span class="secnum">09</span>The streaming layer and its scar tissue</h2>
+          <p>
+            The SSE generator in <code>routers/cowork_agent/chat.py</code> is
+            195 lines, and roughly a third of it is comments explaining bugs.
+            This is the most instructive file in the repository, because
+            streaming to a browser is where clean architecture meets the real
+            world.
+          </p>
+          <h3 id="sse-keepalive">Keepalives, and why not <code>wait_for</code></h3>
+          <p>
+            During a long tool-call run an agent can go quiet for minutes. The
+            frontend has a heartbeat timer, so the server must emit something.
+            The obvious implementation — wrap
+            <code>__anext__()</code> in <code>asyncio.wait_for</code> and emit a
+            heartbeat on timeout — is explicitly rejected in the docstring:
+          </p>
+          <div class="callout">
+            <span class="k">From the source</span>
+            <p>
+              "Keepalives use an <code>asyncio.Queue</code> producer-task
+              pattern — NOT <code>asyncio.wait_for(__anext__)</code> — because
+              cancelling <code>__anext__</code> on an async generator corrupts
+              its internal state and causes it to stop early (the bug that made
+              text disappear after the first timeout)."
+            </p>
+          </div>
+          <p>
+            So a producer task drains the adapter into a queue and pushes a
+            sentinel object at the end; the consumer waits on the
+            <em>queue</em> with a 20-second timeout and emits
+            <code>event: heartbeat</code> when it expires. Cancellation lands on
+            the producer task, never on the generator mid-yield.
+          </p>
+          <h3 id="sse-reconnect">The reconnect window</h3>
+          <p>
+            A native <code>EventSource</code> automatically reconnects the
+            instant the server closes the connection — including immediately
+            after <code>done</code>, before the client has called
+            <code>.close()</code>. React Strict Mode's double-mount produces the
+            same pattern. Either way the second request arrives for a
+            <code>stream_id</code> that has already been consumed and removed.
+          </p>
+          <p>
+            The answer is a second dictionary, <code>_recently_started</code>,
+            holding <code>{session_id, started_at, done_event}</code> for
+            <code>_RECENTLY_STARTED_TTL = 600</code> seconds. The comment states
+            the derivation rather than the number: it "must outlast
+            <code>SSE_HEARTBEAT_TIMEOUT</code> (45 s) + full reconnect backoff."
+            A reconnect that finds a record waits on the
+            <code>asyncio.Event</code> for up to 300 seconds, then replays
+            <code>session-created</code> and <code>done</code> so the client
+            refetches the transcript from disk instead of showing an error.
+          </p>
+          <p>
+            There is one more wrinkle, and it is a nice illustration of the
+            no-backend-names rule surviving contact with a real edge case.
+            Adapter-owned streams don't know their session id up front —
+            openclaw only learns it from the gateway mid-stream. So the router
+            sniffs each outgoing chunk with
+            <code>_session_id_from_sse</code>, which parses only the generic
+            wire shape (<code>data: {…}</code> → <code>session_id</code>) and
+            updates the reconnect record. It reads the stream it is proxying
+            without knowing whose stream it is.
+          </p>
+        </section>
+        <section class="prose">
+          <h2 id="sessions"><span class="secnum">10</span>The index that holds no messages</h2>
+          <p>
+            Here is the design decision the whole product rests on, stated in
+            the module docstring of <code>engine/sessions_io.py</code>:
+          </p>
+          <div class="callout">
+            <span class="k">Security model</span>
+            <p>
+              "The project folder (<code>.xo/sessions/</code>) holds only
+              metadata (<code>sessionslist.json</code>). Chat messages are never
+              written there. They live in each backend's own storage, reached
+              only through that backend's <code>sessions</code> capability;
+              core never reads a backend's message store directly and names no
+              backend here."
+            </p>
+          </div>
+          <p>
+            A <code>sessionslist.json</code> entry is five fields and a usage
+            counter: <code>sessionId</code>, <code>nativeSessionId</code>,
+            <code>directory</code>, <code>backend</code>,
+            <code>updatedAt</code>. That is the entire portable record of a
+            conversation. It is enough to find the messages on the machine that
+            has them and useless anywhere else — which is precisely what makes
+            a project folder safe to sync, fork, or push to git. The
+            confidentiality guarantee is structural rather than procedural: it
+            holds because no code path exists to violate it, not because
+            reviewers remember to check.
+          </p>
+          <p>
+            The cost is that "which backend owns this session?" becomes a real
+            question with a real algorithm, run on every prompt to an existing
+            conversation.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-owner">
+          <div class="figure-head">
+            <span class="figure-label">Figure 6</span>
+            <p class="figure-title">Resolving the owner of a session id, without naming a backend</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1000 340" role="img" aria-label="Flowchart for resolving which adapter owns a session">
+              <rect x="30" y="24" width="230" height="52" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-step" x="44" y="46">find_session_backend(sid)</text>
+              <text class="svg-sub" x="44" y="64">called on every prompt with a session</text>
+
+              <line x1="145" y1="76" x2="145" y2="104" stroke="#b8b8b1"></line>
+              <rect x="30" y="104" width="230" height="70" rx="7" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-step" x="44" y="126">Scan every project</text>
+              <text class="svg-sub" x="44" y="145">~/xo-projects/*/.xo/sessions/</text>
+              <text class="svg-sub" x="44" y="160">sessionslist.json — match sessionId</text>
+
+              <line x1="260" y1="139" x2="330" y2="139" stroke="#b8b8b1"></line>
+              <text class="svg-sub" x="272" y="132">hit</text>
+              <rect x="330" y="104" width="220" height="70" rx="7" fill="#dfede5" stroke="#367f59"></rect>
+              <text class="svg-step" x="344" y="126">Read the backend tag</text>
+              <text class="svg-sub" x="344" y="145">the entry says which runtime wrote</text>
+              <text class="svg-sub" x="344" y="160">it. No probing, no guessing. Done.</text>
+
+              <line x1="145" y1="174" x2="145" y2="204" stroke="#b8b8b1"></line>
+              <text class="svg-sub" x="156" y="194">miss</text>
+              <rect x="30" y="204" width="230" height="70" rx="7" fill="#ece6f3" stroke="#765b98"></rect>
+              <text class="svg-step" x="44" y="226">Ask every adapter</text>
+              <text class="svg-sub" x="44" y="245">list_adapters() → each one's</text>
+              <text class="svg-sub" x="44" y="260">sessions.owns_session(sid)</text>
+
+              <line x1="260" y1="239" x2="330" y2="239" stroke="#b8b8b1"></line>
+              <rect x="330" y="204" width="220" height="70" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-step" x="344" y="226">First claim wins</text>
+              <text class="svg-sub" x="344" y="245">each backend searches only its own</text>
+              <text class="svg-sub" x="344" y="260">store; none returns ⇒ AGENT_NAME</text>
+
+              <line x1="600" y1="30" x2="600" y2="300" stroke="#deded9"></line>
+              <text class="svg-lane" x="630" y="44">THE SAME SHAPE, THREE TIMES</text>
+              <text class="svg-step" x="630" y="76">find_session_backend</text>
+              <text class="svg-sub" x="630" y="94">→ who owns it</text>
+              <text class="svg-step" x="630" y="122">find_session_file</text>
+              <text class="svg-sub" x="630" y="140">→ resolve_native_file on the owner</text>
+              <text class="svg-step" x="630" y="168">load_all_sessions</text>
+              <text class="svg-sub" x="630" y="186">→ project scan (only if the active</text>
+              <text class="svg-sub" x="630" y="201">backend sets USES_PROJECT_SESSIONS)</text>
+              <text class="svg-sub" x="630" y="216">+ list_native_sessions, de-duplicated</text>
+              <text class="svg-sub" x="630" y="231">by id — project-tied wins</text>
+              <line x1="630" y1="252" x2="970" y2="252" stroke="#deded9"></line>
+              <text class="svg-note" x="630" y="274">Listing is filtered to the active backend on purpose:</text>
+              <text class="svg-note" x="630" y="292">the other runtimes' stores are never opened, so their</text>
+              <text class="svg-note" x="630" y="310">sessions cannot leak into the sidebar.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            Two properties fall out of this. A project folder can hold sessions
+            from several runtimes at once and each row still resolves through
+            its <em>own</em> backend, because enrichment routes by the row's
+            tag rather than the active agent. And a listing under
+            <code>AGENT_NAME=hermes</code> physically cannot show a Claude Code
+            conversation — not filtered out, never read.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="write"><span class="secnum">11</span>Journey: a claude_code turn, in full</h2>
+          <p>
+            The claude_code adapter is the best worked example in the
+            repository, because its failure modes have been ground down over
+            several months and the fixes are all still legible in the code. It
+            spawns a subprocess, parses newline-delimited JSON, and has to keep
+            an on-disk mapping honest across a client that may vanish at any
+            moment.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-cc">
+          <div class="figure-head">
+            <span class="figure-label">Figure 7</span>
+            <p class="figure-title">A claude_code stream — pre-allocation, in-loop persistence, and a <code>finally</code> that always pays up</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1120 430" role="img" aria-label="Timeline of a claude_code streaming turn">
+              <text class="svg-lane" x="18" y="26">BEFORE SPAWN</text>
+              <line x1="0" y1="38" x2="1120" y2="38" stroke="#deded9"></line>
+
+              <rect x="30" y="52" width="250" height="84" rx="7" fill="#f7e3c8" stroke="#d98226"></rect>
+              <text class="svg-num" x="44" y="72">1</text>
+              <text class="svg-step" x="62" y="72">Pre-allocate the native id</text>
+              <text class="svg-sub" x="44" y="92">a fresh uuid4 is written to the index</text>
+              <text class="svg-sub" x="44" y="107">and passed as --session-id, so the</text>
+              <text class="svg-sub" x="44" y="122">JSONL filename is known at t=0</text>
+
+              <rect x="300" y="52" width="250" height="84" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-num" x="314" y="72">2</text>
+              <text class="svg-step" x="332" y="72">Resolve the working dir</text>
+              <text class="svg-sub" x="314" y="92">new session ⇒ ~/xo-projects/&lt;agent_id&gt;/</text>
+              <text class="svg-sub" x="314" y="107">existing ⇒ the directory stored on the</text>
+              <text class="svg-sub" x="314" y="122">entry, so a user's pick is preserved</text>
+
+              <rect x="570" y="52" width="250" height="84" rx="7" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-num" x="584" y="72">3</text>
+              <text class="svg-step" x="602" y="72">Sanitize the env</text>
+              <text class="svg-sub" x="584" y="92">drop empty/"sk-ant-none" auth vars;</text>
+              <text class="svg-sub" x="584" y="107">drop any sk-ant-oat… masquerading as</text>
+              <text class="svg-sub" x="584" y="122">an API key; see the note below</text>
+
+              <rect x="840" y="52" width="250" height="84" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-num" x="854" y="72">4</text>
+              <text class="svg-step" x="872" y="72">Build argv</text>
+              <text class="svg-sub" x="854" y="92">--dangerously-skip-permissions</text>
+              <text class="svg-sub" x="854" y="107">--add-dir &lt;ws&gt; --print --verbose</text>
+              <text class="svg-sub" x="854" y="122">--output-format stream-json  -p …</text>
+
+              <text class="svg-lane" x="18" y="176">DURING THE STREAM</text>
+              <line x1="0" y1="188" x2="1120" y2="188" stroke="#deded9"></line>
+
+              <rect x="30" y="202" width="250" height="84" rx="7" fill="#ece6f3" stroke="#765b98"></rect>
+              <text class="svg-num" x="44" y="222">5</text>
+              <text class="svg-step" x="62" y="222">system / init</text>
+              <text class="svg-sub" x="44" y="242">the very first stdout line carries the</text>
+              <text class="svg-sub" x="44" y="257">native session id — persisted inside</text>
+              <text class="svg-sub" x="44" y="272">the loop, not after it</text>
+
+              <rect x="300" y="202" width="250" height="84" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-num" x="314" y="222">6</text>
+              <text class="svg-step" x="332" y="222">content_block_delta</text>
+              <text class="svg-sub" x="314" y="242">text_delta → {"type":"token"} and</text>
+              <text class="svg-sub" x="314" y="257">straight out as an SSE text-delta.</text>
+              <text class="svg-sub" x="314" y="272">Anything unparseable is skipped.</text>
+
+              <rect x="570" y="202" width="250" height="84" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-num" x="584" y="222">7</text>
+              <text class="svg-step" x="602" y="222">result</text>
+              <text class="svg-sub" x="584" y="242">carries usage, model id, and the full</text>
+              <text class="svg-sub" x="584" y="257">text — used as a fallback when no</text>
+              <text class="svg-sub" x="584" y="272">token events were seen at all</text>
+
+              <rect x="840" y="202" width="250" height="84" rx="7" fill="#dfede5" stroke="#367f59"></rect>
+              <text class="svg-num" x="854" y="222">8</text>
+              <text class="svg-step" x="872" y="222">finally:</text>
+              <text class="svg-sub" x="854" y="242">even under cancellation, roll input,</text>
+              <text class="svg-sub" x="854" y="257">output, cache-read and cache-write</text>
+              <text class="svg-sub" x="854" y="272">tokens onto the index entry</text>
+
+              <line x1="0" y1="316" x2="1120" y2="316" stroke="#deded9"></line>
+              <text class="svg-note" x="30" y="342">Why steps 1 and 5 both exist: an SSE disconnect cancels the generator, and the post-loop persistence code then never runs —</text>
+              <text class="svg-note" x="30" y="362">orphaning a real transcript on disk with nothing pointing at it. The repo has an investigation document named after the day it</text>
+              <text class="svg-note" x="30" y="382">was found. The fix is belt-and-braces: pre-allocate the id before spawning, and patch it again the instant it is observed.</text>
+              <text class="svg-note" x="30" y="410">_patch_native_session_id is idempotent and refuses to clobber a different existing id — a resumed session keeps its own.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            <code>--resume</code> and <code>--session-id</code> are mutually
+            exclusive at the CLI, so the builder picks exactly one: a resume id
+            for existing sessions, the pre-allocated uuid for new ones.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <p>
+            Step 3 deserves its own paragraph, because it is a genuinely subtle
+            piece of authentication reasoning. The Claude CLI has an auth
+            precedence chain in which both <code>ANTHROPIC_API_KEY</code> and
+            <code>CLAUDE_CODE_OAUTH_TOKEN</code> outrank a native
+            subscription login. A native login is the durable, self-healing
+            source — the CLI refreshes it itself. So when
+            <code>~/.claude/.credentials.json</code> holds a usable login (a
+            refresh token, or an unexpired access token — <code>expiresAt</code>
+            is epoch milliseconds), the adapter <em>removes</em> all three token
+            variables from the subprocess environment. Otherwise a stale token
+            left over from a previous setup would override the fresh login and
+            silently bill the API or fail outright. With no native login
+            present they are left intact, so explicit API-key mode still works.
+          </p>
+          <p>
+            The adapter also carries a feature that is unusual for a broker:
+            <code>remote_control.py</code> starts and stops a local
+            <code>claude remote-control</code> server so the workspace can be
+            driven from the Claude mobile app. Its docstring is refreshingly
+            candid about what it is doing — "this builds on undocumented CLI
+            internals… because <code>claude remote-control</code> has no
+            headless API. Pin the claude CLI version and run a
+            start→url→stop smoke test on upgrades" — and about why it filters
+            the CLI's live dashboard instead of logging it: the dashboard
+            repaints about six lines per second, roughly 1.3 MB per hour if
+            captured.
+          </p>
+
+          <h2 id="usage"><span class="secnum">12</span>Usage: one shape from four ledgers</h2>
+          <p>
+            <code>/api/usage</code> has to answer the same question against
+            four incompatible records. The solution is a normalized
+            <strong>entry</strong> — one per message — and a
+            <code>Source</code> object holding the only two things that differ
+            per backend: <code>discover()</code>, which finds the session files,
+            and <code>parse_file()</code>, which turns one record into entries.
+            Everything downstream (windowing, per-session summaries, the
+            analytics payload, the daily sync rollup) operates purely on
+            entries and is therefore shared.
+          </p>
+          <pre><code>assistant entry = {
+  "role": "assistant", "timestamp": epoch_ms | None,
+  "usage": {"input","output","cacheRead","cacheWrite","totalTokens","cost"},
+  "provider": str, "model": str, "stopReason": str | None,
+  "toolNames": [str], "toolResultCounts": {"total","errors"},
+  "durationMs": int | None,
+}</code></pre>
+          <p>
+            The extraction note is worth quoting because it is the kind of
+            claim most refactors make and few verify: "Output is byte-for-byte
+            what the per-adapter copies produced before extraction." And the
+            exception is stated rather than hidden — hermes does not use this
+            module at all, because it reads rolled-up session rows from SQLite
+            and no per-message entries exist to normalize.
+          </p>
+          <p>
+            One background job consumes all of this: a daily sync at
+            <code>USAGE_SYNC_HOUR_UTC</code> (default 02:00) that posts
+            aggregates to <code>${CHAT_API_BASE_URL}/usage/report</code>. Its
+            watermark file is namespaced under the active agent, and the
+            comment explains why that is a feature rather than an accident:
+            switching <code>AGENT_NAME</code> lands on a path with no
+            watermark, "which correctly triggers a full backfill for the new
+            agent rather than reusing the previous agent's truncation point."
+          </p>
+
+          <h2 id="projects"><span class="secnum">13</span>The xo-projects model</h2>
+          <p>
+            A project is a folder. That is the whole model, and
+            <code>project_layout.py</code> owns its shape — "the on-disk shape
+            is what makes the agent perform well." Scaffolding is idempotent by
+            construction: the template is copied recursively and a file that
+            already exists is never overwritten, so re-running fills gaps
+            without clobbering work. The template location itself is
+            overridable with <code>XO_PROJECT_TEMPLATE</code>, falling back to
+            the bundled <code>project_template/</code>.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-layout">
+          <div class="figure-head">
+            <span class="figure-label">Figure 8</span>
+            <p class="figure-title">Three storage tiers, and what may live in each</p>
+          </div>
+          <div class="figure-body">
+            <div class="tier-grid">
+              <div class="tier-card ep">
+                <div class="sub">Portable</div>
+                <h4><code>~/xo-projects/&lt;id&gt;/</code></h4>
+                <p>
+                  <code>AGENTS.md</code> (the agent operating contract),
+                  <code>CLAUDE.md</code> (one line: <code>@AGENTS.md</code>),
+                  <code>PROJECT.md</code>, <code>OBJECTIVES.md</code>,
+                  <code>PLAN.md</code>, <code>PROGRESS.md</code>,
+                  <code>memory/</code>, and <code>.xo/</code> — project.json,
+                  the metadata-only session index, todos, stats, an
+                  append-only timeline. Safe to share, fork, or push.
+                </p>
+              </div>
+              <div class="tier-card se">
+                <div class="sub">Machine-local</div>
+                <h4><code>~/.quirq/</code></h4>
+                <p>
+                  Onboarding state, <code>runtime.env</code> (a small
+                  allowlist of non-secret controls),
+                  <code>secrets.env</code> (write-only credentials), watcher
+                  cursors, advisory locks, and live presence snapshots.
+                  Explicitly <em>not</em> project metadata — presence is a
+                  property of this machine, not of the work.
+                </p>
+              </div>
+              <div class="tier-card pr">
+                <div class="sub">Runtime-owned</div>
+                <h4><code>~/.claude/</code>, <code>~/.openclaw/</code>, …</h4>
+                <p>
+                  Every message of every conversation, plus each runtime's own
+                  credentials. xo-space reads these through a backend's
+                  <code>sessions</code> capability and writes only what the
+                  runtime's own auth flow requires. Nothing here is ever
+                  copied into the portable tier.
+                </p>
+              </div>
+            </div>
+          </div>
+          <p class="figure-caption">
+            The rule that makes the three tiers stable is written as a
+            convention and repeated in the agent contract: "The project folder
+            is sacred. Never write chat content, credentials, or anything that
+            wouldn't survive a <code>git push</code> into
+            <code>~/xo-projects/&lt;id&gt;/</code>."
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="quirqdir"><span class="secnum">14</span>Machine-local state, and the discipline of not lying</h2>
+          <p>
+            Two modules govern <code>~/.quirq/</code> and both are notable for
+            what they refuse to do.
+          </p>
+          <p>
+            <code>runtime_config.py</code> maintains an allowlist —
+            <code>AGENT_NAME</code>, <code>QUIRQ_WATCHER_ENABLED</code>,
+            <code>QUIRQ_WATCHER_INTERVAL_SECONDS</code>,
+            <code>QUIRQ_WATCHER_SOURCE_MODE</code>, plus two root paths — and
+            nothing outside it can be set through the API. More interestingly,
+            it does not pretend a change took effect. Runtime controls are read
+            at process startup, so writing one produces "a truthful
+            <code>restart_required</code> state instead of pretending
+            import-time configuration changed live." When the UI needs to know
+            whether secrets changed, it gets a SHA-256 fingerprint computed over
+            sorted key/value pairs — the store is hashed without its values
+            being retained or returned.
+          </p>
+          <p>
+            <code>quirq_catalog.py</code> serves the local Quirq tab and is
+            described as "read-only, privacy-aware": it "deliberately reports
+            structure and operational summaries rather than serving arbitrary
+            files: credential values, native session contents, cursor paths,
+            and symlink targets never leave the machine-local state service."
+            It is bounded too — 500 files, 2 MiB of JSON — and
+            <code>secrets.env</code> is named in a sensitive-files set so its
+            existence can be reported without its contents.
+          </p>
+          <p>
+            The catalog also ships something I have rarely seen in a codebase:
+            a declared <strong>output contract</strong>. Each file the system
+            writes is listed with its producer, its purpose, and its consumers
+            — <code>sessions/sessionslist.json</code> produced by the runtime
+            source adapter and read by the projects APIs and the graph;
+            <code>timeline.jsonl</code> produced by the watcher timeline sink;
+            <code>stats.json</code> by the statistics sink. It is a data
+            dictionary that lives next to the code, which means it can drift,
+            but at least it can be checked.
+          </p>
+
+          <h2 id="backup"><span class="secnum">15</span>Backup: encrypted, chunked, GitHub-backed</h2>
+          <p>
+            The backup subsystem answers a question every local-first product
+            eventually faces: how do you give people durability without
+            becoming a place their data lives? The answer here is that the user
+            keeps the key and GitHub keeps the bytes. Each project gets its own
+            private repository named
+            <code>xo-project-&lt;id&gt;</code>, lazily created on first
+            backup — the prefix is what lets the API discover its own repos
+            through <code>GET /user/repos</code> without colliding with
+            anything else the user owns.
+          </p>
+        </section>
+
+        <figure class="figure wide" id="fig-backup">
+          <div class="figure-head">
+            <span class="figure-label">Figure 9</span>
+            <p class="figure-title">One backup, end to end — and the four places a secret could have leaked but doesn't</p>
+          </div>
+          <div class="figure-body plain">
+            <svg viewBox="0 0 1120 340" role="img" aria-label="Backup pipeline from project folder to GitHub">
+              <text class="svg-lane" x="18" y="26">PIPELINE</text>
+              <line x1="0" y1="38" x2="1120" y2="38" stroke="#deded9"></line>
+
+              <rect x="30" y="56" width="196" height="92" rx="7" fill="#f7f7f5" stroke="#deded9"></rect>
+              <text class="svg-num" x="44" y="76">1</text>
+              <text class="svg-step" x="62" y="76">Select files</text>
+              <text class="svg-sub" x="44" y="96">git repo ⇒ git ls-files --cached</text>
+              <text class="svg-sub" x="44" y="111">--others --exclude-standard, for</text>
+              <text class="svg-sub" x="44" y="126">exact gitignore semantics with</text>
+              <text class="svg-sub" x="44" y="141">no new dependency</text>
+
+              <rect x="246" y="56" width="196" height="92" rx="7" fill="#f3dfdc" stroke="#ad4b43"></rect>
+              <text class="svg-num" x="260" y="76">2</text>
+              <text class="svg-step" x="278" y="76">Mandatory excludes</text>
+              <text class="svg-sub" x="260" y="96">.env · .git · node_modules ·</text>
+              <text class="svg-sub" x="260" y="111">.venv · __pycache__ · .env.* ·</text>
+              <text class="svg-sub" x="260" y="126">*.sock — matched on every path</text>
+              <text class="svg-sub" x="260" y="141">component, at any depth</text>
+
+              <rect x="462" y="56" width="196" height="92" rx="7" fill="#ece6f3" stroke="#765b98"></rect>
+              <text class="svg-num" x="476" y="76">3</text>
+              <text class="svg-step" x="494" y="76">gpg --symmetric</text>
+              <text class="svg-sub" x="476" y="96">passphrase via --passphrase-fd 0,</text>
+              <text class="svg-sub" x="476" y="111">so it never appears in argv or a</text>
+              <text class="svg-sub" x="476" y="126">process listing; --no-symkey-cache</text>
+              <text class="svg-sub" x="476" y="141">so the agent can't decrypt later</text>
+
+              <rect x="678" y="56" width="196" height="92" rx="7" fill="#e0ebf2" stroke="#3c6f97"></rect>
+              <text class="svg-num" x="692" y="76">4</text>
+              <text class="svg-step" x="710" y="76">Chunk</text>
+              <text class="svg-sub" x="692" y="96">part-000.gpg … part-999.gpg,</text>
+              <text class="svg-sub" x="692" y="111">95 MiB each — the only reason</text>
+              <text class="svg-sub" x="692" y="126">splitting exists is GitHub's</text>
+              <text class="svg-sub" x="692" y="141">100 MB file limit</text>
+
+              <rect x="894" y="56" width="196" height="92" rx="7" fill="#dfede5" stroke="#367f59"></rect>
+              <text class="svg-num" x="908" y="76">5</text>
+              <text class="svg-step" x="926" y="76">Push</text>
+              <text class="svg-sub" x="908" y="96">ephemeral --depth=1 clone in a</text>
+              <text class="svg-sub" x="908" y="111">tempdir; the token is injected</text>
+              <text class="svg-sub" x="908" y="126">per-command as an extraheader,</text>
+              <text class="svg-sub" x="908" y="141">never into .git/config</text>
+
+              <line x1="0" y1="176" x2="1120" y2="176" stroke="#deded9"></line>
+              <text class="svg-lane" x="18" y="204">PROPERTIES</text>
+
+              <text class="svg-step" x="30" y="234">Restore verifies first</text>
+              <text class="svg-sub" x="30" y="252">parts are reassembled in numeric order and</text>
+              <text class="svg-sub" x="30" y="267">the manifest sha256 is checked before gpg</text>
+              <text class="svg-sub" x="30" y="282">runs — corruption can't reach the decryptor</text>
+
+              <text class="svg-step" x="400" y="234">Zero idle disk</text>
+              <text class="svg-sub" x="400" y="252">every call opens its own TemporaryDirectory</text>
+              <text class="svg-sub" x="400" y="267">and deletes it on completion; there is no</text>
+              <text class="svg-sub" x="400" y="282">persistent staging area between calls</text>
+
+              <text class="svg-step" x="770" y="234">Per-project locking</text>
+              <text class="svg-sub" x="770" y="252">an asyncio.Lock per project serializes</text>
+              <text class="svg-sub" x="770" y="267">concurrent backups of the same project;</text>
+              <text class="svg-sub" x="770" y="282">different projects still run in parallel</text>
+
+              <line x1="0" y1="302" x2="1120" y2="302" stroke="#deded9"></line>
+              <text class="svg-note" x="30" y="326">Retention is 10 versions per project. Token resolution tries the UI's GitHub connector first, then GITHUB_PAT, then fails with setup instructions — never silently.</text>
+            </svg>
+          </div>
+          <p class="figure-caption">
+            The mandatory-exclude list is the interesting call. Inside a git
+            repo that happens to track <code>node_modules/</code>, it still
+            gets skipped — and the reason given is not size: "The blob is
+            encrypted but a leaked passphrase shouldn't also leak
+            <code>.env</code>." Defense in depth, stated as such.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="connectors"><span class="secnum">16</span>Connectors</h2>
+          <p>
+            Five external services, three credential stores, and one shared
+            lock. <code>token_store.py</code> is declared "the single owner of
+            <code>mcp-tokens.json</code>" — the only module that knows the
+            file's location, shape, and read/write semantics — so that locking
+            or a format migration can later be added in one place instead of
+            five.
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-connectors">
+          <div class="figure-head">
+            <span class="figure-label">Figure 10</span>
+            <p class="figure-title">Five connectors, and where each credential lands</p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead><tr><th>Service</th><th>Method</th><th>Store</th><th>Notable</th></tr></thead>
+              <tbody>
+                <tr><td>Google Drive</td><td><code>rclone authorize drive.file</code> + code paste</td><td><code>rclone.conf</code></td><td>Folder management and 500 MiB streaming uploads with no disk spool and no RAM buffer</td></tr>
+                <tr><td>OneDrive</td><td><code>rclone authorize</code> (Microsoft Graph)</td><td><code>rclone.conf</code></td><td>Shares the OAuth callback port with Drive — hence the lock</td></tr>
+                <tr><td>GitHub</td><td>PAT paste <em>or</em> <code>gh auth login --web</code> device flow</td><td><code>mcp-tokens.json</code></td><td>Also the token source for project backup</td></tr>
+                <tr><td>Vercel</td><td>API token <em>or</em> OAuth 2.1 + PKCE</td><td><code>mcp-tokens.json</code></td><td>Registers its own OAuth client dynamically (RFC 7591) on first use</td></tr>
+                <tr><td>Manus</td><td>API key paste</td><td><code>mcp-tokens.json</code></td><td>The simple case, kept simple</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            rclone's OAuth callback server binds one hardcoded port —
+            <code>:53682</code> — for every backend that uses its bundled
+            client, so only one flow may be live at a time across all
+            connectors. A second <code>rclone authorize</code> would fail to
+            bind and "crash silently." The fix is a registry of session getters
+            plus a liveness window: a flow older than 300 seconds is presumed
+            dead and the lock auto-releases, even if its background task hasn't
+            yet flipped the status.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="space"><span class="secnum">17</span>Space: the workspace as a graph</h2>
+          <p>
+            Bundled with the API is a build-free ES-module UI served at
+            <code>/space/</code> — 28 files, 6,672 lines, no bundler and no
+            dependencies. It renders <code>~/xo-projects</code> as a
+            force-directed graph, a scrubbable timeline, six-degrees
+            pathfinding between artifacts, a telemetry dashboard, a projects
+            view, a chat client, and a bundled wiki. Its view registry gives
+            each view lazy mounting, hash routing, and failure isolation, so one
+            broken view cannot take the page down.
+          </p>
+          <p>
+            The graph data is generated live on request by
+            <code>visualizer/space_index.py</code>, and the module comment
+            explains the constraint that shapes it: "the API runs inside every
+            user's workspace, so the builder must stay cheap regardless of how
+            much is on disk. Each stage is capped."
+          </p>
+        </section>
+
+        <figure class="figure" id="fig-bounds">
+          <div class="figure-head">
+            <span class="figure-label">Figure 11</span>
+            <p class="figure-title">Every stage of the graph build has a number attached</p>
+          </div>
+          <div class="figure-body">
+            <div class="measured">
+              <div><div class="n">2,000</div><div class="k">files walked per project before traversal stops</div></div>
+              <div><div class="n">400</div><div class="k">leaves emitted per project, newest first</div></div>
+              <div><div class="n">1,500</div><div class="k">total leaves — the browser has to render them</div></div>
+              <div><div class="n">10.0 s</div><div class="k">whole-build wall-clock deadline</div></div>
+              <div><div class="n">40</div><div class="k">leaves per group before a directory splits</div></div>
+              <div><div class="n">60</div><div class="k">cross-ties kept, strongest first</div></div>
+              <div><div class="n">30 s</div><div class="k">server-side cache TTL on the built payload</div></div>
+              <div><div class="n">60</div><div class="k">units/tick velocity clamp in the simulation</div></div>
+            </div>
+          </div>
+          <p class="figure-caption">
+            That last number is a local divergence fix, documented as a
+            deviation from the upstream UI: generated data can put 100+ leaves
+            in one cluster, and the summed spring stiffness makes the original
+            explicit-Euler integrator blow up — "positions hit 1e20 and the
+            canvas goes blank."
+          </p>
+        </figure>
+
+        <section class="prose">
+          <p>
+            Two details of the graph's epistemics are worth noting. Ties
+            between files are "derived facts, never editorial": files that
+            repeatedly share commits, documents whose text names another file's
+            relative path, and <code>test_x</code> ↔ <code>x</code> filename
+            pairs. And when the builder throws, the route answers 503 and the
+            UI shows a "no data source" panel rather than a bundled demo map.
+            The README states the preference outright: "a wrong-looking demo
+            map beats nothing, but a truthful error panel beats both."
+          </p>
+          <p>
+            A second projection, <code>categorized_graph.py</code>, collapses
+            every project to a single node and classifies it into five purpose
+            categories — engineering, ops, documentation, research, marketing.
+            Classification is heuristic, and the escape hatch is explicit: a
+            manual <code>category</code> in <code>.xo/project.json</code>
+            overrides the heuristics "so users can correct an ambiguous project
+            without renaming files."
+          </p>
+
+          <h2 id="invariant"><span class="secnum">18</span>The modularity invariant</h2>
+          <p>
+            One rule holds the architecture together: <strong>no core file may
+            name a specific agent in code.</strong> Core is everything except
+            the three agent-owned trees
+            (<code>adapters/&lt;name&gt;/</code>,
+            <code>config/agents/&lt;name&gt;/</code>,
+            <code>config/models/&lt;name&gt;/</code>). Everywhere else, resolve
+            through the loader.
+          </p>
+          <p>
+            What makes this credible rather than aspirational is that the
+            exceptions are enumerated. There are exactly four, each with a
+            stated reason:
+          </p>
+          <ol>
+            <li>the <code>openclaw</code> safe-boot default in <code>agent_registry.py</code> — so the server starts with nothing configured;</li>
+            <li>the <code>/providers/status</code> OAuth keys (<code>claude_code</code>, <code>codex</code>) in <code>providers_status_lib.py</code>;</li>
+            <li>the frozen <code>/openclaw/usage</code> URL alias in <code>legacy/openclaw_usage.py</code>;</li>
+            <li>codex's legacy openclaw-gateway credential writes in <code>routers/auth/codex_setup.py</code> — "old but needed; schema is openclaw-specific."</li>
+          </ol>
+          <p>
+            The enforcement story is the honest weak point, and the repo says
+            so. An AST-based guard exists — it ignores docstrings and comments,
+            and tolerates <code>config.models.*</code> imports — but it is
+            "kept as local dev tooling, not committed." So the invariant is
+            upheld in review, against a written allowlist, by humans. That is a
+            real gap between the stated rule and the mechanized one, and it is
+            precisely the sort of thing a control plane for verified work
+            should eventually not tolerate in itself.
+          </p>
+          <div class="callout">
+            <span class="k">A small piece of evidence</span>
+            <p>
+              The two agent-instruction files in the repo disagree about the
+              route-parity numbers: <code>CLAUDE.md</code> says 144 / 147 / 171
+              OpenAPI paths for claude_code / openclaw / hermes, while
+              <code>AGENTS.md</code> and <code>DEVELOPING.md</code> say 146 /
+              149 / 173 (plus 148 for antigravity). Both were true when
+              written. Documented counts drift the moment a route is added;
+              only the command that produces them
+              (<code>AGENT_NAME=$a python -c "import server; …"</code>) stays
+              correct. Which is an argument for measuring rather than
+              recording — the same argument the quirq program makes about work
+              itself.
+            </p>
+          </div>
+
+          <h2 id="stack"><span class="secnum">19</span>The tech stack, completely</h2>
+        </section>
+
+        <figure class="figure" id="fig-bom">
+          <div class="figure-head">
+            <span class="figure-label">Figure 12</span>
+            <p class="figure-title">Bill of materials, by layer</p>
+          </div>
+          <div class="figure-body">
+            <table>
+              <thead><tr><th>Layer</th><th>What it is</th><th>Size</th></tr></thead>
+              <tbody>
+                <tr><td>HTTP</td><td>FastAPI + uvicorn, Pydantic models, CORS, SSE via <code>StreamingResponse</code></td><td>169 route decorators</td></tr>
+                <tr><td>App entry</td><td><code>server.py</code> — lifespan, router mounts, Plane-A endpoints, health, self-restart/update</td><td>1,072 lines</td></tr>
+                <tr><td>Routers</td><td>auth · status · cowork_agent (chat, sessions, files, secrets, usage, connectors, bff, legacy)</td><td>42 files · 8,580 lines</td></tr>
+                <tr><td>Services</td><td>adapters · engine · registry · connectors · visualizer · xo_projects_sync · project_template</td><td>183 files · 30,184 lines</td></tr>
+                <tr><td>Agent config</td><td>4 manifests + capabilities/settings/setup scripts + 2 Plane-A model clients</td><td>27 files · 4,900 lines</td></tr>
+                <tr><td>Space UI</td><td>Hand-written ES modules and CSS, zero dependencies, canvas rendering</td><td>28 files · 6,672 lines</td></tr>
+                <tr><td>Outbound HTTP</td><td><code>httpx.AsyncClient</code> — gateways, GitHub REST, Vercel OAuth, usage sync</td><td>1800 s stream timeout, 10 s connect</td></tr>
+                <tr><td>Subprocess</td><td><code>asyncio.create_subprocess_exec</code> for every CLI; argv from manifests, never a shell string</td><td>4 runtimes</td></tr>
+                <tr><td>Storage</td><td>JSON on disk (atomic temp-file + rename), SQLite read-only for hermes and antigravity, JSONL transcripts</td><td>no database of its own</td></tr>
+                <tr><td>External tools</td><td><code>git</code>, <code>gh</code>, <code>gpg</code>, <code>rclone</code> — all invoked, none vendored</td><td>installed in the image</td></tr>
+                <tr><td>Packaging</td><td><code>python:3.12-slim</code>, healthcheck every 10 s after a 20 s grace, host port 5003 → container 5002</td><td>one <code>docker compose up</code></td></tr>
+                <tr><td>Tests</td><td>pytest — activity state, agent env, local port, local state, quirq catalog, runtime config, session mounts, space dashboard/sessions/wiki</td><td>11 files · 1,462 lines</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="figure-caption">
+            The container is not a shortcut around the plugin system. The
+            installer asks the running image which host directories to mount by
+            calling <code>scripts/list_runtime_mounts.py</code>, which
+            enumerates manifest <code>home_dir</code>s plus any
+            <code>extra_mounts</code>, then adds optional read-only homes
+            contributed by telemetry-only providers. Adding an agent changes
+            what Docker mounts, without editing the installer.
+          </p>
+        </figure>
+
+        <section class="prose">
+          <h2 id="gaps"><span class="secnum">20</span>What isn't built yet</h2>
+          <p>
+            A teardown that reports only the good parts is advertising. Four
+            things are visibly unfinished, and the code says so.
+          </p>
+          <p>
+            <strong>Workspace memory is a stub.</strong>
+            <code>routers/cowork_agent/workspace_memory.py</code> answers
+            <code>{"memory": null}</code>, <code>[]</code>, and
+            <code>{"ok": true}</code> to six endpoints the frontend calls. The
+            full-text search index is the same: <code>/api/fts/index/*</code>
+            reports <code>idle</code> forever. These are honest placeholders —
+            the shape of the seam exists and nothing pretends to fill it — but
+            they are also the two features that would make a workspace
+            genuinely cumulative rather than merely organized.
+          </p>
+          <p>
+            <strong>The watcher is elsewhere.</strong> Much of what makes
+            <code>.xo/</code> useful — todos, stats, the timeline, activity
+            heartbeats, identity resolution — is produced by a watcher service
+            that this repository documents, catalogs, and reads, but does not
+            contain. The catalog's output contract names its sinks precisely;
+            the sinks themselves live outside this teardown.
+          </p>
+          <p>
+            <strong>Chat state is process-local.</strong> One dictionary,
+            no persistence, incompatible with more than one uvicorn worker. For
+            a local single-user control plane that is the correct trade; it is
+            also the first thing that has to change for anything multi-user,
+            and the RBAC design is still a wiki page rather than code.
+          </p>
+          <p>
+            <strong>The invariant guard isn't committed.</strong> Discussed
+            in §18 — the rule is real, the enforcement is manual.
+          </p>
+
+          <h2 id="quirq"><span class="secnum">21</span>What this means for quirq</h2>
+          <p>
+            Read through the quirq lens, xo-space is three things at once.
+          </p>
+          <p>
+            <strong>It is the environment the unit of work needs.</strong> The
+            proposal insists that a unit of work owns an outcome from
+            definition through verification, and that it has one owner, a
+            definition of done, a budget, a workspace, and a durable result.
+            Three of those five are already materialized here as files and
+            endpoints: the workspace is <code>~/xo-projects/&lt;id&gt;/</code>
+            with a scaffolded contract at its root, the durable result is that
+            same folder after the work (snapshot-able, restorable, portable),
+            and the spend side of the budget is metered across every runtime by
+            <code>/api/usage</code>. What the environment cannot yet do is
+            <em>verify</em> — there is no definition-of-done evaluator and no
+            budget that can refuse. Those are the missing halves, and they are
+            where a quirq implementation would have to attach.
+          </p>
+          <p>
+            <strong>It is instrumentation that does not distort what it
+            measures.</strong> The whitepaper's audit machinery needs an
+            environment that can answer "what was true at time <em>t</em>"
+            without the act of observing changing the run. xo-space's answers
+            are structural: the session index records the mapping and never the
+            content; the graph builder is a pure reader that writes nothing;
+            the telemetry aggregator validates every number as finite and
+            non-negative and rejects a provider's whole payload rather than
+            passing a bad one through; backups are content-addressed by
+            sha256 and verified before decryption. Even its retention rule (10
+            snapshots per project) is a decision about how much history a claim
+            can be checked against.
+          </p>
+          <p>
+            <strong>And it is the substrate a memory engine would plug
+            into.</strong> The tenure hypothesis — cost per unit of verified
+            work falling as an environment's memory M<sub>t</sub> accumulates —
+            requires somewhere for M<sub>t</sub> to live that outlasts any one
+            agent session. Here that place has a name and a layout:
+            <code>memory/</code> beside <code>PROGRESS.md</code>, inside a
+            folder that survives a runtime switch. The control plane is
+            deliberately agnostic about which agent does the work; that
+            agnosticism is exactly what makes accumulated environment memory
+            worth more than accumulated agent memory. Switch the backend and
+            the project remembers; the agent doesn't have to.
+          </p>
+          <p>
+            The lesson I would take from the codebase is narrower and more
+            practical than any of that. The invariant — <em>no core file may
+            name a specific agent</em> — is not architectural elegance for its
+            own sake. It is what makes cross-runtime measurement possible at
+            all. You cannot compare the cost of a unit of work across four
+            agents if the comparison logic has four branches in it. A single
+            normalized entry shape, a single session record, a single event
+            vocabulary: those are the preconditions for a meter. The plugin
+            architecture isn't the point. It's the instrument.
+          </p>
+          <p class="footnote">
+            Subject: xo-space at commit <code>f1fecdd</code>,
+            github.com/quirq-ai/xo-space (MIT), 203 commits on <code>main</code>.
+            All file paths, constants, and quoted comments verified against the
+            source at that commit; line counts are from the working tree.
+            Per-agent route counts are quoted from the repo's own validation
+            playbook and were not re-run here (the checkout ships no virtualenv).
+            This piece is an independent technical analysis.
+          </p>
+        </section>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Writings</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../personal-memory-engine/">Personal memory engine</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../whitepaper/">quirq whitepaper</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>
