@@ -1,0 +1,277 @@
+<h2 id="materialising-a-checkout"><span class="secnum">{{S}}</span>Materialising a checkout</h2>
+<p class="lede">
+  Every build on every bot begins with one step called <code>bot_update</code>.
+  It is not a program. It is a three-layer sandwich: a recipe module that
+  builds a command line, a resource script that drives git, and depot_tools
+  underneath. Knowing which layer you are in is the difference between reading
+  a checkout failure and guessing.
+</p>
+<p>
+  Layer one is <code>bot_update/api.py</code> — 1,035 lines,
+  <code>class BotUpdateApi</code> at line 298, whose docstring at line 5 says
+  the purpose is to ensure a consistent checkout on a bot
+  <span class="src">from the tree</span>.
+  <code>ensure_checkout()</code> turns a gclient config plus the build input
+  into a command line, runs it as a step named exactly <code>bot_update</code>,
+  and translates the JSON it reads back into build properties, an output commit
+  and — since 2025-11-19 — a TurboCI check. TurboCI has no public design
+  doc; from the API it is a 2026 LUCI layer that models a build as a graph of
+  <em>checks</em> with declared dependencies, rather than as an ordered list
+  of steps <span class="recon">reconstruction</span>. What
+  <code>bot_update</code> contributes to that graph is one node. Before the
+  command runs, <code>create_check()</code> writes a node with
+  <code>kind="CHECK_KIND_SOURCE"</code> and
+  <code>state="CHECK_STATE_PLANNED"</code> carrying a
+  <code>GobSourceCheckOptions</code> that holds the revisions and the Gerrit
+  change it intends to produce; afterwards <code>set_result()</code> attaches
+  <code>GobSourceCheckResults</code> and <code>BotUpdateResults</code> — what
+  was actually checked out — and moves the node to FINAL
+  (api.py:147–165, 237–250, 252–295) <span class="src">from the tree</span>.
+  The compile check declares a dependency on that node, so the graph encodes
+  "you cannot compile a checkout that does not exist" as data rather than as
+  step ordering. Layer two is the 1,458-line resource
+  script <code>bot_update.py</code>, which knows nothing about recipes. Layer
+  three is depot_tools proper: <code>git_cache.py</code>,
+  <code>gclient.py</code>, <code>gclient_scm.py</code>.
+</p>
+<p>
+  Figure {{fig-bot-update}} is the sandwich next to a real run of it: the
+  live log of <code>ci/Linux Builder #228485</code> on 2026-09-22, one build,
+  cold builder cache. The pin <code>ed7c7c79</code> was missing from the
+  mirror, so <code>git cat-file -e</code> failed and <code>populate</code>
+  ran. The step took 5 min 17 s, the manifest listed 168 git repositories, and
+  the step text moved the bot's disk from <code>[154GB/290GB used (53%)]</code>
+  to <code>[178GB/290GB used (61%)]</code>. <code>gclient runhooks</code>, a
+  different step, took a further 1 min 42 s.
+</p>
+
+<figure class="figure wide" id="fig-bot-update">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">Three layers, one step, and the eight commands it actually ran</p>
+  </div>
+  <div class="figure-body plain">
+    <div class="stack">
+      <div class="stack-row">
+        <div class="stack-cell head">Layer 1 · recipe module</div>
+        <div class="stack-cell hl-blue"><code>bot_update/api.py</code>, 1,035 lines. Builds the command line, names the step, parses the JSON back into properties, an output commit and a TurboCI source check.</div>
+      </div>
+      <div class="stack-row">
+        <div class="stack-cell head">Layer 2 · resource script</div>
+        <div class="stack-cell hl-green"><code>bot_update/resources/bot_update.py</code>, 1,458 lines. No recipe concepts: raw git, then its own <code>.gclient</code>, then hand off.</div>
+      </div>
+      <div class="stack-row">
+        <div class="stack-cell head">Layer 3 · depot_tools</div>
+        <div class="stack-cell hl-purple"><code>git_cache.py</code> (the bare mirror) and <code>gclient.py</code> / <code>gclient_scm.py</code> (DEPS, <code>apply_patch_ref</code>).</div>
+      </div>
+    </div>
+    <svg viewBox="0 -24 1020 730" role="img" aria-label="A sequence diagram. A blue header shows the recipe module invoking vpython3 on bot_update.py. Below it, eight command rows run down the page with an elapsed-time gutter in the middle and an effect column on the right: cat-file misses, populate takes 0.2 minutes, clone is local, fetch, checkout --force takes 66 seconds, clean, gclient sync takes 3.5 minutes, revinfo takes 0.4 minutes, totalling 5 minutes 17 seconds; gclient runhooks is a separate step at 1 minute 42 seconds. A four-box inset at the bottom shows the try-build patch path: patch_ref, fetch, cherry-pick with keep-redundant-commits, and a soft reset back to the base commit.">
+      <defs>
+        <marker id="fig-bot-update-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+        <marker id="fig-bot-update-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+      </defs>
+
+      <text x="20" y="28" class="svg-lane">COMMAND · ci/Linux Builder #228485, 2026-09-22</text>
+      <text x="450" y="28" class="svg-lane">ELAPSED</text>
+      <text x="650" y="28" class="svg-lane">WHAT IT TOUCHES</text>
+
+      <rect x="20" y="44" width="980" height="44" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="36" y="62" class="svg-step">Layer 1 runs one step: “bot_update”</text>
+      <text x="36" y="80" class="svg-sub">vpython3 -u bot_update.py --spec-path … --git-cache-dir [CACHE]/git --patch_root … --output_json …</text>
+
+      <rect x="20" y="104" width="410" height="36" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="34" y="127" class="svg-sub">git cat-file -e ed7c7c79… (in the mirror)</text>
+      <text x="512" y="127" text-anchor="end" class="svg-sub">miss</text>
+      <text x="650" y="127" class="svg-sub">the pin is not in [CACHE]/git yet</text>
+
+      <rect x="20" y="148" width="410" height="36" rx="6" fill="#ece6f3" stroke="#765b98"/>
+      <text x="34" y="171" class="svg-sub">git_cache.py populate --commit &lt;pin&gt; --ref refs/heads/main</text>
+      <text x="512" y="171" text-anchor="end" class="svg-sub">0.2 min</text>
+      <rect x="520" y="159" width="6" height="14" fill="#d98226"/>
+      <text x="650" y="171" class="svg-sub">mirror fetches the pin · 12 .pack files</text>
+
+      <rect x="20" y="192" width="410" height="36" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="34" y="215" class="svg-sub">git clone --no-checkout --local --shared &lt;mirror&gt; src</text>
+      <text x="512" y="215" text-anchor="end" class="svg-sub">local</text>
+      <text x="650" y="215" class="svg-sub">[CACHE]/builder/src · gc.auto/autodetach/autopacklimit = 0</text>
+
+      <rect x="20" y="236" width="410" height="36" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="34" y="259" class="svg-sub">git fetch origin ed7c7c79…</text>
+      <text x="512" y="259" text-anchor="end" class="svg-sub">—</text>
+      <text x="650" y="259" class="svg-sub">pin lands in the worktree repo</text>
+
+      <rect x="20" y="280" width="410" height="36" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="34" y="303" class="svg-sub">git checkout --force ed7c7c79… --</text>
+      <text x="512" y="303" text-anchor="end" class="svg-sub">66 s</text>
+      <rect x="520" y="291" width="33" height="14" fill="#d98226"/>
+      <text x="650" y="303" class="svg-sub">the src tree appears on disk</text>
+
+      <rect x="20" y="324" width="410" height="36" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="34" y="347" class="svg-sub">git clean -dff</text>
+      <text x="512" y="347" text-anchor="end" class="svg-sub">—</text>
+      <text x="650" y="347" class="svg-sub">untracked leftovers removed</text>
+
+      <rect x="20" y="368" width="410" height="36" rx="6" fill="#ece6f3" stroke="#765b98"/>
+      <text x="34" y="391" class="svg-sub">gclient sync --reset --force --nohooks --revision src@unmanaged</text>
+      <text x="512" y="391" text-anchor="end" class="svg-sub">3.5 min</text>
+      <rect x="520" y="379" width="105" height="14" fill="#d98226"/>
+      <text x="650" y="391" class="svg-sub">DEPS walked · 168 repos, all --shared</text>
+
+      <rect x="20" y="412" width="410" height="36" rx="6" fill="#ece6f3" stroke="#765b98"/>
+      <text x="34" y="435" class="svg-sub">gclient revinfo -a --ignore-dep-type cipd</text>
+      <text x="512" y="435" text-anchor="end" class="svg-sub">0.4 min</text>
+      <rect x="520" y="423" width="12" height="14" fill="#d98226"/>
+      <text x="650" y="435" class="svg-sub">the manifest, into the output JSON</text>
+
+      <line x1="20" y1="464" x2="1000" y2="464" stroke="#b8b8b1" stroke-width="1"/>
+      <text x="34" y="484" class="svg-step">step total: 5 min 17 s</text>
+      <text x="650" y="484" class="svg-sub">disk 154 GB → 178 GB of 290 GB</text>
+
+      <rect x="20" y="498" width="410" height="36" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+      <text x="34" y="521" class="svg-sub">gclient runhooks — a separate step, not bot_update</text>
+      <text x="512" y="521" text-anchor="end" class="svg-sub">1 min 42 s</text>
+      <rect x="520" y="509" width="51" height="14" fill="#f7e3c8" stroke="#d98226"/>
+      <text x="650" y="521" class="svg-sub">DEPS hooks: LASTCHANGE, toolchains, …</text>
+
+      <line x1="20" y1="562" x2="1000" y2="562" stroke="#deded9" stroke-width="1"/>
+      <text x="20" y="586" class="svg-lane">TRY BUILD ONLY · THE PATCH PATH</text>
+
+      <rect x="20" y="598" width="230" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="34" y="620" class="svg-step">--patch_ref</text>
+      <text x="34" y="640" class="svg-sub">…/chromium/src@refs/heads/main:</text>
+      <text x="34" y="654" class="svg-sub">refs/changes/48/8420748/2</text>
+
+      <rect x="270" y="598" width="230" height="62" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="284" y="620" class="svg-step">git fetch --no-tags</text>
+      <text x="284" y="640" class="svg-sub">the patch ref, from the</text>
+      <text x="284" y="654" class="svg-sub">Gerrit host</text>
+
+      <rect x="520" y="598" width="230" height="62" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="534" y="620" class="svg-step">git cherry-pick</text>
+      <text x="534" y="640" class="svg-sub">target..patch</text>
+      <text x="534" y="654" class="svg-sub">--keep-redundant-commits</text>
+
+      <rect x="770" y="598" width="230" height="62" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="784" y="620" class="svg-step">git reset --soft base</text>
+      <text x="784" y="640" class="svg-sub">HEAD = base commit,</text>
+      <text x="784" y="654" class="svg-sub">CL stays in the index</text>
+
+      <line x1="250" y1="629" x2="270" y2="629" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-bot-update-arr-ink)"/>
+      <line x1="500" y1="629" x2="520" y2="629" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-bot-update-arr-ink)"/>
+      <line x1="750" y1="629" x2="770" y2="629" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-bot-update-arr-purple)"/>
+      <text x="510" y="694" text-anchor="middle" class="svg-note">the soft reset is why got_revision on a try build is the base commit, not the CL</text>
+    </svg>
+  </div>
+  <p class="figure-caption">
+    The layers and the try-build inset are read off the source
+    <span class="src">from the tree</span>. Every command, duration and disk
+    figure is measured, but from a single build with a cold builder cache; a
+    warm cache skips <code>populate</code>. Bars are linear, 0.5 px per
+    second.
+  </p>
+</figure>
+
+<p>
+  The mirror is what makes 66 seconds possible. It lives in
+  <code>[CACHE]/git</code> and is re-bootstrapped wholesale from
+  <code>gs://chromium-git-cache/v2/…</code> when it is missing, has zero pack
+  files, or has more than <code>GC_AUTOPACKLIMIT = 50</code> of them
+  (git_cache.py:29, 628–633) <span class="src">from the tree</span>; the log
+  printed 12 for src. If the pin or a ref is still absent after the first
+  <code>populate</code>, the script retries it three times, sleeping 60 seconds
+  between attempts (bot_update.py:792–801). The bot's
+  <code>git_cache_epoch</code> read <code>1789770839</code> — 2026-09-18
+  22:33:59 UTC, the moment the <code>.cache_epoch</code> marker was written on
+  first use of that cache directory (bot_update.py:1240–1254).
+</p>
+<p>
+  Lines 822–835 and 846–847 of <code>bot_update.py</code> are all of layer
+  two's git work:
+</p>
+<pre><code>        git(
+          "clone", "--no-checkout", "--local", "--shared", mirror_dir, sln_dir
+        )
+        _git_disable_gc(sln_dir)
+      else:
+        _git_disable_gc(sln_dir)
+        git("remote", "set-url", "origin", mirror_dir, cwd=sln_dir)
+        git("fetch", "origin", cwd=sln_dir)
+      git("remote", "set-url", "--push", "origin", url, cwd=sln_dir)
+      if pin:
+        git("fetch", "origin", pin, cwd=sln_dir)
+      for ref in refs:
+        refspec = "%s:%s" % (ref, ref_to_remote_ref(ref.lstrip("+")))
+        git("fetch", "origin", refspec, cwd=sln_dir)
+      …
+      git("checkout", "--force", pin or branch, "--", cwd=sln_dir)
+      git("clean", "-dffx" if clean_ignored else "-dff", cwd=sln_dir)</code></pre>
+<p>
+  The script then writes its own <code>.gclient</code> — solutions with
+  <code>managed=False</code>, pointed at the same cache — and calls
+  <code>gclient sync</code> with the flags below, plus
+  <code>--revision &lt;solution&gt;@unmanaged</code> for every solution
+  (bot_update.py:340, 453–461, 970–975).
+</p>
+<pre><code>gclient sync --verbose --reset --force --upstream \
+             --nohooks --noprehooks --delete_unversioned_trees</code></pre>
+<p> <code>unmanaged</code> says the root
+  is already positioned — the log prints
+  <code>________ unmanaged solution; skipping src</code>
+  (gclient_scm.py:1102) — so gclient does only
+  the DEPS below it. <code>--nohooks</code> is deliberate: deferring hooks to a
+  separate step keeps a checkout failure (infra) and a hook failure (product)
+  on two different rows. A <code>GclientSyncFailed</code> deletes the checkout
+  and reruns <code>ensure_checkout</code> exactly once, wiping the whole git
+  cache first if the output contains <code>bad object</code>,
+  <code>could not read</code> or <code>is corrupt</code>
+  (bot_update.py:1308–1332).
+</p>
+
+<h3>The patch model, and the fact everyone trips on</h3>
+<p>
+  On a try build the recipe adds one flag,
+  <code>--patch_ref &lt;repo&gt;@&lt;target_ref&gt;:&lt;fetch_ref&gt;</code>.
+  <code>apply_patch_ref</code> in <code>gclient_scm.py</code> fetches it,
+  cherry-picks <code>target..patch</code> with
+  <code>--keep-redundant-commits</code> — unlanded dependent CLs come along,
+  landed parents are skipped — then soft-resets to the base. Lines 777–783 and
+  812–815 hold both halves:
+</p>
+<pre><code>                        self._Capture(
+                            [
+                                "cherry-pick",
+                                target_rev + ".." + pr,
+                                "--keep-redundant-commits",
+                            ]
+                        )
+        …
+        latest_commit = self.revinfo(None, None, None)
+        if options.reset_patch_ref:
+            self._Capture(["reset", "--soft", base_rev])
+        return latest_commit</code></pre>
+<p>
+  The CL is staged, not committed. That is why <code>got_revision</code> on a
+  try build is the base commit and not the change under test — a fact that
+  looks like a bug until you read line 814. A conflicting cherry-pick exits 88
+  (87 if git failed to download the patch, which is an infra problem instead),
+  and exit 88 makes the recipe attach the <code>patch error</code> log, set the
+  step to <code>FAILURE</code>, emit a <code>PATCH_FAILURE</code> tryjob result
+  and call <code>set_do_not_retry_build()</code> — output property
+  <code>do_not_retry=true</code> (api.py:766–790). The mirror image is
+  <code>deapply_patch()</code>: re-pin the first solution to
+  whichever <code>got_*_revision</code> property that solution maps to — the
+  code refuses to assume it is <code>got_revision</code>, because some gclient
+  configs remap it — resolve every other fixed revision to its observed value, rerun with <code>patch=False</code> as
+  <code>bot_update (without patch)</code> (api.py:997–1027, 1029–1035). Pinning
+  only <code>src</code> is what makes a DEPS-changing CL deapply correctly.
+</p>
+<p>
+  Three numbers bound the step <span class="src">from the tree</span>.
+  <code>chromium_tests</code> passes a 3,600-second timeout, CI and try alike.
+  A subprocess silent on stdout for
+  <code>STALE_PROCESS_DURATION = 1200</code> seconds is killed, with a
+  <code>ps auxwwf</code> tree dumped every 300 seconds (bot_update.py:38,
+  199–200). And git HTTP aborts below
+  <code>GIT_HTTP_LOW_SPEED_LIMIT</code> 102,400 bytes per second held for
+  1,800 seconds (api.py:370–371).
+</p>

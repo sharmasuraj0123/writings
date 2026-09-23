@@ -1,0 +1,291 @@
+          <h2 id="the-tool-belt"><span class="secnum">{{S}}</span>The tool belt and the three files</h2>
+          <p class="lede">
+            depot_tools is a bag of scripts on your <code>PATH</code>.
+            <code>fetch</code> is a recipe runner. The division of labour worth
+            learning is between three files: <code>.gclient</code> is yours,
+            <code>DEPS</code> is the project's, <code>.gclient_entries</code>
+            is gclient's own memory.
+          </p>
+          <p>
+            Start with the belt. depot_tools' README names four tools as the
+            important ones — <code>fetch</code>, <code>gclient</code>,
+            <code>git cl</code> and <code>roll-dep</code> — and lists
+            <code>gn</code>, <code>autoninja</code>,
+            <code>siso</code> and <code>ninja</code> separately, as
+            "shell script/batch file for tools required to build chromium"
+            [<code>depot_tools/README.md</code>:10–33]
+            <span class="src">from the tree</span>. That second list bundles
+            nothing. <code>gn.py</code> asks <code>gclient_paths</code> for the
+            primary solution, looks for
+            <code>&lt;solution&gt;/third_party/gn/gn</code>, falls back to
+            <code>buildtools/&lt;platform&gt;/gn</code>, and reaches
+            <code>$PATH</code> only when there is no buildtools directory at
+            all [<code>depot_tools/gn.py</code>:39–87]. The
+            binary it finds was installed by DEPS. The wrapper is a locator.
+          </p>
+          <p>
+            The belt updates itself. The <code>gclient</code> entry point is a
+            bash script that runs <code>update_depot_tools</code> before
+            every subcommand except nine named in a hard-coded string —
+            <code>grep</code>, <code>fetch</code>, <code>cleanup</code>,
+            <code>diff</code>, <code>help</code>, <code>getdep</code>,
+            <code>root</code>, <code>setdep</code>, <code>recurse</code> —
+            then execs
+            <code>gclient.py</code> under <code>vpython3</code>;
+            <code>DEPOT_TOOLS_UPDATE=0</code> turns that off [<code>depot_tools/gclient</code>:8–29;
+            <code>depot_tools/README.md</code>:73–75]. depot_tools is also,
+            recursively, a Chromium dependency:
+            <code>src/third_party/depot_tools</code> is pinned at
+            <code>0306e468</code> — the exact revision of the clone this post
+            reads — and a hook named
+            <code>disable_depot_tools_selfupdate</code> keeps it there
+            [<code>src/DEPS</code>:2211–2212; :4456–4466].
+          </p>
+
+          <div class="callout">
+            <span class="k">Three Pythons, not one</span>
+            <p>
+              Later sections depend on the difference. The host
+              <code>python3</code> that runs depot_tools needs 3.8+, gsutil
+              3.9–3.13 [<code>depot_tools/README.md</code>:3–5]. The uv-backed
+              <code>vpython3</code> environment hooks run inside is pinned by
+              <code>requires-python = '&gt;=3.11,&lt;3.12'</code>
+              [<code>src/vpython.toml</code>:14]. The hermetic CIPD
+              <code>cpython3</code>, <code>version:3@3.11.9.chromium.38</code>,
+              is what GN executes scripts with:
+              <code>script_executable = "//third_party/cpython3/host/bin/python3"</code>
+              [<code>src/DEPS</code>:295; <code>src/.gn</code>:12]. Three
+              ranges, three interpreters, no contradiction.
+            </p>
+          </div>
+
+          <p>
+            <code>fetch chromium</code> is a recipe runner, and the recipe is
+            short. <code>fetch_configs/chromium.py</code> returns a spec whose
+            single solution is four keys
+            [<code>depot_tools/fetch_configs/chromium.py</code>:15–38]:
+          </p>
+<pre><code>    def fetch_spec(props):
+        url = "https://chromium.googlesource.com/chromium/src.git"
+        solution = {
+            "name": "src",
+            "url": url,
+            "custom_deps": {},
+            "custom_vars": {},
+        }
+        if props.get("webkit_revision", "") == "ToT":
+            solution["custom_vars"]["webkit_revision"] = ""
+        if ast.literal_eval(props.get("internal", "False")):
+            solution["custom_vars"]["checkout_src_internal"] = True
+        spec = {
+            "solutions": [solution],
+        }
+        if props.get("target_os"):
+            spec["target_os"] = props["target_os"].split(",")
+        if props.get("target_os_only"):
+            spec["target_os_only"] = props["target_os_only"]
+
+        return {
+            "type": "gclient_git",
+            "gclient_git_spec": spec,
+        }</code></pre>
+          <p>
+            The whole configuration of a Chromium checkout: one name, one
+            URL, two empty dicts. <code>GclientGitCheckout.init</code> then
+            runs <code>gclient config --spec …</code> followed by
+            <code>gclient sync</code>, appending <code>--nohooks</code>,
+            <code>--no-history</code> or <code>--with_branch_heads</code> if
+            asked, and sets <code>diff.ignoreSubmodules=dirty</code> on the
+            new repository
+            [<code>depot_tools/fetch.py</code>:142–166].
+            <code>fetch android</code>, <code>fetch ios</code> and
+            <code>fetch chrome</code> are not separate recipes: each returns an
+            <code>alias</code> re-invoking <code>chromium</code> with extra
+            props — <code>--target_os=android</code>;
+            <code>--target_os=ios --target_os_only=True</code>;
+            <code>--internal=True</code>
+            [<code>depot_tools/fetch_configs/android.py</code>:14–20;
+            <code>ios.py</code>:14–20; <code>chrome.py</code>:14–22]. The
+            newest flag, <code>--git-cache</code>, adds two keys to the same
+            spec, <code>cache_dir</code> and
+            <code>cache_mode='bootstrap'</code>; §04 and §05 return to them
+            [<code>depot_tools/fetch.py</code>:222–231; :323–332]. The docs
+            still say <code>fetch --nohooks chromium</code>, and warn that you
+            should "Expect the command to take 30 minutes on even a fast
+            connection"
+            [<code>src/docs/linux/build_instructions.md</code>:70–100]
+            <span class="src">from the docs</span>; the size that command
+            moves is §05's subject.
+          </p>
+          <p>
+            <code>gclient config --spec</code> writes <code>.gclient</code>,
+            and <code>.gclient</code> is Python-shaped data, not a program:
+            <code>gclient_eval.ParseLocalConfig</code> runs
+            <code>ast.parse</code> and accepts only assignments of literals
+            [<code>depot_tools/gclient_eval.py</code>:699–774]. A solution
+            carries eight keys — <code>name</code>, <code>url</code>,
+            <code>deps_file</code> (default <code>DEPS</code>),
+            <code>managed</code>, <code>custom_deps</code>,
+            <code>custom_vars</code>, <code>custom_hooks</code> and
+            <code>protocol_override</code>
+            [<code>depot_tools/gclient.py</code>:2215–2239]. Top-level keys
+            add <code>target_os</code> and <code>target_cpu</code>, unioned
+            with the host through <code>DEPS_OS_CHOICES</code> where
+            <code>linux</code> becomes <code>unix</code>, plus
+            <code>cache_dir</code>, <code>cache_mode</code> and a root
+            <code>hooks</code> list
+            [<code>depot_tools/gclient.py</code>:2043–2059; :2160–2256]. Two of
+            those keys are a developer's only leverage over a file they do not
+            own. <code>custom_vars</code> overrides a variable, but only one
+            that already exists — §03 has the filter that enforces it.
+            <code>custom_deps</code> replaces an
+            entry's URL, appends an entry DEPS never had, or — set to
+            <code>None</code> — removes one
+            [<code>depot_tools/gclient.py</code>:756–796]. Figure {{fig-three-files}} draws
+            what crosses between the files.
+          </p>
+          <p>
+            <code>managed</code> deserves dates, because the folklore is wrong
+            in both directions. <code>fetch chromium</code> has produced
+            unmanaged checkouts since 22 August 2013, when its recipe flipped
+            the key from <code>True</code> to <code>False</code> because
+            unmanaged "works in a better, more predictable and robust way"
+            [depot_tools <code>943f35a5f</code>]. gclient's own default did not
+            follow: flipped on 28 June 2016, reverted three weeks later on 18
+            July inside a four-commit revert whose stated reason was "Breaks
+            iOS release branch builds" [depot_tools <code>d4aedc811</code>,
+            <code>ae7ea3167</code>]. The durable flip came ten years
+            later — on 16 June 2026 the default became <code>False</code>,
+            <code>--managed</code> was added, and the explicit
+            <code>managed: False</code> was dropped from every fetch config
+            [depot_tools <code>7447d59a5</code>] — which is why the excerpt
+            above has no <code>managed</code> key at all. Today
+            <code>SetConfig</code> reads
+            <code>managed=s.get("managed", False)</code>
+            [<code>depot_tools/gclient.py</code>:2225].
+          </p>
+          <p>
+            The third file is gclient's own. <code>_SaveEntries</code> writes
+            <code>.gclient_entries</code> next to <code>.gclient</code> as one
+            Python dict, <code>entries = { name: url }</code>, one line per
+            checked-out module
+            [<code>depot_tools/gclient.py</code>:2338–2354]. It is read twice.
+            The next sync diffs it against the tree it just built and treats
+            anything listed there but no longer present as an orphan —
+            what happens to that orphan is the second step of §04's epilogue.
+            And every thin wrapper leans on it: <code>gclient_paths.FindGclientRoot</code>
+            climbs from the current directory to a <code>.gclient</code>, then
+            — if it had to climb — checks that the directory it started in sits
+            inside one of the paths listed in <code>.gclient_entries</code>
+            before accepting that root
+            [<code>depot_tools/gclient_paths.py</code>:21–72]. That check is
+            how <code>gn</code> and <code>ninja</code> find the tree from any
+            subdirectory.
+          </p>
+
+          <figure class="figure wide" id="fig-three-files">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Three files, three owners, and what crosses between them</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 392" role="img" aria-label="Three columns. Left: the .gclient file you own, with solutions, custom_vars, custom_deps and custom_hooks. Middle: the project's src/DEPS, with deps, vars, a single entry URL and hooks. Right: gclient's own .gclient_entries cache, written at the end of a sync and diffed against the tree on the next one. A strip along the bottom shows the variable precedence ladder: DEPS vars, then parent vars, then built-ins, then custom_vars.">
+                <defs>
+                  <marker id="fig-three-files-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-three-files-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-three-files-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="8" y="20" class="svg-lane">.GCLIENT — YOURS</text>
+                <text x="382" y="20" class="svg-lane">src/DEPS — THE PROJECT'S</text>
+                <text x="756" y="20" class="svg-lane">.GCLIENT_ENTRIES — GCLIENT'S</text>
+
+                <rect x="8" y="36" width="236" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="58" class="svg-step">solutions = [ { … } ]</text>
+                <text x="22" y="76" class="svg-sub">name · url · deps_file · managed</text>
+                <rect x="8" y="100" width="236" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="122" class="svg-step">custom_vars</text>
+                <text x="22" y="140" class="svg-sub">existing names only</text>
+                <rect x="8" y="164" width="236" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="186" class="svg-step">custom_deps</text>
+                <text x="22" y="204" class="svg-sub">url · new entry · None</text>
+                <rect x="8" y="228" width="236" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="250" class="svg-step">custom_hooks</text>
+                <text x="22" y="268" class="svg-sub">matched by hook name</text>
+
+                <rect x="382" y="36" width="236" height="54" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="396" y="58" class="svg-step">deps = { … }</text>
+                <text x="396" y="76" class="svg-sub">451 entries · git cipd gcs</text>
+                <rect x="382" y="100" width="236" height="54" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="396" y="122" class="svg-step">vars = { … }</text>
+                <text x="396" y="140" class="svg-sub">143 names, then built-ins</text>
+                <rect x="382" y="164" width="236" height="54" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="396" y="186" class="svg-step">one entry's URL</text>
+                <text x="396" y="204" class="svg-sub">or no entry at all</text>
+                <rect x="382" y="228" width="236" height="54" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="396" y="250" class="svg-step">hooks = [ … ]</text>
+                <text x="396" y="268" class="svg-sub">61 at f288fed6</text>
+
+                <rect x="756" y="44" width="236" height="72" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="770" y="68" class="svg-step">entries = { name: url }</text>
+                <text x="770" y="88" class="svg-sub">one line per module,</text>
+                <text x="770" y="104" class="svg-sub">written when sync ends</text>
+                <rect x="756" y="164" width="236" height="72" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="770" y="188" class="svg-step">the next sync diffs it</text>
+                <text x="770" y="208" class="svg-sub">listed here, gone from</text>
+                <text x="770" y="224" class="svg-sub">the tree → orphan</text>
+
+                <line x1="244" y1="63" x2="382" y2="63" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-three-files-ink)"/>
+                <text x="313" y="49" text-anchor="middle" class="svg-note">a Dependency per solution</text>
+                <text x="313" y="81" text-anchor="middle" class="svg-note">that parses its deps_file</text>
+
+                <line x1="244" y1="127" x2="382" y2="127" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-three-files-blue)"/>
+                <text x="313" y="113" text-anchor="middle" class="svg-note">overrides a var, never</text>
+                <text x="313" y="145" text-anchor="middle" class="svg-note">introduces one</text>
+
+                <line x1="244" y1="191" x2="382" y2="191" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-three-files-blue)"/>
+                <text x="313" y="177" text-anchor="middle" class="svg-note">new URL, or None to</text>
+                <text x="313" y="209" text-anchor="middle" class="svg-note">drop the entry</text>
+
+                <line x1="244" y1="255" x2="382" y2="255" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-three-files-blue)"/>
+                <text x="313" y="241" text-anchor="middle" class="svg-note">suppresses a DEPS hook</text>
+                <text x="313" y="273" text-anchor="middle" class="svg-note">of the same name</text>
+
+                <line x1="618" y1="80" x2="756" y2="80" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-three-files-purple)"/>
+                <text x="687" y="66" text-anchor="middle" class="svg-note">sync records what</text>
+                <text x="687" y="98" text-anchor="middle" class="svg-note">it checked out</text>
+
+                <line x1="756" y1="200" x2="618" y2="200" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-three-files-purple)"/>
+                <text x="687" y="186" text-anchor="middle" class="svg-note">-D deletes it, else a</text>
+                <text x="687" y="218" text-anchor="middle" class="svg-note">WARNING every sync</text>
+
+                <text x="8" y="304" class="svg-note">Also top level in .gclient and not drawn: target_os · target_cpu (unioned with the host) · cache_dir · cache_mode · root hooks.</text>
+
+                <rect x="8" y="322" width="984" height="52" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="24" y="352" class="svg-lane">VARIABLE PRECEDENCE — LAST WINS</text>
+                <rect x="286" y="332" width="104" height="26" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="298" y="349" class="svg-sub">DEPS vars</text>
+                <text x="398" y="350" class="svg-step">&lt;</text>
+                <rect x="414" y="332" width="112" height="26" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="426" y="349" class="svg-sub">parent vars</text>
+                <text x="534" y="350" class="svg-step">&lt;</text>
+                <rect x="550" y="332" width="104" height="26" rx="6" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="562" y="349" class="svg-sub">built-ins</text>
+                <text x="662" y="350" class="svg-step">&lt;</text>
+                <rect x="678" y="332" width="120" height="26" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="690" y="349" class="svg-sub">custom_vars</text>
+                <text x="812" y="350" class="svg-note">gclient.py:1924–1940</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Every key, default, count and line number in the boxes comes
+              from the file named above it, at
+              <code>chromium/src@f288fed6</code> and
+              <code>depot_tools@0306e468</code>
+              <span class="src">from the tree</span>. The three-column
+              arrangement is mine
+              <span class="recon">reconstruction</span>; gclient ships no such
+              diagram. The bottom ladder is the comment inside
+              <code>get_vars()</code>, in its own order.
+            </p>
+          </figure>

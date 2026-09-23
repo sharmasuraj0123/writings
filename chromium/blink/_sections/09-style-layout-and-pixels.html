@@ -1,0 +1,437 @@
+          <h2 id="style-layout-and-pixels"><span class="secnum">{{S}}</span>Style, layout, and pixels</h2>
+          <p class="lede">
+            Steps 16 through 21 of that task are this section. BlinkNG's
+            method fits in one sentence: make every stage a function
+            from immutable inputs to immutable outputs. Style produces a
+            <code>ComputedStyle</code> nobody may edit. Layout produces a
+            <code>PhysicalFragment</code> with no pointer to its parent. Paint
+            produces a <code>PaintArtifact</code>. Each output is the next
+            run's cache, which is why an incremental frame is cheap.
+          </p>
+
+          <h3>The lifecycle is an enum</h3>
+          <p>
+            The stages are not a convention. They are states, and the stages
+            assert on them — <code>core/dom/document_lifecycle.h</code>:49-82
+            <span class="src">from the tree</span>, read from the
+            <code>chromium/main</code> mirror the sparse checkout omits (blank
+            lines elided, two pairs of states joined):
+          </p>
+<pre><code>enum LifecycleState {
+    kUninitialized, kInactive,
+    // When the document is active, it traverses these states.
+    kVisualUpdatePending,
+    kInStyleRecalc,
+    kStyleClean,
+    kInPerformLayout,
+    kAfterPerformLayout,
+    kLayoutClean,
+    kInCompositingInputsUpdate,
+    kCompositingInputsClean,
+    // In InPrePaint step, any data needed by painting are prepared.
+    // Paint property trees are built and paint invalidations are issued.
+    kInPrePaint,
+    kPrePaintClean,
+    // In InPaint step, paint artifacts are generated and raster invalidations
+    // are issued.
+    // In CAP, composited layers are generated/updated.
+    kInPaint,
+    kPaintClean,
+    // Once the document starts shutting down, we cannot return
+    // to the style/layout/compositing states.
+    kStopping, kStopped,
+  };</code></pre>
+          <p>
+            Cite the header, not <code>core/layout/README.md</code>: the older
+            document still names <code>InPreLayout</code> and
+            <code>InLayoutSubtreeChange</code> states that no longer exist.
+          </p>
+
+          <h3>Style</h3>
+          <p>
+            Three phases <span class="src">from the tree</span>.
+            <strong>Index</strong>: a <code>RuleSet</code> buckets each rule by
+            its right-most compound selector, so <code>p.cname</code> lands
+            under the class <code>cname</code> and is never considered for
+            anything else. <strong>Match</strong>:
+            <code>ElementRuleCollector</code> tries the candidate lists against
+            one element and <code>SelectorChecker</code> decides
+            (<code>core/css/style-calculation.md</code>:74-79, 89-100).
+            <strong>Cascade</strong>: <code>StyleCascade</code> folds the
+            survivors into an immutable <code>ComputedStyle</code> whose
+            storage is generated from the same
+            <code>css_properties.json5</code> as §06's property classes. The
+            fold can run more than once: "It is valid to call Apply multiple
+            times (up to 15), and each call may provide a different filter"
+            (<code>core/css/resolver/style_cascade.h</code>:105-110).
+          </p>
+          <p>
+            Invalidation is set-based and deliberately over-approximate. Each
+            RuleSet compiles its selectors into <code>InvalidationSet</code>s;
+            a DOM mutation either marks nodes immediately or schedules sets
+            pushed just before the next recalc
+            (<code>core/css/style-invalidation.md</code>:122-152).
+          </p>
+          <p>
+            The user-agent sheet is the constant part.
+            <code>core/html/resources/html.css</code> is 2,655 lines: about 340
+            style rules by brace depth at <code>f288fed6</code>, 67
+            <code>@supports blink-feature(…)</code> blocks — 41 positive, 26
+            negated — and the UA-only quirky-em unit <code>__qem</code>. It is
+            parsed once per renderer process in <code>kUASheetMode</code>,
+            concatenated with <code>LayoutTheme</code>'s platform extras, then
+            intentionally leaked:
+            <code>LEAK_SANITIZER_IGNORE_OBJECT(sheet)</code>
+            (<code>core/css/css_default_style_sheets.cc</code>:98-137).
+            Nineteen <code>IDR_UASTYLE_*</code> sheets ship in
+            <code>blink_resources.grd</code>; SVG, MathML and the media
+            controls are parsed only when an element that needs them is first
+            styled (:375-400). Author sheets get the opposite treatment: in
+            lazy mode the parser skips each declaration block with a SIMD scan
+            whose own comment claims it is "much, much faster (something like
+            10x), since we don't need to run the full tokenizer"
+            (<code>core/css/parser/find_length_of_declaration_list-inl.h</code>:15-16).
+          </p>
+
+          <h3>Layout</h3>
+          <p>
+            LayoutNG made layout a function too. The contract is one template,
+            <code>core/layout/layout_algorithm.h</code>:43-61
+            <span class="src">from the tree</span>:
+          </p>
+<pre><code>// Base class template for all layout algorithms.
+//
+// Subclassed template specializations (actual layout algorithms) are required
+// to define the following two functions:
+//
+//   MinMaxSizesResult ComputeMinMaxSizes(const MinMaxSizesInput&amp;);
+//   const LayoutResult* Layout();
+//
+// ComputeMinMaxSizes() should compute the min-content and max-content intrinsic
+// sizes for the given box. The result should not take any min-width, max-width
+// or width properties into account.
+//
+// Layout() is the actual layout function. Lays out the children and descendants
+// within the constraints given by the ConstraintSpace. Returns a layout result
+// with the resulting layout information.
+template &lt;typename InputNodeType,
+          typename BoxFragmentBuilderType,
+          typename BreakTokenType&gt;
+class CORE_EXPORT LayoutAlgorithm {</code></pre>
+          <p>
+            Inputs: a <code>BlockNode</code> with its <code>ComputedStyle</code>
+            and children, a <code>ConstraintSpace</code>, a break token. Output:
+            a <code>LayoutResult</code> wrapping an immutable
+            <code>PhysicalFragment</code>. Reading anything outside that tuple
+            is a bug, because results are cached on the box and reused whenever
+            the constraint space compares equal and the node is not marked for
+            layout (<code>core/layout/layout_ng.md</code>:17-38, 75-95). That
+            cache is what brought flex and grid "back to O(n), resulting in
+            predictably linear performance"
+            <span class="src">from the docs</span>. Fragments
+            carry no upward references, so unchanged subtrees survive and only
+            the spine is rebuilt.
+          </p>
+          <p>
+            It shipped in pieces <span class="src">from the docs</span>: Chrome
+            77 for block and inline layout, floats and out-of-flow positioning;
+            93 for grid, which is where the exponential case was fixed;
+            102 for core fragmentation; 103 for flex and grid fragmentation;
+            106 for tables;
+            108 for printing, after which "the legacy engine is no longer used
+            to perform layout". Carry the next sentence too — "we do rely on
+            some legacy data structures for JavaScript APIs that read layout
+            information, such as <code>offsetLeft</code> and
+            <code>offsetTop</code>". Legacy layout ended at 108; legacy data
+            structures did not. Even the prefix is gone: no
+            <code>NGBlockNode</code> or <code>NGConstraintSpace</code>
+            identifier survives under <code>third_party/blink</code>.
+          </p>
+          <p>
+            Text is a pipeline inside layout: <code>ComputedStyle</code> →
+            <code>FontDescription</code> → <code>Font</code> →
+            <code>FontCache</code> → <code>SimpleFontData</code> →
+            <code>SkTypeface</code> <span class="src">from the tree</span>.
+            <code>RunSegmenter</code> first cuts the
+            string into runs of constant script, render orientation and emoji
+            presentation (<code>platform/fonts/shaping/run_segmenter.h</code>:24-39).
+            <code>HarfBuzzShaper</code> is built over the whole
+            paragraph and shapes windows of it with full context, falling down
+            <code>FontFallbackIterator</code>'s seven-value ladder that ends at
+            <code>kOutOfLuck</code>
+            (<code>platform/fonts/font_fallback_iterator.h</code>:72-80).
+            <code>NGShapeCache</code> holds
+            <code>kMaxSize = 2048</code> entries of
+            <code>kMaxTextLengthOfEntries = 30</code> code units
+            (<code>platform/fonts/shaping/ng_shape_cache.h</code>:133-134). Since Chrome
+            145 none of it runs on FreeType:
+            <code>build/config/freetype/freetype.gni</code> changes from "Blink
+            needs a recent … FreeType" at tag 144 to "Blink no longer needs
+            FreeType" at 145.
+          </p>
+
+          <h3>Pre-paint and paint</h3>
+          <p>
+            Pre-paint walks the layout tree exactly once, from the root frame
+            view and across frame boundaries, in document order — "important
+            for efficiently computing DOM-order hierarchy such as the parent
+            containing block" (<code>core/paint/README.md</code>:215-222). It
+            does two things: issue paint invalidations, and build the four
+            property trees. Transform, clip, effect, scroll; parent pointers
+            only (<code>platform/graphics/paint/README.md</code>:38-42); stored
+            per <code>FragmentData</code> in an
+            <code>ObjectPaintProperties</code> of 42 node slots
+            (<code>kNumFields = kClipAlias + 1</code>,
+            <code>kClipAlias = 41</code>, at
+            <code>core/paint/object_paint_properties.h</code>:176-179).
+          </p>
+          <p>
+            Paint then walks the fragment tree in the order CSS 2.1 appendix E
+            describes — the paint README links that page at lines 26-27 —
+            across five phases: background, forced-colors backplate, float,
+            foreground, outline (<code>core/paint/paint_phase.h</code>:32-47).
+            "There is only one <code>PaintController</code> for the entire
+            <code>LocalFrameView</code>"
+            (<code>core/paint/README.md</code>:395-396). It cuts the
+            display-item list into
+            paint chunks, each a run of items sharing one
+            <code>PropertyTreeState</code>. The resulting
+            <code>PaintArtifact</code> is immutable, and it is also the cache
+            the next paint diffs against
+            (<code>platform/graphics/paint/paint_artifact.h</code>:17-26).
+            Figure {{fig-property-trees}} takes a
+            small page through all of it.
+          </p>
+
+          <figure class="figure wide" id="fig-property-trees">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One page, four property trees, five display items, two layers</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 -24 1120 396" role="img" aria-label="Four columns. A small page of markup on the left; four paint property trees (transform, clip, effect, scroll) next; then five display items bracketed into four paint chunks, each labelled with its property tree state; then two pending layers, one merged from three chunks and one kept separate by a direct compositing reason.">
+                <defs>
+                  <marker id="fig-property-trees-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-property-trees-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                  <marker id="fig-property-trees-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+
+                <text x="16" y="-2" class="svg-lane">A SMALL PAGE</text>
+                <text x="262" y="-2" class="svg-lane">FOUR PROPERTY TREES (PRE-PAINT)</text>
+                <text x="662" y="-2" class="svg-lane">DISPLAY ITEMS → CHUNKS (PAINT)</text>
+                <text x="908" y="-2" class="svg-lane">PENDING LAYERS</text>
+
+                <rect x="16" y="14" width="224" height="150" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="30" y="38" class="svg-sub">&lt;header&gt; position: fixed;</text>
+                <text x="44" y="56" class="svg-sub">opacity: .9</text>
+                <text x="30" y="82" class="svg-sub">&lt;main&gt; overflow: scroll;</text>
+                <text x="44" y="100" class="svg-sub">&lt;p&gt; three lines of text</text>
+                <text x="44" y="118" class="svg-sub">&lt;div&gt; will-change:</text>
+                <text x="58" y="136" class="svg-sub">transform</text>
+                <text x="30" y="156" class="svg-note">four boxes, one scroller</text>
+
+                <rect x="262" y="14" width="176" height="122" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="274" y="32" class="svg-step">transform</text>
+                <text x="274" y="52" class="svg-sub">Root</text>
+                <text x="274" y="72" class="svg-sub">PaintOffsetTranslation</text>
+                <text x="274" y="92" class="svg-sub">ScrollTranslation (main)</text>
+                <text x="274" y="112" class="svg-sub">Transform (div)</text>
+                <text x="274" y="130" class="svg-note">4×4 matrix per node</text>
+
+                <rect x="452" y="14" width="176" height="122" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="464" y="32" class="svg-step">clip</text>
+                <text x="464" y="52" class="svg-sub">Root</text>
+                <text x="464" y="72" class="svg-sub">OverflowClip (main)</text>
+                <text x="464" y="130" class="svg-note">parent pointers only</text>
+
+                <rect x="262" y="152" width="176" height="104" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="274" y="170" class="svg-step">effect</text>
+                <text x="274" y="190" class="svg-sub">Root</text>
+                <text x="274" y="210" class="svg-sub">Opacity .9 (header)</text>
+                <text x="274" y="248" class="svg-note">42 slots per fragment</text>
+
+                <rect x="452" y="152" width="176" height="104" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="464" y="170" class="svg-step">scroll</text>
+                <text x="464" y="190" class="svg-sub">Root</text>
+                <text x="464" y="210" class="svg-sub">Scroll (main)</text>
+                <text x="464" y="248" class="svg-note">offsets live as transforms</text>
+
+                <rect x="672" y="14" width="212" height="24" rx="5" fill="#ffffff" stroke="#deded9"/>
+                <text x="682" y="30" class="svg-sub">Drawing · document background</text>
+                <rect x="672" y="58" width="212" height="24" rx="5" fill="#ffffff" stroke="#deded9"/>
+                <text x="682" y="74" class="svg-sub">Drawing · header background</text>
+                <rect x="672" y="86" width="212" height="24" rx="5" fill="#ffffff" stroke="#deded9"/>
+                <text x="682" y="102" class="svg-sub">Drawing · header text</text>
+                <rect x="672" y="130" width="212" height="24" rx="5" fill="#ffffff" stroke="#deded9"/>
+                <text x="682" y="146" class="svg-sub">Drawing · paragraph text</text>
+                <rect x="672" y="174" width="212" height="24" rx="5" fill="#ffffff" stroke="#deded9"/>
+                <text x="682" y="190" class="svg-sub">Drawing · the div</text>
+
+                <path d="M668 14 L662 14 L662 38 L668 38" fill="none" stroke="#765b98" stroke-width="1.5"/>
+                <path d="M668 58 L662 58 L662 110 L668 110" fill="none" stroke="#765b98" stroke-width="1.5"/>
+                <path d="M668 130 L662 130 L662 154 L668 154" fill="none" stroke="#765b98" stroke-width="1.5"/>
+                <path d="M668 174 L662 174 L662 198 L668 198" fill="none" stroke="#765b98" stroke-width="1.5"/>
+                <text x="672" y="52" class="svg-note">chunk A · root state</text>
+                <text x="672" y="124" class="svg-note">chunk B · + Opacity .9</text>
+                <text x="672" y="168" class="svg-note">chunk C · + OverflowClip, Scroll</text>
+                <text x="672" y="212" class="svg-note">chunk D · + Transform (div)</text>
+
+                <rect x="908" y="14" width="204" height="86" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="920" y="34" class="svg-step">cc::Layer 1</text>
+                <text x="920" y="54" class="svg-sub">chunks A + B + C</text>
+                <text x="920" y="74" class="svg-note">no direct reason, no overlap,</text>
+                <text x="920" y="90" class="svg-note">sparsity within tolerance</text>
+
+                <rect x="908" y="120" width="204" height="86" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="920" y="140" class="svg-step">cc::Layer 2</text>
+                <text x="920" y="160" class="svg-sub">chunk D alone</text>
+                <text x="920" y="180" class="svg-note">direct compositing reason:</text>
+                <text x="920" y="196" class="svg-note">will-change: transform</text>
+
+                <rect x="908" y="224" width="204" height="70" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="920" y="244" class="svg-step">merge test</text>
+                <text x="920" y="264" class="svg-note">merged_area − (home + guest)</text>
+                <text x="920" y="280" class="svg-note">≤ 10000 × dpr² · worst case O(n²)</text>
+
+                <line x1="240" y1="76" x2="258" y2="76" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-property-trees-blue)"/>
+                <path d="M128 164 C128 320 600 330 668 210" fill="none" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-property-trees-blue)"/>
+                <text x="330" y="332" class="svg-note">paint walks fragments in CSS 2.1 appendix E order, five phases, one PaintController</text>
+                <line x1="628" y1="90" x2="656" y2="90" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-property-trees-purple)"/>
+                <line x1="884" y1="60" x2="904" y2="60" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-property-trees-ink)"/>
+                <line x1="884" y1="186" x2="904" y2="162" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-property-trees-ink)"/>
+                <text x="560" y="362" text-anchor="middle" class="svg-note">thin blue = data · dashed purple = property-tree state attached to a chunk · thick black = a layerization decision</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured: the four tree kinds, the 42 node slots, the five paint
+              phases, the sparsity rule and its 10000 constant, all read in the
+              tree <span class="src">from the tree</span>. Reconstructed: this
+              particular page, its chunk boundaries and which two layers come
+              out <span class="recon">reconstruction</span> — I did not trace a
+              real document through <code>LayerizeGroup</code>.
+            </p>
+          </figure>
+
+          <h3>Out to the screen</h3>
+          <p>
+            CompositeAfterPaint moved layerization after paint, which is why
+            the paragraph above never mentions a layer.
+            <code>PaintArtifactCompositor</code> makes one
+            <code>PendingLayer</code> per chunk and merges neighbours unless a
+            direct compositing reason, an overlap, or sparsity forbids it:
+            <code>platform/graphics/compositing/pending_layer.cc</code>:205-206
+            tests <code>merged_area − (home_area + guest_area) ≤
+            kMergeSparsityAreaTolerance</code>, constant <code>10000</code>,
+            scaled by the device pixel ratio squared at :302. Worst case the
+            algorithm has "an O(n^2) running time, where n is the number of
+            <code>PaintChunks</code>"
+            (<code>platform/graphics/compositing/README.md</code>:31-32).
+          </p>
+          <p>
+            Downstream is cc, then Viz. Figure {{fig-to-pixels}} follows the
+            data structures rather than the threads.
+          </p>
+
+          <figure class="figure" id="fig-to-pixels">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">From PaintArtifact to a framebuffer, one data structure at a time</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 -24 980 330" role="img" aria-label="Eight data structures in two rows connected by labelled arrows: PaintArtifact, cc layer list with property trees, pending layer tree, tiles, then active layer tree, CompositorFrame, aggregated frame, and framebuffer.">
+                <defs>
+                  <marker id="fig-to-pixels-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+
+                <text x="10" y="-2" class="svg-lane">IN THE RENDERER</text>
+                <text x="510" y="224" class="svg-lane">IN VIZ — ONE PROCESS FOR ALL OF CHROMIUM</text>
+
+                <rect x="10" y="12" width="210" height="58" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="34" class="svg-step">PaintArtifact</text>
+                <text x="22" y="54" class="svg-sub">display items + chunks</text>
+                <rect x="260" y="12" width="210" height="58" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="272" y="34" class="svg-step">cc::Layer list</text>
+                <text x="272" y="54" class="svg-sub">+ four cc::PropertyTrees</text>
+                <rect x="510" y="12" width="210" height="58" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="522" y="34" class="svg-step">pending tree</text>
+                <text x="522" y="54" class="svg-sub">LayerTreeImpl copy</text>
+                <rect x="760" y="12" width="210" height="58" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="772" y="34" class="svg-step">tiles</text>
+                <text x="772" y="54" class="svg-sub">256×256 sw · 4-high gpu</text>
+
+                <line x1="220" y1="41" x2="256" y2="41" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-to-pixels-ink)"/>
+                <text x="238" y="6" text-anchor="middle" class="svg-num">LayerizeGroup</text>
+                <line x1="470" y1="41" x2="506" y2="41" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-to-pixels-ink)"/>
+                <text x="488" y="6" text-anchor="middle" class="svg-num">Commit</text>
+                <line x1="720" y1="41" x2="756" y2="41" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-to-pixels-ink)"/>
+                <text x="738" y="6" text-anchor="middle" class="svg-num">Raster</text>
+
+                <path d="M865 70 L865 104 L115 104 L115 148" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-to-pixels-ink)"/>
+                <text x="490" y="98" text-anchor="middle" class="svg-num">Activate</text>
+
+                <rect x="10" y="150" width="210" height="58" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="22" y="172" class="svg-step">active tree</text>
+                <text x="22" y="192" class="svg-sub">tiles ready to draw</text>
+                <rect x="260" y="150" width="210" height="58" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="272" y="172" class="svg-step">CompositorFrame</text>
+                <text x="272" y="192" class="svg-sub">render passes of quads</text>
+                <rect x="510" y="150" width="210" height="58" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="522" y="172" class="svg-step">aggregated frame</text>
+                <text x="522" y="192" class="svg-sub">every client's surfaces</text>
+                <rect x="760" y="150" width="210" height="58" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="772" y="172" class="svg-step">framebuffer</text>
+                <text x="772" y="192" class="svg-sub">SkiaRenderer output</text>
+
+                <line x1="220" y1="179" x2="256" y2="179" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-to-pixels-ink)"/>
+                <text x="238" y="144" text-anchor="middle" class="svg-num">AppendQuads</text>
+                <line x1="470" y1="179" x2="506" y2="179" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-to-pixels-ink)"/>
+                <text x="488" y="144" text-anchor="middle" class="svg-num">SurfaceAggregator</text>
+                <line x1="720" y1="179" x2="756" y2="179" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-to-pixels-ink)"/>
+                <text x="738" y="144" text-anchor="middle" class="svg-num">Draw</text>
+
+                <text x="10" y="240" class="svg-note">Root render pass is last in the list; quads inside a pass run back to front; a preserve-3d context is BSP-sorted.</text>
+                <text x="10" y="262" class="svg-note">Boxes are data structures. The labels on the arrows are the operations that produce the next one.</text>
+                <text x="10" y="284" class="svg-note">Which thread runs which arrow is §04's problem, not this diagram's.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Every box and every arrow is named in the tree
+              <span class="src">from the tree</span>: the artifact and
+              <code>LayerizeGroup</code> in
+              <code>platform/graphics/paint/paint_artifact.h</code>:17-26 and
+              <code>platform/graphics/compositing/paint_artifact_compositor.cc</code>:846;
+              the cc half — layer list, pending and active trees, tiles,
+              commit, raster, activate, <code>AppendQuads</code>,
+              <code>CompositorFrame</code> — in
+              <code>docs/how_cc_works.md</code>:31-49, 190-207, 231-253,
+              334-360; aggregation, draw and the framebuffer in
+              <code>docs/life_of_a_frame.md</code>:38-42, 56-57. The tile numbers are
+              defaults from <code>cc/trees/layer_tree_settings.cc</code>:17 and
+              <code>cc/layers/tile_size_calculator.cc</code>:64-66; Android,
+              ChromeOS and Mac raise them.
+            </p>
+          </figure>
+
+          <p>
+            The history behind that picture is usually told wrong. The chain is
+            M45 display items → M58 property trees inside Blink → M67 paint
+            chunks → M75 a layer list instead of a layer tree → M94
+            CompositeAfterPaint, and "following launch, 22,000 lines of c++
+            were removed", with −1.3% total Chrome CPU and "3.5%+" on
+            99th-percentile scroll update claimed for the whole 2015–2021
+            project as lower bounds <span class="src">from the docs</span>. But
+            M94 is the milestone a Finch trial turned it on in, not the
+            milestone the code flipped
+            <span class="recon">reconstruction</span>. Finch is Chrome's
+            server-side configuration system: it enables a
+            <code>base::Feature</code> in the field without a new binary, and
+            §11's second gate is where that lands in Blink. The launch thread's
+            agreed schedule reads "Oct 6: Enable at TOT in M96" after the first
+            plan was withdrawn there as "too aggressive", and the flip from
+            status "test" to "stable" landed on 2021-10-27 in commit
+            <code>1479240c28d2</code>, past the M96 branch point.
+          </p>
+          <p>
+            Six years of work, and the deliverable is a shape rather than a
+            speed-up.
+          </p>

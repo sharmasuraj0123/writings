@@ -1,0 +1,375 @@
+<h2 id="one-builder-expanded"><span class="secnum">{{S}}</span>One builder, expanded</h2>
+<p class="lede">
+  A CI builder is one keyword-argument call in Starlark. Ten artefacts come
+  out of it. At run time it is a Swarming task whose command is a recipe the
+  builder does not pin. <code>ci/Linux Builder</code> is the one to walk,
+  because every other builder in the fleet is a variation of it.
+</p>
+<p>
+  The call is 51 lines and it declares almost nothing about machines. This is
+  <code>src/infra/config/subprojects/chromium/ci/chromium.linux.star:328-350</code>,
+  the first half of it <span class="src">from the tree</span>:
+</p>
+<pre><code>ci.builder(
+    name = "Linux Builder",
+    branch_selector = branches.selector.LINUX_BRANCHES,
+    builder_spec = builder_config.builder_spec(
+        gclient_config = builder_config.gclient_config(
+            config = "chromium",
+            apply_configs = [
+                "use_clang_coverage",
+                # This is necessary due to child builders running the
+                # telemetry_perf_unittests suite.
+                "chromium_with_telemetry_dependencies",
+            ],
+        ),
+        chromium_config = builder_config.chromium_config(
+            config = "chromium",
+            apply_configs = [
+                "mb",
+            ],
+            build_config = builder_config.build_config.RELEASE,
+            target_bits = 64,
+            target_platform = builder_config.target_platform.LINUX,
+        ),
+    ),</code></pre>
+<p>
+  The remaining 28 lines (<code>:351-378</code>) name a six-entry
+  <code>gn_args.config</code> — <code>gpu_tests</code>,
+  <code>release_builder</code>, <code>remoteexec</code>,
+  <code>devtools_do_typecheck</code>, <code>linux</code>, <code>x64</code> — a
+  <code>targets.bundle</code> holding <code>chromium_linux_scripts</code> with
+  <code>additional_compile_targets = ["all"]</code>, a console entry with
+  category <code>release</code> and short name <code>bld</code>, and
+  <code>contact_team_email = "chrome-linux-engprod@google.com"</code>. That is
+  the whole authored surface.
+</p>
+<p>
+  Everything about hardware is inherited. The file's own
+  <code>ci.defaults.set</code> supplies builder group
+  <code>chromium.linux</code>, pool <code>luci.chromium.ci</code>,
+  <code>cores = 8</code>, <code>os.LINUX_DEFAULT</code>,
+  <code>gardener_rotations.CHROMIUM</code>, <code>tree_closing = True</code>,
+  the default three-hour <code>execution_timeout</code> and
+  <code>health_spec.default()</code>
+  [<code>chromium.linux.star:20-44</code>; <code>lib/ci_constants.star:5-14</code>].
+  One level up, <code>ci.star</code> sets the bucket-wide defaults: bucket
+  <code>ci</code>, <code>triggered_by = ["chromium-gitiles-trigger"]</code>,
+  <code>cpu.X86_64</code>, <code>free_space.standard</code>, and the shadow
+  pool <code>luci.chromium.try</code> [<code>ci.star:16-26</code>]. Its
+  comment for the shadow bucket is one line: "Shadow bucket of `ci`, for led
+  builds" [<code>ci.star:73-76</code>]. <em>led</em> is depot_tools' LUCI
+  editor: <code>led get-builder</code> prints a builder's job definition as
+  JSON, <code>led edit-*</code> patches it, and <code>led launch</code> runs
+  the result as a Swarming task. The shadow bucket is where those hand-edited
+  jobs land: a developer can run a modified version of any CI builder without
+  landing a CL, and it runs in <code>ci.shadow</code> on the
+  <code>luci.chromium.try</code> pool rather than in <code>ci</code> on the
+  production one.
+</p>
+<p>
+  Ten files change when that call changes. lucicfg emits a Buildbucket builder
+  block (<code>cr-buildbucket.cfg:17817-17935</code>, 119 lines), a Scheduler
+  job (<code>luci-scheduler.cfg:1369-1377</code>), five Milo console entries —
+  in <code>main</code>, <code>mirrors</code>, <code>chromium rotation</code>,
+  <code>chromium tree closers</code> and <code>chromium.linux</code> — a
+  luci-notify <code>tree_closers</code> entry against
+  <code>chromium-status.appspot.com</code>
+  (<code>luci-notify.cfg:780-805</code>), a health spec under
+  <code>specs.ci["Linux Builder"]</code>, the first line of
+  <code>builder-owners/chrome-linux-engprod@google.com.txt</code>, and four
+  per-builder files: <code>properties.json</code> (209 lines),
+  <code>shadow-properties.json</code> (14), <code>gn-args.json</code> (14) and
+  <code>targets/chromium.linux.json</code> (2,756). Fifty-one lines of
+  Starlark; 3,112 lines of generated text
+  <span class="src">from the tree</span>. Figure {{fig-builder-fanout}} lays out
+  the fan-out.
+</p>
+<p>
+  The generated block is where the interesting substitution happens. This is
+  <code>src/infra/config/generated/luci/cr-buildbucket.cfg:17817-17841</code>,
+  dedented by four spaces:
+</p>
+<pre><code>builders {
+  name: "Linux Builder"
+  swarming_host: "chromium-swarm.appspot.com"
+  dimensions: "builderless:1"
+  dimensions: "cores:8"
+  dimensions: "cpu:x86-64"
+  dimensions: "free_space:standard"
+  dimensions: "os:Ubuntu-22.04"
+  dimensions: "pool:luci.chromium.ci"
+  dimensions: "ssd:0"
+  exe {
+    cipd_package: "infra/chromium/bootstrapper/${platform}"
+    cipd_version: "latest"
+    cmd: "bootstrapper"
+  }
+  properties:
+    '{'
+    '  "$bootstrap/exe": {'
+    '    "exe": {'
+    '      "cipd_package": "infra/recipe_bundles/chromium.googlesource.com/chromium/tools/build",'
+    '      "cipd_version": "refs/heads/main",'
+    '      "cmd": ['
+    '        "luciexe"'
+    '      ]'
+    '    }'</code></pre>
+<p>
+  Seven dimensions, and an <code>exe</code> that is not a recipe. The builder
+  runs <code>infra/chromium/bootstrapper/${platform}</code> at
+  <code>cipd_version: "latest"</code>. The real recipe bundle is buried in the
+  <code>$bootstrap/exe</code> property at <code>refs/heads/main</code>, and
+  <code>$bootstrap/properties</code> names
+  <code>infra/config/generated/builders/ci/Linux Builder/properties.json</code>
+  [<code>:17843-17845</code>]. The reason is versioning: the bootstrapper is a
+  passthrough luciexe that reads the properties file <em>from the source
+  revision being built</em>, so "property changes for CQ builders will be
+  applied during the CQ run" and a build of an old revision gets that
+  revision's properties <span class="src">from the docs</span>
+  [<code>infra/chromium starlark-libs/chromium-luci/bootstrap.star:5-18</code>].
+  It applies the CL's own diff to the file before reading it
+  [infra/infra
+  <code>go/src/infra/chromium/bootstrapper/bootstrap/build.go:386-410</code>].
+  Counted at
+  <code>f288fed6</code>: 1,070 of the 1,211 builders run the bootstrapper; 141
+  run <code>cmd: "luciexe"</code> on a bundle directly.
+</p>
+<p>
+  One consequence follows and is worth stating as a guess rather than a
+  reading. Neither an orchestrator nor the compilator it schedules pins the
+  bundle — <code>ScheduleBuildRequest.exe</code> supports only
+  <code>cipd_version</code> overrides — so each resolves
+  <code>refs/heads/main</code> at its own start, and a bundle landing between
+  them puts two recipe revisions in one logical build
+  <span class="recon">reconstruction</span>.
+</p>
+<p>
+  At run time the abstraction collapses. Chromium's own documentation says it
+  is "not inaccurate to conceptualize a Buildbucket build simply as a Swarming
+  task whose command is its 'recipe'"
+  [<code>src/docs/infra/builder_types.md:51-52</code>]. Swarming's own README
+  calls it "purely a task scheduler service" in which "File I/O is done
+  through RBE-CAS"; its design doc calls the fleet "a legion of dumb bots"
+  [luci-py <code>appengine/swarming/README.md</code>;
+  <code>appengine/swarming/doc/Design.md</code>]. The in-tree glossary supplies
+  the matching rule and the boundary: "only bots that match all requested
+  dimensions will execute the task", a pool "acts as a security boundary,
+  enforcing who can view and trigger tasks on its bots", and CAS is glossed by
+  "its predecessor's name: 'isolate'"
+  <span class="src">from the docs</span>
+  [<code>src/docs/infra/glossary.md:134-149</code>]. On the bot,
+  <code>bbagent</code> runs a LogDog butler, merges <code>build.proto</code>
+  datagrams out of the luciexe, forwards them to Buildbucket and uploads every
+  stream to LogDog; a luciexe that exits without a terminal status is recorded
+  as <code>INFRA_FAILURE</code> [luci-go <code>luciexe/doc.go</code>].
+</p>
+
+<figure class="figure wide" id="fig-builder-fanout">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">One <code>ci.builder</code> call in, ten artefacts out, one indirection at run time</p>
+  </div>
+  <div class="figure-body plain">
+    <svg viewBox="0 -24 1020 572" role="img" aria-label="Left: the fifty-one line ci.builder call for Linux Builder, with two boxes below it holding the values inherited from the file's ci.defaults and from ci.star's bucket-wide defaults. Middle: lucicfg. Right: the ten artefacts lucicfg emits, with their paths and line counts. A bottom band shows the run-time resolution chain from bbagent through the bootstrapper at cipd latest, to the recipe bundle at refs slash heads slash main, to the properties file read at the input commit.">
+      <defs>
+        <marker id="fig-builder-fanout-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+        <marker id="fig-builder-fanout-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+        <marker id="fig-builder-fanout-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+      </defs>
+
+      <text x="20" y="28" class="svg-lane">AUTHORED · 51 LINES</text>
+      <text x="350" y="28" class="svg-lane">LUCICFG</text>
+      <text x="600" y="28" class="svg-lane">EMITTED · 3,112 LINES</text>
+
+      <rect x="20" y="48" width="280" height="112" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="36" y="72" class="svg-step">ci.builder(name = "Linux Builder")</text>
+      <text x="36" y="92" class="svg-sub">chromium.linux.star:328-378</text>
+      <text x="36" y="110" class="svg-sub">builder_spec · gclient chromium</text>
+      <text x="36" y="128" class="svg-sub">gn_args: 6 configs · targets.bundle</text>
+      <text x="36" y="146" class="svg-sub">console release/bld · contact e-mail</text>
+
+      <rect x="20" y="176" width="280" height="148" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="36" y="200" class="svg-step">inherited · ci.defaults, :20-44</text>
+      <text x="36" y="220" class="svg-sub">builder_group chromium.linux</text>
+      <text x="36" y="238" class="svg-sub">pool luci.chromium.ci</text>
+      <text x="36" y="256" class="svg-sub">cores 8 · os LINUX_DEFAULT</text>
+      <text x="36" y="274" class="svg-sub">gardener_rotations CHROMIUM</text>
+      <text x="36" y="292" class="svg-sub">tree_closing True · timeout 3 h</text>
+      <text x="36" y="310" class="svg-sub">health_spec.default()</text>
+
+      <rect x="20" y="340" width="280" height="96" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="36" y="364" class="svg-step">inherited · ci.star:16-26</text>
+      <text x="36" y="384" class="svg-sub">bucket ci</text>
+      <text x="36" y="402" class="svg-sub">triggered_by chromium-gitiles-trigger</text>
+      <text x="36" y="420" class="svg-sub">cpu X86_64 · free_space standard</text>
+
+      <rect x="350" y="176" width="180" height="96" rx="10" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <text x="366" y="206" class="svg-step">lucicfg 1.46.7</text>
+      <text x="366" y="228" class="svg-sub">graph → generated/</text>
+      <text x="366" y="250" class="svg-sub">tracked_files decides</text>
+
+      <rect x="600" y="48" width="400" height="152" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="616" y="72" class="svg-step">service configs — 6</text>
+      <text x="616" y="94" class="svg-sub">cr-buildbucket.cfg:17817-17935 · 119 lines</text>
+      <text x="616" y="112" class="svg-sub">luci-scheduler.cfg:1369-1377 · 1 job</text>
+      <text x="616" y="130" class="svg-sub">luci-milo.cfg · 5 console entries</text>
+      <text x="616" y="148" class="svg-sub">luci-notify.cfg:780-805 · tree_closer</text>
+      <text x="616" y="166" class="svg-sub">health-specs.json · specs.ci[…]</text>
+      <text x="616" y="184" class="svg-sub">builder-owners/chrome-linux-engprod…txt:1</text>
+
+      <rect x="600" y="212" width="400" height="116" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="616" y="236" class="svg-step">builders/ci/Linux Builder/ — 4 files</text>
+      <text x="616" y="258" class="svg-sub">properties.json · 209 lines</text>
+      <text x="616" y="276" class="svg-sub">shadow-properties.json · 14</text>
+      <text x="616" y="294" class="svg-sub">gn-args.json · 14</text>
+      <text x="616" y="312" class="svg-sub">targets/chromium.linux.json · 2,756</text>
+
+      <line x1="300" y1="104" x2="350" y2="200" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-builder-fanout-arr-blue)"/>
+      <line x1="300" y1="250" x2="350" y2="224" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-builder-fanout-arr-purple)"/>
+      <line x1="300" y1="388" x2="350" y2="260" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-builder-fanout-arr-purple)"/>
+      <line x1="530" y1="200" x2="600" y2="140" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-builder-fanout-arr-ink)"/>
+      <line x1="530" y1="248" x2="600" y2="270" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-builder-fanout-arr-ink)"/>
+
+      <text x="600" y="376" class="svg-lane">AT RUN TIME · ON ONE SWARMING BOT</text>
+      <rect x="600" y="392" width="400" height="44" rx="8" fill="#ffffff" stroke="#252525"/>
+      <text x="616" y="410" class="svg-step">bbagent</text>
+      <text x="616" y="428" class="svg-sub">LogDog butler · merges build.proto</text>
+      <rect x="600" y="446" width="400" height="44" rx="8" fill="#ffffff" stroke="#252525"/>
+      <text x="616" y="464" class="svg-step">bootstrapper · cipd_version "latest"</text>
+      <text x="616" y="482" class="svg-sub">not pinned — resolved at task start</text>
+      <rect x="600" y="500" width="400" height="44" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+      <text x="616" y="518" class="svg-step">recipe bundle @ refs/heads/main</text>
+      <text x="616" y="536" class="svg-sub">+ properties.json read at the input commit</text>
+
+      <text x="310" y="470" text-anchor="middle" class="svg-note">thin blue = the authored call · dashed purple = inherited defaults</text>
+      <text x="310" y="494" text-anchor="middle" class="svg-note">thick black = generation · the run-time chain resolves top to bottom</text>
+    </svg>
+  </div>
+  <p class="figure-caption">
+    Every path, line range and line count on the right is measured at
+    <code>f288fed6</code> with <code>wc</code> and <code>grep -n</code>
+    <span class="src">from the tree</span>; 119 + 209 + 14 + 14 + 2,756 =
+    3,112, excluding the scheduler, Milo, notify, health-spec and owner lines,
+    which sit inside shared files. The bottom band is read off the generated
+    <code>exe</code> and <code>$bootstrap/*</code> properties, not from an
+    observed build <span class="recon">reconstruction</span>.
+  </p>
+</figure>
+
+<p>
+  Scale that call 1,211 times and you get the fleet. Eighteen buckets of
+  <code>cr-buildbucket.cfg</code> hold it: ci 641 and try 500, ten small ones
+  summing to 70, and six empty dynamic <code>*.shadow</code> buckets. Within
+  them, 55 distinct
+  <code>builder_group</code> values and 32 builders with no group at all: ci is
+  641 builders across 30 named groups plus 6 group-less, try is 500 across 21
+  plus 9. The ten small buckets are where the platform does something other
+  than build Chrome, and Figure {{fig-buckets}} gives each one its clause.
+</p>
+
+<figure class="figure wide" id="fig-buckets">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">18 buckets, 1,211 builders, and what the small ones are for</p>
+  </div>
+  <div class="figure-body plain">
+    <svg viewBox="0 -24 1020 574" role="img" aria-label="A tree map of the eighteen Buildbucket buckets. The ci bucket with 641 builders and the try bucket with 500 fill the top row at proportional widths, each subdivided into horizontal bands for its largest builder groups with a hatched remainder band. Below, ten equal tiles carry the small buckets with their builder counts and a one-line role each. A strip of six hairlines at the bottom stands for the six empty shadow buckets.">
+      <defs>
+        <pattern id="fig-buckets-hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+          <rect width="8" height="8" fill="#f7f7f5"/>
+          <line x1="0" y1="0" x2="0" y2="8" stroke="#b8b8b1" stroke-width="1.5"/>
+        </pattern>
+      </defs>
+
+      <text x="20" y="28" class="svg-lane">CI · 641 BUILDERS · 30 NAMED GROUPS + 6 GROUP-LESS</text>
+      <text x="572" y="28" class="svg-lane">TRY · 500 · 21 + 9</text>
+
+      <rect x="20" y="40" width="548" height="268" rx="6" fill="#f7f7f5" stroke="#3c6f97"/>
+      <rect x="28" y="76" width="532" height="26" fill="#e0ebf2" stroke="#3c6f97" stroke-width="0.5"/>
+      <text x="38" y="94" class="svg-sub">chromium.gpu.fyi · 74</text>
+      <rect x="28" y="102" width="532" height="21" fill="#e0ebf2" stroke="#3c6f97" stroke-width="0.5"/>
+      <text x="38" y="117" class="svg-sub">chromium.dawn · 60</text>
+      <rect x="28" y="123" width="532" height="20" fill="#e0ebf2" stroke="#3c6f97" stroke-width="0.5"/>
+      <text x="38" y="138" class="svg-sub">chromium.android · 58</text>
+      <rect x="28" y="143" width="532" height="20" fill="#e0ebf2" stroke="#3c6f97" stroke-width="0.5"/>
+      <text x="38" y="158" class="svg-sub">chromium.fyi · 56</text>
+      <rect x="28" y="163" width="532" height="18" fill="#e0ebf2" stroke="#3c6f97" stroke-width="0.5"/>
+      <text x="38" y="176" class="svg-sub">chromium.fuzz · 51</text>
+      <rect x="28" y="181" width="532" height="16" fill="#e0ebf2" stroke="#3c6f97" stroke-width="0.5"/>
+      <text x="38" y="193" class="svg-sub">chromium.clang · 47</text>
+      <rect x="28" y="197" width="532" height="103" fill="url(#fig-buckets-hatch)" stroke="#3c6f97" stroke-width="0.5"/>
+      <text x="38" y="226" class="svg-step">remainder · 295</text>
+      <text x="38" y="248" class="svg-sub">24 more named groups, incl. chromium.updater 35,</text>
+      <text x="38" y="266" class="svg-sub">chromium.linux 24, chromium.memory 22, chromium 19,</text>
+      <text x="38" y="284" class="svg-sub">chromium.win 16 — plus 6 builders with no group</text>
+
+      <rect x="572" y="40" width="428" height="268" rx="6" fill="#f7f7f5" stroke="#765b98"/>
+      <rect x="580" y="76" width="412" height="48" fill="#ece6f3" stroke="#765b98" stroke-width="0.5"/>
+      <text x="590" y="106" class="svg-sub">tryserver.chromium.android · 106</text>
+      <rect x="580" y="124" width="412" height="37" fill="#ece6f3" stroke="#765b98" stroke-width="0.5"/>
+      <text x="590" y="148" class="svg-sub">tryserver.chromium.linux · 83</text>
+      <rect x="580" y="161" width="412" height="32" fill="#ece6f3" stroke="#765b98" stroke-width="0.5"/>
+      <text x="590" y="182" class="svg-sub">tryserver.chromium.mac · 72</text>
+      <rect x="580" y="193" width="412" height="22" fill="#ece6f3" stroke="#765b98" stroke-width="0.5"/>
+      <text x="590" y="209" class="svg-sub">tryserver.chromium.win · 49</text>
+      <rect x="580" y="215" width="412" height="85" fill="url(#fig-buckets-hatch)" stroke="#765b98" stroke-width="0.5"/>
+      <text x="590" y="244" class="svg-step">remainder · 190</text>
+      <text x="590" y="266" class="svg-sub">17 more named groups, incl. dawn 38,</text>
+      <text x="590" y="284" class="svg-sub">fuzz 30, chromiumos 18 — plus 9 with no group</text>
+
+      <text x="20" y="336" class="svg-lane">THE OTHER TEN BUCKETS · 70 BUILDERS · NOT DRAWN TO SCALE</text>
+
+      <rect x="20" y="348" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="32" y="370" class="svg-step">build · 20</text>
+      <text x="32" y="390" class="svg-sub">measures Siso/RBE speed</text>
+      <rect x="217" y="348" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="229" y="370" class="svg-step">webrtc.fyi · 14</text>
+      <text x="229" y="390" class="svg-sub">WebRTC in Chromium, FYI</text>
+      <rect x="414" y="348" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="426" y="370" class="svg-step">reviver · 12</text>
+      <text x="426" y="390" class="svg-sub">reruns disabled tests</text>
+      <rect x="611" y="348" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="623" y="370" class="svg-step">codesearch · 8</text>
+      <text x="623" y="390" class="svg-sub">Kythe extract, no kzip upload</text>
+      <rect x="808" y="348" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="820" y="370" class="svg-step">webrtc · 8</text>
+      <text x="820" y="390" class="svg-sub">WebRTC in Chromium</text>
+
+      <rect x="20" y="412" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="32" y="434" class="svg-step">findit · 2</text>
+      <text x="32" y="454" class="svg-sub">LUCI Bisection rerun fleet</text>
+      <rect x="217" y="412" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="229" y="434" class="svg-step">infra · 2</text>
+      <text x="229" y="454" class="svg-sub">the autosharder + its tester</text>
+      <rect x="414" y="412" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="426" y="434" class="svg-step">trusted.robots · 2</text>
+      <text x="426" y="454" class="svg-sub">Clang builds in Lexan</text>
+      <rect x="611" y="412" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="623" y="434" class="svg-step">flaky-reproducer · 1</text>
+      <text x="623" y="454" class="svg-sub">replays one flaky task</text>
+      <rect x="808" y="412" width="192" height="58" rx="6" fill="#dfede5" stroke="#367f59"/>
+      <text x="820" y="434" class="svg-step">ssci · 1</text>
+      <text x="820" y="454" class="svg-sub">third-party vendoring trigger</text>
+
+      <text x="20" y="500" class="svg-lane">SIX EMPTY DYNAMIC BUCKETS · 0 BUILDERS EACH</text>
+      <rect x="20" y="510" width="150" height="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <rect x="180" y="510" width="150" height="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <rect x="340" y="510" width="150" height="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <rect x="500" y="510" width="150" height="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <rect x="660" y="510" width="150" height="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <rect x="820" y="510" width="150" height="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <text x="20" y="536" class="svg-sub">build.shadow · ci.shadow · findit.shadow · infra.shadow · try.shadow · webrtc.fyi.shadow — "for led builds"</text>
+    </svg>
+  </div>
+  <p class="figure-caption">
+    Counts measured by parsing <code>cr-buildbucket.cfg</code> at
+    <code>f288fed6</code>, reading each builder's <code>builder_group</code>
+    property and ignoring <code>shadow_builder_adjustments</code>, which
+    repeats it <span class="src">from the tree</span>; the twelve non-empty
+    buckets sum to 1,211. The ci and try tiles are to scale against each other
+    and their internal bands are to scale within each tile; the ten small
+    buckets are drawn at a fixed size so their roles fit, so that row is not
+    area-true.
+  </p>
+</figure>

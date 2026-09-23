@@ -1,0 +1,198 @@
+          <h2 id="features-tests-and-shipping"><span class="secnum">{{S}}</span>Flags, tests, and shipping a feature</h2>
+          <p class="lede">
+            None of the machinery so far is on for everyone at once. In Blink
+            a feature's existence is a row in a json5 file. Its reach
+            is a status string inside that row. And a line in
+            <code>TestExpectations</code> is how the project admits, in
+            public, that it is not done.
+          </p>
+
+          <p>
+            The file is
+            <code>platform/runtime_enabled_features.json5</code>: 7,514 lines
+            declaring <strong>1,227</strong> features
+            <span class="src">from the tree</span>. Parsed rather than
+            grepped, the shape is 564 rows with a plain-string status
+            <code>"stable"</code>, 301 <code>"experimental"</code>, 90
+            <code>"test"</code>, 90 carrying a per-platform status dictionary
+            — only 22 of which default to stable — and 182 with no status at
+            all. Ninety-five rows name an origin trial, 188 set
+            <code>base_feature: "none"</code> and so have no Finch
+            killswitch, 79 declare <code>depends_on</code>, 26
+            <code>implied_by</code>, and 3 a <code>custom_enable_check</code>. Those counts are a json5 parse at
+            <code>f288fed6</code>, not a line grep: grepping <code>^\s*name: </code> undercounts by two,
+            because two rows omit the space after the colon.
+          </p>
+          <p>
+            One row, at
+            <code>runtime_enabled_features.json5</code>:516-530, carries most
+            of the vocabulary at once:
+          </p>
+<pre><code>{
+  name: "AIRewriterAPI",
+  status: {
+    "Win": "experimental",
+    "Mac": "experimental",
+    "Linux": "experimental",
+    "ChromeOS": "experimental",
+    "default": "",
+  },
+  origin_trial_feature_name: "AIRewriterAPI",
+  origin_trial_os: ["win", "mac", "linux", "chromeos"],
+  origin_trial_allows_third_party: true,
+  base_feature_status: "enabled",
+  copied_from_base_feature_if: "overridden",
+},</code></pre>
+          <p>
+            Status buys reach, and nothing else
+            (<code>RuntimeEnabledFeatures.md</code>:20-29, which prints the
+            matrix as a table): no status is on by default anywhere,
+            <code>test</code> in
+            <code>content_shell</code> under <code>--run-web-tests</code>,
+            <code>experimental</code> also under
+            <code>--enable-experimental-web-platform-features</code>,
+            <code>stable</code> everyone
+            <span class="src">from the docs</span>.
+            <code>make_runtime_features.py</code> then flattens all 1,227 rows
+            into one <code>bool feature_states_[kFlagIndexCount]</code> array
+            indexed by an <code>enum FlagIndex : uint16_t</code>, and looks
+            names up by binary search over a NUL-separated constexpr string
+            pool — small integers, not pointers, so the table needs no
+            relocations
+            (<code>templates/runtime_enabled_features.h.tmpl</code>:29-52,
+            <code>.cc.tmpl</code>:76-124). Accessors fold in
+            <code>depends_on</code> (false if any parent is off) and
+            <code>implied_by</code> (true if any parent is on). Every feature gets a
+            <code>&lt;feature&gt;Enabled(const FeatureContext*)</code>
+            overload, but for most rows it is an inline forward to the
+            context-free check
+            (<code>runtime_enabled_features.h.tmpl</code>:77-81). Origin-trial
+            features get no context-free
+            <code>&lt;feature&gt;Enabled()</code> at all — only
+            <code>&lt;feature&gt;EnabledByRuntimeFlag()</code> and an
+            out-of-line context overload — and the comment at
+            <code>runtime_enabled_features.h.tmpl</code>:86-94 says that
+            runtime-flag form "is almost always the incorrect check."
+          </p>
+          <p>
+            The token that satisfies that context is a base64 structure: one
+            version byte (<code>0x02</code> or <code>0x03</code>), a 64-byte
+            Ed25519 signature, a 4-byte big-endian payload length, and a JSON
+            payload of <code>origin</code>, <code>feature</code> and
+            <code>expiry</code>
+            (<code>public/common/origin_trials/origin_trials_token_structure.md</code>:10-61)
+            <span class="src">from the docs</span>. How long it may keep
+            working, the documentation does not agree on. The
+            launching-features page says an initial trial "may only run for 12
+            milestones of Chromium", extensions "for 6 milestones at a time";
+            running-an-origin-trial says trials "can run for up to 6
+            milestones (~24 weeks)." Neither page carries a date. I print the
+            contradiction rather than pick a winner.
+          </p>
+
+          <figure class="figure wide" id="fig-feature-stack">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Four gates between a json5 row and a user</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row">
+                  <div class="stack-cell head">1 · The user's switch</div>
+                  <div class="stack-cell hl-blue"><code>about:flags</code>, <code>--enable-blink-features=</code> / <code>--disable-blink-features=</code>. Disable is applied later and wins regardless of order.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">2 · The remote switch</div>
+                  <div class="stack-cell hl-green"><code>base::Feature</code> under Finch, copied into the Blink flag by <code>UpdateStatusFromBaseFeatures</code>, subject to <code>copied_from_base_feature_if</code>. <strong>188</strong> rows opt out: <code>base_feature: "none"</code>.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">3 · The C++ check</div>
+                  <div class="stack-cell hl-purple"><code>RuntimeEnabledFeatures::XEnabled()</code> — one bool in <code>feature_states_[kFlagIndexCount]</code>, with <code>depends_on</code> and <code>implied_by</code> folded in. <strong>1,227</strong> rows, <strong>79</strong>+<strong>26</strong> edges.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">4 · The per-origin switch</div>
+                  <div class="stack-cell hl-orange"><code>XEnabled(const FeatureContext*)</code> — every row carries this overload, but only for origin-trial rows is it out-of-line and ending in a signed token check; the rest inline-forward to gate 3. <strong>95</strong> rows.</div>
+                </div>
+              </div>
+              <table>
+                <thead>
+                  <tr><th>status</th><th>content_shell --run-web-tests</th><th>--enable-experimental-web-platform-features</th><th>stable release</th><th>rows</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td><em>missing</em></td><td>No</td><td>No</td><td>No</td><td>182</td></tr>
+                  <tr><td><code>test</code></td><td>Yes</td><td>No</td><td>No</td><td>90</td></tr>
+                  <tr><td><code>experimental</code></td><td>Yes</td><td>Yes</td><td>No</td><td>301</td></tr>
+                  <tr><td><code>stable</code></td><td>Yes</td><td>Yes</td><td>Yes</td><td>564</td></tr>
+                  <tr><td>per-platform dict</td><td colspan="3">whichever row the current platform's string names; 22 of the 90 default to stable</td><td>90</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Matrix columns transcribed from
+              <code>RuntimeEnabledFeatures.md</code>:20-29, minus its fifth
+              column (a non-web-exposed feature with no status can still be
+              turned on from the command line); every count
+              measured by a json5 parse at <code>f288fed6</code>. Ordering the
+              four gates into one stack is mine
+              <span class="recon">reconstruction</span>; the tree draws it
+              nowhere.
+            </p>
+          </figure>
+
+          <p>
+            The second gate is the tests. <code>run_web_tests.py</code> drives
+            <code>content_shell --run-web-tests</code>; the suppression file
+            for that run, <code>web_tests/TestExpectations</code>, is 9,228
+            lines — 6,817 non-comment, 6,398 tagged with a
+            <code>crbug.com</code> link, 5,219 naming something under
+            <code>external/wpt/</code>, 1,449 naming a <code>virtual/</code>
+            path
+            <span class="src">from the tree</span>.
+            <code>web_tests/VirtualTestSuites</code> declares 194 virtual
+            suites that re-run existing directories under extra flags. The one
+            that matters for shipping is <code>stable</code> — owner
+            blink-api-owners@chromium.org, expires <code>"never"</code> —
+            which re-runs <code>webexposed</code> and fifteen other bases under
+            <code>--stable-release-mode</code>. An accidental
+            change to the shipped API surface lands as a diff in a text file
+            owned by the people who vote on API changes.
+          </p>
+          <p>
+            On bots those tests shard 5 / 2 / 1 / 18 across
+            <code>blink_web_tests</code>, <code>blink_wpt_tests</code>,
+            <code>chrome_wpt_tests</code> and
+            <code>headless_shell_wpt_tests</code>. The two suites driven by
+            <code>run_web_tests.py</code> pass <code>--num-retries=3</code>
+            explicitly, so their failures always retry three times
+            (<code>infra/config/targets/tests.star</code>:313-338); the two
+            <code>run_wpt_tests.py</code> suites do not. <code>[ Slow ]</code>
+            buys 5× the usual timeout. WPT
+            is synced both ways by LUCI cron builders — edits under
+            <code>external/wpt</code> upstream within 24 hours, and CLs over
+            1,000 files are never exported — and since the September 2024
+            PSA that half is migrating from <code>content_shell</code> to
+            <code>wptrunner</code>, with 2000+ regressions reported on each
+            platform at the time.
+          </p>
+
+          <p>
+            The last gate is a vote. A ChromeStatus entry comes first; an
+            Intent to Prototype goes to blink-dev and needs no LGTM; Ready for
+            Developer Testing follows; an optional Intent to Experiment needs
+            one LGTM; an Intent to Ship needs three, from the API owners in
+            <code>third_party/blink/API_OWNERS</code> — a 24-line file naming
+            ten current owners, two at non-Google addresses, and eight emeritus
+            in comments. If an intent sits blocked for 5 days with no open
+            feedback, you escalate to blink-api-owners-discuss@chromium.org.
+            Roughly 2 milestones after it has stuck, the row comes back out of
+            the json5
+            <span class="src">from the docs</span>.
+          </p>
+          <p>
+            Every gate in Figure {{fig-feature-stack}}, and every line in
+            <code>TestExpectations</code>, is machine-checked. The last gate
+            is ten people reading email. The json5 row is what connects them:
+            the generator reads it, the bindings compiler reads it, the
+            <code>stable</code> suite catches what it lets through, and you
+            delete it once the vote has held.
+          </p>

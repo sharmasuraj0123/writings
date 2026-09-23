@@ -177,4 +177,4 @@ figures clamp in the 1180–1319px band).
 | `what-is-quirq/` | the flagship: full format, subgrid layout, publication-meta, claim ledger |
 | `personal-memory-engine/` | the standard post layout most pages use (centered `main`, `.prose` + `.figure`) |
 | `j-space/` | sourced-vs-reconstruction badging, equation blocks |
-| `sea-of-nodes/` + `sea-of-nodes-paper/` | short explainer ↔ close reading pairing, cross-linking |
+| `chromium/sea-of-nodes/` + `chromium/sea-of-nodes-paper/` | short explainer ↔ close reading pairing, cross-linking |

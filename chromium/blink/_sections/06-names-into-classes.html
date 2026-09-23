@@ -1,0 +1,317 @@
+          <h2 id="names-into-classes"><span class="secnum">{{S}}</span>How names become classes</h2>
+          <p class="lede">
+            What the renderer fetches is text. Two formats of it enter Blink
+            and leave as C++ objects: tag names
+            and CSS property names. One toolchain handles both, and both id
+            spaces are build artifacts. <code>HTMLTag::kDiv</code> and
+            <code>CSSPropertyID::kWidth</code> are in no checked-in file. To
+            read them you run the generator.
+          </p>
+          <p>
+            That toolchain is
+            <code>third_party/blink/renderer/build/scripts</code>;
+            <code>scripts.gni</code> is its index
+            <span class="src">from the tree</span>.
+            <code>blink_python_runner</code> runs a generator with
+            <code>build/scripts</code>, <code>third_party</code>,
+            <code>third_party/pyjson5/src</code> and <code>tools</code> on
+            <code>PYTHONPATH</code> (:124-163);
+            <code>template("css_properties")</code> gives every CSS generator
+            the same three inputs — <code>css_properties.json5</code>,
+            <code>computed_style_field_aliases.json5</code>,
+            <code>runtime_enabled_features.json5</code> — plus a
+            <code>gperf</code> binary (:261-284). Each generator is a Python
+            class over one json5 file plus Jinja templates. Every generated
+            constant below comes from running them on the
+            <code>f288fed6</code> inputs, not from a checked-in header
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>The HTML front door</h3>
+          <p>
+            <code>core/html/html_tag_names.json5</code> has 153 tag entries.
+            <code>make_element_factory.py</code> derives each class as
+            namespace + UpperCamelCase(name) + "Element" unless the entry sets
+            <code>interfaceName</code> (:112-119), which collapses 153 tags
+            onto 90 classes: 47 are plain <code>HTMLElement</code>, 5 legacy
+            tags are <code>HTMLUnknownElement</code>, h1–h6 share
+            <code>HTMLHeadingElement</code>. Thirteen tags sit behind runtime
+            flags;
+            the three that can be origin-trialled get an
+            <code>OrUnknown</code> suffix —
+            <code>kFencedframeOrUnknown</code>
+            (<code>name_utilities.py</code>:78-82) — because the tokenizer has
+            no document to ask.
+          </p>
+          <p>
+            Four generators read that file.
+            <code>make_element_factory.py</code> emits
+            <code>html_names.{h,cc}</code> — one
+            <code>HTMLQualifiedName</code> per tag,
+            <code>enum class HTMLTag</code> whose <code>kUnknown = 0</code> is
+            explicit because "comparing to 0 saves an instruction on some
+            hardware", and <code>TagToQualifiedName()</code>
+            (<code>templates/make_qualified_names.h.tmpl</code>:27-57) — plus
+            <code>html_element_factory.{h,cc}</code>.
+            <code>make_element_lookup_trie.py</code> emits
+            <code>LookupHtmlTag()</code>, a 2,093-line switch on length then
+            characters, no hash. <code>make_element_type_enum.py</code> emits
+            <code>ElementType</code> — <code>kIsNotElement</code> plus 166
+            element enumerators, 90 HTML + 64 SVG + 12 MathML — and
+            <code>make_element_type_helpers.py</code> emits the
+            <code>DowncastTraits</code> behind
+            <code>IsA&lt;HTMLDivElement&gt;</code> and
+            <code>HtmlElementTypeForTag()</code>
+            (<code>templates/element_type_helpers.h.tmpl</code>:21,42). Names cost up
+            front: <code>CoreInitializer</code> reserves 968 static
+            <code>QualifiedName</code>s (<code>kQualifiedNamesCount</code>),
+            460 of them HTML attributes — 407 plus 53 ARIA.
+          </p>
+          <p>
+            The runtime chain is short. <code>HTMLTokenizer</code> (76 states)
+            emits tokens; <code>AtomicHTMLToken</code> calls
+            <code>LookupHtmlTag</code> once and caches both the tag and the
+            <code>AtomicString</code>; <code>HTMLTreeBuilder</code> is
+            <code>switch (token-&gt;GetHTMLTag())</code> over 21 insertion
+            modes; <code>HTMLConstructionSite::CreateElement</code> builds the
+            element. That last step is where a parser stops being a parser: it
+            resolves the custom-element registry for the intended parent, and
+            when a definition exists it runs a microtask checkpoint, opens a
+            <code>CEReactionsScope</code>, calls the author's constructor
+            synchronously, then re-applies the token's attributes one at a
+            time. From
+            <code>core/html/parser/html_construction_site.cc</code>:1224-1236
+            and :1305-1339, abridged:
+          </p>
+<pre><code>Element* HTMLConstructionSite::CreateElement(
+    AtomicHTMLToken* token,
+    const AtomicString&amp; namespace_uri) {
+…
+  // "4. Let local name be the tag name of the token."
+  QualifiedName tag_name =
+      ((token-&gt;IsValidHTMLTag() &amp;&amp;
+        namespace_uri == html_names::xhtmlNamespaceURI)
+           ? static_cast&lt;const QualifiedName&amp;&gt;(
+                 html_names::TagToQualifiedName(token-&gt;GetHTMLTag()))
+           : QualifiedName(g_null_atom, token-&gt;GetName(), namespace_uri));
+…
+  bool will_execute_script = definition &amp;&amp; !is_parsing_fragment_;
+  if (will_execute_script) {
+…
+    if (0u == reentry_permit_-&gt;ScriptNestingLevel()) {
+      document.GetAgent().event_loop()-&gt;PerformMicrotaskCheckpoint();
+    }
+    CEReactionsScope reactions(document.GetAgent().isolate());
+    element = definition-&gt;CreateElement(
+        creation_document, tag_name,
+        GetCreateElementFlags().SetCreatedByParser(false, nullptr));</code></pre>
+          <p>
+            The parser feeding it yields on a budget
+            <span class="src">from the tree</span>: 250 tokens per pump
+            (<code>kDefaultMaxTokenizationBudget</code>), 10 ms of time
+            widening to 500 ms on desktop and 50 ms on Android after 6 yields
+            (2 on Android), and <code>1e7</code> — no limit in practice — for
+            <code>file://</code> and <code>chrome-extension://</code>. The
+            constants "were chosen using experiment data from the field to
+            optimize Core Web Vitals metrics". The history is an arc, not a
+            contradiction: Chrome 28 shipped a threaded parser in 2013,
+            <code>ForceSynchronousHTMLParsing</code> became the default in
+            M96, the background parser was deleted on 2 February 2022
+            (<code>4dbb35444d</code>), and
+            <code>kThreadedPreloadScanner</code> is still off. The 2026 parser
+            is main-thread, budget-and-yield.
+          </p>
+
+          <p>
+            Figure {{fig-front-doors}} runs both doors side by side, call for
+            call, with the two id spaces under them; its right-hand column is
+            the next subsection.
+          </p>
+
+          <figure class="figure wide" id="fig-front-doors">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Two front doors, and the id spaces behind them</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 -14 1120 602" role="img" aria-label="Two parallel sequences over a shared bottom strip. The left column follows the text div class=x from HTMLTokenizer through LookupHtmlTag, AtomicHTMLToken, HTMLTreeBuilder and HTMLConstructionSite::CreateElement, which branches into a custom-element definition path and a plain HTMLElementFactory path. The right column follows the text width: 50% from CSSTokenizer through ConsumeDeclaration, the gperf hash, CSSPropertyID::kWidth, Width::ParseSingleValue and ApplyValue. Below both, one bar shows 153 HTML tags collapsing onto 90 C++ classes, and one bar shows the CSSPropertyID number line from 0 to 829.">
+                <defs>
+                  <marker id="fig-front-doors-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-front-doors-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="4" y="2" class="svg-lane">LIFE OF &lt;div class=x&gt;</text>
+                <text x="574" y="2" class="svg-lane">LIFE OF width: 50%</text>
+
+                <rect x="4" y="24" width="546" height="46" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="45" class="svg-step">HTMLTokenizer → HTMLToken</text>
+                <text x="20" y="62" class="svg-sub">76 states · one start-tag token</text>
+                <line x1="30" y1="70" x2="30" y2="82" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-front-doors-arr-ink)"/>
+                <rect x="4" y="84" width="546" height="46" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="105" class="svg-step">LookupHtmlTag(name) → HTMLTag::kDiv</text>
+                <text x="20" y="122" class="svg-sub">generated switch on length, then characters · 2,093 lines</text>
+                <line x1="30" y1="130" x2="30" y2="142" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-front-doors-arr-ink)"/>
+                <rect x="4" y="144" width="546" height="46" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="165" class="svg-step">AtomicHTMLToken</text>
+                <text x="20" y="182" class="svg-sub">caches the tag and the AtomicString · looked up once</text>
+                <line x1="30" y1="190" x2="30" y2="202" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-front-doors-arr-ink)"/>
+                <rect x="4" y="204" width="546" height="46" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="225" class="svg-step">HTMLTreeBuilder</text>
+                <text x="20" y="242" class="svg-sub">switch (token-&gt;GetHTMLTag()) · 21 insertion modes</text>
+                <line x1="30" y1="250" x2="30" y2="262" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-front-doors-arr-ink)"/>
+                <rect x="4" y="264" width="546" height="46" rx="8" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="20" y="285" class="svg-step">HTMLConstructionSite::CreateElement</text>
+                <text x="20" y="302" class="svg-sub">TagToQualifiedName → html_names::kDivTag · registry?</text>
+                <line x1="150" y1="310" x2="150" y2="322" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-front-doors-arr-purple)"/>
+                <line x1="410" y1="310" x2="410" y2="322" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-front-doors-arr-ink)"/>
+                <rect x="4" y="324" width="266" height="46" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="18" y="345" class="svg-step">definition found</text>
+                <text x="18" y="362" class="svg-sub">checkpoint · CEReactionsScope</text>
+                <rect x="284" y="324" width="266" height="46" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="298" y="345" class="svg-step">no definition</text>
+                <text x="298" y="362" class="svg-sub">HTMLElementFactory → HTMLDivElement</text>
+
+                <rect x="574" y="24" width="542" height="46" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="590" y="45" class="svg-step">CSSTokenizer</text>
+                <text x="590" y="62" class="svg-sub">stateless lookahead · 33 token types</text>
+                <line x1="600" y1="70" x2="600" y2="82" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-front-doors-arr-ink)"/>
+                <rect x="574" y="84" width="542" height="46" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="590" y="105" class="svg-step">CSSParserImpl::ConsumeDeclaration</text>
+                <text x="590" y="122" class="svg-sub">the ident before ':' → ParseAsUnresolvedCSSPropertyID</text>
+                <line x1="600" y1="130" x2="600" y2="142" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-front-doors-arr-ink)"/>
+                <rect x="574" y="144" width="542" height="46" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="590" y="165" class="svg-step">QuasiLowercase + gperf FindProperty</text>
+                <text x="590" y="182" class="svg-sub">825 (name, id) pairs · 110 carry 0x8000</text>
+                <line x1="600" y1="190" x2="600" y2="202" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-front-doors-arr-ink)"/>
+                <rect x="574" y="204" width="542" height="46" rx="8" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="590" y="225" class="svg-step">CSSPropertyID::kWidth</text>
+                <text x="590" y="242" class="svg-sub">10 bits from here on · the name is gone</text>
+                <line x1="600" y1="250" x2="600" y2="262" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-front-doors-arr-ink)"/>
+                <rect x="574" y="264" width="542" height="46" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="590" y="285" class="svg-step">Width::ParseSingleValue</text>
+                <text x="590" y="302" class="svg-sub">CSSPropertyValue → ImmutableCSSPropertyValueSet</text>
+                <line x1="600" y1="310" x2="600" y2="322" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-front-doors-arr-purple)"/>
+                <rect x="574" y="324" width="542" height="46" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="590" y="345" class="svg-step">To&lt;Longhand&gt;(property).ApplyValue</text>
+                <text x="590" y="362" class="svg-sub">one of 424 generated bodies in longhands.cc</text>
+
+                <text x="4" y="398" class="svg-lane">HTML · 153 TAG ENTRIES → 90 C++ CLASSES</text>
+                <rect x="4" y="410" width="342" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="18" y="431" class="svg-step">47 tags</text>
+                <text x="18" y="448" class="svg-sub">plain HTMLElement</text>
+                <rect x="350" y="410" width="36" height="46" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="358" y="431" class="svg-step">5</text>
+                <rect x="390" y="410" width="726" height="46" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="404" y="431" class="svg-step">101 tags → 88 distinct classes</text>
+                <text x="404" y="448" class="svg-sub">mostly one to one; h1–h6 share HTMLHeadingElement</text>
+                <text x="350" y="472" class="svg-note">5 legacy tags → HTMLUnknownElement: applet, bgsound, command, image, keygen</text>
+
+                <text x="4" y="504" class="svg-lane">CSS · CSSPropertyID, 0 … 829 (SEGMENTS NOT TO SCALE)</text>
+                <rect x="4" y="516" width="76" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="16" y="537" class="svg-step">0</text>
+                <text x="16" y="554" class="svg-sub">kInvalid</text>
+                <rect x="84" y="516" width="76" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="96" y="537" class="svg-step">1</text>
+                <text x="96" y="554" class="svg-sub">kVariable</text>
+                <rect x="164" y="516" width="184" height="46" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="178" y="537" class="svg-step">2 … 43</text>
+                <text x="178" y="554" class="svg-sub">42 high priority</text>
+                <rect x="352" y="516" width="464" height="46" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="366" y="537" class="svg-step">44 … 710</text>
+                <text x="366" y="554" class="svg-sub">the rest of 568 longhands, then 141 shorthands</text>
+                <rect x="820" y="516" width="296" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="834" y="537" class="svg-step">711 … 829</text>
+                <text x="834" y="554" class="svg-sub">119 aliases · 106 of them -webkit-</text>
+                <text x="4" y="580" class="svg-note">thick black = sequence · dashed purple = author code or style effect · 2…43 are kColorScheme…kZoom, the 42 high-priority properties · order is (−priority, internal-visited first, name)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Both columns are the call order in the tree
+              <span class="src">from the tree</span>; the counts come from
+              running the tree's own generators at <code>f288fed6</code>.
+              Segment widths are for legibility, not to scale; the 101-to-88
+              split is <span class="recon">reconstruction</span> from the
+              <code>interfaceName</code> rule.
+            </p>
+          </figure>
+
+          <h3>The CSS front door</h3>
+          <p>
+            <code>core/css/css_properties.json5</code> is 11,136 lines, 75
+            documented parameters, 828 entries: 568 longhands, 141 shorthands,
+            119 aliases (106 of them <code>-webkit-</code>), 33 internal, 82
+            runtime-flagged. The ids come from a sort, not from file order.
+            <code>css_properties.py</code> starts at 2 — 0 is
+            <code>kInvalid</code>, 1 is <code>kVariable</code> (:274-276) —
+            and orders longhands then shorthands on (−priority,
+            internal-visited first, name) (:341-373)
+            <span class="src">from the tree</span>. So
+            <code>kColorScheme = 2</code> … <code>kZoom = 43</code> are the 42
+            high-priority properties — the generated header
+            <code>static_assert</code>s that span is 41
+            (<code>css_property_names.h.tmpl</code>:92-96) —
+            <code>kLastCSSProperty = 710</code>, aliases run 711–829,
+            <code>kNumCSSPropertyIDs = 830</code>.
+            <code>kCSSPropertyIDBitLength</code> is 10 because 829 needs ten
+            bits; <code>kMaxShorthandExpansion</code> is 19 because
+            <code>font</code> expands to 19 longhands.
+          </p>
+          <p>
+            Name lookup is a gperf perfect hash.
+            <code>make_css_property_names.py</code> emits 825 (name, id) pairs
+            and ORs <code>kNotKnownExposedPropertyBit</code> (0x8000) into the
+            110 that are not unconditionally web-exposed, so the common name
+            pays for no exposure check at all. From
+            <code>core/css/parser/css_property_parser.cc</code>:352-400,
+            abridged:
+          </p>
+<pre><code>  if (length &gt;= 3 &amp;&amp; property_name[0] == '-' &amp;&amp;
+      UNSAFE_BUFFERS(property_name[1]) == '-') {
+    return CSSPropertyID::kVariable;
+  }
+  if (length &gt; kMaxCSSPropertyNameLength) {
+    return CSSPropertyID::kInvalid;
+  }
+  char buffer[kMaxCSSPropertyNameLength];
+  if (!QuasiLowercaseIntoBuffer(property_name, buffer)) {
+    return CSSPropertyID::kInvalid;
+  }
+  const char* name = buffer;
+  const Property* hash_table_entry = FindProperty(name, length);
+…
+  int id_and_exposed_bit = hash_table_entry-&gt;id_and_exposed_bit;
+  if (id_and_exposed_bit &amp; kNotKnownExposedPropertyBit) {
+    // The property is behind a runtime flag, so we need to go ahead
+    // and actually do the resolution to see if that flag is on or not.
+    // This should happen only occasionally.</code></pre>
+          <p>
+            What the id indexes is generated too.
+            <code>make_css_property_subclasses.py</code> emits 671
+            <code>final</code> classes into <code>longhands.h</code> and 157
+            into <code>shorthands.h</code>, each with a constexpr constructor
+            baking the id, an OR of up to 34 flag names and the repetition
+            separator into a 16-byte <code>CSSProperty</code>
+            (<code>css_properties.h.tmpl</code>:35-81).
+            <code>make_css_property_instances.py</code> lays them out in one
+            <code>alignas(kCSSPropertyUnionBytes)</code> union array
+            <code>kCssProperties[]</code> indexed by
+            <code>CSSPropertyID</code>
+            (<code>css_property_instances.h.tmpl</code>:27-53), so
+            <code>GetPropertyInternal(id)</code> is pointer arithmetic and a
+            <code>reinterpret_cast</code> — which is why the template's own
+            comment says "multiple inheritance is forbidden"
+            (<code>css_property_instances.cc.tmpl</code>:19-23). The style
+            builder is no longer its own file: 441 <code>ApplyInitial</code>
+            and 424 <code>ApplyValue</code> bodies expand inline into
+            <code>longhands.cc</code>. CSS alone is about 50,978 generated
+            lines.
+          </p>
+          <p>
+            Both doors end the same way. A name is matched once, becomes a
+            small integer, and is never compared as text again: the tree
+            builder switches on <code>HTMLTag</code>, the cascade indexes
+            <code>kCssProperties[]</code> by <code>CSSPropertyID</code>. The
+            price is that the definitive list of either is a build output —
+            grep for <code>kZoom</code> and you find callers, never the line
+            that assigns it 43.
+          </p>

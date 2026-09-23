@@ -1,0 +1,352 @@
+          <h2 id="a-grammar-that-is-never-run"><span class="secnum">{{S}}</span>A grammar that is parsed, never run</h2>
+          <p class="lede">
+            DEPS is Python syntax that no interpreter executes.
+            <code>gclient_eval</code> hands the bytes to
+            <code>ast.parse</code>, walks the tree against an allow-list, and
+            refuses whatever it does not recognise. Four structures survive:
+            variables, string interpolation, conditions, and three shapes of
+            dependency.
+          </p>
+          <p>
+            <code>gclient_eval.Exec</code> calls
+            <code>ast.parse(content, mode="exec")</code> and discards most of
+            the language. A top-level statement must be an
+            <code>ast.Assign</code> with one target, the target must be a plain
+            <code>Name</code>, and no name may be assigned twice — "invalid
+            assignment: overrides var"
+            [<code>depot_tools/gclient_eval.py</code>:486–516]
+            <span class="src">from the tree</span>. Values go through
+            <code>_convert</code>: constants, lists, tuples, dicts (a repeat
+            raises "duplicate key in dictionary"),
+            <code>True</code>/<code>False</code>/<code>None</code>,
+            one-argument calls to <code>Str()</code> and <code>Var()</code> —
+            "Str and Var are the only allowed functions" — and the operators
+            <code>+</code> and <code>%</code>. An import, a <code>def</code>
+            or an f-string raises "unexpected AST node"
+            [:360–480]. Figure {{fig-grammar-pipeline}} is the whole
+            sequence.
+          </p>
+          <p>
+            Every string constant is then expanded.
+            <code>_ExpandVars</code> pushes it through
+            <code>_SafeFormatter</code>, a <code>string.Formatter</code> whose
+            <code>get_field</code> rejects field names containing
+            <code>.</code> or <code>[</code>; the docstring states the threat
+            model, since such access "would otherwise allow a malicious DEPS
+            file to traverse into Python internals (e.g.
+            <code>__globals__</code>) and read process state such as
+            <code>os.environ</code>" [:51–71]. Because every string meets
+            <code>str.format</code>, a literal brace must be doubled: CIPD
+            templates are written
+            <code>$&#123;&#123;platform&#125;&#125;</code> and reach the cipd client as
+            <code>${platform}</code>. <code>src/DEPS</code> spells it that way
+            16 times, plus 3 <code>$&#123;&#123;arch&#125;&#125;</code> and 1 <code>$&#123;&#123;os&#125;&#125;</code>
+            [:1202, :1172, :1850, :2776].
+          </p>
+          <p>
+            The <code>Var()</code> arm of <code>_convert</code> carries the
+            whole variable contract.
+            <code>depot_tools/gclient_eval.py</code>:447–468, dedented eight
+            spaces and otherwise verbatim:
+          </p>
+<pre><code>    arg = _convert(node.args[0])
+    if not isinstance(arg, str):
+        raise ValueError(
+            "Var's argument must be a variable name (file %r, line %s)"
+            % (filename, getattr(node, "lineno", "&lt;unknown&gt;"))
+        )
+    if vars_dict is None:
+        return "{" + arg + "}"
+    if arg not in vars_dict:
+        raise KeyError(
+            "%s was used as a variable, but was not declared in the vars dict "
+            "(file %r, line %s)"
+            % (arg, filename, getattr(node, "lineno", "&lt;unknown&gt;"))
+        )
+    val = vars_dict[arg]
+    if isinstance(val, ConstantString):
+        val = val.value
+    return val
+elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+    return _convert(node.left) + _convert(node.right)
+elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+    return _convert(node.left) % _convert(node.right)</code></pre>
+          <p>
+            <code>+</code> and <code>%</code> being the only operators is why
+            git URLs are assembled by concatenation. And <code>Var()</code>
+            unwraps the <code>ConstantString</code> that <code>Str()</code>
+            builds. <code>Str()</code> exists because
+            <code>WriteGNArgsFile</code> runs a plain-string variable through
+            <code>EvaluateCondition</code> before emitting it, and emits a
+            <code>ConstantString</code> verbatim
+            [<code>depot_tools/gclient.py</code>:1626–1631]. Nine of
+            Chromium's 143 vars are <code>Str()</code> —
+            <code>android_ndk_version</code> =
+            <code>Str('2@30.0.16248370')</code>, <code>rbe_instance</code>,
+            <code>cros_boards</code> and six more — every one either an empty
+            string or a value <code>EvaluateCondition</code> could not parse
+            <span class="src">from the tree</span>.
+          </p>
+          <p>
+            Order inside <code>Exec</code> is fixed: <code>vars</code> first,
+            so the rest of the file can interpolate it; then built-ins; then
+            <code>.gclient</code> <code>custom_vars</code>, "but only if they
+            are already present (overrides do not introduce new variables)"
+            [:543–567]. The built-ins come from <code>target_os</code> and
+            <code>target_cpu</code> — <code>checkout_android</code> through
+            <code>checkout_win</code>, <code>host_os</code>, ten
+            <code>checkout_&lt;cpu&gt;</code> names, <code>host_cpu</code>
+            [<code>gclient.py</code>:1898–1922]. Precedence is DEPS vars
+            &lt; parents &lt; built-ins &lt; <code>custom_vars</code>
+            [:1924–1940], drawn in Figure {{fig-three-files}}, not restated
+            here. The result is validated against a schema naming 21 legal
+            top-level keys [<code>gclient_eval.py</code>:258–357];
+            <code>src/DEPS</code> uses 10.
+          </p>
+
+          <figure class="figure wide" id="fig-grammar-pipeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Twelve steps from DEPS bytes to an evaluated dependency</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1100 490" role="img" aria-label="A twelve-step pipeline in three rows of four. Row one: DEPS bytes, ast.parse in exec mode, the statement rule, the node-kind allow-list. Row two: vars evaluated, built-ins layered, custom_vars overrides, _ExpandVars. Row three: schema validation, _StandardizeDeps, deps_os and hooks_os folded into conditions, EvaluateCondition at sync time. Below, two inset boxes explain Var versus Str and why CIPD platform templates are written with doubled braces.">
+                <defs>
+                  <marker id="fig-grammar-pipeline-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="12" y="26" class="svg-lane">GCLIENT_EVAL.EXEC · PARSE · THEN, AT SYNC TIME, EVALUATE</text>
+
+                <rect x="12" y="40" width="252" height="58" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="250" y="62" text-anchor="end" class="svg-num">01</text>
+                <text x="26" y="64" class="svg-step">DEPS bytes</text>
+                <text x="26" y="84" class="svg-sub">src/DEPS · 5,188 lines</text>
+
+                <rect x="288" y="40" width="252" height="58" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="526" y="62" text-anchor="end" class="svg-num">02</text>
+                <text x="302" y="64" class="svg-step">ast.parse</text>
+                <text x="302" y="84" class="svg-sub">mode='exec' · nothing runs</text>
+
+                <rect x="564" y="40" width="252" height="58" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="802" y="62" text-anchor="end" class="svg-num">03</text>
+                <text x="578" y="64" class="svg-step">statement rule</text>
+                <text x="578" y="84" class="svg-sub">one Assign · one Name · once</text>
+
+                <rect x="840" y="40" width="252" height="58" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="1078" y="62" text-anchor="end" class="svg-num">04</text>
+                <text x="854" y="64" class="svg-step">node-kind allow-list</text>
+                <text x="854" y="84" class="svg-sub">const list dict Str Var + %</text>
+
+                <line x1="264" y1="69" x2="288" y2="69" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+                <line x1="540" y1="69" x2="564" y2="69" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+                <line x1="816" y1="69" x2="840" y2="69" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+                <path d="M966 98 L966 124 L138 124 L138 150" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+
+                <rect x="12" y="150" width="252" height="58" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="250" y="172" text-anchor="end" class="svg-num">05</text>
+                <text x="26" y="174" class="svg-step">vars evaluated</text>
+                <text x="26" y="194" class="svg-sub">143 names, before the rest</text>
+
+                <rect x="288" y="150" width="252" height="58" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="526" y="172" text-anchor="end" class="svg-num">06</text>
+                <text x="302" y="174" class="svg-step">built-ins layered</text>
+                <text x="302" y="194" class="svg-sub">checkout_* · host_os · host_cpu</text>
+
+                <rect x="564" y="150" width="252" height="58" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="802" y="172" text-anchor="end" class="svg-num">07</text>
+                <text x="578" y="174" class="svg-step">custom_vars overrides</text>
+                <text x="578" y="194" class="svg-sub">declared names only</text>
+
+                <rect x="840" y="150" width="252" height="58" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="1078" y="172" text-anchor="end" class="svg-num">08</text>
+                <text x="854" y="174" class="svg-step">_ExpandVars</text>
+                <text x="854" y="194" class="svg-sub">{name} · _SafeFormatter</text>
+
+                <line x1="264" y1="179" x2="288" y2="179" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+                <line x1="540" y1="179" x2="564" y2="179" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+                <line x1="816" y1="179" x2="840" y2="179" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+                <path d="M966 208 L966 234 L138 234 L138 260" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+
+                <rect x="12" y="260" width="252" height="58" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="250" y="282" text-anchor="end" class="svg-num">09</text>
+                <text x="26" y="284" class="svg-step">schema validation</text>
+                <text x="26" y="304" class="svg-sub">21 legal top-level keys</text>
+
+                <rect x="288" y="260" width="252" height="58" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="526" y="282" text-anchor="end" class="svg-num">10</text>
+                <text x="302" y="284" class="svg-step">_StandardizeDeps</text>
+                <text x="302" y="304" class="svg-sub">451 entries → dicts · 'git'</text>
+
+                <rect x="564" y="260" width="252" height="58" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="802" y="282" text-anchor="end" class="svg-num">11</text>
+                <text x="578" y="284" class="svg-step">deps_os / hooks_os folded</text>
+                <text x="578" y="304" class="svg-sub">→ (a) and (checkout_&lt;os&gt;)</text>
+
+                <rect x="840" y="260" width="252" height="58" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="1078" y="282" text-anchor="end" class="svg-num">12</text>
+                <text x="854" y="284" class="svg-step">EvaluateCondition</text>
+                <text x="854" y="304" class="svg-sub">per dep, at sync · 320 gated</text>
+
+                <line x1="264" y1="289" x2="288" y2="289" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+                <line x1="540" y1="289" x2="564" y2="289" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+                <line x1="816" y1="289" x2="840" y2="289" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-grammar-pipeline-ink)"/>
+
+                <rect x="12" y="346" width="528" height="104" rx="8" fill="#ffffff" stroke="#deded9"/>
+                <text x="28" y="372" class="svg-lane">INSET A — VAR() VS STR()</text>
+                <text x="28" y="396" class="svg-sub">Var('gn_version') → the value; a plain string var is re-read as</text>
+                <text x="28" y="416" class="svg-sub">a condition on its way to the GN args file.</text>
+                <text x="28" y="436" class="svg-sub">Str('2@30.0.16248370') → ConstantString, emitted verbatim. 9 of 143.</text>
+
+                <rect x="560" y="346" width="528" height="104" rx="8" fill="#ffffff" stroke="#deded9"/>
+                <text x="576" y="372" class="svg-lane">INSET B — WHY $&#123;&#123;PLATFORM&#125;&#125; IS DOUBLED</text>
+                <text x="576" y="396" class="svg-sub">Step 08 runs str.format over every string constant, and</text>
+                <text x="576" y="416" class="svg-sub">'&#123;&#123;' is format's escape for one literal '{'. So DEPS writes</text>
+                <text x="576" y="436" class="svg-sub">'gn/gn/linux-$&#123;&#123;arch&#125;&#125;' and cipd receives 'gn/gn/linux-${arch}'.</text>
+
+                <text x="12" y="474" class="svg-note">thick black = sequence · white = parsing · green = variables · blue = substitution and values from your .gclient · purple = conditions</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Steps 01–11 are the call order inside
+              <code>gclient_eval.Exec</code> and <code>Parse</code>, read off
+              <code>gclient_eval.py</code>:360–686
+              <span class="src">from the tree</span>; step 12 runs later, per
+              dependency, during the sync walk. Counts are measured by parsing
+              <code>src/DEPS</code> at <code>f288fed6</code>. The serpentine is
+              mine <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            <code>condition</code> is a second whitelist language with its own
+            walker: string constants, names, <code>and</code>,
+            <code>or</code>, <code>not</code>, and one comparison using
+            <code>==</code>, <code>!=</code> or <code>in</code> — "invalid
+            compare: exactly 1 operator required" [:777–892]. A name resolving
+            to a string variable is recursively re-parsed as a condition, with
+            cycle detection — load-bearing here:
+            <code>non_git_source</code> is declared as the <em>string</em>
+            <code>'True'</code> and 108 conditions name it, and
+            <code>checkout_openxr</code> is
+            <code>'checkout_win or checkout_linux or checkout_android'</code> —
+            a condition kept in a variable. 320 of the 451 entries are
+            conditional, but only 74 distinct strings exist between them, and
+            <code>checkout_src_internal</code> alone gates 61. Of the 320, 136
+            use <code>and</code>, 29 <code>==</code>, 19 <code>or</code>, 2
+            <code>not</code>, and none <code>in</code> or <code>!=</code>
+            [every condition re-parsed with <code>ast</code>].
+          </p>
+          <p>
+            <code>deps_os</code> and <code>hooks_os</code> are the last trace
+            of the pre-2017 model, no longer a mechanism:
+            <code>UpdateCondition</code> rewrites them into an AND-ed
+            <code>checkout_&lt;os&gt;</code> string, <code>"(%s) %s (%s)"</code>
+            [:572–686, :624–642]. gclient stopped handling either key on
+            2018-05-16; <code>src/DEPS</code> declares neither. The dependency
+            shapes themselves are in Figure {{fig-dep-types}}.
+          </p>
+
+          <figure class="figure wide" id="fig-dep-types">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Three dependency shapes, and what each must carry</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>dep_type</th><th>Value shape</th><th>Required keys</th><th>A real entry</th><th>Count</th><th>Inner count</th><th>Fetched by</th></tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><code>git</code></td>
+                    <td><code>None</code>, <code>'url@revision'</code>, or a dict</td>
+                    <td><code>url</code> (may be <code>None</code>)</td>
+                    <td><code>'src/v8':</code><br><code>Var('chromium_git') + '/v8/v8.git'</code><br><code>+ '@' + Var('v8_revision')</code> [:3342–3343]</td>
+                    <td>273</td>
+                    <td>124 bare strings, 149 dicts</td>
+                    <td>fetch via the git cache, check out the pin</td>
+                  </tr>
+                  <tr>
+                    <td><code>cipd</code></td>
+                    <td>dict with <code>packages</code></td>
+                    <td>per package: <code>package</code> plus <code>version</code> <em>or</em> <code>version_file</code></td>
+                    <td><code>'src/buildtools/linux64'</code> → <code>gn/gn/linux-$&#123;&#123;arch&#125;&#125;</code> at <code>Var('gn_version')</code> [:1169–1178]</td>
+                    <td>147</td>
+                    <td>153 packages, 4 on <code>version_file</code></td>
+                    <td>one <code>cipd ensure</code>, after the tree walk</td>
+                  </tr>
+                  <tr>
+                    <td><code>gcs</code></td>
+                    <td>dict with <code>bucket</code> and <code>objects</code></td>
+                    <td><code>bucket</code>; per object <code>object_name</code>, <code>sha256sum</code>, <code>size_bytes</code>, <code>generation</code></td>
+                    <td><code>'src/third_party/llvm-build/Release+Asserts'</code>, bucket <code>chromium-browser-clang</code> [:924–928]</td>
+                    <td>31</td>
+                    <td>87 objects, 31 with own condition</td>
+                    <td><code>gsutil cp</code> in the walk, hash and size checked</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Shapes and required keys are the schema at
+              <code>gclient_eval.py</code>:181–236
+              <span class="src">from the tree</span>; entries are quoted from
+              <code>src/DEPS</code>. Counts come from running
+              <code>gclient_eval.Exec</code> over that file:
+              273 + 147 + 31 = 451. The last column compresses machinery §04
+              takes apart.
+            </p>
+          </figure>
+
+          <p>
+            §01 quoted the head of this block. Here is
+            <code>src/DEPS</code>:35–58 whole, for the exported list:
+          </p>
+<pre><code># We expect all git dependencies specified in this file to be in sync with git
+# submodules (gitlinks).
+git_dependencies = 'SYNC'
+
+gclient_gn_args_file = 'src/build/config/gclient_args.gni'
+gclient_gn_args = [
+  'android_ndk_version',
+  'build_with_chromium',
+  'checkout_android',
+  'checkout_android_prebuilts_build_tools',
+  'checkout_clang_coverage_tools',
+  'checkout_copybara',
+  'checkout_fuchsia',
+  'checkout_glic_e2e_tests',
+  'checkout_ios_webkit',
+  'checkout_mutter',
+  'checkout_openxr',
+  'checkout_src_internal',
+  'checkout_src_internal_infra',
+  'checkout_clusterfuzz_data',
+  'cros_boards',
+  'cros_boards_with_qemu_images',
+  'generate_location_tags',
+]</code></pre>
+          <p>
+            Seventeen names, three of them <code>Str()</code> vars and one
+            (<code>checkout_openxr</code>) the condition-in-a-variable that
+            <code>WriteGNArgsFile</code> re-evaluates. Two keys remain.
+            <code>hooks</code> is a flat list of
+            <code>{action, name?, pattern?, cwd?, condition?}</code> whose
+            schema retires a field in place — "In practice, with git, gclient
+            runs all the hooks regardless of this field" [:238–256]; ordering
+            is §04's. <code>recursedeps</code> names the nine children whose
+            own DEPS is read — angle, dawn, instrumented_libs, openscreen,
+            devtools-frontend, clank, the internal optimization-guide,
+            ios_internal, webpagereplay [<code>src/DEPS</code>:5170–5188]. The
+            older <code>recursion = N</code> has been logged and ignored since
+            2018-06-11 [<code>gclient.py</code>:1106–1111].
+          </p>
+          <p>
+            Nothing above the schema is enforced, and the file shows it: three
+            spellings of a git dependency coexist. 124 entries are bare strings
+            — 10 interpolating braces,
+            <code>'{chromium_git}/vulkan-deps@5d15b738…'</code> [:3217–3226],
+            the rest concatenating <code>Var()</code> with <code>+</code>
+            [:3342–3343] — and 149 are dicts with a <code>url</code> key, the
+            form required to attach a condition [:3347–3348]. The parser
+            normalises all three into one dict. Nothing normalises the text.
+          </p>

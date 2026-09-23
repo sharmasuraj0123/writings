@@ -1,0 +1,283 @@
+<h2 id="from-green-to-main"><span class="secnum">{{S}}</span>From green to refs/heads/main</h2>
+<p class="lede">
+  There is no commit-numbering daemon. The sequence in
+  <code>Cr-Commit-Position: refs/heads/main@{#1702467}</code> is not issued by a
+  service that counts. It falls out of three machines that never speak to each
+  other &mdash; CV's single-submitter queue, Gerrit's <code>REBASE_ALWAYS</code>
+  submit type, and a plugin whose entire rule is three lines long.
+</p>
+<p>
+  Divide the work first. CV owns the Run. Gerrit owns the merge:
+  chromium/src's project config reads
+  <code>submit_type = "REBASE_ALWAYS"</code>, configured and inherited, with
+  <code>use_content_merge</code> inherited true and
+  <code>reject_implicit_merges</code> on. The git-numberer Gerrit plugin owns
+  numbering, and <code>docs/contributing.md</code>:642&ndash;647 says so:
+  <code>Cr-Commit-Position</code> is "automatically added by the git-numberer
+  Gerrit plugin when a change is submitted"
+  <span class="src">from the docs</span>. The division shows in every commit
+  object. The <em>author</em> is the CL owner; the <em>committer</em> is CV's
+  project-scoped identity
+  <code>chromium-scoped@luci-project-accounts.iam.gserviceaccount.com</code>
+  &mdash; 397 of the last 400 commits on main. The other three were people
+  clicking Submit in Gerrit.
+</p>
+<p>
+  The Run's states come from <code>cv/internal/run/storage.proto</code>:30&ndash;73
+  <span class="src">from the tree</span>: PENDING, RUNNING,
+  WAITING_FOR_SUBMISSION, SUBMITTING, then SUCCEEDED, FAILED or CANCELLED. The
+  proto gives three reasons for waiting &mdash; a closed tree, "another Run in
+  the same LUCI Project that is currently submitting", and rate limiting &mdash;
+  and that state is cancellable. SUBMITTING is not: once CV has begun handing
+  revisions to Gerrit, your CQ&minus;1 does nothing. A Run that never resolves is
+  force-cancelled when its total duration reaches
+  <code>MaxRunTotalDuration = 10 * 24 * time.Hour</code>
+  (cv/internal/common/run.go:35&ndash;39).
+</p>
+<p>
+  <code>OnReadyForSubmission</code> is where serialisation happens
+  (run/impl/handler/submit.go:52&ndash;184). It acquires the SubmitQueue first and
+  checks the tree second. The queue is one datastore entity per LUCI project: a
+  <code>Current</code> Run, a FIFO <code>Waitlist</code>, and a
+  <code>History</code> of submission timestamps inside the burst window
+  (run/impl/submit/queue.go:38&ndash;58). Lose the race and you are waitlisted. Win
+  it and the tree check runs &mdash; OPEN and THROTTLED both count as open
+  (run/impl/state/state.go:153&ndash;200), closed or unknown releases the slot and
+  pokes again after <code>treeCheckInterval = time.Minute</code>, and more than
+  <code>treeStatusFailureTimeLimit = 10 * time.Minute</code> of status-service
+  errors fails the Run (run/impl/handler/poke.go:37&ndash;42).
+</p>
+<p>
+  That acquire-check-release loop is visible from outside. Run
+  <code>8832899183854-1-066668e19c71f84c</code> finished its presubmit at
+  10:16:04 UTC on 2026-09-22 into a tree that had been closed since 10:08:05.
+  Its event log then reads "Acquired Submit Queue", "Tree Status Check",
+  "Released Submit Queue", over and over, roughly every 11 seconds, until the
+  tree reopened at 10:19:19. It was waitlisted twice &mdash; 10:19:29 and
+  10:20:24 &mdash; acquired the queue at 10:20:39, and Gerrit reported the
+  merge in the same second. Two things follow. The slot is genuinely
+  surrendered on every failed tree check, which is why a closed tree does not
+  head-of-line-block the Runs behind it; and the observed 11-second period is
+  shorter than <code>treeCheckInterval</code>, so that constant is a floor on
+  self-rescheduling, not the whole set of reasons a Run wakes up
+  <span class="recon">reconstruction</span>.
+</p>
+<p>
+  Pacing lives in that same entity. <code>src/infra/config/main.star</code>:144&ndash;149
+  sets <code>submit_max_burst = 2</code> and
+  <code>submit_burst_delay = time.minute</code>, emitted by lucicfg as
+  <code>submit_options { max_burst: 2 burst_delay { seconds: 60 } }</code>
+  (commit-queue.cfg:8&ndash;13) <span class="src">from the tree</span>.
+  <code>nextSubmissionETA</code> (queue.go:75&ndash;90) returns <code>now</code>, unless the
+  <code>maxBurst</code>-th most recent submission is newer than <code>now</code>
+  minus <code>burstDelay</code> &mdash; in which case it returns that timestamp
+  plus the delay. In plain language: the third commit in any 60-second window
+  waits. Figure {{fig-submit-machine}} puts the state machine, the queue and the
+  rewrite on one page.
+</p>
+
+<figure class="figure wide" id="fig-submit-machine">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">Three machines between a green run and a numbered commit</p>
+  </div>
+  <div class="figure-body plain">
+    <svg viewBox="0 0 1080 586" role="img" aria-label="Left: the CV Run state machine from PENDING to SUCCEEDED, with SUBMITTING shaded as uncancellable. Right: the SubmitQueue entity with Current, Waitlist and History fields, its next-submission arithmetic, and a strip plot of commits showing at most two CV commits per sixty seconds with human submits as outliers. Bottom: the Gerrit submit band, rebase always to change message modifier to git-numberer to validator to ref update.">
+      <defs>
+        <marker id="fig-submit-machine-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+        <marker id="fig-submit-machine-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+        <marker id="fig-submit-machine-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+      </defs>
+
+      <text x="30" y="24" class="svg-lane">CV RUN · storage.proto:30-73</text>
+      <rect x="30" y="38" width="250" height="40" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <text x="46" y="63" class="svg-step">PENDING</text>
+      <rect x="30" y="112" width="250" height="40" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="46" y="137" class="svg-step">RUNNING</text>
+      <rect x="30" y="186" width="250" height="52" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="46" y="209" class="svg-step">WAITING_FOR_SUBMISSION</text>
+      <text x="46" y="228" class="svg-sub">cancellable · 3 documented causes</text>
+      <rect x="30" y="272" width="250" height="52" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+      <text x="46" y="295" class="svg-step">SUBMITTING</text>
+      <text x="46" y="314" class="svg-sub">NOT cancellable · 20 min deadline</text>
+      <rect x="30" y="358" width="118" height="40" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="46" y="383" class="svg-step">SUCCEEDED</text>
+      <rect x="162" y="358" width="118" height="40" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <text x="176" y="383" class="svg-step">FAILED / CANC.</text>
+
+      <line x1="72" y1="78" x2="72" y2="112" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-submit-machine-ink)"/>
+      <text x="86" y="100" class="svg-sub">run quota available</text>
+      <line x1="72" y1="152" x2="72" y2="186" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-submit-machine-ink)"/>
+      <text x="86" y="174" class="svg-sub">tryjobs SUCCEEDED (tryjobs.go:101-105)</text>
+      <line x1="72" y1="238" x2="72" y2="272" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-submit-machine-ink)"/>
+      <text x="86" y="260" class="svg-sub">queue slot + tree open</text>
+      <line x1="72" y1="324" x2="72" y2="358" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-submit-machine-ink)"/>
+      <text x="86" y="346" class="svg-sub">every CL merged</text>
+      <path d="M280 212 C332 212 332 300 280 300" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-submit-machine-purple)"/>
+      <text x="300" y="256" class="svg-note">slot</text>
+
+      <text x="392" y="24" class="svg-lane">SUBMIT QUEUE · one entity per LUCI project</text>
+      <rect x="392" y="38" width="648" height="126" rx="10" fill="#ffffff" stroke="#252525"/>
+      <text x="410" y="64" class="svg-step">Current</text>
+      <text x="530" y="64" class="svg-sub">the Run submitting right now &mdash; there is only ever one</text>
+      <text x="410" y="90" class="svg-step">Waitlist</text>
+      <text x="530" y="90" class="svg-sub">FIFO; each Run is notified when its turn arrives</text>
+      <text x="410" y="116" class="svg-step">History</text>
+      <text x="530" y="116" class="svg-sub">submit timestamps inside BurstDelay (60 s)</text>
+      <text x="410" y="146" class="svg-step">Opts</text>
+      <text x="530" y="146" class="svg-sub">max_burst 2 · burst_delay 60 s (main.star:144-149)</text>
+
+      <rect x="392" y="180" width="648" height="40" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <text x="410" y="205" class="svg-sub">nextSubmissionETA(now) = History[len&minus;2] + 60 s  if  History[len&minus;2] &gt; now &minus; 60 s,  else now</text>
+
+      <text x="392" y="252" class="svg-lane">400 CONSECUTIVE COMMITS ON MAIN · 12.6 h · 31.8/h</text>
+      <line x1="392" y1="300" x2="1040" y2="300" stroke="#b8b8b1" stroke-width="1"/>
+      <rect x="418" y="278" width="150" height="44" fill="#f7f7f5" stroke="#deded9"/>
+      <text x="493" y="340" text-anchor="middle" class="svg-note">60 s window · 2 CV commits</text>
+      <circle cx="440" cy="300" r="5" fill="#3c6f97"/>
+      <circle cx="530" cy="300" r="5" fill="#3c6f97"/>
+      <circle cx="600" cy="300" r="5" fill="#3c6f97"/>
+      <circle cx="660" cy="300" r="5" fill="#3c6f97"/>
+      <rect x="716" y="278" width="150" height="44" fill="#f3dfdc" stroke="#ad4b43"/>
+      <circle cx="736" cy="300" r="5" fill="#3c6f97"/>
+      <circle cx="800" cy="300" r="5" fill="#ad4b43"/>
+      <circle cx="858" cy="300" r="5" fill="#3c6f97"/>
+      <text x="791" y="340" text-anchor="middle" class="svg-note">3 in 57.0 s &mdash; one is a human submit</text>
+      <circle cx="930" cy="300" r="5" fill="#3c6f97"/>
+      <circle cx="1010" cy="300" r="5" fill="#3c6f97"/>
+      <text x="392" y="368" class="svg-sub">blue = committer chromium-scoped (397/400) · red = direct human submit (3/400)</text>
+
+      <text x="376" y="424" class="svg-lane">GERRIT SUBMIT · one commit is written</text>
+      <rect x="30" y="438" width="186" height="72" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="44" y="462" class="svg-step">REBASE_ALWAYS</text>
+      <text x="44" y="481" class="svg-sub">rebase onto the tip even</text>
+      <text x="44" y="498" class="svg-sub">when a fast-forward works</text>
+      <rect x="244" y="438" width="186" height="72" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="258" y="462" class="svg-step">ChangeMessage-</text>
+      <text x="258" y="479" class="svg-step">Modifier hook</text>
+      <text x="258" y="498" class="svg-sub">runs for 2 submit types only</text>
+      <rect x="458" y="438" width="186" height="72" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+      <text x="472" y="462" class="svg-step">git-numberer</text>
+      <text x="472" y="481" class="svg-sub">parent @{#X}</text>
+      <text x="472" y="498" class="svg-sub">child  @{#X+1}</text>
+      <rect x="672" y="438" width="186" height="72" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+      <text x="686" y="462" class="svg-step">validator</text>
+      <text x="686" y="481" class="svg-sub">one parent · X+1 · lineage</text>
+      <text x="686" y="498" class="svg-sub">no merge commits</text>
+      <rect x="886" y="438" width="154" height="72" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="900" y="462" class="svg-step">ref update</text>
+      <text x="900" y="481" class="svg-sub">refs/heads/main</text>
+      <text x="900" y="498" class="svg-sub">advances by one</text>
+
+      <line x1="216" y1="474" x2="244" y2="474" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-submit-machine-ink)"/>
+      <line x1="430" y1="474" x2="458" y2="474" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-submit-machine-ink)"/>
+      <line x1="644" y1="474" x2="672" y2="474" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-submit-machine-ink)"/>
+      <line x1="858" y1="474" x2="886" y2="474" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-submit-machine-ink)"/>
+      <path d="M280 310 L330 310 L330 420 L123 420 L123 438" fill="none" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-submit-machine-blue)"/>
+      <text x="160" y="412" class="svg-sub">SubmitRevision, one CL at a time</text>
+      <text x="30" y="546" class="svg-note">thick black = control flow · thin blue = the Run that reached SUCCEEDED · dashed purple = the queue slot, taken and released</text>
+      <text x="30" y="568" class="svg-note">The three coloured bands are three separate systems: LUCI CV, Gerrit core, and a Gerrit plugin. None of them counts commits.</text>
+    </svg>
+  </div>
+  <p class="figure-caption">
+    The state machine, the queue fields and the submit band are read from
+    source <span class="src">from the tree</span>. The strip is schematic: what
+    is measured is the sample &mdash; 397 of 400 commits committed by
+    <code>chromium-scoped</code>, and no window with three CV commits inside 60
+    seconds &mdash; not the tick positions drawn here.
+  </p>
+</figure>
+
+<p>
+  That is testable against public data, so I tested it. Over 400 consecutive
+  commits on <code>refs/heads/main</code> &mdash; 2026-09-21 21:45 to 2026-09-22
+  10:20 UTC, 12.6 hours at 31.8 commits an hour &mdash; no three CV-committed
+  commits fell inside 60 seconds. Exactly two windows held three commits at all,
+  the tighter spanning 57.0 seconds, and each contained a direct human submit
+  (iwells@chromium.org at 00:01:31). The pacing is real; the exceptions bypass
+  the queue.
+</p>
+<p>
+  Submission itself is unglamorous. <code>RunCLsSubmitter.Submit</code>
+  re-checks that it still holds the queue, then calls Gerrit
+  <code>SubmitRevision</code> once per CL in dependency order, each with up to
+  10 exponential-backoff retries from a 200 ms base, doubling
+  (submitter.go:161&ndash;222, 231&ndash;252). <code>FailedPrecondition</code> &mdash;
+  Gerrit's 409, "either because the change can't be merged, or this revision
+  isn't the latest" &mdash; is permanent (submitter.go:307&ndash;347), and when the
+  Run ends CV removes the Commit-Queue votes, triggering vote last
+  (gerrit/trigger/reset.go:156&ndash;186) <span class="src">from the tree</span>.
+  On a live CL the comment reads "Cannot rebase &lt;sha&gt;: Change N could not be
+  rebased due to a conflict during merge" (CL 8431183, 2026-09-22). The
+  whole submission is bounded by
+  <code>defaultSubmissionDuration = 20 * time.Minute</code>, 40 for a CrOS
+  kernel change (handler/submit.go:506&ndash;526).
+</p>
+
+<h3>Why the rebase is load-bearing</h3>
+<p>
+  <code>REBASE_ALWAYS</code> is usually explained as history hygiene: Gerrit
+  "always does a rebase, even if a fast-forward is possible", so main stays
+  linear (Documentation/config-project-config.txt)
+  <span class="src">from the docs</span>. True, and beside the point. The
+  consequence that matters is in Gerrit's plugin documentation: a Change Message
+  Modifier can "modify commit message of the change being submitted by Rebase
+  Always and Cherry Pick submit strategies" &mdash; and by nothing else
+  (Documentation/dev-plugins.txt). git-numberer's generator <em>is</em> a
+  <code>ChangeMessageModifier</code>. Numbering works only because the commit is
+  rewritten at submit, and the plugin states the inverse itself: when
+  <code>baseCommit</code> equals the original it returns the message untouched
+  (GitNumberFooterGenerator.java:36&ndash;73). That causal chain is a
+  <span class="recon">reconstruction</span>; each link in it is sourced.
+</p>
+<p>
+  The generator's rule fits on a screen. This is <code>Generator.childMessage</code>,
+  lines 35&ndash;56 of <code>Generator.java</code> in
+  <code>infra/gerrit-plugins/git-numberer</code>:
+</p>
+<pre><code>  public static String childMessage(
+      RevCommit expectedParent, String childCommitMessage, String destRef)
+      throws GitNumberValidationError {
+    checkNotNull(expectedParent);
+    PositionFooters pfParent = PositionFooters.extract(expectedParent);
+    if (!pfParent.errors.isEmpty())
+      throw new GitNumberValidationError(pfParent.formatErrors(expectedParent));
+
+    StringBuilder newMessage = MessageTweaker.copyAndModifyingFooters(childCommitMessage);
+    // Post-condition: we are appending lines to last paragraph
+    // and all prior footers like Change-Id are already in this paragraph.
+
+    if (destRef.equals(pfParent.position.branch)) {
+      PositionFooters.appendCommitPosition(newMessage, destRef, pfParent.position.number + 1);
+    } else {
+      PositionFooters.appendCommitPosition(newMessage, destRef, 1);
+      PositionFooters.appendBranchedFrom(newMessage, expectedParent.getName(), pfParent.position);
+    }
+    PositionFooters.copyBranchedFrom(newMessage, pfParent);
+    newMessage.append('\n');
+    return newMessage.toString();
+  }</code></pre>
+<p>
+  Same destination ref as the parent: X+1. A different ref: position 1, plus a
+  <code>Cr-Branched-From</code> footer naming the parent's sha and position, with
+  the parent's lineage copied forward. That is the whole numbering system. The
+  other half of the plugin is a verifier, bound as both
+  <code>RefOperationValidationListener</code> and
+  <code>OnSubmitValidationListener</code> (GitNumbererModule.java:22&ndash;63), so the same rule holds for a raw
+  <code>git push</code> and a Gerrit submit alike: it rejects merge commits with
+  "merge commit &lt;sha&gt; not allowed", non-fast-forward updates, wrong branches
+  and wrong lineage (CommitValidator.java:169&ndash;242).
+</p>
+<p>
+  One last piece of folklore. Auto-Submit is not a CV feature either. CV knows
+  the label only through <code>HasAutoSubmit</code> and uses it for one
+  decision: <code>quotaPayer</code> charges the full-run quota to the CL
+  <em>owner</em> rather than to whoever voted (prjmanager/triager/runs.go:703&ndash;720). The
+  vote is cast in a browser. The <code>chromium-behavior</code> Gerrit frontend
+  plugin watches the reply dialog and, when a reviewer sets Code-Review+1 on a
+  CL carrying Auto-Submit+1 with no unresolved comments or drafts, sets
+  Commit-Queue+2 in the same review (web/autosubmit.ts:225&ndash;283), under the
+  notice "Your approval will also set CQ+2" (autosubmit.ts:288&ndash;298). Rubber Stamper does the same from
+  the bot side. Three machines land the commit, and the button that starts them
+  is in somebody else's browser.
+</p>

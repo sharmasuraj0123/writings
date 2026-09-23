@@ -1,0 +1,470 @@
+          <h2 id="processes-threads-and-the-scheduler"><span class="secnum">{{S}}</span>Processes, threads, and the scheduler</h2>
+          <p class="lede">
+            Blink has one main thread. The DOM, style, layout, and every
+            piece of JavaScript outside a worker run on it. So the
+            engineering is not in the thread. It is in
+            the scheduler deciding what that thread may do next. Three
+            questions: which process, which thread, which object.
+          </p>
+
+          <h3>Which process</h3>
+          <p>
+            Blink runs only inside a sandboxed renderer, and it does not
+            choose which one. That is a browser-side decision, built on three
+            abstractions <span class="src">from the docs</span>
+            (<code>docs/process_model_and_site_isolation.md</code>:80-131).
+            <strong>SiteInfo</strong> is the security principal, "typically a
+            'site' (i.e., scheme plus eTLD+1)".
+            <strong>SiteInstance</strong> is a principal instance, which
+            "roughly corresponds to the agent cluster concept in the spec,
+            although they do not match exactly".
+            <strong>BrowsingInstance</strong> is the browsing context group.
+            The rule: two documents with the same principal in the same
+            browsing context group must share a process, because they have
+            synchronous access to each other.
+          </p>
+          <p>
+            How much ships depends on the platform. Desktop runs full
+            site-per-process, from Chrome 67, at roughly 10–13% memory
+            overhead; Android with at least 2 GB of RAM runs partial
+            isolation, from Chrome 77, at 3–5%; low-RAM Android, WebView and
+            iOS get none <span class="src">from the docs</span> (same file,
+            :141-195, and chromium.org's Site Isolation page). Since
+            127.0.6483.0 desktop also splits off sandboxed same-site iframes
+            (same file, :453-459).
+          </p>
+
+          <h3>Which thread</h3>
+          <p>
+            <code>renderer_main.cc</code> names the thread
+            <code>CrRendererMain</code> at line 202 and builds the Blink
+            main-thread scheduler at 219-221;
+            <code>platform.EnableSandbox()</code> is at 255
+            <span class="src">from the tree</span>. The scheduler exists
+            before the sandbox closes. (Files outside the sparse checkout are
+            read at <code>chromium/main</code>, 22 September 2026.)
+          </p>
+          <p>
+            That thread gets one V8 isolate — a shipping fact, not a
+            structural one. The scheduler interface already assumes several:
+            <code>MainThreadScheduler::ForEachMainThreadIsolate</code> takes a
+            callback per isolate "bound to the main thread"
+            (<code>platform/scheduler/public/main_thread_scheduler.h</code>:78-81).
+            The feature that would create them is MBI, Multiple Blink
+            Isolates: give each <code>AgentSchedulingGroup</code> its own IPC
+            channel and, in time, its own isolate.
+            <code>enum class MBIMode</code> has three values.
+            <code>kLegacy</code> keeps the process-wide channel and leaves the
+            group "effectively a pass-through".
+            <code>kEnabledPerRenderProcessHost</code> gives each group a
+            channel, one per process.
+            <code>kEnabledPerSiteInstance</code> allows "potentially multiple
+            AgentSchedulingGroups per RenderProcessHost", and charges for it:
+            "Ordering between the AgentSchedulingGroups in the same render
+            process is not preserved"
+            (<code>content/public/common/content_features.h</code>:216-235).
+            <code>kMBIMode</code> is <code>FEATURE_ENABLED_BY_DEFAULT</code>
+            only under an <code>MBI_MODE_*</code> buildflag and
+            <code>FEATURE_DISABLED_BY_DEFAULT</code> otherwise, under a
+            comment that is not ambiguous: "DO NOT USE! The feature is not yet
+            fully implemented. See crbug.com/1111231."
+            (<code>content_features.cc</code>:710-718)
+            <span class="src">from the tree</span>, both files on
+            <code>main</code>.
+          </p>
+          <p>
+            The compositor thread comes later, and is optional:
+            <code>RenderThreadImpl::InitializeWebKit</code> calls
+            <code>InitializeCompositorThread()</code> only
+            <code>if (!command_line.HasSwitch(switches::kDisableThreadedCompositing))</code>
+            (<code>content/renderer/render_thread_impl.cc</code>:839-840).
+            It creates a Blink <code>NonMainThread</code> of
+            <code>ThreadType::kCompositorThread</code> at
+            <code>base::ThreadType::kPresentation</code>
+            (<code>platform/scheduler/common/thread.cc</code>:76-80) — and on
+            Linux and ChromeOS it asks the browser to apply that priority:
+            "This is not possible inside the sandbox" (same file, :98-107).
+          </p>
+          <p>
+            Workers are the third family, and the exception to everything
+            above. Each <code>WorkerThread</code> borrows a
+            <code>WorkerBackingThread</code>, "a WebThread with Oilpan and
+            V8" — Oilpan is Blink's garbage collector, §10's subject — so own
+            isolate, own heap
+            (<code>core/workers/worker_backing_thread.h</code>:22-25).
+            Terminating one gives JavaScript a
+            <code>kForcibleTerminationDelay = base::Seconds(2)</code> grace,
+            then stops it (<code>worker_thread.cc</code>:84). Pausing one
+            enters a nested event loop where "Only the none pausable tasks
+            will execute" — the typo is in the tree
+            (<code>PausingAndFreezing.md</code>:56-57).
+            Figure {{fig-containers}} nests all three.
+          </p>
+
+          <figure class="figure wide" id="fig-containers">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Three nested containers — process, thread, object</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 -14 1120 346" role="img" aria-label="Three panels read left to right. The first shows one browser process above two sandboxed renderer processes and one Viz process. Two dotted fans zoom into the second panel, which shows the threads inside a single renderer: CrRendererMain, the compositor thread, the IO thread, and N worker threads each with their own isolate and Oilpan heap. A second fan zooms from CrRendererMain into the third panel, the main-thread object graph: AgentSchedulingGroup contains a WebView and blink::Page, which owns a FrameTree of LocalFrame and RemoteFrame; under LocalFrame sits LocalDOMWindow, which points at a WindowAgent holding an EventLoop and microtask queue.">
+                <defs>
+                  <marker id="fig-containers-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-containers-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <line x1="334" y1="100" x2="368" y2="24" stroke="#b8b8b1" stroke-width="1" stroke-dasharray="3 3"/>
+                <line x1="334" y1="126" x2="368" y2="278" stroke="#b8b8b1" stroke-width="1" stroke-dasharray="3 3"/>
+                <line x1="700" y1="52" x2="732" y2="24" stroke="#b8b8b1" stroke-width="1" stroke-dasharray="3 3"/>
+                <line x1="700" y1="76" x2="732" y2="278" stroke="#b8b8b1" stroke-width="1" stroke-dasharray="3 3"/>
+
+                <text x="4" y="2" class="svg-lane">PROCESSES</text>
+                <rect x="4" y="24" width="330" height="50" rx="8" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="20" y="48" class="svg-step">Browser process</text>
+                <text x="20" y="65" class="svg-sub">decides placement · SiteInfo · SiteInstance</text>
+                <rect x="4" y="86" width="330" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="110" class="svg-step">Renderer · sandboxed</text>
+                <text x="20" y="127" class="svg-sub">locked to one site: scheme + eTLD+1</text>
+                <rect x="4" y="150" width="330" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="174" class="svg-step">Renderer · sandboxed</text>
+                <text x="20" y="191" class="svg-sub">another principal, another process</text>
+                <text x="20" y="220" class="svg-sub">… N more, up to a soft process limit</text>
+                <rect x="4" y="230" width="330" height="48" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="20" y="253" class="svg-step">Viz process</text>
+                <text x="20" y="269" class="svg-sub">one, for all of Chromium</text>
+                <text x="4" y="302" class="svg-note">desktop: site-per-process since Chrome 67, ~10–13% memory</text>
+                <text x="4" y="320" class="svg-note">≥ 2 GB Android: partial · below that, WebView, iOS: none</text>
+
+                <text x="368" y="2" class="svg-lane">THREADS IN ONE RENDERER</text>
+                <rect x="368" y="24" width="332" height="254" rx="10" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="380" y="38" width="308" height="52" rx="8" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="394" y="60" class="svg-step">CrRendererMain</text>
+                <text x="394" y="77" class="svg-sub">one V8 isolate · one Oilpan heap</text>
+                <rect x="380" y="100" width="308" height="52" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="394" y="122" class="svg-step">Compositor</text>
+                <text x="394" y="139" class="svg-sub">kCompositorThread · kPresentation</text>
+                <rect x="380" y="162" width="308" height="48" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="394" y="184" class="svg-step">IO thread</text>
+                <text x="394" y="201" class="svg-sub">every Mojo message lands here first</text>
+                <rect x="380" y="220" width="308" height="48" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="394" y="242" class="svg-step">N worker threads</text>
+                <text x="394" y="259" class="svg-sub">each: own isolate, own Oilpan heap</text>
+                <text x="368" y="302" class="svg-note">compositor thread optional: --disable-threaded-compositing</text>
+                <text x="368" y="320" class="svg-note">blue = main thread · orange = compositor · purple = workers</text>
+
+                <text x="732" y="2" class="svg-lane">OBJECTS ON CrRendererMain</text>
+                <rect x="732" y="24" width="384" height="44" rx="8" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="746" y="46" class="svg-step">AgentSchedulingGroup</text>
+                <text x="746" y="61" class="svg-sub">one WebAgentGroupScheduler</text>
+                <line x1="760" y1="68" x2="760" y2="78" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-containers-arr-ink)"/>
+                <rect x="744" y="78" width="372" height="44" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="758" y="100" class="svg-step">WebView → blink::Page</text>
+                <text x="758" y="115" class="svg-sub">"roughly … a tab or popup window"</text>
+                <line x1="760" y1="122" x2="760" y2="138" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-containers-arr-ink)"/>
+                <text x="790" y="132" class="svg-lane">FRAMETREE</text>
+                <rect x="756" y="138" width="172" height="66" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="768" y="158" class="svg-step">LocalFrame</text>
+                <text x="768" y="176" class="svg-sub">local root → widget</text>
+                <text x="768" y="194" class="svg-sub">→ cc::LayerTreeHost</text>
+                <rect x="952" y="138" width="164" height="66" rx="8" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+                <text x="964" y="158" class="svg-step">RemoteFrame</text>
+                <text x="964" y="176" class="svg-sub">always cross-site</text>
+                <text x="964" y="194" class="svg-sub">a stand-in, no DOM</text>
+                <line x1="800" y1="204" x2="800" y2="216" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-containers-arr-ink)"/>
+                <rect x="756" y="216" width="172" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="768" y="236" class="svg-step">LocalDOMWindow</text>
+                <text x="768" y="253" class="svg-sub">is the ExecutionContext</text>
+                <text x="768" y="270" class="svg-sub">Document hangs off it</text>
+                <line x1="928" y1="247" x2="952" y2="247" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-containers-arr-purple)"/>
+                <rect x="952" y="216" width="164" height="62" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="964" y="236" class="svg-step">WindowAgent</text>
+                <text x="964" y="253" class="svg-sub">one per AgentClusterKey</text>
+                <text x="964" y="270" class="svg-sub">EventLoop + microtasks</text>
+                <text x="732" y="302" class="svg-note">thick black = ownership · dashed purple = agent of a context</text>
+                <text x="732" y="320" class="svg-note">only a local root owns a widget, and so a LayerTreeHost</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The dotted fans are zooms. Every box and label comes from the
+              tree or its docs; the arrangement is mine
+              <span class="recon">reconstruction</span>. One isolate per
+              main thread is the shipping case, because MBI is off unless a
+              buildflag turns it on <span class="src">from the tree</span>;
+              the <code>AgentSchedulingGroup</code> box at the head of the
+              third panel is the unit MBI would multiply.
+            </p>
+          </figure>
+
+          <h3>The scheduler</h3>
+          <p>
+            A task is a <code>base::OnceClosure</code>: "if a task has
+            started, it can't be interrupted until it completes. The scheduler
+            can only choose a new task to run from the eligible tasks or can
+            elect not to run any task at all"
+            <span class="src">from the tree</span>
+            (<code>platform/scheduler/TaskSchedulingInBlink.md</code>:31-34).
+            All the control is in the choosing, which is why posting is
+            fenced in. Almost every main-thread task goes through
+            <code>FrameScheduler::GetTaskRunner(TaskType)</code> so that the
+            scheduler can freeze, throttle, or prioritise one frame (same
+            file, :38-47), and
+            <code>base::SingleThreadTaskRunner::GetCurrentDefault</code> is
+            "<strong>banned</strong> in <code>blink/</code> and
+            <code>content/renderer/</code>" because tasks posted to it "lack
+            any attribution" (same file, :69-77).
+          </p>
+          <p>
+            <code>TaskType</code> carries 79 concrete values
+            (<code>grep -cE '^\s+k[A-Za-z0-9_]+ = [0-9]+,'</code> over
+            <code>public/platform/task_type.h</code> at
+            <code>f288fed6</code>), and the header's own "Next value: 88"
+            comment is already wrong: 88 and 89 are taken.
+            <code>FrameSchedulerImpl::CreateQueueTraitsForTaskType</code> is
+            one 182-line switch (<code>frame_scheduler_impl.cc</code>:487-668)
+            turning each into <code>QueueTraits</code>: deferrable,
+            throttleable, intensively throttleable, pausable, freezable, plus
+            a prioritisation type. Delayed JavaScript timers are throttleable;
+            immediate ones only deferrable.
+          </p>
+          <p>
+            Prioritisation then lands on a ladder of exactly eleven rungs —
+            the right half of Figure {{fig-scheduler}}.
+            <code>platform/scheduler/common/task_priority.h</code>:14-31
+            <span class="src">from the tree</span>:
+          </p>
+<pre><code>enum class TaskPriority : base::sequence_manager::TaskQueue::QueuePriority {
+  // Priorities are in descending order.
+  kControlPriority = 0,
+  kHighestPriority = 1,
+  kExtremelyHighPriority = 2,
+  kVeryHighPriority = 3,
+  kHighPriorityContinuation = 4,
+  kHighPriority = 5,
+  kNormalPriorityContinuation = 6,
+  kNormalPriority = 7,
+  kDefaultPriority = kNormalPriority,
+  kLowPriorityContinuation = 8,
+  kLowPriority = 9,
+  kBestEffortPriority = 10,
+
+  // Must be the last entry.
+  kPriorityCount = 11,
+};</code></pre>
+          <p>
+            Input queues sit at <code>kHighestPriority</code>
+            unconditionally. The compositor queue is the one that moves, and
+            what moves it is a <code>UseCase</code> state machine — nine
+            states, <code>kNone</code> and <code>kEarlyLoading</code> through
+            <code>kCompositorGesture</code> to
+            <code>kDiscreteInputResponse</code>
+            (<code>main_thread/use_case.h</code>:16-53) — fed by a
+            <code>UserModel</code> of four constants — 100 ms of escalation
+            after input, a 300 ms median gesture "based on two weeks of
+            Android usage data", a 2000 ms window in which another gesture is
+            likely, 50 ms of maximum deferral
+            (<code>user_model.h</code>:21-39). A compositor gesture drops the
+            queue to <code>kLowPriority</code>; a main-thread gesture,
+            touchstart, or discrete input raises it to
+            <code>kHighestPriority</code>
+            (<code>main_thread_scheduler_impl.cc</code>:2915-2943). Two
+            safety valves sit above:
+            <code>kDefaultRenderingStarvationThreshold</code>, 100 ms without
+            a frame, and <code>kRenderBlockingStarvationThreshold</code>,
+            500 ms (<code>main_thread_scheduler_impl.h</code>:118-119, :124-125).
+          </p>
+          <p>
+            Idle tasks take what is left: "typically less than 10ms" after
+            BeginMainFrame, "typically up to 50ms" when no frames are
+            expected, a 1 ms floor (<code>common/idle_helper.h</code>:36-41, :71-73) —
+            and none at all ten seconds after the renderer's widgets are
+            hidden (<code>kEndIdleWhenHiddenDelayMillis = 10000</code>,
+            <code>main_thread_scheduler_impl.h</code>:551).
+          </p>
+          <p>
+            The docs get one background number wrong.
+            <code>TaskSchedulingInBlink.md</code>:142 reads "On mobile all
+            pages are frozen after five minutes in the background." That was
+            true from 2019 until M143. The constant today is
+            <code>kDefaultDelayForBackgroundTabFreezing = base::Minutes(1)</code>
+            (<code>page_scheduler_impl.cc</code>:55-56), and the branch that
+            uses it runs only when
+            <code>blink::features::kStopInBackground</code> is enabled (same
+            file, :850-851) — <code>FEATURE_ENABLED_BY_DEFAULT</code> under
+            <code>IS_ANDROID &amp;&amp; !IS_CAST_ANDROID &amp;&amp; !IS_DESKTOP_ANDROID</code>,
+            <code>FEATURE_DISABLED_BY_DEFAULT</code> everywhere else
+            (<code>blink/common/features.cc</code>:2251-2261).
+            So on desktop no page freezes itself; only the embedder can, via
+            <code>PageSchedulerImpl::SetPageFrozen()</code>.
+            The five minutes that survives belongs to a different mechanism —
+            intensive wake-up throttling, grace period <code>5 * 60</code>
+            seconds, or <code>60</code> once the page has loaded
+            (<code>platform/scheduler/common/features.h</code>:40-41).
+          </p>
+
+          <figure class="figure wide" id="fig-scheduler">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The hierarchy, the ladder, and a backgrounded page's clock</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 -14 1120 528" role="img" aria-label="Left: a five-step hierarchy from MainThreadSchedulerImpl through AgentGroupScheduler, PageScheduler and FrameScheduler down to MainThreadTaskQueue with its QueueTraits bits. Right: the eleven-rung TaskPriority ladder from kControlPriority at zero to kBestEffortPriority at ten, with four annotations showing which queues land on which rung. Bottom: a piecewise timeline of a backgrounded page marking full throttling at ten seconds, freezing at one minute on Android only, and one wake-up per minute after the intensive-throttling grace period.">
+                <defs>
+                  <marker id="fig-scheduler-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+
+                <text x="4" y="2" class="svg-lane">THE HIERARCHY</text>
+                <rect x="4" y="18" width="340" height="44" rx="8" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="18" y="40" class="svg-step">MainThreadSchedulerImpl</text>
+                <text x="18" y="55" class="svg-sub">one per CrRendererMain · owns the UseCase</text>
+                <line x1="34" y1="62" x2="34" y2="74" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-scheduler-arr-ink)"/>
+                <rect x="20" y="74" width="324" height="44" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="34" y="96" class="svg-step">AgentGroupScheduler</text>
+                <text x="34" y="111" class="svg-sub">default + compositor runners · Isolate()</text>
+                <line x1="50" y1="118" x2="50" y2="130" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-scheduler-arr-ink)"/>
+                <rect x="36" y="130" width="308" height="44" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50" y="152" class="svg-step">PageScheduler</text>
+                <text x="50" y="167" class="svg-sub">visible · frozen · bfcached · audible</text>
+                <line x1="66" y1="174" x2="66" y2="186" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-scheduler-arr-ink)"/>
+                <rect x="52" y="186" width="292" height="44" rx="8" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="66" y="208" class="svg-step">FrameScheduler</text>
+                <text x="66" y="223" class="svg-sub">GetTaskRunner(TaskType) — the only door</text>
+                <line x1="82" y1="230" x2="82" y2="242" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-scheduler-arr-ink)"/>
+                <rect x="68" y="242" width="276" height="66" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="82" y="264" class="svg-step">MainThreadTaskQueue</text>
+                <text x="82" y="281" class="svg-sub">QueueTraits: deferrable · throttleable ·</text>
+                <text x="82" y="297" class="svg-sub">intensively throttleable · pausable · freezable</text>
+                <text x="4" y="330" class="svg-note">79 TaskTypes collapse into one queue per distinct trait set</text>
+                <text x="4" y="348" class="svg-note">idle periods: &lt; 10 ms short, ≤ 50 ms long, 1 ms minimum</text>
+
+                <text x="400" y="2" class="svg-lane">TASKPRIORITY · 11 RUNGS</text>
+                <text x="424" y="34" text-anchor="end" class="svg-sub">0</text>
+                <rect x="432" y="18" width="300" height="22" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="444" y="34" class="svg-step">kControlPriority</text>
+                <text x="424" y="60" text-anchor="end" class="svg-sub">1</text>
+                <rect x="432" y="44" width="300" height="22" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="444" y="60" class="svg-step">kHighestPriority</text>
+                <text x="424" y="86" text-anchor="end" class="svg-sub">2</text>
+                <rect x="432" y="70" width="300" height="22" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="444" y="86" class="svg-step">kExtremelyHighPriority</text>
+                <text x="424" y="112" text-anchor="end" class="svg-sub">3</text>
+                <rect x="432" y="96" width="300" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="444" y="112" class="svg-step">kVeryHighPriority</text>
+                <text x="424" y="138" text-anchor="end" class="svg-sub">4</text>
+                <rect x="432" y="122" width="300" height="22" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="444" y="138" class="svg-step">kHighPriorityContinuation</text>
+                <text x="424" y="164" text-anchor="end" class="svg-sub">5</text>
+                <rect x="432" y="148" width="300" height="22" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="444" y="164" class="svg-step">kHighPriority</text>
+                <text x="424" y="190" text-anchor="end" class="svg-sub">6</text>
+                <rect x="432" y="174" width="300" height="22" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="444" y="190" class="svg-step">kNormalPriorityContinuation</text>
+                <text x="424" y="216" text-anchor="end" class="svg-sub">7</text>
+                <rect x="432" y="200" width="300" height="22" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="444" y="216" class="svg-step">kNormalPriority</text>
+                <text x="724" y="216" text-anchor="end" class="svg-sub">= kDefaultPriority</text>
+                <text x="424" y="242" text-anchor="end" class="svg-sub">8</text>
+                <rect x="432" y="226" width="300" height="22" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="444" y="242" class="svg-step">kLowPriorityContinuation</text>
+                <text x="424" y="268" text-anchor="end" class="svg-sub">9</text>
+                <rect x="432" y="252" width="300" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="444" y="268" class="svg-step">kLowPriority</text>
+                <text x="424" y="294" text-anchor="end" class="svg-sub">10</text>
+                <rect x="432" y="278" width="300" height="22" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="444" y="294" class="svg-step">kBestEffortPriority</text>
+
+                <line x1="758" y1="55" x2="734" y2="55" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-scheduler-arr-ink)"/>
+                <text x="766" y="50" class="svg-step">input queues · always</text>
+                <text x="766" y="66" class="svg-sub">compositor queue under kTouchstart,</text>
+                <text x="766" y="82" class="svg-sub">main-thread gesture, kDiscreteInputResponse</text>
+                <line x1="758" y1="107" x2="734" y2="107" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-scheduler-arr-ink)"/>
+                <text x="766" y="103" class="svg-step">the default queue</text>
+                <text x="766" y="119" class="svg-sub">when IPC tasks are prioritised</text>
+                <line x1="758" y1="263" x2="734" y2="263" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-scheduler-arr-ink)"/>
+                <text x="766" y="250" class="svg-step">compositor queue</text>
+                <text x="766" y="266" class="svg-sub">under kCompositorGesture, unless</text>
+                <text x="766" y="282" class="svg-sub">blocking input is expected soon</text>
+                <line x1="758" y1="289" x2="734" y2="289" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-scheduler-arr-ink)"/>
+                <text x="766" y="302" class="svg-step">idle tasks</text>
+                <text x="766" y="318" class="svg-sub">and only inside an idle period</text>
+                <text x="400" y="348" class="svg-note">UserModel: 100 ms escalation after input · 300 ms median gesture</text>
+                <text x="400" y="364" class="svg-note">2000 ms another-gesture window · 50 ms max discrete-input deferral</text>
+
+                <line x1="4" y1="364" x2="1116" y2="364" stroke="#deded9" stroke-width="1"/>
+                <text x="4" y="384" class="svg-lane">A BACKGROUNDED PAGE'S CLOCK</text>
+                <line x1="300" y1="404" x2="300" y2="470" stroke="#deded9" stroke-width="1"/>
+                <line x1="620" y1="404" x2="620" y2="470" stroke="#deded9" stroke-width="1"/>
+                <path d="M620 400L620 392L1040 392L1040 400" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4"/>
+                <text x="830" y="386" text-anchor="middle" class="svg-sub">intensive-throttling grace: 60 s once loaded, else 5 min</text>
+                <line x1="40" y1="440" x2="1100" y2="440" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-scheduler-arr-ink)"/>
+                <line x1="60" y1="440" x2="60" y2="416" stroke="#252525" stroke-width="1.5"/>
+                <circle cx="60" cy="440" r="5" fill="#252525"/>
+                <text x="60" y="412" text-anchor="middle" class="svg-step">backgrounded</text>
+                <text x="60" y="458" text-anchor="middle" class="svg-sub">t = 0</text>
+                <line x1="300" y1="440" x2="300" y2="416" stroke="#3c6f97" stroke-width="1.5"/>
+                <circle cx="300" cy="440" r="5" fill="#3c6f97"/>
+                <text x="300" y="412" text-anchor="middle" class="svg-step">full throttling</text>
+                <text x="300" y="458" text-anchor="middle" class="svg-sub">10 s · wake-ups every 1 s</text>
+                <text x="300" y="474" text-anchor="middle" class="svg-sub">idle periods stop being scheduled</text>
+                <line x1="620" y1="440" x2="620" y2="416" stroke="#d98226" stroke-width="1.5"/>
+                <circle cx="620" cy="440" r="5" fill="#d98226"/>
+                <text x="620" y="412" text-anchor="middle" class="svg-step">freeze</text>
+                <text x="620" y="458" text-anchor="middle" class="svg-sub">60 s · only where kStopInBackground is on</text>
+                <text x="620" y="474" text-anchor="middle" class="svg-sub">elsewhere: only on SetPageFrozen()</text>
+                <line x1="1040" y1="440" x2="1040" y2="416" stroke="#765b98" stroke-width="1.5"/>
+                <circle cx="1040" cy="440" r="5" fill="#765b98"/>
+                <text x="1100" y="412" text-anchor="end" class="svg-step">1 wake-up / minute</text>
+                <text x="1100" y="458" text-anchor="end" class="svg-sub">5 min, or 60 s if loaded</text>
+                <text x="4" y="500" class="svg-note">the axis is piecewise: 0–10 s, 10–60 s and 60 s–5 min each take a third of the width, so read order, not spacing</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Rungs and constants are verbatim from the headers named above
+              <span class="src">from the tree</span>; the four arrows are
+              cases <code>ComputePriority</code> and
+              <code>ComputeCompositorPriorityFromUseCase</code> return
+              literally. Uncoloured rungs I did not trace
+              <span class="recon">reconstruction</span>. The clock is the
+              corrected one: one minute, not five.
+            </p>
+          </figure>
+
+          <h3>Which object</h3>
+          <p>
+            <code>blink::Page</code> "roughly corresponds to a tab or popup
+            window in a browser. It owns a tree of frames"
+            <span class="src">from the tree</span>
+            (<code>core/page/page.h</code>:112-115). That tree mixes two
+            kinds of frame, and the split is a security statement, not a layout one:
+            "A remote frame is always cross-site; a local frame
+            may be either same-site or cross-site"
+            (<code>public/web/web_frame.h</code>:60-62). A
+            <code>RemoteFrame</code> holds no DOM. Only a local root gets a
+            widget — <code>InitializeFrameWidget</code> "must be a LocalRoot"
+            (<code>public/web/web_local_frame.h</code>:275-279) — so only a
+            local root owns a <code>cc::LayerTreeHost</code>.
+          </p>
+          <p>
+            One thing here is routinely misread.
+            <code>LocalDOMWindow</code> <em>is</em> the
+            <code>ExecutionContext</code>:
+            <code>class CORE_EXPORT LocalDOMWindow final</code> <code>: public DOMWindow, public ExecutionContext, …</code>
+            (<code>core/frame/local_dom_window.h</code>:115-116).
+            <code>core/execution_context/README.md</code>:10 still says the
+            opposite — "inherited by Document instead of
+            DOMWindow/LocalDOMWindow for historical reasons". That sentence
+            is stale; the header is the tree.
+          </p>
+          <p>
+            Above the window sits the agent, the HTML spec's formalism in
+            C++. One <code>WindowAgentFactory</code> per group
+            of documents "mutually reachable via <code>window.opener</code>,
+            <code>window.frames</code> or others"
+            (<code>core/execution_context/window_agent_factory.h</code>:22-24)
+            hands out one <code>WindowAgent</code> per
+            <code>AgentClusterKey</code>, and each <code>Agent</code> owns a
+            <code>scheduler::EventLoop</code> and a microtask queue
+            (<code>agent.h</code>:30-37, :52, :57). Which answers the third
+            question: a task does not run "on the main thread" so much as on
+            a frame, inside a page, inside an agent — and every one of those
+            nouns is a knob the scheduler can turn.
+          </p>

@@ -1,0 +1,257 @@
+          <h2 id="four-pipelines"><span class="secnum">{{S}}</span>Four pipelines on one substrate</h2>
+          <p class="lede">
+            Chromium does not have a CI/CD pipeline. It has four. The only
+            thing that makes them one system is that all four are configured
+            from files checked into <code>chromium/src</code> itself. The rest
+            of this post is the proof.
+          </p>
+          <p>
+            The four divide by what they consume. A <strong>pre-submit</strong>
+            pipeline verifies every CL before it can land. A
+            <strong>post-submit</strong> pipeline rebuilds and retests every
+            commit that reaches <code>refs/heads/main</code>. A
+            <strong>performance</strong> pipeline measures a much smaller set
+            of commits on real hardware. A <strong>release</strong> pipeline
+            cuts branches, bumps versions, pins dependencies and packages
+            binaries. They are different pipelines in the sense that matters —
+            different triggers, different latency budgets, different owners —
+            and they share machines, a scheduler, a result store and a UI.
+          </p>
+          <p>
+            That shared substrate is LUCI. The infra glossary defines it in two
+            sentences: "LUCI is a collection of continuous integration services
+            running on Google Cloud. These services largely make-up the backbone
+            of Chromium's CI"
+            [<code>src/docs/infra/glossary.md:101-102</code>]
+            <span class="src">from the docs</span>. The same page fixes the
+            vocabulary the whole post runs on. A <em>Build</em> is "A Buildbucket
+            job that runs a single CI-specific task", composed of steps rendered
+            in Milo. A <em>Builder</em> is "A named configuration (or grouping)
+            of builds in Buildbucket". And, the sentence that collapses two
+            layers into one: "As of writing (Q3 2022), all Buildbucket builds
+            are themselves Swarming tasks"
+            [<code>src/docs/infra/glossary.md:10-20</code>].
+          </p>
+          <p>
+            That last claim is four years old, so check it against the tree
+            rather than repeat it. In the generated Buildbucket config,
+            <code>swarming_host: "chromium-swarm.appspot.com"</code> occurs
+            1,211 times — once for each of the 1,211 builder blocks in the file
+            [<code>src/infra/config/generated/luci/cr-buildbucket.cfg</code>,
+            re-counted locally at <code>f288fed6</code>]
+            <span class="src">from the tree</span>. Not one builder in the
+            public project opts out. A newer document restates the claim with
+            a hedge and a wider scope: "As of writing (Q2 2025), nearly 100% of
+            all workloads in Chromium's infra run as Swarming tasks"
+            [<code>src/docs/infra/builder_types.md:20-32</code>].
+          </p>
+          <p>
+            The service hosts the four lanes share are named once, in nine
+            lines of <code>src/infra/config/main.star</code> (lines 88–96),
+            and Figure {{fig-substrate}} puts the four lanes against them:
+          </p>
+<pre><code>luci.project(
+    name = settings.project,
+    config_dir = "luci",
+    buildbucket = "cr-buildbucket.appspot.com",
+    logdog = "luci-logdog.appspot.com",
+    milo = "luci-milo.appspot.com",
+    notify = "luci-notify.appspot.com",
+    scheduler = "luci-scheduler.appspot.com",
+    swarming = "chromium-swarm.appspot.com",</code></pre>
+
+          <figure class="figure wide" id="fig-substrate">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Four lanes across five services — and where two of them leave the public project</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 -34 1100 468" role="img" aria-label="Four horizontal lanes — pre-submit, post-submit, performance, release — crossing five vertical service columns: Gerrit, LUCI CV, Buildbucket, Swarming plus RBE-CAS, and ResultDB plus LUCI Analysis. The performance and release lanes turn red at the Buildbucket column because their builders live in the internal chrome project. A band underneath shows five side-channel services, four of them with appspot hosts bound in main.star.">
+                <defs>
+                  <marker id="fig-substrate-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-substrate-arr-grey" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#b8b8b1"/></marker>
+                </defs>
+
+                <text x="150" y="-16" class="svg-lane">GERRIT</text>
+                <text x="338" y="-16" class="svg-lane">LUCI CV</text>
+                <text x="526" y="-16" class="svg-lane">BUILDBUCKET</text>
+                <text x="714" y="-16" class="svg-lane">SWARMING + RBE-CAS</text>
+                <text x="902" y="-16" class="svg-lane">RESULTDB + ANALYSIS</text>
+                <text x="150" y="0" class="svg-sub">chromium-review…</text>
+                <text x="338" y="0" class="svg-sub">chromium-cq-status</text>
+                <text x="526" y="0" class="svg-sub">cr-buildbucket.appspot</text>
+                <text x="714" y="0" class="svg-sub">chromium-swarm.appspot</text>
+                <text x="902" y="0" class="svg-sub">no host in main.star</text>
+                <line x1="0" y1="12" x2="1070" y2="12" stroke="#deded9" stroke-width="1"/>
+
+                <rect x="0" y="24" width="5" height="62" fill="#3c6f97"/>
+                <text x="16" y="48" class="svg-step">Pre-submit</text>
+                <text x="16" y="68" class="svg-sub">every CL</text>
+                <rect x="150" y="24" width="164" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="164" y="48" class="svg-step">CL, patchset N</text>
+                <text x="164" y="68" class="svg-sub">Commit-Queue+2</text>
+                <rect x="338" y="24" width="164" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="352" y="48" class="svg-step">Run → tryjobs</text>
+                <text x="352" y="68" class="svg-sub">reuse, retry, submit</text>
+                <rect x="526" y="24" width="164" height="62" rx="8" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="540" y="48" class="svg-step">chromium/try</text>
+                <text x="540" y="68" class="svg-sub">public project</text>
+                <rect x="714" y="24" width="164" height="62" rx="8" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="728" y="48" class="svg-step">pools/try</text>
+                <text x="728" y="68" class="svg-sub">+ pools/tests</text>
+                <rect x="902" y="24" width="164" height="62" rx="8" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="916" y="48" class="svg-step">results, exoneration</text>
+                <text x="916" y="68" class="svg-sub">gate on the verdict</text>
+
+                <rect x="0" y="100" width="5" height="62" fill="#367f59"/>
+                <text x="16" y="124" class="svg-step">Post-submit</text>
+                <text x="16" y="144" class="svg-sub">every commit</text>
+                <rect x="150" y="100" width="164" height="62" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="164" y="124" class="svg-step">refs/heads/main</text>
+                <text x="164" y="144" class="svg-sub">gitiles poller</text>
+                <rect x="338" y="100" width="164" height="62" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="352" y="132" class="svg-sub">not involved</text>
+                <rect x="526" y="100" width="164" height="62" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="540" y="124" class="svg-step">chromium/ci</text>
+                <text x="540" y="144" class="svg-sub">public project</text>
+                <rect x="714" y="100" width="164" height="62" rx="8" fill="#ffffff" stroke="#367f59"/>
+                <text x="728" y="124" class="svg-step">pools/ci</text>
+                <text x="728" y="144" class="svg-sub">+ pools/tests</text>
+                <rect x="902" y="100" width="164" height="62" rx="8" fill="#ffffff" stroke="#367f59"/>
+                <text x="916" y="124" class="svg-step">failure clusters</text>
+                <text x="916" y="144" class="svg-sub">gardeners, bisection</text>
+
+                <rect x="0" y="176" width="5" height="62" fill="#765b98"/>
+                <text x="16" y="200" class="svg-step">Performance</text>
+                <text x="16" y="220" class="svg-sub">few commits</text>
+                <rect x="150" y="176" width="164" height="62" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="164" y="208" class="svg-sub">landed commits only</text>
+                <rect x="338" y="176" width="164" height="62" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="352" y="208" class="svg-sub">not involved</text>
+                <rect x="526" y="176" width="164" height="62" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="540" y="200" class="svg-step">chrome/ci</text>
+                <text x="540" y="220" class="svg-sub">internal project</text>
+                <rect x="714" y="176" width="164" height="62" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="728" y="200" class="svg-step">real hardware</text>
+                <text x="728" y="220" class="svg-sub">Android, Win, Mac, Linux</text>
+                <rect x="902" y="176" width="164" height="62" rx="8" fill="#ffffff" stroke="#765b98"/>
+                <text x="916" y="200" class="svg-step">Skia Perf</text>
+                <text x="916" y="220" class="svg-sub">perf.luci.app, public</text>
+
+                <rect x="0" y="252" width="5" height="62" fill="#d98226"/>
+                <text x="16" y="276" class="svg-step">Release</text>
+                <text x="16" y="296" class="svg-sub">per milestone</text>
+                <rect x="150" y="252" width="164" height="62" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="164" y="276" class="svg-step">refs/branch-heads/*</text>
+                <text x="164" y="296" class="svg-sub">merges, VERSION</text>
+                <rect x="338" y="252" width="164" height="62" rx="8" fill="#ffffff" stroke="#d98226"/>
+                <text x="352" y="276" class="svg-step">branch CQ</text>
+                <text x="352" y="296" class="svg-sub">regenerated config</text>
+                <rect x="526" y="252" width="164" height="62" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="540" y="276" class="svg-step">chrome project</text>
+                <text x="540" y="296" class="svg-sub">bucket not public</text>
+                <rect x="714" y="252" width="164" height="62" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="728" y="276" class="svg-step">official builders</text>
+                <text x="728" y="296" class="svg-sub">not enumerable</text>
+                <rect x="902" y="252" width="164" height="62" rx="8" fill="#ffffff" stroke="#d98226"/>
+                <text x="916" y="276" class="svg-step">chromiumdash</text>
+                <text x="916" y="296" class="svg-sub">branch, ship dates</text>
+
+                <line x1="314" y1="55" x2="338" y2="55" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="502" y1="55" x2="526" y2="55" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="690" y1="55" x2="714" y2="55" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="878" y1="55" x2="902" y2="55" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="314" y1="131" x2="338" y2="131" stroke="#b8b8b1" stroke-width="1.5" marker-end="url(#fig-substrate-arr-grey)"/>
+                <line x1="502" y1="131" x2="526" y2="131" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="690" y1="131" x2="714" y2="131" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="878" y1="131" x2="902" y2="131" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="314" y1="207" x2="338" y2="207" stroke="#b8b8b1" stroke-width="1.5" marker-end="url(#fig-substrate-arr-grey)"/>
+                <line x1="502" y1="207" x2="526" y2="207" stroke="#b8b8b1" stroke-width="1.5" marker-end="url(#fig-substrate-arr-grey)"/>
+                <line x1="690" y1="207" x2="714" y2="207" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="878" y1="207" x2="902" y2="207" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="314" y1="283" x2="338" y2="283" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="502" y1="283" x2="526" y2="283" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="690" y1="283" x2="714" y2="283" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+                <line x1="878" y1="283" x2="902" y2="283" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-substrate-arr-blue)"/>
+
+                <line x1="516" y1="168" x2="516" y2="322" stroke="#ad4b43" stroke-width="1.5" stroke-dasharray="5 4"/>
+                <text x="508" y="338" text-anchor="end" class="svg-note">left of this line: readable by anyone</text>
+
+                <text x="0" y="372" class="svg-lane">SIDE CHANNELS — HOSTS BOUND IN main.star:88-96</text>
+                <rect x="150" y="384" width="164" height="50" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="164" y="404" class="svg-step">Milo</text>
+                <text x="164" y="422" class="svg-sub">luci-milo.appspot.com</text>
+                <rect x="338" y="384" width="164" height="50" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="352" y="404" class="svg-step">LogDog</text>
+                <text x="352" y="422" class="svg-sub">luci-logdog.appspot.com</text>
+                <rect x="526" y="384" width="164" height="50" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="540" y="404" class="svg-step">LUCI Scheduler</text>
+                <text x="540" y="422" class="svg-sub">luci-scheduler.appspot…</text>
+                <rect x="714" y="384" width="164" height="50" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="728" y="404" class="svg-step">LUCI Notify</text>
+                <text x="728" y="422" class="svg-sub">luci-notify.appspot.com</text>
+                <rect x="902" y="384" width="164" height="50" rx="8" fill="#ffffff" stroke="#deded9"/>
+                <text x="916" y="404" class="svg-step">LUCI Bisection</text>
+                <text x="916" y="422" class="svg-sub">cfg copied, host unbound</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Columns, lanes and the six appspot hosts are measured: the hosts
+              are the nine lines of <code>main.star:88-96</code> quoted above,
+              and the grey boxes are lanes that genuinely do not touch that
+              service. The red cells are the payload. The performance lane's
+              builders are defined in
+              <code>//internal/infra/config/subprojects/chrome/ci/chromium.perf.star</code>,
+              a path the public recipe file names but does not contain
+              [<code>chromium/tools/build recipes/…/builders/chromium_perf.py:181-188</code>],
+              and on 2026-09-22 a Buildbucket <code>ListBuilders</code> call for
+              <code>{project: chrome, bucket: ci}</code> answered 404 to an
+              anonymous caller. The release lane is drawn the same red on weaker
+              evidence <span class="recon">reconstruction</span>: its scripts
+              and its branch are public, its official builders sit in that same
+              closed project. Lane-to-lane arrow colour follows the house
+              convention — thin blue is data, grey is "no edge here".
+            </p>
+          </figure>
+
+          <p>
+            The shape is legible only against what it replaced. LUCI stands for
+            Layered Universal Continuous Integration, and it was built to break
+            up Buildbot, "our existing single-threaded monolithic continuous
+            integration system": one "master" process per set of builders had
+            owned scheduling, distributing, collecting, archiving and logging,
+            and LUCI split each concern into an independent service, "negating
+            the need for a master." Masters survive as a naming convention —
+            "groups" of builders, one per former master, with the builder names
+            kept identical [<code>src/docs/tour_of_luci_ui.md:279-297</code>]
+            <span class="src">from the docs</span>. The turndown has a date. On
+            25 September 2019 Eric Foo of Chrome Operations posted to
+            chromium-dev under the subject "Chrome is 100% on LUCI. Buildbot
+            officially turned down": "Yesterday, we officially turned down the
+            last Buildbot master and are now 100% on LUCI (ci.chromium.org) as
+            the official build infrastructure for ChromeOS and Chrome official
+            releases, CI/Waterfall, and CQ/tryjobs systems." Seven years on,
+            the fossils are still load-bearing enough to name twice: the
+            tree-closing step regexp still begins with <code>bot_update</code>,
+            a step that can no longer close the tree (§09), and
+            <code>//testing/buildbot</code> still carries a
+            <code>waterfalls.pyl</code> (§05).
+          </p>
+          <p>
+            One reference frame, stated once and used throughout.
+            Paths and line numbers are <code>chromium/src</code> at
+            <code>f288fed6</code> — <code>chrome/VERSION</code> 156.0.8067.0,
+            <code>refs/heads/main@{#1701190}</code>, checked out 2026-09-18 —
+            with <code>depot_tools</code> at <code>0306e468</code> and V8
+            15.6.0. Readings taken from a live service, as opposed to from the
+            tree, are dated where they appear, because they move.
+          </p>
+          <p>
+            The order that follows is the order the machinery runs in: the
+            configuration layer first, standing there with nothing to do
+            (&sect;&sect;02&ndash;05); then one change moving through it, from
+            <code>git cl upload</code> to a numbered commit and the people who
+            watch what it broke (&sect;&sect;06&ndash;09); then release, the
+            cadence and the scripts (&sect;&sect;10&ndash;11). &sect;12 is the
+            ledger — what this design buys and what each property costs.
+          </p>

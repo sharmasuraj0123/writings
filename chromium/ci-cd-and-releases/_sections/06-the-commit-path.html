@@ -1,0 +1,278 @@
+<h2 id="the-commit-path"><span class="secnum">{{S}}</span>The commit path, upload to tryjob</h2>
+<p class="lede">
+  Between a keystroke and a running tryjob sit five machines and two presubmit
+  runs. Which tryjobs run is decided by a generated file, not by a person, and
+  most of them do not run at all: the second time you ask, the answer is a
+  build somebody else already paid for.
+</p>
+<p>
+  &sect;&sect;02&ndash;05 were the supply side: the fleet, standing there,
+  configured. The next four sections are the demand side, one change at a time.
+  Figure {{fig-commit-path}} is the whole path on one page.
+  <code>git cl upload</code> shells out to
+  <code>presubmit_support.py --upload</code> under vpython3, then pushes the
+  squashed commit to Gerrit's magic ref
+  <code>refs/for/&lt;branch&gt;%&lt;opts&gt;</code>
+  (git_cl.py:1935&ndash;1996, 7205&ndash;7218)
+  <span class="src">from the tree</span>. New changes are work-in-progress
+  unless you pass <code>--send-mail</code>. The <code>%</code>-suffix is where
+  the flags go: <code>-c</code> and <code>-d</code> become label votes in a
+  push option. depot_tools/git_cl.py:2245&ndash;2253 is the whole
+  mechanism:
+</p>
+<pre><code>            refspec_opts.append("l=Auto-Submit+1")
+        if options.enable_owners_override:
+            refspec_opts.append("l=Owners-Override+1")
+        if options.set_bot_commit:
+            refspec_opts.append("l=Bot-Commit+1")
+        if options.use_commit_queue:
+            refspec_opts.append("l=Commit-Queue+2")
+        elif options.cq_dry_run:
+            refspec_opts.append("l=Commit-Queue+1")</code></pre>
+<p>
+  <code>git cl try</code> with no arguments just votes Commit-Queue+1. With
+  <code>-B luci.chromium.try -b &lt;builder&gt;</code> it skips the queue
+  entirely and calls Buildbucket's <code>ScheduleBuild</code> itself, tagging
+  every request <code>user_agent: git_cl_try</code>
+  (git_cl.py:437&ndash;490, 8112&ndash;8124). That path has no quota. The docs
+  ask for no more than about five to ten tryjobs per builder per hour, and say why:
+  "we don't have per-user quotas yet"
+  (docs/infra/trybot_usage.md:25&ndash;29) <span class="src">from the docs</span>.
+</p>
+
+<h3>Two presubmit runs, one script</h3>
+<p>
+  <code>src/PRESUBMIT.py</code> declares <code>PRESUBMIT_VERSION = '2.0.0'</code>
+  on line 23. Under that protocol presubmit_support runs every global function
+  whose name starts with <code>Check</code>, skipping the ones ending in
+  <code>Commit</code> on upload and the ones ending in <code>Upload</code> on
+  commit (presubmit_support.py:1797&ndash;1811). The file is 8,937 lines and
+  defines 95 top-level checks (<code>grep -c '^def Check'</code> at f288fed6). Banned patterns
+  are <code>BanRule</code> dataclasses.
+  <code>CheckUnwantedDependencies</code> runs checkdeps over newly added
+  include lines, erroring on <code>-</code> rules and warning on
+  <code>!</code>. <code>CheckTodoBugReferences</code> rejects any TODO whose
+  bug id is at or below 1524553, Monorail's last id.
+  <code>CheckTreeIsOpenOnCommit</code> asks
+  chromium-status whether the tree will take a commit at all. depot_tools
+  hard-codes Chromium's holiday infra freezes as datetime literals &mdash;
+  2025-11-21 to 11-30 and 2025-12-19 to 2026-01-04, Pacific &mdash; bypassable
+  only with <code>Ignore-Freeze</code>
+  (presubmit_canned_checks.py:1179, 1184&ndash;1195).
+</p>
+<p>
+  Your workstation is not trusted to have run any of this. Two CQ builders,
+  <code>linux-presubmit</code> and <code>win-presubmit</code>, run the same
+  scripts again in the cloud on recipe <code>presubmit</code>: a 40-minute
+  build timeout, an 8-minute presubmit step timeout, priority 25 against
+  Buildbucket's default 30, and <code>on_default_cq</code>
+  (try/presubmit.star:27&ndash;31, 178&ndash;220); the generated config gives
+  both of them <code>disable_reuse: true</code>, so a presubmit build is never
+  adopted from an earlier run (commit-queue.cfg:6383&ndash;6384 and
+  8735&ndash;8736). The recipe
+  passes <code>--commit --skip_canned CheckTreeIsOpen</code>, because CV owns
+  the tree check itself
+  (depot_tools/recipes/recipe_modules/presubmit/api.py:176&ndash;194). What
+  it does with the output is the part worth naming.
+  <code>upload_findings_from_result</code> walks the presubmit step's JSON and
+  turns its <code>errors</code>, <code>warnings</code> and
+  <code>notifications</code> lists into <code>Finding</code> protos of
+  <code>category="chromium_presubmit"</code> at
+  <code>SEVERITY_LEVEL_ERROR</code>, <code>_WARNING</code> and
+  <code>_INFO</code>. Each one carries a
+  <code>Location.GerritChangeReference</code> &mdash; host, project, change,
+  patchset &mdash; plus the <code>file_path</code> and the start and end line
+  and column the check reported, then goes up in one
+  <code>upload_findings</code> call (api.py:242&ndash;288)
+  <span class="src">from the tree</span>. That is why a presubmit complaint
+  appears against the line it is about rather than as a wall of text: the
+  coordinates were in the proto. A check that returns no
+  <code>locations</code> gets no finding at all, and stays in the log.
+  Review gates are Gerrit-side: one committer's
+  Code-Review+1, or two if the author is not a committer; an OWNERS approval
+  per file; <code>Owners-Override+1</code> for gardeners and Release Program
+  Managers; <code>Bot-Commit+1</code> from the Rubber Stamper on clean reverts
+  and cherry-picks, which never grants OWNERS approval, by design
+  (docs/code_reviews.md:27&ndash;29, 235&ndash;313).
+</p>
+
+<figure class="figure wide" id="fig-commit-path">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">Five lanes between a keystroke and a running tryjob</p>
+  </div>
+  <div class="figure-body plain">
+    <svg viewBox="0 -6 1080 476" role="img" aria-label="Five horizontal lanes. Workstation: git cl upload and git cl try. Gerrit: the magic ref push and the review gates. LUCI CV: a run, then a gate narrowing 604 builder entries to 32 required. Buildbucket and Swarming: a previous run's reusable builds feeding back into the gate, and 32 fresh tryjobs. ResultDB and Gerrit checks: a stub pointing at later sections.">
+      <defs>
+        <marker id="fig-commit-path-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+        <marker id="fig-commit-path-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+        <marker id="fig-commit-path-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+      </defs>
+
+      <line x1="0" y1="104" x2="1080" y2="104" stroke="#deded9"/>
+      <line x1="0" y1="196" x2="1080" y2="196" stroke="#deded9"/>
+      <line x1="0" y1="304" x2="1080" y2="304" stroke="#deded9"/>
+      <line x1="0" y1="394" x2="1080" y2="394" stroke="#deded9"/>
+      <line x1="160" y1="8" x2="160" y2="466" stroke="#deded9"/>
+
+      <text x="8" y="34" class="svg-lane">WORKSTATION</text>
+      <text x="8" y="128" class="svg-lane">GERRIT</text>
+      <text x="8" y="220" class="svg-lane">LUCI CV</text>
+      <text x="8" y="328" class="svg-lane">BUILDBUCKET</text>
+      <text x="8" y="344" class="svg-lane">+ SWARMING</text>
+      <text x="8" y="418" class="svg-lane">RESULTDB</text>
+
+      <rect x="175" y="26" width="212" height="58" rx="8" fill="#f7f7f5" stroke="#252525"/>
+      <text x="189" y="50" class="svg-step">git cl upload</text>
+      <text x="189" y="70" class="svg-sub">presubmit_support --upload</text>
+
+      <rect x="412" y="26" width="212" height="58" rx="8" fill="#f7f7f5" stroke="#252525"/>
+      <text x="426" y="50" class="svg-step">git cl try -B … -b …</text>
+      <text x="426" y="70" class="svg-sub">user_agent: git_cl_try</text>
+
+      <rect x="175" y="118" width="212" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="189" y="142" class="svg-step">New change, WIP</text>
+      <text x="189" y="162" class="svg-sub">refs/for/&lt;branch&gt;%l=CQ+2</text>
+
+      <rect x="412" y="118" width="212" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="426" y="142" class="svg-step">Review gates</text>
+      <text x="426" y="162" class="svg-sub">CR+1 · OWNERS · Bot-Commit</text>
+
+      <rect x="412" y="212" width="212" height="62" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="426" y="236" class="svg-step">Run: PENDING → RUNNING</text>
+      <text x="426" y="256" class="svg-sub">largest CQ vote, clamped 2</text>
+
+      <polygon points="660,208 872,238 872,266 660,296" fill="#f7f7f5" stroke="#765b98"/>
+      <text x="672" y="236" class="svg-sub">604 builders {}</text>
+      <text x="672" y="278" class="svg-sub">467 includable_only</text>
+      <text x="862" y="258" text-anchor="end" class="svg-step">32</text>
+
+      <rect x="628" y="316" width="196" height="62" rx="8" fill="#ffffff" stroke="#765b98" stroke-dasharray="5 4"/>
+      <text x="642" y="340" class="svg-step">Earlier run's builds</text>
+      <text x="642" y="360" class="svg-sub">same ReuseKey, &lt; 24 h</text>
+
+      <rect x="860" y="316" width="205" height="62" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="874" y="340" class="svg-step">32 tryjobs scheduled</text>
+      <text x="874" y="360" class="svg-sub">+ Cq-Include-Trybots</text>
+
+      <rect x="860" y="406" width="205" height="52" rx="8" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="4 4"/>
+      <text x="874" y="428" class="svg-step">§07 inside the build</text>
+      <text x="874" y="448" class="svg-sub">§08 submit and number</text>
+
+      <line x1="281" y1="84" x2="281" y2="118" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-commit-path-arr-ink)"/>
+      <text x="291" y="106" class="svg-note">git_cl.py:7205–7218</text>
+      <line x1="387" y1="149" x2="412" y2="149" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-commit-path-arr-blue)"/>
+      <line x1="518" y1="180" x2="518" y2="212" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-commit-path-arr-ink)"/>
+      <text x="528" y="202" class="svg-note">commit-queue.cfg:15–31</text>
+      <line x1="624" y1="243" x2="656" y2="243" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-commit-path-arr-ink)"/>
+      <text x="684" y="196" class="svg-note">gate = cq-usage/default.cfg</text>
+      <path d="M872 252 L920 252 L920 316" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-commit-path-arr-ink)"/>
+      <path d="M726 316 L726 300 L766 300" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-commit-path-arr-purple)"/>
+      <text x="628" y="392" class="svg-note">reuse_common.go:192–220 · equi.go:24–76</text>
+      <path d="M624 55 L1042 55 L1042 340 L1065 340" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-commit-path-arr-ink)"/>
+      <text x="1032" y="40" text-anchor="end" class="svg-note">git cl try -b bypasses CV — git_cl.py:437–490</text>
+      <line x1="962" y1="378" x2="962" y2="406" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-commit-path-arr-ink)"/>
+
+      <text x="175" y="466" class="svg-note">thick black = control · thin blue = data · dashed purple = reuse, an effect on a previous run's builds</text>
+    </svg>
+  </div>
+  <p class="figure-caption">
+    Measured: every file and line label, the 604 / 467 / 32 counts and the
+    24-hour window, read from chromium/src at f288fed6 and depot_tools
+    <span class="src">from the tree</span>. Reconstructed: the lane assignment
+    and the left-to-right ordering
+    <span class="recon">reconstruction</span>. The right third is a stub:
+    inside a scheduled build is §07, submission is §08.
+  </p>
+</figure>
+
+<h3>Which tryjobs run</h3>
+<p>
+  <code>commit-queue.cfg</code> is 9,451 generated lines holding two config
+  groups. <code>cq</code> watches <code>refs/heads/.+</code> of
+  chromium/src, with committers drawn from
+  <code>project-chromium-submit-access</code>, dry-runners from
+  <code>project-chromium-tryjob-access</code>, a <code>tree_status</code>
+  verifier pointed at chromium-status, and one <code>tryjob</code> verifier
+  listing 603 builders.
+  <code>fallback-cq</code> carries <code>fallback: YES</code>, watches every
+  <code>refs/branch-heads/.*</code> except the seven live milestone refs
+  (7559, 7871, 7922, 7977, 8010, 8037, 8059) and runs a single builder,
+  <code>requires-testing-checker</code> &mdash; 604 <code>builders {}</code>
+  entries in the file (commit-queue.cfg:15&ndash;31, 9411&ndash;9450).
+  Figure {{fig-cq-funnel}} is the funnel those 604 entries form.
+</p>
+
+<figure class="figure" id="fig-cq-funnel">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">604 entries in, 32 that can block a landing</p>
+  </div>
+  <div class="figure-body plain">
+    <div class="measured" style="grid-template-columns: repeat(2, minmax(0, 1fr))">
+      <div><div class="n">604</div><div class="k"><code>builders {}</code> entries in <code>commit-queue.cfg</code> — 603 in the <code>cq</code> group, 1 in <code>fallback-cq</code></div></div>
+      <div><div class="n">467</div><div class="k">of the 603 are <code>includable_only</code>: reachable only by a <code>Cq-Include-Trybots</code> footer</div></div>
+      <div><div class="n">95</div><div class="k">path-based builders in <code>cq-builders.md</code>, triggered by <code>location_filters</code></div></div>
+      <div><div class="n">32</div><div class="k">required — 28 chromium + 4 chrome; the same 32 <code>builders {}</code> in <code>cq-usage/default.cfg</code></div></div>
+    </div>
+    <div class="measured" style="grid-template-columns: repeat(2, minmax(0, 1fr))">
+      <div><div class="n">7</div><div class="k">carry <code>experiment_percentage</code>; their results never block</div></div>
+      <div><div class="n">185</div><div class="k">trybots listed in <code>cq-usage/mega_cq_bots.txt</code> that a <code>mega-cq-launcher</code> may start</div></div>
+      <div><div class="n">12</div><div class="k">entries with <code>disable_reuse: true</code> — 11 in <code>cq</code>, plus <code>requires-testing-checker</code></div></div>
+      <div><div class="n">40 min</div><div class="k">median cycle time a CQ builder must hold, p90 about an hour, to be admitted</div></div>
+    </div>
+  </div>
+  <p class="figure-caption">
+    Seven of these eight are counts I re-ran over the generated files at
+    f288fed6 — <code>grep -c 'builders {'</code>,
+    <code>grep -c 'includable_only: true'</code>,
+    <code>wc -l mega_cq_bots.txt</code> <span class="src">from the tree</span>.
+    The last is the admission bar stated in
+    <code>docs/infra/cq.md</code>:304–305 <span class="src">from the docs</span>
+    — a requirement, not a measurement.
+  </p>
+</figure>
+
+<p>
+  The tree reports the blocking count three ways. Every required or
+  path-based CQ builder also gets a <code>cq</code> input property for
+  BigQuery analysis; counting it in
+  <code>cr-buildbucket.cfg</code> gives 37 required and 92 path-based, because
+  the property is attached before <code>includable_only</code> and
+  <code>experiment_percentage</code> apply. The blocking set is the one in
+  <code>infra/config/generated/cq-usage/default.cfg</code>: 32
+  <code>builders {}</code> entries, matching cq-builders.md exactly. Use that
+  file, not the property. And 126 of the 137 entries that are not
+  <code>includable_only</code> carry the same default exclusions,
+  <code>infra/config/.+</code> and <code>docs/.+</code>, plus an include for
+  their own generated directory &mdash; so a docs-only CL triggers nearly
+  nothing, while editing one builder's properties runs that builder. The
+  eleven that carry no path filter at all run on every CL: the two presubmit
+  builders, the seven config verifiers,
+  <code>linux-full-remote-rel</code> and
+  <code>requires-testing-checker</code>.
+</p>
+
+<h3>Why CQ+1 then CQ+2 feels free</h3>
+<p>
+  It is free, usually. Each tryjob gets a <code>ReuseKey</code>: a sha256 over
+  the CL id, its <code>MinEquivalentPatchset</code>, and the values of any
+  disable-reuse footers (luci-go
+  cv/internal/tryjob/execute/reuse_common.go:192&ndash;220)
+  <span class="src">from the tree</span>.
+  <code>MinEquivalentPatchset</code> survives Gerrit revision kinds
+  <code>NO_CHANGE</code>, <code>NO_CODE_CHANGE</code>,
+  <code>MERGE_FIRST_PARENT_UPDATE</code>, <code>TRIVIAL_REBASE</code> and
+  <code>TRIVIAL_REBASE_WITH_MESSAGE_UPDATE</code>; only a <code>REWORK</code>
+  forks it (luci-go cv/internal/gerrit/equi.go:24&ndash;76). Same key, same builder,
+  build younger than <code>staleTryjobAge = 24h</code>, and CV adopts the
+  existing build. Since 2026-07-27 CV can measure
+  staleness in commits instead of hours, comparing the build's output
+  <code>Cr-Commit-Position</code> against the branch tip; Chromium turned it on for
+  one builder on 2026-09-18: <code>linux_chromium_compile_dbg_ng</code>, at
+  <code>reuse_max_commit_distance = 800 if settings.is_main else None</code>
+  (tryserver.chromium.linux.star:888&ndash;891). A worked example, measured on a live CL:
+  8423730's dry run was reused 14.4 hours later by its full run for 32 of 34
+  tryjobs. The two fresh launches were the presubmit builders
+  &mdash; the only kind that always pays.
+</p>

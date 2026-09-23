@@ -2,8 +2,10 @@
 """Scan the writings tree and regenerate research/manifest.json.
 
 Every document folder with an index.html becomes one manifest entry:
-  - research/<slug>/index.html            -> section "research"
   - whitepaper/index.html, what-is-quirq/ -> section "foundations"
+  - research/<slug>/index.html            -> section "research"
+  - every other post listed in posts.json -> section "research", or
+    section "chromium" when its slug starts with "chromium/"
 
 The loader at research/index.html fetches the manifest at runtime, so a new
 log starts loading as soon as this script has run once:
@@ -26,7 +28,9 @@ WORDS_PER_MINUTE = 220
 
 
 def text_of(html_source: str) -> str:
-    stripped = re.sub(r"<(script|style)\b.*?</\1>", " ", html_source, flags=re.S | re.I)
+    # Strip SVG too: figure labels are not prose, and counting them inflates the
+    # estimate on figure-heavy posts (AGENTS.md §7.4 measures prose only).
+    stripped = re.sub(r"<(script|style|svg)\b.*?</\1>", " ", html_source, flags=re.S | re.I)
     stripped = re.sub(r"<[^>]+>", " ", stripped)
     return html.unescape(stripped)
 
@@ -65,6 +69,12 @@ def date_of(path: Path) -> str:
 
 
 def main() -> int:
+    # Publication dates are facts, not derivable from git (a retouch is not a
+    # re-publication); keep whatever the previous manifest recorded.
+    try:
+        previous = {e["path"]: e["date"] for e in json.loads(MANIFEST.read_text(encoding="utf-8"))["entries"]}
+    except (OSError, ValueError, KeyError):
+        previous = {}
     entries = []
     for name in FOUNDATIONS:
         index = ROOT / name / "index.html"
@@ -73,11 +83,36 @@ def main() -> int:
                             **meta_of(index)})
 
     for index in sorted((ROOT / "research").glob("*/index.html")):
-        entries.append({"slug": index.parent.name, "path": f"research/{index.parent.name}/",
-                        "section": "research", **meta_of(index)})
+        entry = {"slug": index.parent.name, "path": f"research/{index.parent.name}/",
+                 "section": "research", **meta_of(index)}
+        entry["date"] = previous.get(entry["path"], entry["date"])
+        entries.append(entry)
 
-    entries.sort(key=lambda e: (e["section"] != "foundations", e["date"]), reverse=False)
-    entries.reverse()  # newest research first, foundations keep their block
+    # Root-level posts (and the chromium/ collection) are indexed by posts.json;
+    # mirror them here so the research log and the viewer never disagree.
+    posts = json.loads((ROOT / "posts.json").read_text(encoding="utf-8")).get("posts", [])
+    # posts.json carries the measured reading time (words ÷ 225, prose only); it wins.
+    stated = {f'{p["slug"]}/': p.get("readingMinutes") for p in posts}
+    for e in entries:
+        if stated.get(e["path"]):
+            e["minutes"] = stated[e["path"]]
+    seen = {e["path"] for e in entries}
+    for post in posts:
+        slug = post["slug"]
+        if slug in FOUNDATIONS or f"{slug}/" in seen:
+            continue
+        index = ROOT / slug / "index.html"
+        if not index.is_file():
+            continue
+        section = "chromium" if slug.startswith("chromium/") else "research"
+        entries.append({"slug": slug.split("/")[-1], "path": f"{slug}/", "section": section,
+                        **meta_of(index), "date": post.get("published") or date_of(index),
+                        "minutes": post.get("readingMinutes") or meta_of(index)["minutes"]})
+        seen.add(f"{slug}/")
+
+    order = {"foundations": 0, "research": 1, "chromium": 2}
+    entries.sort(key=lambda e: (order.get(e["section"], 9), e["date"]))
+    entries.reverse()  # newest first within a section; sections keep their blocks
 
     MANIFEST.write_text(json.dumps({"entries": entries}, indent=2) + "\n", encoding="utf-8")
     for e in entries:

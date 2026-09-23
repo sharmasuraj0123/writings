@@ -1,0 +1,136 @@
+          <h2 id="the-shape-of-the-problem"><span class="secnum">{{S}}</span>One repository, 451 dependencies</h2>
+          <p class="lede">
+            Chromium is not a monorepo. It is one git repository plus a
+            declarative description of everything else it needs, and the
+            program that reads that description never executes it.
+          </p>
+          <p>
+            The description is <code>src/DEPS</code>. At the commit this post
+            reads — <code>chromium/src@f288fed6</code>, <code>chrome/VERSION</code>
+            <code>156.0.8067.0</code>, checked out 18 September 2026 — it is
+            5,188 lines of Python syntax declaring 451 dependency entries: 273
+            git, 147 CIPD and 31 Google Cloud Storage, the last two carrying
+            153 CIPD packages and 87 GCS objects between them. Around the
+            entries sit 143 <code>vars</code>, 61 <code>hooks</code>, 9
+            <code>recursedeps</code>, 24 <code>allowed_hosts</code> and 49 root
+            <code>include_rules</code> <span class="src">from the tree</span>.
+            None of those counts is an estimate: I parsed the file twice, with
+            depot_tools' own <code>gclient_eval.Exec</code> and with a plain
+            <code>ast.parse</code>, and the two agree. The census is
+            host-independent, because <code>gclient_eval</code> never
+            evaluates a condition at parse time. Figure {{fig-census}}
+            collects the eight numbers this post keeps coming back to.
+          </p>
+          <p>
+            Three kinds of entry exist, and the tree says so in one sentence:
+            "<code>gclient</code> supports three dependency types: git, gcs, and
+            cipd" [<code>src/docs/dependencies.md</code>:9–10]
+            <span class="src">from the docs</span>. The middle one is a
+            service, not a format: CIPD is Chrome Infrastructure Package
+            Deployment, at <code>chrome-infra-packages.appspot.com</code>,
+            where a package is content-addressed by instance ID, labelled with
+            tags, and installed by one <code>cipd ensure</code>.
+            The reader is gclient, a
+            "Meta checkout dependency manager for Git" whose entire on-disk
+            state is three files, named in its own module docstring
+            [<code>depot_tools/gclient.py</code>:5–20]: <code>.gclient</code>,
+            the "Current client configuration, written by 'config' command",
+            defining the solutions; <code>.gclient_entries</code>, "A cache
+            constructed by 'update' command", recording what is on disk; and
+            each module's <code>DEPS</code>. The first belongs to the
+            developer, the third to the project, and <code>gclient sync</code>
+            is the thing that reconciles them.
+          </p>
+
+          <figure class="figure" id="fig-census">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Eight numbers that bound the topic</p>
+            </div>
+            <div class="figure-body plain">
+              <div class="measured">
+                <div><div class="n">5,188</div><div class="k">lines in <code>src/DEPS</code> at <code>f288fed6</code></div></div>
+                <div><div class="n">451</div><div class="k">dependency entries — 273 git, 147 CIPD, 31 GCS</div></div>
+                <div><div class="n">143</div><div class="k"><code>vars</code>, the substitution namespace every entry draws on</div></div>
+                <div><div class="n">61</div><div class="k">hooks; 13 of them run on a default Linux x64 sync</div></div>
+                <div><div class="n">320</div><div class="k">of the 451 entries carry a <code>condition</code> string</div></div>
+                <div><div class="n">195</div><div class="k">entries active on default Linux x64 — 154 git, 24 CIPD, 17 GCS</div></div>
+                <div><div class="n">≈25.1 GB</div><div class="k">unique content a first sync moves, with history — a lower bound</div></div>
+                <div><div class="n">9</div><div class="k"><code>recursedeps</code>: the only children whose own DEPS are read</div></div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              All eight measured <span class="src">from the tree</span>. The
+              structural counts — lines, entries, vars, hooks, conditions,
+              <code>recursedeps</code> — come from parsing <code>src/DEPS</code>
+              twice, once with <code>gclient_eval</code> and once with
+              <code>ast</code>; the two active counts, 195 entries and 13
+              hooks, re-evaluate every <code>condition</code> against default
+              Linux x64 built-ins. The
+              byte figure is 15.48 GB of <code>chromium/src</code> mirror plus
+              8.06 GB of unique dependency mirrors plus 0.92 GB of GCS objects
+              plus 0.62 GB of CIPD packages = 25,075,599,060 B; six active
+              deps have no published mirror snapshot and were not counted, so
+              it can only be too low. §05 does that arithmetic properly.
+            </p>
+          </figure>
+
+          <p>
+            Seven lines near the top carry the handoff that organises the
+            whole post [<code>src/DEPS</code>:35–41]:
+          </p>
+<pre><code># We expect all git dependencies specified in this file to be in sync with git
+# submodules (gitlinks).
+git_dependencies = 'SYNC'
+
+gclient_gn_args_file = 'src/build/config/gclient_args.gni'
+gclient_gn_args = [
+  'android_ndk_version',</code></pre>
+          <p>
+            That list runs to line 58 and holds exactly 17 names. When a sync
+            finishes, gclient resolves each one against the evaluated vars and
+            writes it into <code>src/build/config/gclient_args.gni</code>, a
+            generated GN file whose first line records the DEPS it came from
+            [<code>depot_tools/gclient.py</code>:1612–1631]. Three lines into
+            <code>build/toolchain/siso.gni</code> sits
+            <code>import("//build/config/gclient_args.gni")</code>, and nine
+            lines later <code>build_with_chromium</code> — one of those 17 —
+            decides whether Siso is the default build tool
+            [<code>src/build/toolchain/siso.gni</code>:3–14]. That import is
+            the seam. Everything above it is dependency description.
+            Everything below it is the distributed build: goma, then reclient,
+            then Siso.
+          </p>
+          <p>
+            The thesis the rest of this post argues is visible from here. A
+            declarative file is cheap to change and the ecosystem that parses
+            it is not. Rollers, presubmits, codesearch, release tooling and a
+            decade of scripts all read <code>DEPS</code>, so Chromium's answer
+            to every migration has been to keep the old interface alive and
+            move the load to a new mechanism underneath it, indefinitely.
+          </p>
+          <p>
+            The post reads the machine in that order: the three files a
+            checkout is made of, the grammar gclient parses but never executes,
+            one sync step by step and the same sync in bytes, the compiler
+            pinned in text, the programs that rewrite that text around the
+            clock, the submodule migration that landed stage one and stopped —
+            and then the other side of that import.
+          </p>
+          <p>
+            Two facts to file away now and collect later. The first is in the
+            excerpt above: <code>git_dependencies = 'SYNC'</code> is stage one
+            of a submodule migration [<code>src/DEPS</code>:35–37]
+            <span class="src">from the tree</span> whose stage two was
+            scheduled for 2023 Q4 <span class="src">from the docs</span> and
+            has not shipped, nearly three years on. The second is at the other
+            end of the pipeline: a June 2025 PSA said "Reclient will be removed
+            from Chromium at the end of September"
+            <span class="src">from the docs</span>, and this tree — pulled
+            a year after that deadline — still declares
+            <code>use_reclient = use_remoteexec &amp;&amp; !use_siso</code> as a
+            GN argument [<code>src/build/toolchain/rbe.gni</code>:29–31] and
+            still pins <code>re_client_version:0.185.0.db415f21-gomaip</code>
+            in DEPS [<code>src/DEPS</code>:304–307]. Neither fact is explained
+            yet. Both are the same fact.
+          </p>

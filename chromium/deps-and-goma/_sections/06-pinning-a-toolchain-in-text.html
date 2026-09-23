@@ -1,0 +1,284 @@
+          <h2 id="pinning-a-toolchain-in-text"><span class="secnum">{{S}}</span>Pinning a toolchain in text</h2>
+          <p class="lede">
+            Chromium's compiler is not installed. It is pinned — two constants
+            in a Python file, a list of hashed objects in DEPS, and an assert
+            in GN that refuses to build when the two disagree. Nothing fetches
+            clang from a hook.
+          </p>
+          <p>
+            The pin is two lines. <code>tools/clang/scripts/update.py</code>
+            holds <code>CLANG_REVISION = 'llvmorg-24-init-7747-g62397f8b'</code>
+            and <code>CLANG_SUB_REVISION = 29</code>; together they make
+            <code>PACKAGE_VERSION</code>, while <code>RELEASE_VERSION</code>
+            records the LLVM major as <code>'24'</code>
+            [<code>src/tools/clang/scripts/update.py</code>:36–47]
+            <span class="src">from the tree</span>. The revision is not a tag;
+            it is the output of <code>git describe</code> on the LLVM monorepo.
+            The comment above it names writer and reader:
+          </p>
+<pre><code># Do NOT CHANGE this if you don't know what you're doing -- see
+# https://chromium.googlesource.com/chromium/src/+/main/docs/updating_clang.md
+# Reverting problematic clang rolls is safe, though.
+# This is the output of `git describe` and is usable as a commit-ish.
+# These fields are written by //tools/clang/scripts/upload_revision.py, and
+# should not be changed manually.
+# They are also read by build/config/compiler/BUILD.gn.
+CLANG_REVISION = 'llvmorg-24-init-7747-g62397f8b'
+CLANG_SUB_REVISION = 29
+
+PACKAGE_VERSION = '%s-%s' % (CLANG_REVISION, CLANG_SUB_REVISION)
+RELEASE_VERSION = '24'</code></pre>
+          <p>
+            No sync runs that script. Since June 2024
+            <code>src/third_party/llvm-build/Release+Asserts</code> has been a
+            first-class GCS dep — bucket <code>chromium-browser-clang</code>,
+            condition <code>not llvm_force_head_revision</code> — carrying 23
+            objects [<code>src/DEPS</code>:924–1091]. Get the count right:
+            re-parsing the block with depot_tools'
+            <code>gclient_eval.Exec</code> gives Linux_x64 6, Mac 6, Win 6 and
+            Mac_arm64 5 — Mac_arm64 has no runtime-library package. "Six
+            per host platform" is wrong by one. Each object carries its own
+            condition; with <code>checkout_clang_tidy</code>,
+            <code>checkout_clangd</code> and
+            <code>checkout_clang_coverage_tools</code> all defaulting to
+            <code>False</code> [<code>:176, 179, 170</code>], a plain Linux
+            checkout resolves two of the 23.
+          </p>
+          <p>
+            Text alone is a wish; something has to check it.
+            <code>config("clang_revision")</code> in
+            <code>build/config/compiler/BUILD.gn</code> reads the
+            <code>cr_build_revision</code> stamp shipped inside the tarball,
+            parses both constants back out of <code>update.py</code>, and
+            asserts they agree — lines 1499–1522, the stamp read four lines
+            earlier.
+          </p>
+<pre><code>      # Ensure that the synced clang version matches what's in git.
+      if (_perform_consistency_checks) {
+        # Parse the clang version from the Python script.
+        _clang_version_lines = filter_include(
+                read_file("//tools/clang/scripts/update.py", "list lines"),
+                [ "CLANG_*REVISION = *" ])
+        _py_revision =
+            string_replace(_clang_version_lines[0], "CLANG_REVISION = '", "")
+        _py_revision = string_replace(_py_revision, "'", "")
+        _py_subrevision =
+            string_replace(_clang_version_lines[1], "CLANG_SUB_REVISION = ", "")
+        _expected_clang_revision = "$_py_revision-$_py_subrevision"
+
+        # TODO(agrieve): Change filter_include to _clang_revision ==
+        # _expected_clang_revision once angle &amp; webrtc use a GCS DEPS entry
+        # rather than a update.py runhook.
+        assert(
+            filter_include([ _clang_revision ],
+                           [
+                             _expected_clang_revision,
+                             "$_expected_clang_revision,*",
+                           ]) != [],
+            "clang_revision=\"$_clang_revision\" but update.py expected \"$_expected_clang_revision\". Did you forget to gclient sync?")
+      }</code></pre>
+          <p>
+            The same config then emits
+            <code>defines = [ "CR_CLANG_REVISION=\"$_clang_revision\"" ]</code>
+            [<code>:1591</code>], so a roll changes a define every translation
+            unit sees; the tree rebuilds whole. A second assert ties
+            <code>clang_version = "24"</code> to the same string
+            [<code>…/BUILD.gn</code>:1525–1531; the arg is declared in
+            <code>src/build/toolchain/toolchain.gni</code>:43–45]. Rust moves
+            in lockstep because rustc is built against the pinned LLVM: its
+            package name is
+            <code>&lt;RUST_REVISION&gt;-&lt;RUST_SUB_REVISION&gt;-&lt;CLANG_REVISION&gt;</code>
+            [<code>src/tools/rust/update_rust.py</code>:69–72].
+          </p>
+          <p>
+            A roll is a two-file edit plus a mechanical DEPS rewrite — Figure
+            {{fig-clang-roll}}. <code>upload_revision.py</code> resolves the
+            newest LLVM commit, computes the revision with <code>git describe
+            --long --abbrev=8 --match=*llvmorg-*-init</code>
+            [<code>src/tools/clang/scripts/build.py</code>:352–364], patches
+            both update scripts and fires the eight upload bots
+            [<code>…/upload_revision.py</code>:155–213; bots named at :48–59,
+            triggered by <code>git cl try</code> at :453–471].
+            <code>package.py</code> uploads to
+            <code>chromium-browser-clang-staging</code> under
+            <code>-h x-goog-if-generation-match:0</code>
+            [<code>…/package.py</code>:36, 140]; a reused
+            hash-plus-sub-revision is refused and the bot still reports success
+            [<code>src/docs/updating_clang.md</code>:90–96]
+            <span class="src">from the docs</span>. Staging is untrusted, so a
+            Googler with promote rights copies the chosen packages to production
+            and runs <code>sync_deps.py</code>, which stats and hashes each
+            object, then calls <code>gclient setdep
+            --revision=path@object,sha256,size,generation</code>
+            [<code>…/sync_deps.py</code>:56–153]. Cadence: 2–4 weeks
+            [<code>src/docs/toolchain_support.md</code>:35–37].
+          </p>
+
+          <figure class="figure wide" id="fig-clang-roll">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One lap of a clang roll, from git describe to rebuild</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 476" role="img" aria-label="Four stacked lanes. Lane one, author: upload_revision.py resolves the newest LLVM commit with git describe, patches update.py and update_rust.py by regex, and uploads a roll CL on a branch. Lane two, upload bots: eight bots run package.py, which compresses with xz preset 9 EXTREME and writes to the staging bucket with x-goog-if-generation-match zero; a reused hash plus sub-revision is skipped silently while the bot still reports success. Lane three, promotion: a Googler with promote rights copies staging to the production bucket, then sync_deps.py stats and hashes each object and calls gclient setdep. Lane four, tree: the DEPS CL lands, GN asserts the stamp matches update.py, and the CR_CLANG_REVISION define forces every object file to rebuild. One lap takes two to four weeks.">
+                <defs>
+                  <marker id="fig-clang-roll-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-clang-roll-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-clang-roll-arr-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#ad4b43"/></marker>
+                  <marker id="fig-clang-roll-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="16" y="34" class="svg-lane">AUTHOR · SCRIPTED</text>
+                <rect x="16" y="46" width="290" height="70" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="30" y="72" class="svg-step">upload_revision.py</text>
+                <text x="30" y="92" class="svg-sub">git describe --long --abbrev=8</text>
+                <text x="30" y="108" class="svg-sub">--match=*llvmorg-*-init</text>
+                <rect x="336" y="46" width="290" height="70" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="350" y="72" class="svg-step">patch two files by regex</text>
+                <text x="350" y="92" class="svg-sub">update.py · update_rust.py</text>
+                <text x="350" y="108" class="svg-sub">CLANG_SUB_REVISION bumped</text>
+                <rect x="656" y="46" width="290" height="70" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="670" y="72" class="svg-step">branch + git cl upload</text>
+                <text x="670" y="92" class="svg-sub">clang-&lt;v&gt;_rust-&lt;v&gt;</text>
+                <text x="670" y="108" class="svg-sub">fires *_upload_clang / _rust</text>
+                <line x1="306" y1="81" x2="336" y2="81" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-clang-roll-arr-ink)"/>
+                <line x1="626" y1="81" x2="656" y2="81" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-clang-roll-arr-ink)"/>
+
+                <text x="16" y="154" class="svg-lane">UPLOAD BOTS · UNTRUSTED</text>
+                <rect x="16" y="166" width="290" height="70" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="30" y="192" class="svg-step">eight bots build LLVM</text>
+                <text x="30" y="212" class="svg-sub">linux · mac · mac_arm · win</text>
+                <text x="30" y="228" class="svg-sub">clang and rust each</text>
+                <rect x="336" y="166" width="290" height="70" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="350" y="192" class="svg-step">package.py</text>
+                <text x="350" y="212" class="svg-sub">tar.xz, preset=9 | PRESET_EXTREME</text>
+                <text x="350" y="228" class="svg-sub">stamp must equal PACKAGE_VERSION</text>
+                <rect x="656" y="166" width="290" height="70" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="670" y="192" class="svg-step">staging bucket</text>
+                <text x="670" y="212" class="svg-sub">chromium-browser-clang-staging</text>
+                <text x="670" y="228" class="svg-sub">-h x-goog-if-generation-match:0</text>
+                <line x1="306" y1="201" x2="336" y2="201" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-clang-roll-arr-ink)"/>
+                <line x1="626" y1="201" x2="656" y2="201" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-clang-roll-arr-ink)"/>
+                <line x1="161" y1="116" x2="161" y2="166" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-clang-roll-arr-ink)"/>
+                <rect x="966" y="166" width="140" height="82" rx="8" fill="#f3dfdc" stroke="#ad4b43" stroke-dasharray="5 4"/>
+                <text x="978" y="190" class="svg-sub">failure mode</text>
+                <text x="978" y="208" class="svg-sub">reused hash +</text>
+                <text x="978" y="224" class="svg-sub">sub-rev: upload</text>
+                <text x="978" y="240" class="svg-sub">skipped, bot green</text>
+                <line x1="946" y1="201" x2="966" y2="201" stroke="#ad4b43" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-clang-roll-arr-red)"/>
+
+                <text x="16" y="274" class="svg-lane">PROMOTION · ONE HUMAN</text>
+                <rect x="16" y="286" width="290" height="70" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="30" y="312" class="svg-step">Googler with promote rights</text>
+                <text x="30" y="332" class="svg-sub">staging → chromium-browser-clang</text>
+                <text x="30" y="348" class="svg-sub">then pushed to RBE</text>
+                <rect x="336" y="286" width="290" height="70" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="350" y="312" class="svg-step">sync_deps.py</text>
+                <text x="350" y="332" class="svg-sub">gsutil.py stat → generation, size</text>
+                <text x="350" y="348" class="svg-sub">download → sha256</text>
+                <rect x="656" y="286" width="290" height="70" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="670" y="312" class="svg-step">gclient setdep</text>
+                <text x="670" y="332" class="svg-sub">--revision=path@object,</text>
+                <text x="670" y="348" class="svg-sub">sha256,size,generation</text>
+                <line x1="306" y1="321" x2="336" y2="321" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-clang-roll-arr-ink)"/>
+                <line x1="626" y1="321" x2="656" y2="321" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-clang-roll-arr-blue)"/>
+                <line x1="161" y1="236" x2="161" y2="286" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-clang-roll-arr-ink)"/>
+
+                <text x="16" y="394" class="svg-lane">TREE · EVERY BUILDER</text>
+                <rect x="16" y="406" width="290" height="60" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="30" y="432" class="svg-step">DEPS CL lands</text>
+                <text x="30" y="452" class="svg-sub">23 objects rewritten in one entry</text>
+                <rect x="336" y="406" width="290" height="60" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="350" y="432" class="svg-step">GN consistency check</text>
+                <text x="350" y="452" class="svg-sub">stamp == update.py, or assert</text>
+                <rect x="656" y="406" width="290" height="60" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="670" y="432" class="svg-step">CR_CLANG_REVISION define</text>
+                <text x="670" y="452" class="svg-sub">every object file rebuilds</text>
+                <line x1="306" y1="436" x2="336" y2="436" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-clang-roll-arr-ink)"/>
+                <line x1="626" y1="436" x2="656" y2="436" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-clang-roll-arr-purple)"/>
+                <line x1="161" y1="356" x2="161" y2="406" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-clang-roll-arr-ink)"/>
+
+                <rect x="1078" y="46" width="26" height="110" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1091" y="101" class="svg-lane" text-anchor="middle" transform="rotate(-90 1091 101)">2–4 WEEKS</text>
+                <text x="896" y="404" class="svg-note">thick black = sequence</text>
+                <text x="966" y="424" class="svg-note">thin blue = object data</text>
+                <text x="966" y="444" class="svg-note">dashed purple = effect</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Every box is a script, a bucket or an assert named in the tree
+              <span class="src">from the tree</span>; the lane grouping is mine
+              <span class="recon">reconstruction</span>. The cadence band is
+              documented, not measured.
+            </p>
+          </figure>
+
+          <p>
+            Every other build input has the same shape — a version in text, a
+            transport, something that rewrites it. Only the transport changes,
+            tracking size and churn (Figure {{fig-pin-points}}).
+          </p>
+
+          <figure class="figure wide" id="fig-pin-points">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Where each pinned artefact's version literally lives</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Artefact</th><th>Where the version lives</th><th>Transport</th><th>What rewrites it</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>clang and five sibling packages</td><td><code>CLANG_REVISION</code>, <code>CLANG_SUB_REVISION</code> [<code>update.py</code>:43–44]; 23 objects [<code>DEPS</code>:924–1091]</td><td>GCS <code>chromium-browser-clang</code></td><td><code>upload_revision.py</code> → bots → promote → <code>sync_deps.py</code></td></tr>
+                  <tr><td>Rust, crubit, bindgen</td><td><code>RUST_REVISION</code>, <code>RUST_SUB_REVISION</code> [<code>update_rust.py</code>:47–51]; object name embeds <code>CLANG_REVISION</code></td><td>GCS, same bucket</td><td>same CL as clang</td></tr>
+                  <tr><td>GN, ninja, Siso, CPython 3.11.9</td><td><code>gn_version</code>, <code>ninja_version</code>, <code>siso_version</code>, <code>cpython3_version</code> [<code>DEPS</code>:571, 578, 292, 295]</td><td>CIPD</td><td>DEPS var edit; GN by <code>gn-chromium-autoroll</code></td></tr>
+                  <tr><td>clang-format, nine Debian sysroots</td><td>object name is a hash; a sysroot's is the tarball sha256 [<code>DEPS</code>:754–808; :637–752]</td><td>GCS, hash-named</td><td><code>build_and_upload.py</code> → <code>gclient setdep</code>; clang-format by hand</td></tr>
+                  <tr><td>libc++, libc++abi, libunwind</td><td><code>libcxx_revision</code> [<code>DEPS</code>:568] <em>and</em> <code>buildtools/deps_revisions.gni</code>:8; <code>libcxxabi_revision</code> [<code>DEPS</code>:524], <code>libunwind_revision</code> [<code>DEPS</code>:528]</td><td>git sub-repo</td><td>one CL, both files</td></tr>
+                  <tr><td>Android NDK, SDK</td><td><code>android_ndk_version = '2@30.0.16248370'</code> [<code>DEPS</code>:64]</td><td>CIPD, conditional on <code>checkout_android</code></td><td>DEPS var edit</td></tr>
+                  <tr><td>Windows SDK, MSVC</td><td><code>TOOLCHAIN_HASH = '3bfcb536c8'</code>, <code>SDK_VERSION = '10.0.28000.0'</code> [<code>build/vs_toolchain.py</code>:62–63]</td><td>hook <code>win_toolchain</code> [<code>DEPS</code>:4527]</td><td>hand edit</td></tr>
+                  <tr><td>Xcode, macOS SDK</td><td><code>MAC_BINARIES_TAG</code> [<code>build/mac_toolchain.py</code>:58–59]</td><td>hook <code>mac_toolchain</code> → internal CIPD</td><td>hand edit</td></tr>
+                  <tr><td>PGO and AFDO profiles</td><td><code>chrome/build/&lt;target&gt;.pgo.txt</code></td><td>nine PGO hooks [<code>DEPS</code>:4925–5026]</td><td>nothing; the hook takes the newest, ~4×/day</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Every cell is a file-and-line reading of the
+              <code>f288fed6</code> tree <span class="src">from the tree</span>;
+              the grouping by transport is mine
+              <span class="recon">reconstruction</span>. The last column is mechanism,
+              not team. When row one's check fails,
+              GN says: <code>clang_revision="…" but update.py expected
+              "…". Did you forget to gclient sync?</code>
+            </p>
+          </figure>
+
+          <p>
+            The last row explains the others. PGO profiles stay hooks on
+            purpose: <code>tools/update_pgo_profiles.py</code>:5–12 drops stale
+            profiles after two days "to save disk spaces because profiles are
+            large (~1GB) and updated frequently (~4 times a day)"
+            <span class="src">from the tree</span>. A DEPS entry names one
+            immutable object; an artefact that turns over four times a day
+            would make every refresh a CL.
+          </p>
+          <p>
+            The cheapest illustration of the design is the version string. Five
+            of the 61 hooks call <code>build/util/lastchange.py</code>
+            [<code>src/DEPS</code>:4564–4605]; it runs <code>git log -1
+            --format=%H %ct</code> filtered by the default
+            <code>--grep=^Change-Id:</code>, reads the
+            <code>Cr-Commit-Position</code> footer, and writes
+            <code>LASTCHANGE=&lt;sha&gt;-refs/heads/main@{#N}</code>
+            [<code>src/build/util/lastchange.py</code>:153–189; :770–796].
+            <code>build/util/version.py</code> combines it with
+            <code>chrome/VERSION</code> — <code>MAJOR=156 MINOR=0 BUILD=8067
+            PATCH=0</code> — for every <code>@KEY@</code> substitution
+            [<code>:33–88</code>]. The rest of the list is housekeeping:
+            <code>vpython3_common</code> first, then <code>landmines</code>,
+            <code>disable_depot_tools_selfupdate</code>, seven
+            <code>.sha1</code> downloads in four families (ciopfs, dsymutil, rc,
+            apache_win32), and <code>configure_siso</code> at position 57 of 61.
+            Sixty-one hooks sounds like a lot until you notice none of them
+            fetches a compiler.
+          </p>

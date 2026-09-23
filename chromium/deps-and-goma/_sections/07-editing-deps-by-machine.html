@@ -1,0 +1,281 @@
+          <h2 id="editing-deps-by-machine"><span class="secnum">{{S}}</span>Editing DEPS by machine</h2>
+          <p class="lede">
+            DEPS is editable by program because gclient parses it twice — once
+            into a syntax tree, once into a stream of tokens. A roll rewrites
+            one string token. Every other byte, comments included,
+            comes back as it was.
+          </p>
+          <p>
+            The two parses are kept together.
+            <code>gclient_eval.Exec</code> builds the AST and, in the same
+            pass, keys every <code>tokenize</code> token by its
+            <code>(line, column)</code> start position; the result is a
+            <code>_NodeDict</code> holding values and tokens side by side
+            [<code>depot_tools/gclient_eval.py</code>:95; :536–541].
+            Writing is the inverse. <code>_UpdateAstString</code> changes
+            exactly one entry — reading the original quote character out of
+            the token's own text and putting it back around the new value —
+            and <code>RenderDEPSFile</code> sorts the token dict by position
+            and hands it to <code>tokenize.untokenize</code>
+            [<code>gclient_eval.py</code>:895–909]
+            <span class="src">from the tree</span>. Nothing ever renders the
+            AST. The AST only says which token to touch.
+          </p>
+          <p>
+            Choosing the token is the whole trick. It is fifteen lines of
+            <code>depot_tools/gclient_eval.py</code>:1137–1151:
+          </p>
+<pre><code>        var_name = _GetVarName(node)
+        if var_name is not None:
+            SetVar(gclient_dict, var_name, new_revision)
+        else:
+            if "@" in node.value:
+                # '@' is part of the last string, which we want to modify.
+                # Discard whatever was after the '@' and put the new revision in
+                # its place.
+                new_revision = node.value.split("@")[0] + "@" + new_revision
+            elif "@" not in dep_dict[dep_key]:
+                # '@' is not part of the URL at all. This mean the dependency is
+                # unpinned and we should pin it.
+                new_revision = node.value + "@" + new_revision
+            _UpdateAstString(tokens, node, new_revision)
+            dep_dict.SetNode(dep_key, new_revision, node)</code></pre>
+          <p>
+            <code>src/v8</code> is spelled
+            <code>Var('chromium_git') + '/v8/v8.git' + '@' + Var('v8_revision')</code>
+            [<code>src/DEPS</code>:3342–3343], so
+            <code>_GetVarName</code> returns <code>v8_revision</code> and the
+            edit lands on the <em>variable</em>, at
+            <code>src/DEPS</code>:344 — never on the URL. Running
+            <code>gclient setdep -r src/v8@0000…</code> against a copy of
+            <code>src/DEPS</code> produces a diff of exactly one
+            line: line 344 — re-run here at <code>f288fed6</code>
+            <span class="src">from the tree</span>. The
+            same function refuses multi-line and implicitly concatenated
+            strings: "Consider reformatting the DEPS
+            file" [:1122–1129]. Its two siblings are narrower still:
+            <code>SetCIPD</code> evaluates and strips a
+            <code>'version:' + Var(…)</code> prefix before writing what is
+            left [:1046–1106], and <code>SetGCS</code> may only touch
+            <code>object_name</code>, <code>sha256sum</code>,
+            <code>size_bytes</code> and <code>generation</code>, and rejects
+            any update whose object count differs from the one already in the
+            file [:1016–1043].
+          </p>
+          <p>
+            <code>gclient getdep</code> reads. It takes <code>--var</code>,
+            and <code>-r</code> with a path for a git dep or
+            <code>path:package</code> for a CIPD one; a missing key prints the
+            <code>KeyError</code> and exits 2
+            [<code>depot_tools/gclient.py</code>:5034–5119]. When
+            <code>git_dependencies</code> is <code>SUBMODULES</code> it stops
+            reading DEPS and reads the gitlinks instead [:5091–5101].
+          </p>
+          <p>
+            <code>gclient setdep</code> writes, and in <code>SYNC</code> or
+            <code>SUBMODULES</code> state it writes twice: the DEPS token, then
+            the gitlink — the entry in git's index with mode
+            <code>160000</code> whose object id is a commit in another
+            repository. It collects
+            the submodule paths with
+            <code>git ls-files --format=%(objectmode) %(path)</code>, keeps
+            the <code>160000</code> lines, and warns that "gitlinks won't be
+            updated" if that fails [:5191–5219]. Then, per dependency, the
+            gitlink [<code>depot_tools/gclient.py</code>:5314–5335]:
+          </p>
+<pre><code>                # Update the gitlink for the submodule.
+                subprocess2.call(
+                    [
+                        "git",
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        f"160000,{value},{git_module_name}",
+                    ],
+                    cwd=cwd,
+                )
+
+    with open(options.deps_file, "wb") as f:
+        f.write(gclient_eval.RenderDEPSFile(local_scope).encode("utf-8"))
+
+    if git_modules:
+        subprocess2.call(["git", "add", options.deps_file], cwd=cwd)
+        print(
+            "Changes have been staged. See changes with `git status`.\n"
+            'Use `git commit -m "Manual roll"` to commit your changes. \n'
+            "Run gclient sync to update your local dependency checkout."
+        )</code></pre>
+          <p>
+            Figure {{fig-setdep}} follows one command through both writes.
+          </p>
+
+          <figure class="figure wide" id="fig-setdep">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One <code>gclient setdep</code>, two staged artefacts — and the two-file diff that reaches Gerrit</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1100 712" role="img" aria-label="A two-column diagram. The left column shows gclient setdep parsing DEPS into an AST and a token stream, both stored in a _NodeDict; a panel of DEPS text shows the v8 dependency line hopping back up to the v8_revision variable; below it, _UpdateAstString rewrites one token and RenderDEPSFile untokenizes the file. The right column shows the second write: git ls-files finds the submodule paths, the path prefix is stripped, a missing .gitmodules entry raises KeyError, and git update-index writes the gitlink, after which DEPS is staged and a message is printed. A bottom band shows the two files a real roll CL touches.">
+                <defs>
+                  <marker id="fig-setdep-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-setdep-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-setdep-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="16" y="22" class="svg-lane">ARTEFACT 1 — THE DEPS FILE</text>
+                <text x="580" y="22" class="svg-lane">ARTEFACT 2 — THE GIT INDEX</text>
+
+                <rect x="16" y="36" width="524" height="52" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="32" y="60" class="svg-step">$ gclient setdep</text>
+                <text x="32" y="80" class="svg-sub">-r src/v8@036aa7eb7170dce9118b6c6cbd9d7c0f98d02577</text>
+
+                <rect x="16" y="112" width="248" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="32" y="136" class="svg-step">ast.parse</text>
+                <text x="32" y="156" class="svg-sub">assignments only; Str/Var</text>
+                <rect x="292" y="112" width="248" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="308" y="136" class="svg-step">tokenize</text>
+                <text x="308" y="156" class="svg-sub">(line, col) to [type, text, ...]</text>
+
+                <rect x="16" y="196" width="524" height="40" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="222" class="svg-sub">_NodeDict(values, tokens) — both kept, side by side</text>
+
+                <rect x="16" y="256" width="524" height="138" rx="8" fill="#ffffff" stroke="#deded9"/>
+                <text x="32" y="282" class="svg-sub">vars = {</text>
+                <text x="32" y="304" class="svg-sub">  'v8_revision': 'b1747cd84090...',</text>
+                <text x="524" y="304" text-anchor="end" class="svg-num">:344</text>
+                <text x="32" y="326" class="svg-sub">}</text>
+                <text x="32" y="354" class="svg-sub">'src/v8':</text>
+                <text x="32" y="376" class="svg-sub">  Var('chromium_git') + '/v8/v8.git' + '@' + Var('v8_revision'),</text>
+                <text x="524" y="354" text-anchor="end" class="svg-num">:3343</text>
+                <path d="M452 370 C 496 370 496 300 300 300" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-setdep-purple)"/>
+
+                <text x="16" y="414" class="svg-note">_GetVarName finds v8_revision, so SetVar rewrites the variable — the URL is never touched</text>
+
+                <rect x="16" y="428" width="524" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="32" y="452" class="svg-step">_UpdateAstString</text>
+                <text x="32" y="472" class="svg-sub">tokens[(344, 17)][1] = "'036aa7eb7170...'" — quote char reused</text>
+
+                <rect x="16" y="512" width="524" height="62" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="32" y="536" class="svg-step">RenderDEPSFile</text>
+                <text x="32" y="556" class="svg-sub">untokenize(sorted tokens) — whole file rewritten, byte-identical elsewhere</text>
+
+                <rect x="580" y="112" width="504" height="62" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="596" y="136" class="svg-step">git ls-files --format=%(objectmode) %(path)</text>
+                <text x="596" y="156" class="svg-sub">keep the 160000 lines — 273 submodule paths at f288fed6</text>
+
+                <rect x="580" y="196" width="504" height="40" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="596" y="222" class="svg-sub">'src/v8' minus the gclient-root prefix = 'v8'</text>
+
+                <rect x="580" y="256" width="504" height="52" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="596" y="280" class="svg-step">KeyError</text>
+                <text x="596" y="300" class="svg-sub">if 'v8' is not already a section in .gitmodules</text>
+
+                <rect x="580" y="328" width="504" height="66" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="596" y="352" class="svg-step">git update-index --add --cacheinfo</text>
+                <text x="596" y="376" class="svg-sub">160000,036aa7eb7170dce9118b6c6cbd9d7c0f98d02577,v8</text>
+
+                <rect x="580" y="428" width="504" height="62" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="596" y="452" class="svg-step">git add DEPS</text>
+                <text x="596" y="472" class="svg-sub">only when git_modules is non-empty</text>
+
+                <rect x="580" y="512" width="504" height="62" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="596" y="543" class="svg-note">"Changes have been staged. See changes with `git status`."</text>
+
+                <line x1="140" y1="88" x2="140" y2="112" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-setdep-blue)"/>
+                <line x1="416" y1="88" x2="416" y2="112" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-setdep-blue)"/>
+                <line x1="140" y1="174" x2="140" y2="196" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-setdep-blue)"/>
+                <line x1="416" y1="174" x2="416" y2="196" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-setdep-blue)"/>
+                <line x1="278" y1="236" x2="278" y2="256" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-setdep-blue)"/>
+                <line x1="278" y1="394" x2="278" y2="428" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-setdep-ink)"/>
+                <line x1="278" y1="490" x2="278" y2="512" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-setdep-ink)"/>
+
+                <path d="M542 62 C 566 62 566 143 574 143" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-setdep-purple)"/>
+                <line x1="832" y1="174" x2="832" y2="196" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-setdep-ink)"/>
+                <line x1="832" y1="236" x2="832" y2="256" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-setdep-ink)"/>
+                <line x1="832" y1="308" x2="832" y2="328" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-setdep-ink)"/>
+                <line x1="832" y1="394" x2="832" y2="428" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-setdep-ink)"/>
+                <line x1="832" y1="490" x2="832" y2="512" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-setdep-ink)"/>
+
+                <text x="16" y="604" class="svg-lane">WHAT THE ROLL CL CONTAINS — CL 8433063, "ROLL V8 FROM 37FB84941C9B TO 036AA7EB7170 (3 REVISIONS)"</text>
+                <rect x="16" y="616" width="524" height="74" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="32" y="640" class="svg-lane">DEPS — ONE LINE</text>
+                <text x="32" y="662" class="svg-sub">-  'v8_revision': '37fb84941c9be9f9914ee50b1ad366f06a1bd764',</text>
+                <text x="32" y="682" class="svg-sub">+  'v8_revision': '036aa7eb7170dce9118b6c6cbd9d7c0f98d02577',</text>
+                <rect x="580" y="616" width="504" height="74" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="596" y="640" class="svg-lane">v8 — THE GITLINK</text>
+                <text x="596" y="662" class="svg-sub">- Subproject commit 37fb84941c9be9f9914ee50b1ad366f06a1bd764</text>
+                <text x="596" y="682" class="svg-sub">+ Subproject commit 036aa7eb7170dce9118b6c6cbd9d7c0f98d02577</text>
+
+                <text x="550" y="708" text-anchor="middle" class="svg-note">thin blue = data · thick black = control · dashed purple = state written outside DEPS</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Code path, line numbers and token position are read from
+              depot_tools at <code>0306e468</code> and
+              <code>src/DEPS</code> at <code>f288fed6</code>; the bottom band
+              is the file list and diff of a landed CL
+              <span class="src">from the tree</span>. The two columns are
+              drawn side by side; in the source they are one loop body and
+              one trailing write
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            <code>roll-dep</code> is the wrapper a human uses. It will not
+            start on a tree that differs from <code>origin/main</code>, staged
+            or unstaged, without <code>--ignore-dirty-tree</code>; it fetches the
+            dependency, resolves <code>--roll-to</code> (default
+            <code>origin/HEAD</code>) to a hash, calls
+            <code>gclient setdep</code> once with every <code>-r</code>,
+            checks the dep out at the new commit, rewrites
+            <code>README.chromium</code> only when it finds exactly one
+            <code>Revision:</code> line, stages the gitlink itself, and
+            commits a message headed
+            <code>Roll &lt;dep&gt;/ &lt;from[:9]&gt;..&lt;to[:9]&gt; (N commits)</code>
+            [<code>depot_tools/roll_dep.py</code>:99–107; :204–222;
+            :467–493; :239–276; :143–166].
+          </p>
+          <p>
+            The rest of the surface is read-mostly.
+            <code>gclient revinfo -s</code> prints a snapshot
+            <code>.gclient</code> — header
+            <code># Snapshot generated with gclient revinfo --snapshot</code> —
+            pinning every recursive dependency into <code>custom_deps</code>
+            [<code>gclient.py</code>:4932–4989; :2975–3008; :2078–2081].
+            <code>gclient flatten</code> merges the whole tree into one
+            hermetic DEPS, and <code>--pin-all-deps</code> expands refs and
+            short hashes to full 40-hex SHAs [:4059–4114]; I found no consumer
+            of <code>flatten</code> in the tree or in the infra configs on
+            disk.
+            <code>gclient recurse</code>, <code>gclient runhooks</code> and
+            <code>gclient gitmodules</code> round it out — the last
+            regenerating <code>.gitmodules</code> and staging gitlinks in
+            <code>update-index</code> batches of 100, "Windows has limit how
+            long" [:4044–4046].
+          </p>
+          <p>
+            A machine edit is safe only because presubmit re-checks it.
+            depot_tools' <code>CheckForCommitObjects</code> enforces
+            DEPS/gitlink parity whenever
+            <code>git_dependencies</code> is <code>SYNC</code>, and the only
+            exemptions are hard-coded: ANGLE's
+            <code>third_party/dummy_chromium</code> and Dawn's
+            <code>third_party/placeholder_chromium</code>
+            [<code>depot_tools/presubmit_canned_checks.py</code>:2875–3138;
+            :3056–3066]. <code>src/PRESUBMIT.py</code> adds five more:
+            <code>CheckNewDEPSHooksHasRequiredReviewers</code> and
+            <code>CheckValidHostsInDEPSOnUpload</code>, which shells out to
+            <code>gclient verify</code> [:6573–6578];
+            <code>CheckForNewDEPSDownloadFromGoogleStorageHooks</code>, a flat
+            ban on new <code>download_from_google_storage</code> hooks
+            [:4042–4071]; <code>CheckLibcxxRevisionsMatch</code>, which
+            requires <code>libcxx_revision</code> to be identical in DEPS and
+            <code>buildtools/deps_revisions.gni</code> [:8303–8330]; and
+            <code>CheckUnwantedDependencies</code> over added includes
+            [:3555–3667]. A sixth guards nothing:
+            <code>CheckNoDEPSGIT</code> still rejects edits to
+            <code>.DEPS.git</code>, a generated file deleted from trunk on
+            2014-08-23 [:3341–3353]. The interface outlived its mechanism by
+            twelve years, which is this post's thesis in one function.
+          </p>

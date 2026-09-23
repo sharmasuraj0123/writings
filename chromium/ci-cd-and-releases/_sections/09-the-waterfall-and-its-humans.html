@@ -1,0 +1,335 @@
+<h2 id="the-waterfall-and-its-humans"><span class="secnum">{{S}}</span>The waterfall and its humans</h2>
+<p class="lede">
+  Pre-submit is a funnel. Post-submit is a fan-out, one regular expression,
+  twelve rotations of people and a bisection service. Look at the regular
+  expression: it names seven steps that close the Chromium tree, and the first
+  cannot fire.
+</p>
+
+<p>
+  One scheduler job does the fan-out. <code>chromium-gitiles-trigger</code>
+  polls <code>refs/heads/main</code> on <code>chromium/src</code> and names 386
+  builders it starts directly, counted from the <code>triggers:</code> lines of
+  one block at
+  <code>infra/config/generated/luci/luci-scheduler.cfg</code>:6647&ndash;7040
+  <span class="src">from the tree</span>. The <code>ci</code> bucket holds 641,
+  so the other 255 never hear from the scheduler at all. Their parents trigger
+  them from inside the recipe: <code>chromium_tests/api.py</code>'s
+  <code>trigger_child_builds</code> emits a
+  <code>scheduler.GitilesTrigger</code> for the same repo, ref and revision,
+  carrying <code>parent_got_*</code> and <code>deps_revision_overrides</code>
+  so the tester pins the exact inputs its builder used. That is the
+  builder/tester split of &sect;07 seen from the scheduler's side: the
+  scheduler knows about compilers, compilers know about their testers.
+</p>
+<p>
+  133 of those builders are tree closers, against 252 notifiers in the
+  generated <code>luci-notify.cfg</code> (counted at <code>f288fed6</code>).
+  What all 133 watch is a single constant. The source is
+  <code>infra/config/notifiers.star</code>:85&ndash;125, condensed here to the
+  regexp and the two closers declared against it:
+</p>
+<pre><code>TREE_CLOSING_STEPS_REGEXP = "\\b({})\\b".format("|".join([
+    "bot_update",
+    "compile",
+    "gclient runhooks",
+    "generate_build_files",
+    "runhooks",
+    "update",
+    "\\w*nocompile_test",
+]))
+
+# … tree_closer() wraps luci.tree_closer in notifiers.tree_closer_branch(),
+# so on a release branch the name resolves to a notifier with no recipients.
+
+tree_closer(
+    name = "chromium-tree-closer",
+    tree_status_host = "chromium-status.appspot.com",
+    failed_step_regexp = TREE_CLOSING_STEPS_REGEXP,
+)
+
+tree_closer(
+    name = "close-on-any-step-failure",
+    tree_status_host = "chromium-status.appspot.com",
+)</code></pre>
+<p>
+  Read the first entry against how LUCI Notify behaves. Notify will not
+  touch the tree unless a build ends SUCCESS or FAILURE &mdash; "infra
+  failures, for example, shouldn't cause us to close or re-open the tree"
+  (luci-go <code>luci_notify/notify/notify.go</code>:392&ndash;404)
+  <span class="src">from the tree</span>. And <code>bot_update</code> runs with
+  <code>kwargs.setdefault("infra_step", True)</code> (depot_tools
+  <code>bot_update/api.py</code>:310), so a failed checkout ends the build
+  purple, as INFRA_FAILURE, not red. The
+  step named first in the regexp is the one step in the list that
+  structurally cannot close the tree. What closes it on a broken checkout is
+  the next step: hooks are excluded from the sync <code>bot_update</code> runs
+  (<code>--nohooks --noprehooks</code>, depot_tools
+  <code>bot_update/resources/bot_update.py</code>:459&ndash;460) and run as
+  <code>gclient runhooks</code>, which <code>gclient/api.py</code>:302&ndash;306
+  runs with <code>infra_step=False</code>. I found no recipe path in
+  <code>tools/build</code> that runs <code>bot_update</code> that way, which
+  would make the entry live again; absent one it reads as a Buildbot-era
+  holdover, like <code>update</code>, the name of no step a modern Chromium
+  build emits <span class="recon">reconstruction</span>.
+</p>
+<p>
+  Closure is asymmetric, and the asymmetry is policy encoded in a state
+  machine. luci-go's <code>luci_notify/notify/tree_status.go</code> leaves a
+  manually closed tree unchanged forever, while an automatically closed one
+  reopens when all tree-closer builds pass, or when every still-failing build started before the last
+  automated revert. <code>throttled</code> and <code>maintenance</code> are
+  read as closed <span class="src">from the tree</span>. The host every closer
+  names is a facade: <code>chromium-status.appspot.com</code>'s
+  <code>status.py</code>:39&ndash;40 sets <code>TREE_STATUS_SERVICE</code> to
+  <code>luci-tree-status.appspot.com/prpc/luci.tree_status.v1.TreeStatus/</code>
+  and proxies <code>GetStatus</code>/<code>ListStatus</code> to it. Queried
+  both ways on 2026-09-22 they returned one record: createTime
+  2026-09-20T12:19:05.626463Z, "Tree is open (Automatic: All tree-closer
+  builders are passing)".
+</p>
+
+<figure class="figure wide" id="fig-tree-closure">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">Fan-out, the closing regexp, and what reverts a culprit</p>
+  </div>
+  <div class="figure-body plain">
+    <svg viewBox="0 -6 1080 566" role="img" aria-label="Three panels. Left: the gitiles trigger fans out to 386 CI builders directly and 255 by their parents, of which 133 are tree closers. Middle: a truth table of the seven regexp entries against the step status each can actually reach, with bot_update marked unreachable and gclient runhooks marked as the one that fires, above an OPEN / THROTTLED / CLOSED state machine with an asymmetric reopen arrow. Right: the LUCI Bisection loop from nth-section to a submitted revert, with its five refusal gates and daily limits.">
+      <defs>
+        <marker id="fig-tree-closure-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+        <marker id="fig-tree-closure-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+        <marker id="fig-tree-closure-arr-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#ad4b43"/></marker>
+      </defs>
+
+      <line x1="312" y1="8" x2="312" y2="552" stroke="#deded9"/>
+      <line x1="756" y1="8" x2="756" y2="552" stroke="#deded9"/>
+
+      <text x="8" y="22" class="svg-lane">FAN-OUT</text>
+      <rect x="10" y="38" width="284" height="56" rx="8" fill="#f7f7f5" stroke="#252525"/>
+      <text x="24" y="62" class="svg-step">chromium-gitiles-trigger</text>
+      <text x="24" y="82" class="svg-sub">polls refs/heads/main</text>
+      <line x1="152" y1="94" x2="152" y2="128" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-tree-closure-arr-ink)"/>
+
+      <rect x="10" y="128" width="284" height="58" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="24" y="152" class="svg-step">386 builders, triggered directly</text>
+      <text x="24" y="172" class="svg-sub">luci-scheduler.cfg:6647–7040</text>
+      <line x1="152" y1="186" x2="152" y2="218" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-tree-closure-arr-purple)"/>
+
+      <rect x="10" y="218" width="284" height="76" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="24" y="242" class="svg-step">255 more, by their parents</text>
+      <text x="24" y="262" class="svg-sub">scheduler.GitilesTrigger, in-recipe</text>
+      <text x="24" y="280" class="svg-sub">parent_got_* · deps_revision_overrides</text>
+
+      <text x="10" y="316" class="svg-note">641 builders in bucket ci · 386 + 255</text>
+      <line x1="152" y1="326" x2="152" y2="356" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-tree-closure-arr-ink)"/>
+
+      <rect x="10" y="356" width="284" height="58" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+      <text x="24" y="380" class="svg-step">133 are tree closers</text>
+      <text x="24" y="400" class="svg-sub">of 252 notifiers in luci-notify.cfg</text>
+      <line x1="294" y1="385" x2="336" y2="385" stroke="#ad4b43" stroke-width="2.5" marker-end="url(#fig-tree-closure-arr-red)"/>
+
+      <text x="336" y="22" class="svg-lane">WHICH FAILING STEP CLOSES IT</text>
+      <rect x="336" y="34" width="392" height="28" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <text x="346" y="53" class="svg-lane">STEP IN THE REGEXP</text>
+      <text x="556" y="53" class="svg-lane">STATUS IT REACHES</text>
+      <text x="700" y="53" class="svg-lane">TREE</text>
+
+      <rect x="336" y="62" width="392" height="30" fill="#ffffff" stroke="#deded9"/>
+      <rect x="668" y="62" width="60" height="30" fill="#f3dfdc" stroke="#ad4b43"/>
+      <text x="346" y="82" class="svg-sub">bot_update</text>
+      <text x="556" y="82" class="svg-sub">INFRA_FAILURE</text>
+      <text x="678" y="82" class="svg-sub">never</text>
+
+      <rect x="336" y="92" width="392" height="30" fill="#ffffff" stroke="#deded9"/>
+      <rect x="668" y="92" width="60" height="30" fill="#dfede5" stroke="#367f59"/>
+      <text x="346" y="112" class="svg-sub">compile</text>
+      <text x="556" y="112" class="svg-sub">FAILURE</text>
+      <text x="678" y="112" class="svg-sub">closes</text>
+
+      <rect x="336" y="122" width="392" height="30" fill="#f7f7f5" stroke="#deded9"/>
+      <rect x="668" y="122" width="60" height="30" fill="#dfede5" stroke="#367f59"/>
+      <text x="346" y="142" class="svg-sub">gclient runhooks</text>
+      <text x="556" y="142" class="svg-sub">FAILURE (not infra)</text>
+      <text x="678" y="142" class="svg-sub">closes</text>
+
+      <rect x="336" y="152" width="392" height="30" fill="#ffffff" stroke="#deded9"/>
+      <rect x="668" y="152" width="60" height="30" fill="#dfede5" stroke="#367f59"/>
+      <text x="346" y="172" class="svg-sub">generate_build_files · *nocompile</text>
+      <text x="556" y="172" class="svg-sub">FAILURE</text>
+      <text x="678" y="172" class="svg-sub">closes</text>
+
+      <rect x="336" y="182" width="392" height="30" fill="#ffffff" stroke="#deded9"/>
+      <rect x="668" y="182" width="60" height="30" fill="#f3dfdc" stroke="#ad4b43"/>
+      <text x="346" y="202" class="svg-sub">runhooks · update</text>
+      <text x="556" y="202" class="svg-sub">no step emits these</text>
+      <text x="678" y="202" class="svg-sub">never</text>
+
+      <text x="336" y="230" class="svg-note">LUCI Notify ignores any build that is not SUCCESS or FAILURE.</text>
+      <text x="336" y="248" class="svg-note">So the bot_update row is dead config, not a rule.</text>
+
+      <text x="336" y="288" class="svg-lane">AND THE STATE IT WRITES</text>
+      <rect x="336" y="302" width="150" height="50" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="350" y="326" class="svg-step">OPEN</text>
+      <text x="350" y="344" class="svg-sub">CQ may submit</text>
+
+      <rect x="516" y="302" width="212" height="50" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+      <text x="530" y="326" class="svg-step">THROTTLED · MAINTENANCE</text>
+      <text x="530" y="344" class="svg-sub">read as closed</text>
+
+      <line x1="372" y1="352" x2="372" y2="410" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-tree-closure-arr-ink)"/>
+      <text x="380" y="378" class="svg-note">a closer fails</text>
+      <path d="M452 410 C470 390 470 372 452 352" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-tree-closure-arr-purple)"/>
+
+      <rect x="336" y="410" width="172" height="62" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+      <text x="350" y="434" class="svg-step">CLOSED (automatic)</text>
+      <text x="350" y="452" class="svg-sub">reopens: all closers pass,</text>
+      <text x="350" y="466" class="svg-sub">or a culprit revert lands</text>
+
+      <rect x="540" y="410" width="188" height="62" rx="8" fill="#ffffff" stroke="#ad4b43"/>
+      <text x="554" y="434" class="svg-step">CLOSED (manual)</text>
+      <text x="554" y="452" class="svg-sub">always left unchanged —</text>
+      <text x="554" y="466" class="svg-sub">no bot ever reopens it</text>
+
+      <text x="336" y="496" class="svg-note">Host: chromium-status.appspot.com, an App Engine proxy in front of</text>
+      <text x="336" y="514" class="svg-note">luci.tree_status.v1.TreeStatus. Both returned the same record, 2026-09-22.</text>
+
+      <text x="776" y="22" class="svg-lane">LUCI BISECTION</text>
+      <rect x="778" y="34" width="292" height="56" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="792" y="58" class="svg-step">nth-section over the blamelist</text>
+      <text x="792" y="78" class="svg-sub">findit/gofindit-culprit-verification</text>
+      <line x1="924" y1="90" x2="924" y2="112" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-tree-closure-arr-ink)"/>
+
+      <rect x="778" y="112" width="292" height="52" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="792" y="136" class="svg-step">culprit verification</text>
+      <text x="792" y="154" class="svg-sub">rerun the suspect and its parent</text>
+      <line x1="924" y1="164" x2="924" y2="186" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-tree-closure-arr-ink)"/>
+
+      <rect x="778" y="186" width="292" height="126" rx="8" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="4 4"/>
+      <text x="792" y="208" class="svg-step">It refuses to revert when</text>
+      <text x="792" y="228" class="svg-sub">· the author is an autoroller</text>
+      <text x="792" y="246" class="svg-sub">· the description says NOAUTOREVERT=true</text>
+      <text x="792" y="264" class="svg-sub">· merged changes depend on it</text>
+      <text x="792" y="282" class="svg-sub">· no gardener rotation watches the builder</text>
+      <text x="792" y="300" class="svg-sub">· the culprit is a sub-commit of a rolled dep</text>
+      <line x1="924" y1="312" x2="924" y2="334" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-tree-closure-arr-ink)"/>
+
+      <rect x="778" y="334" width="292" height="52" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+      <text x="792" y="358" class="svg-step">create revert — 10 / day</text>
+      <text x="792" y="376" class="svg-sub">test failures stop here, always</text>
+      <line x1="924" y1="386" x2="924" y2="408" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-tree-closure-arr-ink)"/>
+
+      <rect x="778" y="408" width="292" height="64" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="792" y="432" class="svg-step">submit revert — 4 / day</text>
+      <text x="792" y="450" class="svg-sub">Owners-Override+1 · Bot-Commit+1</text>
+      <text x="792" y="466" class="svg-sub">Commit-Queue+2 · compile only · under 6 h</text>
+
+      <path d="M778 440 C740 440 740 500 560 490" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-tree-closure-arr-purple)"/>
+      <text x="600" y="540" text-anchor="middle" class="svg-note">a landed culprit revert is one of the two ways an automatically closed tree reopens</text>
+
+      <text x="776" y="496" class="svg-note">thick black = control · red = the tree-closing path</text>
+      <text x="776" y="514" class="svg-note">dashed purple = state written elsewhere</text>
+    </svg>
+  </div>
+  <p class="figure-caption">
+    Measured: the counts from the generated configs at <code>f288fed6</code>,
+    the limits from <code>luci-bisection.cfg</code>, the state machine from
+    <code>tree_status.go</code>. Reconstructed: the two red "never" rows. No
+    config says those steps are dead; that follows from
+    <code>infra_step=True</code> and from no step emitting those names; one
+    recipe I did not find would falsify it.
+  </p>
+</figure>
+
+<h3>Twelve rotations and a bisector</h3>
+<p>
+  The people are organised as twelve gardener rotations, declared in
+  <code>infra/config/lib/gardener_rotations.star</code>:10&ndash;23. Eleven
+  have a generated builder list under
+  <code>generated/sheriff-rotations/</code>, 436 lines in all, led by
+  chromium with 141 builders, chromium.gpu with 94, dawn 56, chromium.clang 46
+  and android 43 <span class="src">from the tree</span>. The directory keeps
+  the old name. Rotations were renamed from "sheriffs" to "gardeners" on
+  17 May 2023, and <code>docs/sheriff.md</code> is now a
+  redirect stub. <code>docs/gardener.md</code>:3&ndash;35 gives the job in
+  priority order: "<strong>The tree is open</strong>, because when the tree is
+  closed nobody can make progress", then no new test failures, then repair the
+  old ones. Gardeners may revert freely, using
+  <code>Owners-Override</code> to skip OWNERS and the Rubber Stamper bot's
+  <code>Bot-Commit+1</code> to skip human review on a clean revert. A shift is
+  eight hours: "if &gt;8 hours have passed, that person is no longer gardener"
+  (:62).
+</p>
+<p>
+  Beside them runs LUCI Bisection, "formerly GoFindit &hellip; the rewrite in
+  Golang of the Python2 version of Findit". Its authority, hand-written and
+  only copied by lucicfg, is
+  <code>infra/config/luci-bisection.cfg</code>:4&ndash;24:
+</p>
+<pre><code>compile_analysis_config {
+  build_config: {
+    builder: {
+      project: "chromium",
+      bucket: "findit",
+      builder: "gofindit-culprit-verification"
+    }
+  }
+  culprit_verification_enabled: true
+  nthsection_enabled: true
+  gerrit_config {
+    actions_enabled: true
+    create_revert_settings: {
+      enabled: true
+      daily_limit: 10
+    }
+    submit_revert_settings: {
+      enabled: true
+      daily_limit: 4
+    }
+    max_revertible_culprit_age: 21600</code></pre>
+<p>
+  Ten reverts created a day; four submitted, and only when the culprit is
+  younger than 21,600 seconds &mdash; six hours. The age is a submit-time gate,
+  not a create-time one: <code>MaxRevertibleCulpritAge</code> is read in
+  <code>commitrevert.go</code>:39&ndash;52, which also refuses to auto-commit
+  any revert for a test failure. The test half points at
+  <code>findit/test-single-revision</code> and creates reverts it never
+  submits. The refusals, boxed at the right of
+  Figure {{fig-tree-closure}}, live in code, not config: luci-go's
+  <code>bisection/culpritaction/revertculprit/createrevert.go</code> declines a
+  culprit whose author is an autoroller, whose description matches
+  <code>(NOAUTOREVERT)(\s)*=(\s)*true</code>, which has merged changes
+  depending on it, which is "a sub-commit inside a rolled dependency", or which
+  broke a builder "not watched by gardeners, therefore less important"
+  <span class="src">from the tree</span>. A 2026 layer sits above this, added
+  on 6 February 2026 and visible only as a note in one e-mail template:
+  <code>infra/config/templates/tree_closure_email.template</code> tells
+  gardeners "GardenerAI is currently attempting to identify and revert the
+  culprit. Please defer investigation until you receive a IRM notification."
+  I found no public design doc for it; that note is the whole public surface
+  <span class="recon">reconstruction</span>.
+</p>
+
+<h3>The other waterfall</h3>
+<p>
+  Performance CI is a second post-submit pipeline, in the internal
+  <code>chrome</code> project, so the only public enumeration is src-side.
+  <code>testing/buildbot/chromium.perf.json</code> holds 71 entries &mdash; 18
+  <code>*-builder-perf*</code>, 46 testers, 7 <code>*-processor-perf</code>
+  &mdash; and summing <code>swarming.shards</code> across the testers gives 628
+  shards over the 39 primary platforms in
+  <code>docs/speed/perf_lab_platforms.md</code>
+  <span class="src">from the tree</span>. Builders POST each isolate's CAS
+  digest to Pinpoint's <code>/api/isolate</code> so a bisect can reuse a
+  waterfall build, and testers do not run per commit:
+  <code>docs/speed/perf_waterfall.md</code>:17&ndash;42 describes "a single
+  tester job running continuously", each run covering "the set of commits from
+  the end commit of the previous invocation to the latest <em>built</em>
+  commit". Enforcement is social: no perf tester is a required CQ builder. Size
+  is the exception. <code>android-binary-size</code> (no more than 16 kB on
+  arm32, 64 kB on high-end arm64, 50 dex methods),
+  <code>compile-size</code> (<code>size_threshold_mib</code> 200) and
+  <code>fuchsia-binary-size</code> are all <code>cq: required</code>, and the
+  only way past them is a <code>Binary-Size:</code> or
+  <code>Compile-Size:</code> footer.
+</p>

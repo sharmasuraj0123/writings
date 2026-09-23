@@ -1,0 +1,323 @@
+<h2 id="the-release-scripts"><span class="secnum">{{S}}</span>The release scripts</h2>
+<p class="lede">
+  The scripts that actually ship a browser are small, old and deliberately
+  boring. A list of <code>Step</code> classes with a JSON resume file. A regex
+  over four <code>#define</code> lines. A DEPS hook writing one string into a
+  file. The fleet has already done everything difficult; what is left is
+  arithmetic and a <code>git push</code>.
+</p>
+
+<p>
+  V8's live in <code>v8/tools/release/</code>, and
+  <code>common_includes.py</code> — Copyright 2013 — gives every one of them
+  the same three things <span class="src">from the tree</span>. A script is an
+  ordered list of <code>Step</code> classes; <code>Step.Run</code> reloads a
+  state file, runs the step, and in a <code>finally:</code> block writes the
+  state back as JSON, so <code>-s N</code> resumes a half-finished push
+  [<code>common_includes.py</code>:340&ndash;351, 741]. Git calls carry retry
+  wait-plans: <code>[5, 30]</code> seconds in general [:401&ndash;407]; when a
+  landed commit has yet to replicate, fetch and grep the remote branch for the
+  unique commit title on a plan of <code>10, 30, 60, 60, 60, 60, 60</code>,
+  then die with "Maybe the git updater is lagging behind?" [:283&ndash;301].
+  And the version is grepped, not parsed — a regex over the four
+  <code>#define</code> lines of <code>include/v8-version.h</code>
+  [:487&ndash;498], which here reads 15.6.0 with
+  <code>V8_IS_CANDIDATE_VERSION 1</code>.
+</p>
+
+<p>
+  The daily push is <code>create_release.py</code>, thirteen steps long
+  [:211&ndash;226], and what feeds it is a ref, not a human.
+  <code>refs/heads/lkgr</code> is V8's <em>last known good revision</em>, and
+  it is maintained by a builder, not by the release script. On V8's
+  <code>refs/heads/infra/config</code> branch, a builder named "V8 lkgr
+  finder" carries <code>"ref": "refs/heads/lkgr"</code> and
+  <code>schedule = "2/6 * * * *"</code> &mdash; every six minutes, offset two
+  &mdash; and its job is to move that ref forward
+  [v8 <code>infra/config builders/tools.star</code>:145]
+  <span class="src">from the tree</span>. The effect is that "the newest trunk
+  commit that passed" is addressable as a git ref, so the release script never
+  has to decide what is good. <code>auto_push.py</code> reads it
+  in two lines &mdash;
+  <code>git fetch origin +refs/heads/lkgr:refs/heads/lkgr</code> then
+  <code>git show-ref -s refs/heads/lkgr</code> &mdash; and then declines to do
+  anything if <code>last_release..candidate</code> is empty, printing
+  "Already pushed current candidate"
+  [<code>auto_push.py</code>:42&ndash;61]. A day on which V8 lands nothing
+  produces no release, without a special case. Lines 41&ndash;57 of
+  <code>v8/tools/release/create_release.py</code> are the whole version
+  policy:
+</p>
+<pre><code>    # Use the highest version from main or from tags to determine the new
+    # version.
+    authoritative_version = sorted(
+        [main_version, latest_version], key=LooseVersion)[1]
+    self.StoreVersion(authoritative_version, "authoritative_")
+
+    # Variables prefixed with 'new_' contain the new version numbers for the
+    # ongoing candidates push.
+    self["new_major"] = self["authoritative_major"]
+    self["new_minor"] = self["authoritative_minor"]
+    self["new_build"] = str(int(self["authoritative_build"]) + 1)
+
+    # Make sure patch level is 0 in a new push.
+    self["new_patch"] = "0"
+
+    # The new version is not a candidate.
+    self["new_candidate"] = "0"</code></pre>
+<p>
+  Build plus one, patch zero. The remaining steps push that revision to
+  <code>refs/heads/&lt;x.y.z&gt;</code>, branch off it, rewrite the header,
+  un-comment the <code>v8-merges@googlegroups.com</code> line in
+  <code>WATCHLISTS</code> so the branch starts mailing merge reviewers
+  [:115&ndash;125], and land the commit with
+  <code>--set-bot-commit --bypass-hooks</code> then
+  <code>git cl land --bypass-hooks -f</code>, next to a TODO conceding this
+  might need to go through the CQ [:139&ndash;159]. Then tag.
+</p>
+
+<figure class="figure wide" id="fig-v8-life">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">One V8 version's life, from lkgr to a Chromium DEPS line</p>
+  </div>
+  <div class="figure-body plain">
+    <svg viewBox="0 -6 1080 508" role="img" aria-label="Four horizontal lanes on the left. Lane one: the V8 lkgr finder every six minutes feeds refs slash heads slash lkgr, which auto_push.py picks up. Lane two: create_release.py as thirteen numbered steps above a JSON state strip that is rewritten after every step, enabling resume with dash s N. Lane three: the pushed branch and tag, the PGO builder adding a minus pgo tag fifteen to twenty minutes later, and detect_roll_candidate scanning one hundred and sixty tags before force-pushing refs slash heads slash roll. Lane four: Skia's v8-chromium-autoroll opening a Roll V8 CL with fifty try jobs that lands in Chromium's DEPS. A panel on the right shows the back-merge path through Gerrit's REST API.">
+      <defs>
+        <marker id="fig-v8-life-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+        <marker id="fig-v8-life-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+        <marker id="fig-v8-life-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+      </defs>
+
+      <line x1="788" y1="8" x2="788" y2="470" stroke="#deded9"/>
+
+      <text x="10" y="20" class="svg-lane">1 · TRUNK</text>
+      <rect x="10" y="30" width="216" height="54" rx="8" fill="#f7f7f5" stroke="#252525"/>
+      <text x="24" y="53" class="svg-step">V8 lkgr finder</text>
+      <text x="24" y="72" class="svg-sub">runs every 6 minutes</text>
+      <line x1="226" y1="57" x2="264" y2="57" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-v8-life-arr-ink)"/>
+      <rect x="268" y="30" width="216" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="282" y="53" class="svg-step">refs/heads/lkgr</text>
+      <text x="282" y="72" class="svg-sub">the candidate revision</text>
+      <line x1="484" y1="57" x2="522" y2="57" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-v8-life-arr-ink)"/>
+      <rect x="526" y="30" width="244" height="54" rx="8" fill="#f7f7f5" stroke="#252525"/>
+      <text x="540" y="53" class="svg-step">auto_push.py</text>
+      <text x="540" y="72" class="svg-sub">recipe v8/auto_roll_push</text>
+
+      <text x="10" y="112" class="svg-lane">2 · CREATE_RELEASE.PY — 13 STEPS, ONE STATE FILE</text>
+      <rect x="10" y="122" width="52" height="32" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/><text x="28" y="144" class="svg-num">1</text>
+      <rect x="68" y="122" width="52" height="32" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/><text x="86" y="144" class="svg-num">2</text>
+      <rect x="126" y="122" width="52" height="32" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/><text x="144" y="144" class="svg-num">3</text>
+      <rect x="184" y="122" width="52" height="32" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/><text x="202" y="144" class="svg-num">4</text>
+      <rect x="242" y="122" width="52" height="32" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/><text x="260" y="144" class="svg-num">5</text>
+      <rect x="300" y="122" width="52" height="32" rx="4" fill="#dfede5" stroke="#367f59"/><text x="318" y="144" class="svg-num">6</text>
+      <rect x="358" y="122" width="52" height="32" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/><text x="376" y="144" class="svg-num">7</text>
+      <rect x="416" y="122" width="52" height="32" rx="4" fill="#dfede5" stroke="#367f59"/><text x="434" y="144" class="svg-num">8</text>
+      <rect x="474" y="122" width="52" height="32" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/><text x="492" y="144" class="svg-num">9</text>
+      <rect x="532" y="122" width="52" height="32" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/><text x="546" y="144" class="svg-num">10</text>
+      <rect x="590" y="122" width="52" height="32" rx="4" fill="#dfede5" stroke="#367f59"/><text x="604" y="144" class="svg-num">11</text>
+      <rect x="648" y="122" width="52" height="32" rx="4" fill="#dfede5" stroke="#367f59"/><text x="662" y="144" class="svg-num">12</text>
+      <rect x="706" y="122" width="64" height="32" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/><text x="724" y="144" class="svg-num">13</text>
+      <text x="10" y="184" class="svg-sub">1 Preparation · 2 PrepareBranchRevision · 3 IncrementVersion · 4 DetectLastRelease · 5 DeleteBranchRef · 6 PushBranchRef</text>
+      <text x="10" y="202" class="svg-sub">7 MakeBranch · 8 SetVersion · 9 EnableMergeWatchlist · 10 CommitBranch · 11 LandBranch · 12 TagRevision · 13 CleanUp</text>
+      <rect x="10" y="214" width="760" height="32" rx="6" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 4"/>
+      <text x="24" y="235" class="svg-sub">/tmp/create-releases-tempfile-state.json — rewritten in a finally: block after every step</text>
+      <path d="M740 234 C760 254 34 254 22 236" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-v8-life-arr-purple)"/>
+      <text x="356" y="264" class="svg-note">a failed run resumes with -s N</text>
+
+      <text x="10" y="292" class="svg-lane">3 · WHAT IT PUSHES, AND THE GATE THAT HOLDS IT</text>
+      <rect x="10" y="302" width="216" height="54" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="24" y="325" class="svg-step">refs/heads/15.6.31</text>
+      <text x="24" y="344" class="svg-sub">+ tag 15.6.31 · candidate 0</text>
+      <line x1="226" y1="329" x2="264" y2="329" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-v8-life-arr-purple)"/>
+      <rect x="268" y="302" width="216" height="54" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+      <text x="282" y="325" class="svg-step">tag 15.6.31-pgo</text>
+      <text x="282" y="344" class="svg-sub">PGO builder, 15–20 min later</text>
+      <line x1="484" y1="329" x2="522" y2="329" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-v8-life-arr-ink)"/>
+      <rect x="526" y="302" width="244" height="54" rx="8" fill="#f7f7f5" stroke="#252525"/>
+      <text x="540" y="325" class="svg-step">detect_roll_candidate</text>
+      <text x="540" y="344" class="svg-sub">160 newest tags → refs/heads/roll</text>
+
+      <text x="10" y="384" class="svg-lane">4 · CHROMIUM</text>
+      <rect x="10" y="394" width="284" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="24" y="417" class="svg-step">v8-chromium-autoroll (Skia)</text>
+      <text x="24" y="436" class="svg-sub">mode RUNNING · strategy BATCH</text>
+      <line x1="294" y1="421" x2="332" y2="421" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-v8-life-arr-blue)"/>
+      <rect x="336" y="394" width="248" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="350" y="417" class="svg-step">"Roll V8 from A to B"</text>
+      <text x="350" y="436" class="svg-sub">50 try jobs per roll CL</text>
+      <line x1="584" y1="421" x2="622" y2="421" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-v8-life-arr-blue)"/>
+      <rect x="626" y="394" width="144" height="54" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="640" y="417" class="svg-step">DEPS</text>
+      <text x="640" y="436" class="svg-sub">v8_revision = …</text>
+
+      <text x="804" y="20" class="svg-lane">BACK-MERGE · NO LOCAL GIT</text>
+      <rect x="804" y="30" width="266" height="70" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="818" y="53" class="svg-step">merge_to_branch_gerrit.py</text>
+      <text x="818" y="71" class="svg-sub">Gerrit REST cherry-pick</text>
+      <text x="818" y="89" class="svg-sub">"Merged: " · footers stripped</text>
+      <line x1="937" y1="100" x2="937" y2="126" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-v8-life-arr-ink)"/>
+      <rect x="804" y="130" width="266" height="88" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="818" y="153" class="svg-step">roll_merge_gerrit.py</text>
+      <text x="818" y="171" class="svg-sub">V8_PATCH_LEVEL + 1 by change edit</text>
+      <text x="818" y="189" class="svg-sub">hashtag roll-merge</text>
+      <text x="818" y="207" class="svg-sub">Owners-Override +1 · rubber-stamper</text>
+      <line x1="937" y1="218" x2="937" y2="244" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-v8-life-arr-ink)"/>
+      <rect x="804" y="248" width="266" height="70" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+      <text x="818" y="271" class="svg-step">submit · tag · wait</text>
+      <text x="818" y="289" class="svg-sub">for the -pgo tag, 15–20 min</text>
+      <text x="818" y="307" class="svg-sub">before the roller reopens</text>
+      <text x="804" y="344" class="svg-note">The same gate closes the loop:</text>
+      <text x="804" y="362" class="svg-note">nothing rolls without PGO data.</text>
+
+      <text x="10" y="478" class="svg-note">thick black = control · thin blue = data into Chromium · dashed purple = state written or awaited</text>
+    </svg>
+  </div>
+  <p class="figure-caption">
+    All four lanes and the inset are read from the scripts and recipes
+    <span class="src">from the tree</span>. The version numbers are one real
+    day — 15.6.31 on <code>refs/heads/15.6.31</code>, pushed by
+    <code>v8-ci-autoroll-builder</code> — and lane 4 is live roller status
+    fetched 2026-09-21, not a steady state. The 15&ndash;20 minute PGO wait is
+    the number the script itself quotes, not one I measured.
+  </p>
+</figure>
+
+<p>
+  Getting that version into Chromium is two-stage.
+  <code>detect_roll_candidate</code> reads <code>v8_revision</code> out of
+  Chromium's DEPS with <code>gclient getdep</code>, scans the 160 newest tags
+  for the newest version carrying a matching <code>-pgo</code> tag — patched
+  four-component versions get a three-hour priority window — and force-pushes
+  the winner to <code>refs/heads/roll</code>. Skia's
+  <code>v8-chromium-autoroll</code>, strategy <code>BATCH</code> since
+  2023-09-01, turns that ref into "Roll V8 from A to B" CLs carrying 50 try
+  jobs. The <code>-pgo</code> tag is the real gate. V8 ships
+  profile-guided-optimisation data alongside a version &mdash; execution
+  profiles that the compiler consumes to lay out the binary &mdash; and a
+  separate job publishes a git tag <code>&lt;version&gt;-pgo</code> once that
+  data exists for exactly that revision. A version without the tag is a
+  version whose profiles are missing, so nothing will roll it.
+  <code>roll_merge_gerrit.py</code> makes the wait explicit: it polls
+  <code>tags/&lt;version&gt;-pgo</code>, asserts the tagged revision is the
+  commit it just landed, and prints "Waiting for PGO profile tag
+  (%s-pgo), this can take 15-20 minutes" while it spins
+  [<code>roll_merge_gerrit.py</code>:287&ndash;298]
+  <span class="src">from the tree</span> &mdash; which is why the back-merge
+  path in Figure {{fig-v8-life}} ends there. Those
+  back-merges never touch a local checkout.
+  <code>merge_to_branch_gerrit.py</code> cherry-picks through Gerrit's REST
+  API, prefixes "Merged: ", strips the
+  <code>Change-Id</code>/<code>Reviewed-on</code>/<code>Commit-Queue</code>
+  footers and appends <code>(cherry picked from commit …)</code>
+  [:92&ndash;107]; <code>roll_merge_gerrit.py</code> bumps
+  <code>V8_PATCH_LEVEL</code> by one inside a Gerrit change edit and adds the
+  <code>roll-merge</code> hashtag so Rubber Stamper reads it as benign
+  [<code>roll_merge_gerrit.py</code>:154&ndash;175].
+</p>
+
+<h3>Chromium's own two</h3>
+<p>
+  <code>build/util/version.py</code> is a template engine.
+  <code>@KEY@</code> placeholders come from <code>chrome/VERSION</code>, a
+  branding file, and exactly one of two lastchange files, picked by an
+  <code>if</code> on line 59: <code>LASTCHANGE</code> for official builds,
+  <code>LASTCHANGE.dummy</code> otherwise [:44&ndash;66]. That is how
+  156.0.8067.0 reaches the About box, a Windows <code>FILEVERSION</code>
+  resource, and an Android <code>versionCode</code>, which is positional:
+  <code>{full BUILD number}{3 digits: PATCH}{1 digit: package}{1 digit: ABIs}</code>,
+  with "Next" builds adding 50000 so they sort newer than any real build of
+  the same branch [<code>android_chrome_version.py</code>:37&ndash;44, 76].
+  Lines 166&ndash;188 of <code>build/util/lastchange.py</code> are the join
+  between &sect;08's commit numbering and the string in the binary:
+</p>
+<pre><code>    hash_ = ''
+
+    git_args = ['log', '-1', '--format=%H %ct']
+    if commit_filter is not None:
+        git_args.append('--grep=' + commit_filter)
+
+    git_args.append(start_commit)
+
+    output = _RunGitCommand(directory, git_args)
+    hash_, commit_timestamp = output.split()
+    if not hash_:
+        return _EMPTY_VERSION_INFO
+
+    revision = hash_
+    pos = ''
+    output = _RunGitCommand(directory, ['cat-file', 'commit', hash_])
+    for line in reversed(output.splitlines()):
+        if line.startswith('Cr-Commit-Position:'):
+            pos = line.rsplit()[-1].strip()
+            logging.debug("Found Cr-Commit-Position '%s'", pos)
+            revision = "{}-{}".format(hash_, pos)
+            break
+    return VersionInfo(hash_, revision, pos, int(commit_timestamp))</code></pre>
+<p>
+  It reads the raw commit object and looks for the footer the Gerrit plugin
+  wrote, so <code>LASTCHANGE</code> becomes
+  <code>&lt;hash&gt;-&lt;Cr-Commit-Position&gt;</code>. Non-official builds
+  never see it: <code>lastchange.gni</code> declares
+  <code>use_dummy_lastchange = !is_official_build</code>, and the dummy file
+  is forty zeros, a dash, forty zeros, "for commit independent reproducible
+  binaries" [:5&ndash;16]. Your local Chromium does not know which commit it
+  is, on purpose.
+</p>
+
+<h3>Packaging, and the one place it is not vestigial</h3>
+<p>
+  <code>chrome/tools/build/README.md</code> declares <code>FILES.cfg</code>
+  obsolete for archiving; 11 JSON files in <code>infra/archive_config/</code>
+  drive the dev archive builders instead, the official ones being configured in
+  <code>src-internal</code> <span class="src">from the tree</span>.
+  Windows is the exception. <code>create_installer_archive.py</code> builds
+  <code>chrome.7z</code> from a staged <code>chrome.release</code> and
+  compresses it with flags whose comment is their own justification:
+  <code>-m0=BCJ2 -m1=LZMA:d27:fb128 …</code>, credited with "a ~2.3MB decrease
+  in installer size on a 24MB installer" plus "an additional ~3.5MB"
+  [:85&ndash;99]. Differential installers substitute a bsdiff or Zucchini
+  patch [:431&ndash;452, 241&ndash;258]; <code>setup.ex_</code> is packed by
+  <code>makecab.py</code>, a reimplementation of <code>makecab.exe</code> that
+  lets a Windows installer be built on a Linux bot [:516&ndash;527].
+</p>
+
+<h3>Where a human still sits</h3>
+<p>
+  Toolchain rolls. <code>tools/clang/scripts/upload_revision.py</code>
+  rewrites <code>CLANG_REVISION</code> and <code>CLANG_SUB_REVISION</code> in
+  <code>update.py</code> (<code>llvmorg-24-init-7747-g62397f8b</code>,
+  sub-revision 29 here) plus the Rust revisions, uploads
+  <code>--bypass-hooks</code> with 28 <code>Cq-Include-Trybots:</code> lines,
+  and fires four <code>*_upload_clang</code> and four
+  <code>*_upload_rust</code> trybots
+  [<code>upload_revision.py</code>:48&ndash;59, 444&ndash;462], which run
+  <code>package.py --upload</code> into a staging bucket with
+  <code>x-goog-if-generation-match:0</code> so nothing is overwritten
+  [<code>package.py</code>:140]. Then it stops: step 3 of
+  <code>docs/updating_clang.md</code> is a Googler running an internal promote
+  script, because "Writing to the production bucket requires special
+  permissions" <span class="src">from the docs</span>.
+</p>
+
+<h3>The third thing that propagates</h3>
+<p>
+  Configs reach the fleet by &sect;02's path. Code has its own. Every commit
+  to <code>chromium/tools/build</code> becomes a CIPD bundle —
+  <code>recipes.py fetch</code>, <code>recipes.py bundle</code>,
+  <code>cipd create -tag git_revision:&lt;sha&gt; -ref &lt;ref&gt;</code> — 0.7
+  to 4.2 minutes from commit to registration, measured on 2026-09-22 across
+  the 12 newest instances in CIPD.
+  Only <code>refs/heads/main</code> still moves: the 479
+  <code>refs/heads/chromium/NNNN</code> refs were last touched 2020-11-16,
+  which is why branch projects run trunk recipes. Upstream pins move by an
+  autoroller on a 10-minute cadence, 163 roll CLs in 30 days, 122 merged, 41
+  abandoned. Binaries are stranger. The bootstrapper is Go, packaged for 7
+  platforms and uploaded <code>-ref latest</code>; because the build is
+  reproducible an unchanged binary re-registers as the <em>same</em> instance,
+  so the live <code>latest</code> carries 210 tag pairs over 7.4 days and
+  moves only when the bytes change. There is nothing to canary. bbagent is the
+  exception: Buildbucket pins it in service settings with a separate
+  <code>version_canary</code>, which chromium's try bucket takes at
+  <code>task_template_canary_percentage = 5</code>.
+</p>

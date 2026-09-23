@@ -1,0 +1,302 @@
+          <h2 id="oilpan-and-wtf"><span class="secnum">{{S}}</span>Oilpan, and what is left of WTF</h2>
+          <p class="lede">
+            Every object those stages produce is allocated somewhere, and
+            Blink has two answers. The first one moved out of the building:
+            Blink's garbage collector is no longer written in Blink. The
+            directory that still carries its name is an adapter onto a library
+            that lives in V8.
+          </p>
+
+          <p>
+            <code>third_party/blink/renderer/platform/heap</code> is 42 files
+            at the top level, 69 counting <code>collection_support/</code> and
+            <code>test/</code>. Exactly 27 lines in it are <code>using</code>
+            aliases onto <code>cppgc::</code>, and those 27 lines are the
+            entire type surface a Blink author touches. The other roughly
+            5,900 lines — 5,862 counted over the top-level headers and
+            sources plus <code>collection_support/</code>, tests
+            excluded — are glue: <code>ThreadState</code>, six custom heap
+            spaces, heap collections over WTF's containers, trace traits,
+            cross-thread handles, a memory-dump provider
+            <span class="src">from the tree</span>.
+          </p>
+          <p>
+            <code>platform/heap/member.h</code>:21-28 and :70-78 is the
+            adapter in miniature — three aliases, and one assertion that the
+            wrapper never grows:
+          </p>
+<pre><code>template &lt;typename T&gt;
+using Member = cppgc::Member&lt;T&gt;;
+
+template &lt;typename T&gt;
+using WeakMember = cppgc::WeakMember&lt;T&gt;;
+
+template &lt;typename T&gt;
+using UntracedMember = cppgc::UntracedMember&lt;T&gt;;
+…
+// We should never bloat the Member&lt;&gt; wrapper.
+// NOTE: The Member&lt;void*&gt; works as we never use this Member in a trace method.
+static_assert(kBlinkMemberGCHasDebugChecks ||
+                  sizeof(Member&lt;void*&gt;) &lt;= sizeof(void*),
+              "Member&lt;&gt; should stay small!");</code></pre>
+          <p>
+            The carve-out began in early 2020; the library launched in V8 v9.4
+            and was switched on for Blink in M94
+            <span class="src">from the docs</span>. On 24 September 2021
+            <em>heap: Remove Oilpan in Blink</em> (commit
+            <code>0e8ab8bb7a15</code>) deleted the in-tree collector — 23,206
+            lines across 120 files. Throughput rose: an allocation
+            microbenchmark moved from 40,660 to 46,451 allocations per
+            millisecond on Linux (1.14×) and 32,038 to 34,559 on Windows
+            (1.08×). Two numbers that travel with this story need scoping.
+            "Around 30k targets" is the pre-carve-out pain point that
+            motivated the work, not a cost of the M94 integration;
+            "&gt;400 unit tests" counts cppgc's stand-alone core suite, not
+            Blink's.
+          </p>
+
+          <h3>What Blink links against now</h3>
+          <p>
+            cppgc is mark-and-sweep with limited compaction, incremental and
+            concurrent in both marking and sweeping, conservative when the
+            stack is not empty. Pages are 2<sup>17</sup> bytes = 128 KiB; an
+            object over half a page — 64 KiB — goes to a large-object space;
+            every object carries an 8-byte header holding a 14-bit
+            <code>GCInfoIndex</code>, an in-construction bit, a 15-bit size
+            and the mark bit. The heap sits in a 4 GiB cage, 16 GiB with
+            <code>CPPGC_ENABLE_LARGER_CAGE</code>, which is what lets
+            <code>Member&lt;T&gt;</code> be a 32-bit offset rather than a
+            pointer. Compression became the default in Chrome 106, for −21%
+            P50 and −33% P99 Oilpan memory on Windows and −6% / −8% on
+            Android; concurrent sweeping, in M78, had already cut main-thread
+            sweeping time by 25–50%, 42% on average
+            <span class="src">from the docs</span>. Figure {{fig-heap-map}}
+            puts a single object inside all three of those — the cage, the
+            page, the compressed pointer.
+          </p>
+          <figure class="figure wide" id="fig-heap-map">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Where a Blink object physically lands</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 452" role="img" aria-label="Three panels. Left: the 4 GiB caged reservation, containing normal size-bucketed page spaces, a large-object space for objects over 64 KiB, and Blink's six custom spaces with indices zero to five. Middle: one 128 KiB page with per-object 8-byte headers, and the header's bitfields listed. Right: a 64-bit address inside the cage shifted right into a 32-bit compressed Member, and decompressed by sign-extending, shifting and masking with the cage base.">
+                <defs>
+                  <marker id="fig-heap-map-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-heap-map-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="16" y="18" class="svg-lane">THE CAGE</text>
+                <text x="564" y="18" class="svg-lane">ONE PAGE, AND ONE OBJECT HEADER</text>
+                <text x="884" y="18" class="svg-lane">MEMBER&lt;T&gt;</text>
+
+                <rect x="16" y="30" width="524" height="404" rx="10" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="54" class="svg-step">Caged reservation — 4 GiB</text>
+                <text x="32" y="72" class="svg-sub">16 GiB with CPPGC_ENABLE_LARGER_CAGE</text>
+
+                <rect x="32" y="86" width="492" height="50" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="46" y="108" class="svg-step">Normal page spaces</text>
+                <text x="46" y="126" class="svg-sub">bucketed by object size</text>
+
+                <rect x="32" y="146" width="492" height="50" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="46" y="168" class="svg-step">Large object space</text>
+                <text x="46" y="186" class="svg-sub">objects &gt; 64 KiB = kPageSize / 2</text>
+
+                <text x="32" y="224" class="svg-lane">SIX CUSTOM SPACES · INDEX 0–5</text>
+
+                <rect x="32" y="234" width="492" height="38" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="44" y="250" class="svg-sub">0 · CompactableHeapVectorBackingSpace</text>
+                <text x="44" y="266" class="svg-note">kSupportsCompaction = true</text>
+
+                <rect x="32" y="276" width="492" height="38" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="44" y="292" class="svg-sub">1 · CompactableHeapHashTableBackingSpace</text>
+                <text x="44" y="308" class="svg-note">kSupportsCompaction = true</text>
+
+                <rect x="32" y="318" width="236" height="50" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="44" y="340" class="svg-sub">2 · NodeSpace</text>
+                <text x="44" y="358" class="svg-note">Text, Comment, the rest of Node</text>
+
+                <rect x="288" y="318" width="236" height="50" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="300" y="340" class="svg-sub">3 · CSSValueSpace</text>
+                <text x="300" y="358" class="svg-note">one space per hot type</text>
+
+                <rect x="32" y="372" width="236" height="50" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="44" y="394" class="svg-sub">4 · LayoutObjectSpace</text>
+                <text x="44" y="412" class="svg-note">added 2021-03-31</text>
+
+                <rect x="288" y="372" width="236" height="50" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="300" y="394" class="svg-sub">5 · ElementSpace</text>
+                <text x="300" y="412" class="svg-note">split from NodeSpace, 2026-06</text>
+
+                <rect x="564" y="30" width="296" height="118" rx="10" fill="#ffffff" stroke="#252525"/>
+                <text x="578" y="54" class="svg-step">One page — 128 KiB</text>
+                <text x="578" y="72" class="svg-sub">kPageSizeBits = 17</text>
+                <rect x="578" y="88" width="10" height="28" fill="#d98226"/>
+                <rect x="588" y="88" width="62" height="28" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="654" y="88" width="10" height="28" fill="#d98226"/>
+                <rect x="664" y="88" width="94" height="28" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="762" y="88" width="10" height="28" fill="#d98226"/>
+                <rect x="772" y="88" width="34" height="28" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="578" y="136" class="svg-note">orange = the 8-byte header prepended to every object</text>
+
+                <text x="564" y="176" class="svg-lane">HEAPOBJECTHEADER · 64 BITS</text>
+                <rect x="564" y="186" width="296" height="24" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="576" y="202" class="svg-sub">padding · 32 — 64-bit platforms only</text>
+                <rect x="564" y="212" width="296" height="24" fill="#ffffff" stroke="#deded9"/>
+                <text x="576" y="228" class="svg-sub">GCInfoIndex · 14</text>
+                <rect x="564" y="238" width="296" height="24" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="576" y="254" class="svg-sub">unused · 1</text>
+                <rect x="564" y="264" width="296" height="24" fill="#ffffff" stroke="#deded9"/>
+                <text x="576" y="280" class="svg-sub">in construction · 1 — encoded as false</text>
+                <rect x="564" y="290" width="296" height="24" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="576" y="306" class="svg-sub">size · 15 — up to 2^17; 0 = large object</text>
+                <rect x="564" y="316" width="296" height="24" fill="#ffffff" stroke="#deded9"/>
+                <text x="576" y="332" class="svg-sub">mark bit · 1</text>
+                <text x="564" y="360" class="svg-note">mark and in-construction sit in separate</text>
+                <text x="564" y="378" class="svg-note">16-bit halves, so each can be read alone</text>
+
+                <rect x="884" y="30" width="220" height="52" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="896" y="52" class="svg-step">64-bit address</text>
+                <text x="896" y="70" class="svg-sub">inside the cage</text>
+                <line x1="994" y1="82" x2="994" y2="122" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-heap-map-arr-purple)"/>
+                <text x="1004" y="100" class="svg-note">&gt;&gt; 1, or 3</text>
+                <text x="1004" y="116" class="svg-note">with the larger cage</text>
+
+                <rect x="884" y="128" width="220" height="52" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="896" y="150" class="svg-step">uint32_t offset</text>
+                <text x="896" y="168" class="svg-sub">4 bytes, not 8</text>
+                <line x1="994" y1="180" x2="994" y2="216" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-heap-map-arr-ink)"/>
+
+                <rect x="884" y="222" width="220" height="70" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="896" y="244" class="svg-step">Decompress</text>
+                <text x="896" y="262" class="svg-sub">sign-extend · shift left</text>
+                <text x="896" y="280" class="svg-sub">AND the cage base</text>
+                <text x="884" y="316" class="svg-note">nullptr and the sentinel survive</text>
+                <text x="884" y="334" class="svg-note">the round trip unchanged</text>
+                <text x="884" y="366" class="svg-note">static_assert: sizeof(Member&lt;void*&gt;)</text>
+                <text x="884" y="384" class="svg-note">&lt;= sizeof(void*)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Space names and indices from
+              <code>platform/heap/custom_spaces.h</code>:22-59; sizes, shifts
+              and the cage from
+              <code>v8/include/cppgc/internal/api-constants.h</code>:33-56;
+              the bitfields from
+              <code>v8/src/heap/cppgc-internal/heap-object-header.h</code>:32-57
+              <span class="src">from the tree</span>. Object sizes inside the
+              page are illustrative, not measured
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            The aliases buy a vocabulary whose rules are positional. A raw
+            pointer is legal only on the stack, where conservative scanning
+            finds it; an on-heap field must be a <code>Member</code>; an
+            off-heap field must be a <code>Persistent</code>.
+            <code>blink-gc-plugin</code> — the second of §03's two compiler
+            plugins — rejects the rest at compile time. Figure {{fig-handles}} is the
+            whole vocabulary in one table: eight handles, where each is legal,
+            and what it does to the collector.
+          </p>
+
+          <figure class="figure wide" id="fig-handles">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Eight ways to hold a garbage-collected object</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Handle</th><th>Where allowed</th><th>Keeps alive</th><th>Cleared on death</th><th>Traced</th><th>Write barrier</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td><code>T*</code></td><td>Stack only — locals, parameters, returns</td><td>Yes, conservatively</td><td>No</td><td>By the stack scan</td><td>None</td></tr>
+                  <tr><td><code>Member&lt;T&gt;</code></td><td>On-heap field, own thread</td><td>Yes</td><td>No</td><td>In <code>Trace()</code></td><td>Dijkstra</td></tr>
+                  <tr><td><code>WeakMember&lt;T&gt;</code></td><td>On-heap field, own thread</td><td>No</td><td>Yes → <code>nullptr</code></td><td>In <code>Trace()</code></td><td>Dijkstra</td></tr>
+                  <tr><td><code>UntracedMember&lt;T&gt;</code></td><td>On-heap field, custom weakness only</td><td>No</td><td>No</td><td>Must not be</td><td>None</td></tr>
+                  <tr><td><code>Persistent&lt;T&gt;</code></td><td>Off-heap field, own thread</td><td>Yes — a root</td><td>No</td><td>As a root</td><td>None — root</td></tr>
+                  <tr><td><code>WeakPersistent&lt;T&gt;</code></td><td>Off-heap field, own thread</td><td>No</td><td>Yes → <code>nullptr</code></td><td>As a root</td><td>None — root</td></tr>
+                  <tr><td><code>CrossThreadPersistent&lt;T&gt;</code></td><td>Off-heap, into another thread's heap</td><td>Yes — a root</td><td>Weak variant clears</td><td>As a root</td><td>None — root</td></tr>
+                  <tr><td><code>CrossThreadHandle&lt;T&gt;</code></td><td>Another thread; deref only on the owner</td><td>Yes — a root</td><td>Weak variant clears</td><td>As a root</td><td>None — root</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              The first five columns come from
+              <code>platform/heap/BlinkGCAPIReference.md</code>:272-399
+              <span class="src">from the docs</span>; the write barriers from
+              the policy arguments in
+              <code>v8/include/cppgc/member.h</code>:569-596
+              <span class="src">from the tree</span>. "As a root" and
+              "None — root" on the persistent rows are mine:
+              <code>BasicPersistent</code> takes no write-barrier policy and
+              is documented as "always a GC root from the point of view of the
+              GC" in <code>v8/include/cppgc/persistent.h</code>:353-362
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <h3>The bridge to JavaScript</h3>
+          <p>
+            One inheritance edge carries it.
+            <code>ScriptWrappable</code> derives from
+            <code>v8::Object::Wrappable</code>, itself a
+            <code>cppgc::GarbageCollected&lt;Wrappable&gt;</code>, and stores
+            the main-world wrapper inline as a
+            <code>TraceWrapperV8Reference&lt;v8::Object&gt;</code>; other
+            worlds' wrappers live in <code>DOMDataStore</code>'s ephemeron
+            map, a
+            <code>HeapHashMap&lt;WeakMember&lt;const ScriptWrappable&gt;,</code>
+            <code>TraceWrapperV8Reference&lt;v8::Object&gt;&gt;</code>
+            <span class="src">from the tree</span>. Both halves are cppgc
+            objects, so a V8 major GC marks one combined graph rather than
+            two. That is what makes "who owns this DOM node" answerable: no
+            C++ owner does — the combined graph does.
+          </p>
+
+          <h3>What is still PartitionAlloc</h3>
+          <p>
+            Everything else belongs to PartitionAlloc, and WTF is the library
+            sitting on it. A <code>StringImpl</code> header is three 32-bit
+            words — reference count, length in code units, a 24-bit cached
+            hash plus 8 flag bits — followed inline by the
+            <code>LChar</code> or <code>UChar</code> array, so a string is one
+            allocation. <code>AtomicString</code> interns those
+            <code>StringImpl</code>s until equality is pointer equality; the
+            table is "thread safe and there is a single table for all
+            threads", lock-guarded, not per-thread. Buffer and FastMalloc
+            bucket sizes "are chosen to keep the worst-case memory overhead
+            less than 10%" <span class="src">from the tree</span>.
+          </p>
+          <p>
+            Which allocator you get is a five-way decision, stated as prose in
+            <code>wtf/Allocator.md</code>:95-132: script-exposed (derives from
+            <code>ScriptWrappable</code>) → Oilpan; lifetime simpler under GC →
+            Oilpan; very high allocation rate with no cycles → PartitionAlloc
+            via <code>USING_FAST_MALLOC</code>; stack-only →
+            <code>STACK_ALLOCATED()</code>; part of another object →
+            <code>DISALLOW_NEW()</code>.
+          </p>
+          <div class="callout">
+            <span class="k">The example is stale; the rule is not</span>
+            <p>
+              <code>wtf/Allocator.md</code>:112-113 ends that guideline with
+              "we allocate Strings and LayoutObjects on PartitionAlloc", and
+              <code>wtf/allocator/Allocator.md</code>:7-9 still describes a
+              "LayoutObject partition" that "is a
+              <code>ThreadUnsafePartitionAllocator</code>". Half of that has
+              been wrong for five years. <code>LayoutObject</code> has been
+              <code>GarbageCollected&lt;LayoutObject&gt;</code> since 13
+              August 2021 (reland #4, <code>77d6cb6241</code>, bug 1030176),
+              allocated in <code>LayoutObjectSpace</code>,
+              <code>kSpaceIndex = 4</code> — a space added 31 March 2021
+              (<code>5c902fed1aa0</code>), four and a half months earlier.
+              <code>LayoutPartition</code>, the last
+              <code>ThreadUnsafePartition</code>, was deleted on 6 December
+              2021 (<code>cc3b7598a441</code>). The Strings half is still
+              true: <code>string_impl.cc</code> allocates through
+              <code>Partitions::BufferMalloc</code>.
+            </p>
+          </div>

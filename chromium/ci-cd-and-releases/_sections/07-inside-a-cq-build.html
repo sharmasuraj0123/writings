@@ -1,0 +1,274 @@
+<h2 id="inside-a-cq-build"><span class="secnum">{{S}}</span>Inside a CQ build</h2>
+<p class="lede">
+  A CQ build is not one build, and a test failure is not a verdict. What you
+  click on is one row in Gerrit; underneath it are two machines on two core
+  counts, four time-ordered test phases, and two independent subtractions
+  before red is allowed to mean "your change is broken". That structure has one
+  measured cause, stated plainly in the docs:
+  "the CQ has roughly ~20,000 unique flaky tests"
+  (docs/infra/cq.md:343&ndash;352) <span class="src">from the docs</span>.
+</p>
+
+<h3>Two machines, one build row</h3>
+<p>
+  <code>docs/infra/builder_types.md</code> names four patterns, and they are a
+  progression <span class="src">from the docs</span>. All-in-one with local
+  tests does checkout, compile and test as steps of one build on one machine
+  (:71&ndash;85). All-in-one with swarmed tests keeps the single build but fires
+  each suite off as a raw Swarming task (:89&ndash;111). The builder/tester split
+  separates compile and test into two builds so the parent need not wait
+  (:113&ndash;155), at the cost that it "roughly doubles the amount of builds
+  at-play, which would double the amount of results that may need inspecting"
+  (:161&ndash;163). The
+  orchestrator/compilator split fixes that last cost: "a single builder called
+  the 'orchestrator' runs for the entire duration and is the sole/primary
+  user-facing build", and it immediately triggers a <em>compilator</em> that
+  "handles all compilation while the original orchestrator is simply sleeping"
+  (:159&ndash;187).
+</p>
+<p>
+  The point is not parallelism. It is that the expensive machine is held only
+  while it compiles. Static-analysis checks that need the whole checkout stay
+  on the compilator, which is what lets the orchestrator skip syncing a source
+  tree and run on 2- or 4-core bots; the compilator gets a
+  "beefier &gt;=16 core bot" and, once it has compiled and run those checks,
+  "can immediately move on to pick up a new build"
+  (docs/infra/builder_types.md:159&ndash;187,
+  docs/infra/new_builder.md:403&ndash;407)
+  <span class="src">from the docs</span>. <code>linux-rel</code> is declared
+  with <code>try_.orchestrator_builder</code>, mirrors
+  <code>ci/Linux Builder</code>, <code>ci/Linux Tests</code>,
+  <code>ci/GPU Linux Builder</code> and <code>ci/Linux Release (NVIDIA)</code>,
+  and names <code>compilator = "linux-rel-compilator"</code>
+  (tryserver.chromium.linux.star:453&ndash;492)
+  <span class="src">from the tree</span>.
+</p>
+
+<h3>Four phases</h3>
+<p>
+  The ladder is written down. <code>docs/infra/cq.md</code>:243&ndash;262, verbatim
+  <span class="src">from the docs</span> &mdash; the recipes that implement it
+  live in <code>chromium/tools/build</code>, not in this checkout:
+</p>
+<pre><code>The CQ has the following structure:
+
+* Compile all test suites that might be affected by the CL.
+* Runs all test suites that might be affected by the CL.
+    * Many test suites are divided into shards. Each shard is run as a separate
+      swarming task.
+    * These steps are labeled '(with patch)'
+* Retry each shard that has a test failure. The retry has the exact same
+  configuration as the original run. No recompile is necessary.
+    * If the retry succeeds, then the failure is ignored.
+    * These steps are labeled '(retry shards with patch)'
+    * It's important to retry with the exact same configuration. Attempting to
+      retry the failing test in isolation often produces different behavior.
+* Recompile each failing test suite without the CL. Rerun each failing test
+  suite in isolation.
+    * If the retry fails, then the fail is ignored, as it's assumed that the test
+      is broken/flaky on tip of tree.
+    * These steps are labeled '(without patch)'
+* Fail the build if there are tests which failed in both '(with patch)' and
+  '(retry shards with patch)' but passed in '(without patch)'.</code></pre>
+<p>
+  The constants come from the recipe module. The <code>(without patch)</code>
+  phase repeats each failing test 10 times with the launcher retry limit set to
+  0, and only runs when &le;&nbsp;100 tests need retrying. CI builders take the
+  opposite tack: they retry failed shards with the limit raised to 5. The retry
+  filter naming which tests to rerun is capped by the command line, 6,000
+  characters on Windows and 90,000 elsewhere; over the cap the filter is
+  dropped and the whole suite reruns
+  (tools/build recipes/recipe_modules/chromium_tests/steps.py:81&ndash;85,
+  229&ndash;245) <span class="src">from the tree</span>. The unmodified default,
+  the one every <code>(with patch)</code> shard runs under, is
+  <code>--isolated-script-test-launcher-retry-limit</code> = 3, "so, for N+1
+  total invocations of the test"
+  (docs/testing/test_executable_api.md:168&ndash;171)
+  <span class="src">from the docs</span>. Figure {{fig-retry-ladder}} puts the
+  four phases on the two lanes that run them.
+</p>
+
+<figure class="figure wide" id="fig-retry-ladder">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">Four phases, two lanes, and the three rows that decide a CL</p>
+  </div>
+  <div class="figure-body plain">
+    <svg viewBox="0 -24 1064 560" role="img" aria-label="A two-lane sequence diagram over a truth table. The compilator lane holds phase one, compile affected suites, and phase four's recompile without the CL. The orchestrator lane holds phase two, all shards with patch, phase three, failed shard indices only, and phase four, each failing test ten times. A LUCI Analysis QueryStability box below the orchestrator lane feeds a ResultDB TestExoneration box. Below, a three-row truth table: fail then pass is ignored; fail, fail, fail is exonerated as occurs-on-mainline; fail, fail, pass fails the build.">
+      <defs>
+        <marker id="fig-retry-ladder-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+        <marker id="fig-retry-ladder-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+        <marker id="fig-retry-ladder-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+      </defs>
+
+      <text x="128" y="4" class="svg-num">1</text><text x="142" y="4" class="svg-lane">COMPILE</text>
+      <text x="360" y="4" class="svg-num">2</text><text x="374" y="4" class="svg-lane">(WITH PATCH)</text>
+      <text x="592" y="4" class="svg-num">3</text><text x="606" y="4" class="svg-lane">(RETRY SHARDS WITH PATCH)</text>
+      <text x="824" y="4" class="svg-num">4</text><text x="838" y="4" class="svg-lane">(WITHOUT PATCH)</text>
+
+      <text x="8" y="60" class="svg-lane">COMPILATOR</text>
+      <text x="8" y="150" class="svg-lane">ORCHESTRATOR</text>
+
+      <rect x="128" y="24" width="216" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="142" y="48" class="svg-step">Compile affected suites</text>
+      <text x="142" y="68" class="svg-sub">&gt;=16 cores &middot; uploads isolates</text>
+
+      <rect x="824" y="24" width="216" height="62" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="838" y="48" class="svg-step">Recompile, patch reverted</text>
+      <text x="838" y="68" class="svg-sub">only the failing suites</text>
+
+      <rect x="360" y="116" width="216" height="74" rx="8" fill="#ffffff" stroke="#252525"/>
+      <text x="374" y="140" class="svg-step">All shards</text>
+      <text x="374" y="160" class="svg-sub">Swarming tasks</text>
+      <text x="374" y="178" class="svg-sub">retry-limit 3 per test</text>
+
+      <rect x="592" y="116" width="216" height="74" rx="8" fill="#ffffff" stroke="#252525"/>
+      <text x="606" y="140" class="svg-step">Failed shard indices</text>
+      <text x="606" y="160" class="svg-sub">identical configuration</text>
+      <text x="606" y="178" class="svg-sub">non-idempotent tasks</text>
+
+      <rect x="824" y="116" width="216" height="74" rx="8" fill="#ffffff" stroke="#252525"/>
+      <text x="838" y="140" class="svg-step">Each failing test &times; 10</text>
+      <text x="838" y="160" class="svg-sub">retry-limit 0, in isolation</text>
+      <text x="838" y="178" class="svg-sub">guard: only if &lt;= 100 tests</text>
+
+      <line x1="236" y1="86" x2="400" y2="116" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-retry-ladder-arr-blue)"/>
+      <text x="252" y="108" class="svg-note">isolates</text>
+      <line x1="576" y1="153" x2="592" y2="153" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-retry-ladder-arr-ink)"/>
+      <path d="M700 116 V 55 H 816" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-retry-ladder-arr-ink)"/>
+      <text x="714" y="46" class="svg-note">trigger recompile</text>
+      <line x1="932" y1="86" x2="932" y2="116" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-retry-ladder-arr-blue)"/>
+
+      <rect x="360" y="216" width="448" height="60" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <text x="374" y="240" class="svg-step">LUCI Analysis &middot; QueryStability, per failing variant</text>
+      <text x="374" y="260" class="svg-sub">failure_threshold 6 &middot; consecutive 3 &middot; flake_threshold 3</text>
+
+      <rect x="824" y="216" width="216" height="92" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="838" y="240" class="svg-step">ResultDB TestExoneration</text>
+      <text x="838" y="262" class="svg-sub">OCCURS_ON_MAINLINE</text>
+      <text x="838" y="280" class="svg-sub">OCCURS_ON_OTHER_CLS</text>
+      <text x="838" y="298" class="svg-sub">NOT_CRITICAL</text>
+
+      <line x1="452" y1="190" x2="452" y2="216" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-retry-ladder-arr-blue)"/>
+      <line x1="808" y1="246" x2="824" y2="246" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-retry-ladder-arr-purple)"/>
+      <line x1="990" y1="190" x2="990" y2="216" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-retry-ladder-arr-purple)"/>
+
+      <rect x="128" y="316" width="216" height="30" fill="#f7f7f5" stroke="#deded9"/>
+      <rect x="344" y="316" width="216" height="30" fill="#f7f7f5" stroke="#deded9"/>
+      <rect x="560" y="316" width="216" height="30" fill="#f7f7f5" stroke="#deded9"/>
+      <rect x="776" y="316" width="264" height="30" fill="#f7f7f5" stroke="#deded9"/>
+      <text x="142" y="336" class="svg-lane">(WITH PATCH)</text>
+      <text x="358" y="336" class="svg-lane">(RETRY SHARDS)</text>
+      <text x="574" y="336" class="svg-lane">(WITHOUT PATCH)</text>
+      <text x="790" y="336" class="svg-lane">OUTCOME FOR THE CL</text>
+
+      <rect x="128" y="346" width="216" height="44" fill="#ffffff" stroke="#deded9"/>
+      <rect x="344" y="346" width="216" height="44" fill="#ffffff" stroke="#deded9"/>
+      <rect x="560" y="346" width="216" height="44" fill="#ffffff" stroke="#deded9"/>
+      <rect x="776" y="346" width="264" height="44" fill="#dfede5" stroke="#367f59"/>
+      <text x="142" y="373" class="svg-sub">failed</text>
+      <text x="358" y="373" class="svg-sub">passed</text>
+      <text x="574" y="373" class="svg-sub">not run</text>
+      <text x="790" y="373" class="svg-step">Ignored. The shard was flaky.</text>
+
+      <rect x="128" y="390" width="216" height="44" fill="#ffffff" stroke="#deded9"/>
+      <rect x="344" y="390" width="216" height="44" fill="#ffffff" stroke="#deded9"/>
+      <rect x="560" y="390" width="216" height="44" fill="#ffffff" stroke="#deded9"/>
+      <rect x="776" y="390" width="264" height="44" fill="#dfede5" stroke="#367f59"/>
+      <text x="142" y="417" class="svg-sub">failed</text>
+      <text x="358" y="417" class="svg-sub">failed</text>
+      <text x="574" y="417" class="svg-sub">failed</text>
+      <text x="790" y="417" class="svg-step">Exonerated: OCCURS_ON_MAINLINE</text>
+
+      <rect x="128" y="434" width="216" height="44" fill="#ffffff" stroke="#deded9"/>
+      <rect x="344" y="434" width="216" height="44" fill="#ffffff" stroke="#deded9"/>
+      <rect x="560" y="434" width="216" height="44" fill="#ffffff" stroke="#deded9"/>
+      <rect x="776" y="434" width="264" height="44" fill="#f3dfdc" stroke="#ad4b43"/>
+      <text x="142" y="461" class="svg-sub">failed</text>
+      <text x="358" y="461" class="svg-sub">failed</text>
+      <text x="574" y="461" class="svg-sub">passed</text>
+      <text x="790" y="461" class="svg-step">Build fails. The CL is blamed.</text>
+
+      <text x="532" y="510" text-anchor="middle" class="svg-note">thin blue = data (isolates, stability query) &middot; thick black = control/sequence &middot; dashed purple = effect (exoneration records)</text>
+    </svg>
+  </div>
+  <p class="figure-caption">
+    The two lanes and the phase order are stated in
+    <code>docs/infra/builder_types.md</code>:159&ndash;187 and
+    <code>docs/infra/cq.md</code>:243&ndash;262; the thresholds in the
+    QueryStability box are read from
+    <code>infra/config/generated/luci/luci-analysis.cfg</code>:165&ndash;176
+    <span class="src">from the tree</span>. The lane assignment of phase 4's
+    recompile, and the exact placement of the exoneration write, are my
+    reading of those two documents against the recipe module
+    <span class="recon">reconstruction</span>.
+  </p>
+</figure>
+
+<h3>The second subtraction</h3>
+<p>
+  The ladder removes failures that do not reproduce. Exoneration removes
+  failures that reproduce and are still not yours. For each failing variant the
+  recipe calls LUCI Analysis <code>QueryStability</code> with the build's
+  gitiles commit and its Gerrit changes, then writes back ResultDB
+  <code>TestExoneration</code> records with machine-readable reasons:
+  <code>OCCURS_ON_MAINLINE</code> when the test also failed
+  <code>(without patch)</code>, <code>OCCURS_ON_OTHER_CLS</code> when
+  "LUCI Analysis reported this test as being flaky or failing", and
+  <code>NOT_CRITICAL</code> for experimental suites (tools/build
+  recipes/recipe_modules/test_utils/api.py,
+  <code>_query_stability_rate</code> and
+  <code>_exonerate_unrelated_failures</code>)
+  <span class="src">from the tree</span>. If the query itself errors, nothing
+  is exonerated and <code>luci_analysis_query_error</code> is set &mdash; the
+  side channel fails closed.
+</p>
+<p>
+  What counts as unstable is configured in the repository. Under
+  <code>test_stability_criteria</code>:
+  <code>failure_rate { failure_threshold: 6, consecutive_failure_threshold: 3 }</code>
+  and <code>flake_rate { &hellip; flake_threshold: 3 &hellip; }</code>
+  (infra/config/generated/luci/luci-analysis.cfg:165&ndash;176)
+  <span class="src">from the tree</span>. Two other sets of numbers live in
+  the same file and are easy to confuse with those, so name the field. The
+  legacy top-level <code>bug_filing_thresholds</code> at :4&ndash;15 files on 75
+  exonerated critical failures in three days, or 10 builds failed by flaky
+  tests in seven. The newer <code>bug_management.policies</code> at :80&ndash;163
+  are activation thresholds with their own deactivation floors: 30
+  exonerations in three days (deactivating below 1 in seven) at P2, 7 failed
+  gardened builds in three days at P1, and 10 human CLs rejected in one day at
+  P0 &mdash; the priority that fires when "exoneration can no longer mitigate
+  the impact".
+</p>
+
+<h3>When a build is thrown away</h3>
+<p>
+  Two rules, often conflated. Any patchset change cancels the <em>Run</em>.
+  Only a <code>REWORK</code> &mdash; the one Gerrit revision kind that advances
+  <code>MinEquivalentPatchset</code> &mdash; cancels the running <em>builds</em>,
+  so a rebase-and-repush costs the queue position but not the compile. Two
+  builders opt out with <code>cancel_stale: NO</code>,
+  <code>win-arm64-compile-dbg</code> and
+  <code>win_chromium_compile_dbg_ng</code>; the Starlark says why:
+  "Remove once cancelling doesn't wipe out builder cache", crbug.com/40847153
+  (commit-queue.cfg:8489, 9098; tryserver.chromium.win.star:475&ndash;480,
+  306&ndash;311)
+  <span class="src">from the tree</span>. The budgets around it:
+  <code>retry_config { single_quota: 1, global_quota: 2, &hellip; timeout_weight: 2 }</code>,
+  so one timeout burns the whole global allowance (:9354&ndash;9360); 10 active
+  runs per user, 20 for <code>chromium-src-increased-quota</code>, unlimited
+  for <code>chromium-src-emergency-quota</code> and the Skia autoroller
+  (:9375&ndash;9407); and a try build pending 2 hours is expired, a value
+  <code>try.star</code>:18&ndash;20 asks you to "Keep this in sync" with CV.
+</p>
+<p>
+  Add it up honestly. Three of the four phases exist to distinguish "your
+  change is broken" from "this test is broken", and the price is that a CQ run
+  can compile the tree twice. That is affordable only because the second
+  compile touches just the failing suites, and it is bounded by the same
+  budget that governs admission to the CQ at all &mdash; the median cycle time
+  under 40 minutes counted in &sect;06's funnel
+  (docs/infra/cq.md:304&ndash;305) <span class="src">from the docs</span>.
+  The 10 repeats, the 100-test guard,
+  the 6,000-character filter cap: each is a local answer to that one number.
+</p>

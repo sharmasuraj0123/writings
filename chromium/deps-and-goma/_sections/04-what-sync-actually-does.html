@@ -1,0 +1,438 @@
+          <h2 id="what-sync-actually-does"><span class="secnum">{{S}}</span>What gclient sync actually does</h2>
+          <p class="lede">
+            <code>gclient sync</code> is a scheduler with a fixed epilogue.
+            The order is the mechanism: everything that can run in parallel
+            runs first, and five things happen strictly after the queue
+            drains.
+          </p>
+          <p>
+            <code>CMDsync</code> parses options. <code>--jobs</code> defaults
+            to <code>max(8, NumLocalCpus())</code>, except on a non-Mac ARM
+            machine where it is 1 — "Some arm boards have issues with parallel
+            sync" [<code>depot_tools/gclient.py</code>:5409–5414]
+            <span class="src">from the tree</span>.
+            <code>LoadCurrentConfig</code> calls
+            <code>FindGclientRoot</code> — the upward walk to
+            <code>.gclient</code>, confirmed against
+            <code>.gclient_entries</code>, that §02 traced
+            [<code>depot_tools/gclient_paths.py</code>:21–73]. Then
+            <code>RunOnDeps("update")</code> runs — unless the checkout is a
+            Cog cloud workspace, where git is not gclient's to manage and the
+            command becomes <code>runhooks</code> [:4769–4772].
+          </p>
+          <p>
+            <code>RunOnDeps</code> checks each managed solution's remote
+            against <code>.gclient</code>, applies <code>--revision</code> and
+            <code>--patch-ref</code> overrides, stores the solutions'
+            <code>custom_vars</code> for the next run, and builds the queue [<code>gclient.py</code>:2786–2845]:
+          </p>
+<pre><code>        work_queue = gclient_utils.ExecutionQueue(
+            self._options.jobs,
+            pm,
+            ignore_requirements=ignore_requirements,
+            verbose=self._options.verbose,
+        )
+        for s in self.dependencies:
+            if s.should_process:
+                work_queue.enqueue(s)
+        with trace_utils.trace(
+            f"ExecutionQueue.flush ({command})", cat="gclient"
+        ):
+            work_queue.flush(
+                revision_overrides,
+                command,
+                args,
+                options=self._options,
+                patch_refs=patch_refs,
+                target_branches=target_branches,
+                skip_sync_revisions=skip_sync_revisions,
+            )</code></pre>
+          <p>
+            The queue is dependency-aware, not merely parallel.
+            <code>flush</code> starts a queued <code>Dependency</code> only
+            when every name in its <code>requirements</code> is in
+            <code>ran</code> and no running job shares a resource with it
+            [<code>gclient_utils.py</code>:1047–1059]. Requirements are three
+            rules: the parent, implicitly; every top-level solution, if this
+            is a second-level node; and any dep whose name is a path prefix of
+            its own, so <code>src/third_party/angle</code> waits for
+            <code>src</code> [<code>gclient.py</code>:672–708]. The resource is
+            the repository URL with the revision stripped —
+            <code>self.url.split("@")[0]</code>, since "The @123 portion is irrelevant"
+            [:538–542] — so two deps pinned to two commits of one repo are
+            serialised. Figure {{fig-sync-sequence}} is one run,
+            top to bottom.
+          </p>
+          <p>
+            Two timers watch the queue. After 60 s with no task finishing it
+            prints "Still working on:" and names the running items; after 300 s
+            of total silence it prints "STALL DETECTED: gclient has been
+            silent for 5 minutes.", the active tasks with their durations, and
+            suggestions [<code>gclient_utils.py</code>:977, 1085].
+            They read as one feature and are twelve years apart: the reminder
+            landed in <code>fe0d1902b</code>, "Revamped terminal output for
+            update.", on 2014-04-08; the stall diagnostic in
+            <code>442cbd6d5</code> on 2026-04-16
+            <span class="src">from the tree</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-sync-sequence">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One sync, in order — the queue, its two gates, and the five-step epilogue below the line</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1100 972" role="img" aria-label="A vertical sequence. CMDsync, LoadCurrentConfig and SetConfig feed an ExecutionQueue. The queue runs a per-dependency block of four steps — checkout, parse DEPS, pre_deps_hooks, enqueue children — whose children loop back into the queue. Two gates on the right govern what may start: the requirements rule and the one-job-per-URL rule. A timer gutter on the left marks sixty seconds and three hundred seconds. A dashed branch on the right shows GCS objects downloading during the walk. A heavy bar marks the queue draining, below which five steps run in order: gclient_args.gni, removing unversioned directories, one cipd ensure, hooks, and writing the previous sync commits.">
+                <defs>
+                  <marker id="fig-sync-sequence-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-sync-sequence-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <text x="12" y="26" class="svg-lane">TIMERS</text>
+                <text x="190" y="26" class="svg-lane">ONE SYNC, TOP TO BOTTOM</text>
+                <text x="640" y="26" class="svg-lane">GATES, THE CAP, AND THE ONE SIDE BRANCH</text>
+
+                <rect x="190" y="44" width="400" height="54" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="574" y="66" text-anchor="end" class="svg-num">01</text>
+                <text x="206" y="68" class="svg-step">CMDsync</text>
+                <text x="206" y="88" class="svg-sub">--jobs = max(8, CPUs); 1 on non-Mac ARM</text>
+
+                <rect x="190" y="114" width="400" height="54" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="574" y="136" text-anchor="end" class="svg-num">02</text>
+                <text x="206" y="138" class="svg-step">LoadCurrentConfig</text>
+                <text x="206" y="158" class="svg-sub">walk up to .gclient; .gclient_entries checks the cwd</text>
+
+                <rect x="190" y="184" width="400" height="54" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="574" y="206" text-anchor="end" class="svg-num">03</text>
+                <text x="206" y="208" class="svg-step">SetConfig</text>
+                <text x="206" y="228" class="svg-sub">each solution becomes a GitDependency</text>
+
+                <rect x="190" y="254" width="400" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="574" y="276" text-anchor="end" class="svg-num">04</text>
+                <text x="206" y="278" class="svg-step">ExecutionQueue(jobs) · enqueue · flush</text>
+                <text x="206" y="298" class="svg-sub">one daemon thread per running dependency</text>
+
+                <line x1="390" y1="98" x2="390" y2="114" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+                <line x1="390" y1="168" x2="390" y2="184" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+                <line x1="390" y1="238" x2="390" y2="254" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+                <line x1="390" y1="308" x2="390" y2="326" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+
+                <rect x="190" y="326" width="400" height="204" rx="10" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="206" y="350" class="svg-lane">PER DEPENDENCY — MANY AT ONCE</text>
+                <rect x="206" y="360" width="368" height="36" rx="6" fill="#ffffff" stroke="#deded9"/>
+                <text x="220" y="383" class="svg-sub">05 · check out — GitWrapper.update</text>
+                <rect x="206" y="402" width="368" height="36" rx="6" fill="#ffffff" stroke="#deded9"/>
+                <text x="220" y="425" class="svg-sub">06 · ParseDepsFile — only if it may recurse</text>
+                <rect x="206" y="444" width="368" height="36" rx="6" fill="#ffffff" stroke="#deded9"/>
+                <text x="220" y="467" class="svg-sub">07 · pre_deps_hooks — unless --noprehooks</text>
+                <rect x="206" y="486" width="368" height="36" rx="6" fill="#ffffff" stroke="#deded9"/>
+                <text x="220" y="509" class="svg-sub">08 · enqueue children whose condition is true</text>
+
+                <path d="M590 504 L614 504 L614 281 L594 281" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+
+                <line x1="158" y1="254" x2="158" y2="556" stroke="#b8b8b1" stroke-width="1.5" stroke-dasharray="4 4"/>
+                <line x1="150" y1="360" x2="166" y2="360" stroke="#d98226" stroke-width="2.5"/>
+                <text x="12" y="352" class="svg-sub">60 s</text>
+                <text x="12" y="370" class="svg-note">"Still working on:"</text>
+                <text x="12" y="386" class="svg-note">added 2014-04-08</text>
+                <line x1="150" y1="470" x2="166" y2="470" stroke="#ad4b43" stroke-width="2.5"/>
+                <text x="12" y="462" class="svg-sub">300 s</text>
+                <text x="12" y="480" class="svg-note">"STALL DETECTED"</text>
+                <text x="12" y="496" class="svg-note">added 2026-04-16</text>
+
+                <rect x="640" y="254" width="448" height="88" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="656" y="278" class="svg-lane">GATE 1 — EVERY REQUIREMENT HAS RUN</text>
+                <text x="656" y="300" class="svg-sub">the parent · every top-level solution, for a</text>
+                <text x="656" y="318" class="svg-sub">second-level node · any dep whose name is a</text>
+                <text x="656" y="336" class="svg-sub">path prefix of this one</text>
+
+                <rect x="640" y="356" width="448" height="70" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="656" y="380" class="svg-lane">GATE 2 — ONE JOB PER REPOSITORY</text>
+                <text x="656" y="402" class="svg-sub">resource = url.split("@")[0]; two pins on one</text>
+                <text x="656" y="420" class="svg-sub">repo are serialised, never concurrent</text>
+
+                <rect x="640" y="440" width="448" height="70" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="656" y="464" class="svg-lane">CAP — RECURSION LIMIT 2</text>
+                <text x="656" y="486" class="svg-sub">"Only solution level and immediate DEPS are</text>
+                <text x="656" y="504" class="svg-sub">processed"; children inherit the parent condition</text>
+
+                <path d="M574 522 L614 522 L614 560 L640 560" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-sync-sequence-purple)"/>
+                <rect x="640" y="524" width="448" height="88" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="656" y="548" class="svg-lane">SIDE BRANCH — GCS, DURING THE WALK</text>
+                <text x="656" y="570" class="svg-sub">gsutil cp · verify sha256sum and size_bytes</text>
+                <text x="656" y="588" class="svg-sub">· auto-extract tar or zip · three marker files</text>
+                <text x="656" y="606" class="svg-sub">· recorded in .gcs_entries — not in the epilogue</text>
+
+                <rect x="190" y="556" width="400" height="38" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="2"/>
+                <text x="390" y="581" text-anchor="middle" class="svg-step">QUEUE DRAINS</text>
+
+                <line x1="390" y1="530" x2="390" y2="556" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+
+                <rect x="190" y="622" width="400" height="50" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="574" y="644" text-anchor="end" class="svg-num">09</text>
+                <text x="206" y="646" class="svg-step">gclient_args.gni</text>
+                <text x="206" y="664" class="svg-sub">rewritten only if the bytes differ</text>
+
+                <rect x="190" y="690" width="400" height="50" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="574" y="712" text-anchor="end" class="svg-num">10</text>
+                <text x="206" y="714" class="svg-step">_RemoveUnversionedGitDirs</text>
+                <text x="206" y="732" class="svg-sub">deletes only with -D; git restore for gitlinks</text>
+
+                <rect x="190" y="758" width="400" height="50" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="574" y="780" text-anchor="end" class="svg-num">11</text>
+                <text x="206" y="782" class="svg-step">one cipd ensure</text>
+                <text x="206" y="800" class="svg-sub">every package from every DEPS, one file</text>
+
+                <rect x="190" y="826" width="400" height="50" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="574" y="848" text-anchor="end" class="svg-num">12</text>
+                <text x="206" y="850" class="svg-step">hooks</text>
+                <text x="206" y="868" class="svg-sub">root first, then depth-first; a failure exits 2</text>
+
+                <rect x="190" y="894" width="400" height="50" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="574" y="916" text-anchor="end" class="svg-num">13</text>
+                <text x="206" y="918" class="svg-step">.gclient_previous_sync_commits</text>
+                <text x="206" y="936" class="svg-sub">the commit each dep landed on, for next time</text>
+
+                <line x1="390" y1="594" x2="390" y2="622" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+                <line x1="390" y1="672" x2="390" y2="690" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+                <line x1="390" y1="740" x2="390" y2="758" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+                <line x1="390" y1="808" x2="390" y2="826" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+                <line x1="390" y1="876" x2="390" y2="894" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-sync-sequence-ink)"/>
+
+                <text x="640" y="642" class="svg-note">thick black = sequence · blue = the queue and its gates · grey = repeating</text>
+                <text x="640" y="662" class="svg-note">red = the barrier · green = the epilogue · dashed purple = the exception</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Steps 01–13 are the call order read off
+              <code>gclient.py</code>:4769–4772, 2786–2945 and 1502–1525, the
+              gates off <code>gclient_utils.py</code>:1047–1059 and
+              <code>gclient.py</code>:672–708
+              <span class="src">from the tree</span>. Timer marks are placed
+              for legibility, not to scale. The layout is mine
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            Inside the repeating unit: check out, then — only if this node
+            may recurse — parse its DEPS, run its
+            <code>pre_deps_hooks</code> unless <code>--noprehooks</code>, and
+            enqueue the children whose conditions came out true
+            [<code>gclient.py</code>:1502–1525]. Recursion is capped at two:
+            <code>GClient.__init__</code> sets
+            <code>self._recursion_limit = 2</code> under "Do not change previous
+            behavior. Only solution level and immediate DEPS
+            are processed" [:2084–2086]. Children inherit the parent's
+            condition, ANDed in so a flattened tree keeps the restriction
+            [:798–806].
+          </p>
+          <p>
+            The git mechanics are <code>GitWrapper.update</code>, a decision
+            tree — Figure {{fig-git-cases}}. A fresh dep is cloned
+            with <code>git clone --no-checkout --progress</code>, plus
+            <code>--shared</code> when a cache exists and the mode is not
+            bootstrap, into a temporary directory beside the target whose
+            <code>.git</code> is moved into place;
+            <code>--no-history</code> skips the clone for
+            <code>git init --object-format=…</code> and a depth-1 fetch
+            [<code>gclient_scm.py</code>:1742–1775]. Either way HEAD is left
+            detached, with gclient's message standing in for git's
+            [:1811–1821]. An existing dep meets the fast path first
+            [:1109–1121]:
+          </p>
+<pre><code>        # Special case for rev_type = hash. If we use submodules, we can check
+        # information already.
+        if rev_type == "hash":
+            if self.current_revision == revision:
+                if verbose:
+                    self.Print("Using submodule information to skip check")
+                if options.reset or options.force:
+                    self._EnsureValidHeadObjectOrCheckout(
+                        revision, options, url
+                    )
+                    self._Scrub("HEAD", options)
+
+                return revision</code></pre>
+          <p>
+            <code>current_revision</code> was seeded from the parent's
+            submodule index and diff before <code>update</code> was called
+            [<code>gclient.py</code>:1384–1460]; when it equals the pin,
+            nothing runs — no fetch, no checkout, no subprocess. Past it,
+            gclient switches the remote if the URL moved, fetches only when the
+            revision is not already a valid local SHA, and falls through to the
+            five documented cases in Figure {{fig-git-cases}} — detached HEAD
+            through a branch switch needing <code>--force</code>
+            [<code>gclient_scm.py</code>:1198–1214, 1241–1266]. Underneath sits
+            <code>git_cache.Mirror</code>: one bare repository per URL,
+            populated under a lock, re-bootstrapped from a
+            <code>gs://&lt;bucket&gt;/v2/&lt;dir&gt;</code> snapshot when it is
+            absent, empty, or holds more than
+            <code>GC_AUTOPACKLIMIT = 50</code> pack files
+            [<code>git_cache.py</code>:29, 175, 575–632] — and only ten
+            googlesource hosts have snapshots [:137–150].
+          </p>
+
+          <figure class="figure" id="fig-git-cases">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">GitWrapper.update — five questions, then five cases</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 584" role="img" aria-label="A decision tree. Five questions in a column: is the solution managed, does the checkout have a .git directory, does the gitlink already equal the pinned hash, does the remote URL match DEPS, and is the revision already a local SHA. Each has an outcome box to its right: skip, clone, return without running anything, switch the remote, or fetch. Below them a box lists the five fall-through cases zero to four. On the right, a panel lists the four git config values set after update returns, and a second panel describes the git cache mirror.">
+                <defs>
+                  <marker id="fig-git-cases-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="12" y="26" class="svg-lane">GCLIENT_SCM.PY:937–1300</text>
+                <text x="580" y="26" class="svg-lane">AFTER UPDATE RETURNS</text>
+
+                <rect x="12" y="44" width="300" height="52" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="28" y="76" class="svg-step">managed?</text>
+                <rect x="336" y="44" width="216" height="52" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="350" y="68" class="svg-sub">no → set fetch config,</text>
+                <text x="350" y="86" class="svg-sub">"unmanaged solution; skipping"</text>
+
+                <rect x="12" y="114" width="300" height="52" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="28" y="146" class="svg-step">has a .git directory?</text>
+                <rect x="336" y="114" width="216" height="52" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="350" y="138" class="svg-sub">no → clone --no-checkout</text>
+                <text x="350" y="156" class="svg-sub">(or init + depth-1 fetch)</text>
+
+                <rect x="12" y="184" width="300" height="52" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="28" y="216" class="svg-step">gitlink == pinned hash?</text>
+                <rect x="336" y="184" width="216" height="52" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="350" y="208" class="svg-sub">yes → return revision;</text>
+                <text x="350" y="226" class="svg-sub">no git runs at all</text>
+
+                <rect x="12" y="254" width="300" height="52" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="28" y="286" class="svg-step">remote URL == DEPS URL?</text>
+                <rect x="336" y="254" width="216" height="52" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="350" y="278" class="svg-sub">no → switch upstream;</text>
+                <text x="350" y="296" class="svg-sub">clean tree unless --force</text>
+
+                <rect x="12" y="324" width="300" height="52" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="28" y="356" class="svg-step">revision already a local SHA?</text>
+                <rect x="336" y="324" width="216" height="52" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="350" y="348" class="svg-sub">no → git fetch, then</text>
+                <text x="350" y="366" class="svg-sub">git remote update</text>
+
+                <line x1="312" y1="70" x2="336" y2="70" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+                <line x1="312" y1="140" x2="336" y2="140" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+                <line x1="312" y1="210" x2="336" y2="210" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+                <line x1="312" y1="280" x2="336" y2="280" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+                <line x1="312" y1="350" x2="336" y2="350" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+                <line x1="162" y1="96" x2="162" y2="114" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+                <line x1="162" y1="166" x2="162" y2="184" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+                <line x1="162" y1="236" x2="162" y2="254" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+                <line x1="162" y1="306" x2="162" y2="324" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+                <line x1="162" y1="376" x2="162" y2="396" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-git-cases-ink)"/>
+
+                <rect x="12" y="396" width="540" height="160" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="28" y="420" class="svg-lane">FALL-THROUGH — THE FIVE DOCUMENTED CASES</text>
+                <text x="28" y="446" class="svg-sub">0 · HEAD detached — the normal pinned dep; checkout --quiet</text>
+                <text x="28" y="468" class="svg-sub">1 · a branch tracking no remote — rebase onto the hash or branch</text>
+                <text x="28" y="490" class="svg-sub">2 · tracking, but DEPS now names a hash — rebase onto the hash</text>
+                <text x="28" y="512" class="svg-sub">3 · tracking, no switch — fast-forward, else ask</text>
+                <text x="28" y="534" class="svg-sub">4 · DEPS moved to another branch — needs --force, maybe --reset</text>
+
+                <rect x="580" y="44" width="408" height="232" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="596" y="68" class="svg-lane">@SET_CONFIG — POST-CONDITIONS</text>
+                <text x="596" y="94" class="svg-sub">runs after update returns, if .git exists;</text>
+                <text x="596" y="112" class="svg-sub">reads every value first, then writes, because</text>
+                <text x="596" y="130" class="svg-sub">SetConfig evicts the GetConfig cache.</text>
+                <text x="596" y="160" class="svg-sub">blame.ignoreRevsFile → set when the file is</text>
+                <text x="596" y="178" class="svg-sub">   there, unset when it is not</text>
+                <text x="596" y="200" class="svg-sub">diff.ignoreSubmodules → dirty (warns if other)</text>
+                <text x="596" y="222" class="svg-sub">fetch.recurseSubmodules → off</text>
+                <text x="596" y="244" class="svg-sub">push.recurseSubmodules → off: "We never want</text>
+                <text x="596" y="262" class="svg-sub">   to push submodules for gclient managed…"</text>
+
+                <rect x="580" y="296" width="408" height="180" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="596" y="320" class="svg-lane">UNDERNEATH — GIT_CACHE.MIRROR</text>
+                <text x="596" y="346" class="svg-sub">one bare repo per URL under cache_dir</text>
+                <text x="596" y="368" class="svg-sub">populated under a lock, one writer</text>
+                <text x="596" y="390" class="svg-sub">re-bootstrapped from gs://&lt;bucket&gt;/v2/&lt;dir&gt;</text>
+                <text x="596" y="412" class="svg-sub">when absent, empty, or &gt; 50 pack files</text>
+                <text x="596" y="434" class="svg-sub">only 10 googlesource hosts have snapshots</text>
+                <text x="596" y="456" class="svg-sub">--shared borrows objects; bootstrap copies</text>
+
+                <text x="580" y="510" class="svg-note">white = a question · grey = nothing to do · blue = new bytes</text>
+                <text x="580" y="530" class="svg-note">green = the skip · orange = network work · purple = state left behind</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The branch order is <code>gclient_scm.py</code>:1099–1266, the
+              case list quoted verbatim from the comment at :1198–1214, the
+              panels :838–931 and <code>git_cache.py</code>:137–150, 575–632
+              <span class="src">from the tree</span>. Drawing five questions as
+              one column is mine — the code interleaves them with lock-breaking
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            Then the epilogue, in this order and only once <code>flush</code>
+            returns — "Once all the dependencies have been processed,
+            it's now safe to write out the gn_args_file and run the hooks"
+            [<code>gclient.py</code>:2895–2943]. One:
+            <code>gclient_args.gni</code> is regenerated, and written only if
+            the bytes differ [:1681–1688]. Two:
+            <code>_RemoveUnversionedGitDirs</code> diffs the previous
+            <code>.gclient_entries</code> against the new tree, deletes an
+            orphan only with <code>-D</code> and no local modifications —
+            otherwise warning again on every sync — restores a submodule mount
+            point with <code>git restore</code>, and re-saves the entries file [:2554–2766]. Three: one
+            <code>cipd ensure</code> for every package from every DEPS, through
+            a generated ensure file that opens
+            <code>$ParanoidMode CheckPresence</code> and
+            <code>$OverrideInstallMode copy</code> and groups packages under
+            <code>@Subdir</code> blocks
+            [<code>gclient_scm.py</code>:2351–2370] — after the deletions, so a
+            dep that moved from git to CIPD does not land on its own old
+            directory [<code>gclient.py</code>:2911–2916]. Four: hooks. Five:
+            the commit each dep landed on is written to
+            <code>.gclient_previous_sync_commits</code> [:2940–2943].
+          </p>
+          <p>
+            That fifth step exists for a sync that has not shipped. On a later
+            run with <code>--experiment no-sync</code>,
+            <code>_EnforceSkipSyncRevisions</code> reads the file back and
+            subtracts: a <code>--patch-ref</code> naming anything that is not a
+            solution disables the optimisation outright, and any solution whose
+            <code>custom_vars</code> changed is dropped with a printed reason
+            [<code>gclient.py</code>:2394–2448]. What survives becomes one
+            question per dependency, asked after patches are applied —
+            <code>check_diff(skip_sync_rev, files=["DEPS"])</code> — and a
+            dependency whose <code>DEPS</code> has not moved since the recorded
+            commit has <code>_should_sync</code> set false and is never walked
+            [:1482–1499] <span class="src">from the tree</span>.
+          </p>
+          <p>
+            GCS objects are the exception. They download during the tree walk,
+            not in the epilogue:
+            <code>gsutil cp</code>, a check of both the
+            <code>sha256sum</code> and the <code>size_bytes</code> declared in
+            DEPS, auto-extraction, then three hidden markers beside the
+            artefact: <code>.&lt;prefix&gt;_hash</code>,
+            <code>.&lt;prefix&gt;_content_names</code> — the JSON list of every
+            name the archive held — and
+            <code>.&lt;object_name&gt;_is_first_class_gcs</code>, which holds
+            one character and whose existence is the whole message
+            [:3141–3167, :3318–3465]. A root-level
+            <code>.gcs_entries</code> maps each path to the objects installed
+            under it; when that count changes, the files listed in
+            <code>_content_names</code> and the markers are deleted before the
+            re-download [<code>gclient_scm.py</code>:2579–2735]. Hooks are flat and last:
+            <code>GetHooks</code> returns the root's first, then each
+            dependency's, depth-first, and <code>pattern</code> is documented
+            as a "noop with git; deprecated", so every hook runs [:1698–1716,
+            184]. One that fails takes the sync with it — "a discrete exit
+            status code of 2" [:270, 283–287].
+          </p>
+          <p>
+            The file is larger than the work it causes. On a default Linux x64
+            host 154 of the 273 git deps, 24 of the 147 CIPD entries and 17 of
+            the 31 GCS entries are active, and 13 of the 61 hooks run
+            [<code>src/DEPS</code> at <code>f288fed6</code>, every condition
+            evaluated against default Linux built-ins]. What those counts
+            weigh is §05.
+          </p>

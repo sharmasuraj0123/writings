@@ -1,0 +1,338 @@
+          <h2 id="the-weight-of-a-checkout"><span class="secnum">{{S}}</span>A checkout on a bot, and in bytes</h2>
+          <p class="lede">
+            A continuous-integration builder never runs <code>fetch</code>. It
+            runs one Python script that does the same things in the same order
+            on every machine, prints its own timings, and leaves behind a
+            record of how many bytes it moved.
+          </p>
+          <p>
+            The launch path is uniform. Every chromium/src builder is a
+            Buildbucket job whose <code>exe</code> is
+            <code>infra/chromium/bootstrapper</code>; the bootstrapper pulls
+            the tools/build recipe bundle at <code>refs/heads/main</code> and
+            reads the builder's own <code>properties.json</code> back out of
+            chromium/src
+            [<code>src/infra/config/generated/luci/cr-buildbucket.cfg</code>:17–37]
+            <span class="src">from the tree</span>. The 2026 tree generates
+            1,066 of those files — 584 under <code>ci</code>, 438 under
+            <code>try</code>, the remaining 44 under <code>build</code>,
+            <code>webrtc</code>, <code>webrtc.fyi</code> and
+            <code>infra</code>; that is a count of
+            <code>generated/builders/*/*/properties.json</code> on the
+            <code>f288fed6</code> checkout, not an estimate. The
+            recipe calls <code>prepare_checkout</code>, which forwards to
+            <code>bot_update.ensure_checkout</code>
+            [<code>depot_tools/recipes/recipe_modules/bot_update/api.py</code>:420],
+            and the step runs <code>vpython3 -u bot_update.py</code> [:306–323]
+            with <code>CHROME_HEADLESS=1</code> [:359–379]; the
+            <code>depot_tools.on_path()</code> context that call enters also
+            sets <code>DEPOT_TOOLS_UPDATE=0</code>, so a bot never self-updates
+            depot_tools
+            [<code>depot_tools/recipes/recipe_modules/depot_tools/api.py</code>:64–68].
+          </p>
+          <p>
+            This is the command line that step logged on
+            <code>chromium/ci/Linux Builder</code> #228484, build
+            8669987184970100865, on 22 September 2026:
+          </p>
+<pre><code>Executing command [
+  '/b/s/w/ir/cipd_bin_packages/vpython3',
+  '-u',
+  '/b/s/w/ir/x/w/packages/cipd/exe/depot_tools/recipes/recipe_modules/bot_update/resources/bot_update.py',
+  '--spec-path',
+  '/b/s/w/ir/x/t/tmpq6jcyij7',
+  '--revision_mapping_file',
+  '/b/s/w/ir/x/t/tmpbpb4zjyg.json',
+  '--git-cache-dir',
+  '/b/s/w/ir/cache/git',
+  '--cleanup-dir',
+  '/b/s/w/ir/x/w/rc/bot_update',
+  '--output_json',
+  '/b/s/w/ir/x/t/tmpstmue3zb.json',
+  '--revision',
+  'src@44c197b6d5d37dedd191319b0546c69b4a0e240d',
+  '--refs',
+  'refs/heads/main',
+  '--no_fetch_tags',
+]
+in dir /b/s/w/ir/cache/builder</code></pre>
+          <p>
+            Note what is absent: no <code>--experiments</code>, no
+            <code>--clobber</code>, no <code>--no-history</code> or
+            <code>--shallow</code>. Inside, the order never varies.
+            bot_update sets <code>core.trustctime false</code> — gn's
+            hardlinks would otherwise make <code>git reset</code> rewrite the
+            sources and trigger rebuilds
+            [<code>bot_update.py</code>:1436–1442] — reads or creates
+            <code>.cache_epoch</code> in the git cache dir [:1241–1247], moves
+            the entire workspace into the cleanup dir if a
+            <code>.dirty_bot_checkout</code> marker survived a previous run
+            [:1265–1267], then per solution runs <code>git cache populate</code>
+            (only when the pin is missing or <code>--enforce_fetch</code> is
+            set), <code>git clone --no-checkout --local --shared &lt;mirror&gt;</code>,
+            <code>git fetch origin &lt;pin&gt;</code>,
+            <code>git checkout --force</code> and <code>git clean -dff</code>
+            [:768–847], writes <code>.gclient</code>, and runs the sync below [:453–462] with
+            <code>--revision src@unmanaged</code>, then
+            <code>gclient revinfo -a --ignore-dep-type cipd --output-json</code>
+            to build the manifest [:524–542]. Every subprocess carries two
+            timers: <code>ps auxwwf</code> after 300 s of silence, a kill at
+            <code>STALE_PROCESS_DURATION</code> = 1200 s [:34–38, :198–201].
+            Figure {{fig-bot-lanes}} is that path with the durations attached.
+          </p>
+<pre><code>gclient sync --verbose --reset --force --upstream \
+             --nohooks --noprehooks --delete_unversioned_trees</code></pre>
+
+          <figure class="figure wide" id="fig-bot-lanes">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One builder, two lanes — how a bot gets a checkout, and what each step cost</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 462" role="img" aria-label="Left lane: a Buildbucket job runs the chromium bootstrapper, which loads the tools/build recipe bundle and the builder's properties.json, and the recipe's prepare_checkout runs bot_update.py in the builder cache. Right lane: the ten fixed steps inside bot_update.py, with horizontal bars for the four that the CI build timed — git cache populate 1.7 minutes, git checkout --force 3.4 minutes, gclient sync 6.6 minutes, gclient revinfo 0.1 minutes — and a compressed ghost bar for the 80-second warm try run below.">
+                <defs>
+                  <marker id="fig-bot-lanes-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+
+                <text x="8" y="20" class="svg-lane">LAUNCH PATH — EVERY chromium/src BUILDER</text>
+
+                <rect x="8" y="34" width="236" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="58" class="svg-step">Buildbucket job</text>
+                <text x="22" y="76" class="svg-sub">exe: infra/chromium/bootstrapper</text>
+                <rect x="8" y="102" width="236" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="126" class="svg-step">bootstrapper</text>
+                <text x="22" y="144" class="svg-sub">recipe bundle @ refs/heads/main</text>
+                <rect x="8" y="170" width="236" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="194" class="svg-step">recipe: chromium</text>
+                <text x="22" y="212" class="svg-sub">properties.json — 1 of 1,066</text>
+                <rect x="8" y="238" width="236" height="54" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="262" class="svg-step">prepare_checkout</text>
+                <text x="22" y="280" class="svg-sub">→ bot_update.ensure_checkout</text>
+                <rect x="8" y="306" width="236" height="54" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="22" y="330" class="svg-step">bot_update.py</text>
+                <text x="22" y="348" class="svg-sub">cwd [CACHE]/builder</text>
+
+                <line x1="126" y1="88" x2="126" y2="100" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-bot-lanes-ink)"/>
+                <line x1="126" y1="156" x2="126" y2="168" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-bot-lanes-ink)"/>
+                <line x1="126" y1="224" x2="126" y2="236" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-bot-lanes-ink)"/>
+                <line x1="126" y1="292" x2="126" y2="304" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-bot-lanes-ink)"/>
+                <path d="M244 333 H266 V44 H282" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-bot-lanes-ink)"/>
+
+                <text x="8" y="386" class="svg-note">env: CHROME_HEADLESS=1</text>
+                <text x="8" y="402" class="svg-note">DEPOT_TOOLS_UPDATE=0</text>
+                <text x="8" y="418" class="svg-note">git aborts below 100 KiB/s for 1800 s</text>
+                <text x="8" y="434" class="svg-note">every subprocess: ps auxwwf at 300 s,</text>
+                <text x="8" y="450" class="svg-note">killed at 1200 s</text>
+
+                <text x="300" y="20" class="svg-lane">INSIDE bot_update.py — ci/Linux Builder #228484</text>
+
+                <rect x="604" y="37" width="3" height="14" fill="#b8b8b1"/>
+                <text x="288" y="48" class="svg-step">git config core.trustctime false</text>
+                <text x="616" y="48" class="svg-note">not timed separately</text>
+
+                <rect x="604" y="67" width="3" height="14" fill="#b8b8b1"/>
+                <text x="288" y="78" class="svg-step">read or create .cache_epoch</text>
+                <text x="616" y="78" class="svg-note">6 days old on this run</text>
+
+                <rect x="604" y="97" width="62" height="14" fill="#dfede5" stroke="#367f59"/>
+                <text x="288" y="108" class="svg-step">git cache populate --commit &lt;pin&gt;</text>
+                <text x="674" y="108" class="svg-sub">1.7 min</text>
+
+                <rect x="604" y="127" width="3" height="14" fill="#b8b8b1"/>
+                <text x="288" y="138" class="svg-step">git clone --no-checkout --local --shared</text>
+                <text x="616" y="138" class="svg-note">not timed separately</text>
+
+                <rect x="604" y="157" width="3" height="14" fill="#b8b8b1"/>
+                <text x="288" y="168" class="svg-step">git fetch origin &lt;pin&gt;</text>
+                <text x="616" y="168" class="svg-note">not timed separately</text>
+
+                <rect x="604" y="187" width="124" height="14" fill="#dfede5" stroke="#367f59"/>
+                <text x="288" y="198" class="svg-step">git checkout --force</text>
+                <text x="736" y="198" class="svg-sub">3.4 min</text>
+
+                <rect x="604" y="217" width="3" height="14" fill="#b8b8b1"/>
+                <text x="288" y="228" class="svg-step">git clean -dff</text>
+                <text x="616" y="228" class="svg-note">not timed separately</text>
+
+                <rect x="604" y="247" width="3" height="14" fill="#b8b8b1"/>
+                <text x="288" y="258" class="svg-step">write .gclient</text>
+                <text x="616" y="258" class="svg-note">not timed separately</text>
+
+                <rect x="604" y="277" width="240" height="14" fill="#ece6f3" stroke="#765b98"/>
+                <text x="288" y="288" class="svg-step">gclient sync … --revision src@unmanaged</text>
+                <text x="852" y="288" class="svg-sub">6.6 min</text>
+
+                <rect x="604" y="307" width="4" height="14" fill="#ece6f3" stroke="#765b98"/>
+                <text x="288" y="318" class="svg-step">gclient revinfo -a … --output-json</text>
+                <text x="616" y="318" class="svg-sub">0.1 min</text>
+
+                <line x1="604" y1="332" x2="844" y2="332" stroke="#b8b8b1" stroke-width="1"/>
+                <line x1="604" y1="332" x2="604" y2="337" stroke="#b8b8b1" stroke-width="1"/>
+                <line x1="677" y1="332" x2="677" y2="337" stroke="#b8b8b1" stroke-width="1"/>
+                <line x1="749" y1="332" x2="749" y2="337" stroke="#b8b8b1" stroke-width="1"/>
+                <line x1="822" y1="332" x2="822" y2="337" stroke="#b8b8b1" stroke-width="1"/>
+                <text x="604" y="350" class="svg-sub">0</text>
+                <text x="673" y="350" class="svg-sub">2</text>
+                <text x="745" y="350" class="svg-sub">4</text>
+                <text x="818" y="350" class="svg-sub">6 min</text>
+
+                <text x="288" y="374" class="svg-note">populate: 188,439 objects, 17 pack files · sync: 167 deps cloned --shared from the local mirror, one cipd ensure</text>
+                <text x="288" y="392" class="svg-note">disk 167 GB → 192 GB of 290 GB · timed steps 11.8 min vs a step total of 11 m 55 s: ≈ 7 s left for everything grey</text>
+
+                <text x="288" y="420" class="svg-lane">SAME SCRIPT, WARM CACHE — try/linux-rel-compilator, same day</text>
+                <rect x="604" y="426" width="4" height="12" fill="#dfede5" stroke="#367f59"/>
+                <rect x="608" y="426" width="44" height="12" fill="#ece6f3" stroke="#765b98"/>
+                <text x="288" y="436" class="svg-note">blue = recipe layer · green = git · purple = gclient</text>
+                <text x="660" y="436" class="svg-sub">80 s total</text>
+                <text x="288" y="454" class="svg-note">populate 0.1 min · sync 1.2 min, of which 50 s was the Gerrit ref fetch · 167 shared clones already up to date</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured: the four bars and the ghost bar are the durations the
+              two builds printed for their own sub-steps, read off
+              <code>logs.chromium.org</code>. Reconstructed: the
+              ordering of the six grey rows, which comes from reading
+              <code>bot_update.py</code> top to bottom — those steps were
+              never timed individually, and the residual bounds them at about
+              seven seconds together. Sub-step times print to 0.1 min, so that
+              residual carries roughly ±12 s.
+            </p>
+          </figure>
+
+          <p>
+            Two knobs exist and nobody turns them. <code>clobber</code>,
+            <code>no_history</code> and <code>shallow</code> are fields on the
+            builder spec; across the 1,666 <code>builder_spec</code> entries in
+            the generated properties, not one sets any of the three. And
+            <code>bot_update_experiments</code> — the only route by which
+            <code>gclient sync --experiment no-sync</code> could ever reach a
+            bot [<code>api.py</code>:703–707] — appears in none of the 1,066
+            properties files and zero times in
+            <code>cr-buildbucket.cfg</code>; I grepped both. So §04's fifth
+            epilogue step writes, on every builder in the fleet, a file that
+            nothing on that builder will read: the incremental-sync
+            optimisation is dormant plumbing.
+          </p>
+
+          <h3>The same sync, in bytes</h3>
+          <p>
+            GCS is exact, because DEPS declares <code>size_bytes</code> beside
+            every object. A default Linux x64 checkout activates 17 GCS
+            entries holding 46 objects, 917,327,049 bytes. The largest is the
+            Meet GPU test bundle at 276,997,227 B — the "~278MB" DEPS' own
+            comment warns of [<code>src/DEPS</code>:148–150, :1220–1232]
+            <span class="src">from the tree</span> — and the second is the
+            Rust toolchain tarball at 276,524,576 B [:1093–1104]. Clang is
+            63,156,692 B in two objects [:924–1091]. CIPD carries no sizes in
+            DEPS, so the 26 packages inside the 24 active CIPD entries had to
+            be resolved live against
+            chrome-infra-packages on 22 September 2026: 621,162,316 bytes, led
+            by the JDK at 148,797,791 B. The git side is readable from the
+            public bootstrap bucket: the chromium/src snapshot is
+            15,481,300,760 B in 46 files — seven packs capped at 2 GiB, 842 MB
+            of <code>.idx</code>, a 58.7 MB commit-graph, a packed-refs holding
+            47,639 refs — and the 148 active deps that have a snapshot cover
+            142 distinct repositories worth 8,055,808,935 B.
+          </p>
+          <p>
+            Add them and a first sync moves 25,075,599,060 bytes of unique
+            content, of which the non-git part is 1,538,489,365 B — 6.1% of the
+            bytes for 41 of the 195 active entries — the 17 GCS and 24 CIPD
+            ones. Sum by checkout path
+            instead and you get 25,701,532,050 B, because git_cache keys a
+            mirror by URL and not by path
+            [<code>depot_tools/git_cache.py</code>:105–112]: JetStream is
+            checked out at three paths and Speedometer at five, so
+            625,932,990 B gets counted more than once. Both totals are lower
+            bounds, for the reason the caption gives.
+            The docs compress the whole question into one parenthesis: the
+            cache "mirrors every repo it fetches (~30 GB for Chromium)"
+            [<code>src/docs/linux/build_instructions.md</code>:95]
+            <span class="src">from the docs</span>. Figure {{fig-sync-bytes}}
+            splits that number four ways.
+          </p>
+
+          <figure class="figure wide" id="fig-sync-bytes">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Where 25 GB goes — git mirrors, GCS objects, CIPD packages</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 432" role="img" aria-label="A stacked bar of 25.08 gigabytes of unique content: the chromium/src git mirror is 15.48 GB or 61.7 percent, the deduplicated dependency mirrors 8.06 GB or 32.1 percent, GCS objects 0.92 GB or 3.7 percent, CIPD packages 0.62 GB or 2.5 percent, with a dashed tail for the 0.63 GB of paths counted more than once. Below, two area-proportional treemaps: the 46 GCS objects dominated by test data and toolchains, and the 26 CIPD packages dominated by the JDK.">
+                <text x="48" y="24" class="svg-lane">UNIQUE CONTENT A DEFAULT LINUX x64 SYNC MOVES — 25,075,599,060 B</text>
+
+                <rect x="48" y="40" width="556" height="46" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="62" y="62" class="svg-step">git src mirror</text>
+                <text x="62" y="80" class="svg-sub">15,481,300,760 B · 61.7%</text>
+                <rect x="604" y="40" width="289" height="46" fill="#dfede5" stroke="#367f59"/>
+                <text x="618" y="62" class="svg-step">git dep mirrors</text>
+                <text x="618" y="80" class="svg-sub">8,055,808,935 B · 32.1%</text>
+                <rect x="893" y="40" width="33" height="46" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="926" y="40" width="22" height="46" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="948" y="40" width="23" height="46" fill="none" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+
+                <rect x="48" y="100" width="12" height="12" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="68" y="110" class="svg-sub">GCS 917,327,049 B · 3.7% — 46 objects, every size declared in DEPS</text>
+                <rect x="48" y="120" width="12" height="12" fill="#ece6f3" stroke="#765b98"/>
+                <text x="68" y="130" class="svg-sub">CIPD 621,162,316 B · 2.5% — 26 packages, sizes resolved live 2026-09-22</text>
+                <rect x="48" y="140" width="12" height="12" fill="none" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+                <text x="68" y="150" class="svg-sub">+625,932,990 B counted twice or more → 25,701,532,050 B summed by checkout path</text>
+                <text x="48" y="174" class="svg-note">blue and green = git mirrors · orange and purple = the non-git payload, 6.1% of the bytes for 41 of 195 active entries</text>
+
+                <text x="48" y="202" class="svg-lane">THE 46 GCS OBJECTS — 917.3 MB</text>
+                <rect x="48" y="210" width="195" height="150" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="60" y="234" class="svg-step">test data</text>
+                <text x="60" y="252" class="svg-sub">425.3 MB · 46.4%</text>
+                <text x="60" y="268" class="svg-sub">35 objects</text>
+                <text x="60" y="292" class="svg-sub">Meet GPU bundle</text>
+                <text x="60" y="308" class="svg-sub">277.0 MB alone</text>
+                <rect x="243" y="210" width="225" height="111" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="255" y="234" class="svg-step">toolchains</text>
+                <text x="255" y="252" class="svg-sub">362.6 MB · 39.5% · 4 objects</text>
+                <text x="255" y="270" class="svg-sub">Rust 276.5 · clang 63.2</text>
+                <rect x="243" y="321" width="150" height="39" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="255" y="345" class="svg-sub">node+npm 86.2</text>
+                <rect x="393" y="321" width="68" height="39" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="461" y="321" width="7" height="39" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="48" y="380" class="svg-note">unlabelled tiles: sysroots 39.5 MB (4.3%), clang-format 3.8 MB (0.4%)</text>
+
+                <text x="530" y="202" class="svg-lane">THE 26 CIPD PACKAGES — 621.2 MB</text>
+                <rect x="530" y="210" width="101" height="150" fill="#ece6f3" stroke="#765b98"/>
+                <text x="542" y="234" class="svg-step">JDK 25</text>
+                <text x="542" y="252" class="svg-sub">148.8 MB</text>
+                <text x="542" y="268" class="svg-sub">24.0%</text>
+                <rect x="631" y="210" width="101" height="78" fill="#ece6f3" stroke="#765b98"/>
+                <text x="643" y="234" class="svg-step">screen-ai</text>
+                <text x="643" y="252" class="svg-sub">77.4 MB</text>
+                <rect x="732" y="210" width="93" height="78" fill="#ece6f3" stroke="#765b98"/>
+                <text x="744" y="234" class="svg-step">ktfmt</text>
+                <text x="744" y="252" class="svg-sub">71.4 MB</text>
+                <rect x="825" y="210" width="62" height="78" fill="#ece6f3" stroke="#765b98"/>
+                <text x="833" y="234" class="svg-sub">cpython3</text>
+                <text x="833" y="250" class="svg-sub">48.6 MB</text>
+                <rect x="887" y="210" width="63" height="78" fill="#ece6f3" stroke="#765b98"/>
+                <text x="895" y="234" class="svg-sub">same</text>
+                <text x="895" y="250" class="svg-sub">instance</text>
+                <rect x="631" y="288" width="42" height="72" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="673" y="288" width="33" height="72" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="706" y="288" width="28" height="72" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="734" y="288" width="216" height="72" fill="#ece6f3" stroke="#765b98"/>
+                <text x="746" y="314" class="svg-step">18 smaller packages</text>
+                <text x="746" y="332" class="svg-sub">152.2 MB · 24.5%</text>
+                <text x="530" y="380" class="svg-note">unlabelled tiles: siso 30.1 MB, goldctl 23.9 MB, httpd-php 20.0 MB</text>
+
+                <text x="48" y="412" class="svg-note">Tile areas are proportional to bytes. Both treemaps are of the default Linux x64 configuration at chromium/src@f288fed6.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured, three different ways. The GCS column is arithmetic on
+              <code>size_bytes</code> literals in <code>src/DEPS</code>. The
+              CIPD column was resolved package by package against
+              chrome-infra-packages on 22 September 2026, because DEPS does not
+              record CIPD sizes. The git columns are the file listings of the
+              public <code>chromium-git-cache</code> bootstrap snapshots. Six
+              active git deps have no snapshot in that bucket, so both git
+              figures — and therefore the 25.08 GB total — are lower bounds;
+              the docs' own "~30 GB" is the number to hold beside them.
+            </p>
+          </figure>

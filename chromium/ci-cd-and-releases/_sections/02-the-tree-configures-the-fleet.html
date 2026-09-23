@@ -1,0 +1,255 @@
+<h2 id="the-tree-configures-the-fleet"><span class="secnum">{{S}}</span>The tree configures the fleet</h2>
+<p class="lede">
+  <code>//infra/config</code> is a compiler. 125 Starlark files go in, 3,555
+  generated files come out, and the LUCI services read those files back out of
+  git. Nothing is deployed. A change to the fleet is a CL.
+</p>
+<p>
+  The directory's own README says what it is for: the configuration rooted at
+  <code>main.star</code> "defines the LUCI services configuration for the
+  chromium project on the production instance of LUCI", written in Starlark,
+  executed by lucicfg into the raw cfg files under <code>generated/</code>,
+  with "a presubmit check" that "enforces that the generated files are kept in
+  sync" <span class="src">from the docs</span>
+  [<code>src/infra/config/README.md:15-30</code>]. At <code>f288fed6</code> the
+  directory is itself a lucicfg <em>package</em>. <code>PACKAGE.star</code>
+  declares <code>@chromium-project</code> with a minimum lucicfg of
+  <code>1.44.1</code>, two entry points — <code>main.star</code> for production
+  and <code>dev.star</code> for the dev instance — and two dependencies: a
+  local <code>@chromium-targets</code> rooted at
+  <code>infra/config/targets</code>, and <code>@chromium-luci</code>, fetched
+  from the separate <code>infra/chromium</code> repository and pinned at
+  revision <code>3c067cfcf061330718cee8a4c74d9cd7232595c6</code>.
+  <code>PACKAGE.lock</code> records the lucicfg that actually ran: 1.46.7
+  <span class="src">from the tree</span>
+  [<code>src/infra/config/PACKAGE.star:7-43</code>;
+  <code>PACKAGE.lock:2-9</code>].
+</p>
+<p>
+  That pin is recent history. On 2025-07-22, commit <code>b711da6e4f</code>
+  deleted the library code under <code>infra/config/lib</code> in chromium/src —
+  <code>builders.star</code>, <code>ci.star</code>, <code>try.star</code>,
+  <code>builder_config.star</code>, <code>gn_args.star</code>,
+  <code>targets.star</code>, <code>bootstrap.star</code>,
+  <code>branches.star</code>, <code>notifiers.star</code>,
+  <code>orchestrator.star</code> — and replaced every call site with an import
+  of the form <code>load("@chromium-luci//ci.star", "ci")</code>, so that
+  chromium and the internal chrome project execute one library instead of two
+  copies <span class="src">from the tree</span>. Ninety-eight of the 125
+  Starlark files now name <code>@chromium-luci</code>.
+</p>
+<p>
+  What survived in <code>lib/</code> is constants, not logic. CI defaults:
+  executable <code>recipe:chromium</code>, a three-hour execution timeout, pool
+  <code>luci.chromium.ci</code>, shadow pool <code>luci.chromium.try</code>
+  [<code>lib/ci_constants.star:5-14</code>]. Try defaults:
+  <code>recipe:chromium_trybot</code>, four hours,
+  <code>luci.chromium.try</code> [<code>lib/try_constants.star:5-10</code>].
+  The Siso remote-execution tiers — 250 jobs by default, 80 and 500 for low-
+  and high-parallelism CI, 150 for low CQ, and <code>-1</code> for high CQ,
+  which the comment says is "Calculated based on the number of CPUs inside
+  Siso" [<code>lib/siso.star:5-21</code>]. The default iOS toolchain, Xcode
+  27.0 RC <code>27a266a</code> [<code>lib/xcode.star:7-14</code>]. Twelve
+  gardener rotations [<code>lib/gardener_rotations.star:10-23</code>]. And a
+  file of grandfathered exemptions carrying a banner warning that the lists
+  "should <em>only</em> decrease"
+  [<code>lib/builder_exemptions.star:5-11</code>].
+</p>
+<p>
+  <code>main.star</code> is the contract between the Starlark and the tree. It
+  checks the lucicfg version, enables the <code>crbug.com/1182002</code>
+  Scheduler experiment, and then declares, by hand, every path lucicfg is
+  allowed to own. This is <code>src/infra/config/main.star:36-68</code>,
+  condensed with elision markers:
+</p>
+<pre><code>lucicfg.config(
+    config_dir = "generated",
+    tracked_files = [
+        "builders/*/*/*",
+        "builders/*/*/*/*",
+        "builders/alerting-builders.txt",
+        "builders/gn_args_locations.json",
+        "builder-owners/*.txt",
+        "cq-builders.md",
+        "cq-usage/cq-tests.md",
+        # ... 3 more cq-usage/* entries elided
+        "health-specs/health-specs.json",
+        "luci/commit-queue.cfg",
+        "luci/cr-buildbucket.cfg",
+        # ... 8 more luci/* entries elided
+        "luci/realms.cfg",
+        "luci/testhaus.cfg",
+        "outages.pyl",
+        "sheriff-rotations/*.txt",
+        "project.pyl",
+        "testing/*.pyl",
+    ],
+    fail_on_warnings = True,
+)</code></pre>
+<p>
+  Two things fall out of that block. <code>fail_on_warnings = True</code>
+  means, in lucicfg's own words, "treat validation warnings as errors" — a
+  warning is a build break, not a note <span class="src">from the docs</span>.
+  And <code>tracked_files</code> makes the generated tree closed in both
+  directions: "only files that are in this set will be actually written to the
+  disk (and all other files are discarded)", and a tracked file that
+  disappears from the output "must be deleted from the disk as well"
+  <span class="src">from the docs</span>. Three configs are explicitly <em>not</em> generated —
+  <code>testhaus.cfg</code>, <code>luci-analysis.cfg</code> and
+  <code>luci-bisection.cfg</code> are hand-written at the top of the directory
+  and copied verbatim into <code>generated/luci/</code> by
+  <code>lucicfg.emit</code> [<code>main.star:70-86</code>]. Everything else
+  comes out of the <code>luci.project</code> call quoted in &sect;01, which
+  binds the six appspot hosts [<code>main.star:88-96</code>].
+  Figure {{fig-lucicfg}} counts both ends of that compile and the poll that
+  carries the result to the services.
+</p>
+
+<figure class="figure wide" id="fig-lucicfg">
+  <div class="figure-head">
+    <span class="figure-label">Figure {{N}}</span>
+    <p class="figure-title">125 Starlark files in, 3,555 generated files out, then a poll</p>
+  </div>
+  <div class="figure-body plain">
+    <svg viewBox="0 -24 1020 520" role="img" aria-label="Three bands. Left: inputs in the tree, PACKAGE.star with its chromium-luci pin, 125 Starlark files totalling 76,580 lines, settings.json and milestones.json, and the lib constants. Middle: lucicfg 1.46.7 executing in three stages behind a tracked_files gate with fail_on_warnings set. Right: the generated tree, 3,555 files and 36.5 megabytes, split into luci, builders, and the rest. Below: after the CL lands, the LUCI Config import cron runs within a ten-minute window and the services poll every minute.">
+      <defs>
+        <marker id="fig-lucicfg-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+        <marker id="fig-lucicfg-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+        <marker id="fig-lucicfg-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+      </defs>
+
+      <text x="20" y="28" class="svg-lane">INPUTS · IN THE TREE</text>
+      <text x="330" y="28" class="svg-lane">LUCICFG 1.46.7</text>
+      <text x="620" y="28" class="svg-lane">GENERATED/ · IN THE TREE</text>
+
+      <rect x="20" y="48" width="280" height="76" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="36" y="72" class="svg-step">PACKAGE.star</text>
+      <text x="36" y="92" class="svg-sub">@chromium-project · lucicfg ≥ 1.44.1</text>
+      <text x="36" y="110" class="svg-sub">dep @chromium-luci @ 3c067cfc</text>
+
+      <rect x="20" y="136" width="280" height="76" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="36" y="160" class="svg-step">125 .star files · 76,580 lines</text>
+      <text x="36" y="180" class="svg-sub">main.star · dev.star (entry points)</text>
+      <text x="36" y="198" class="svg-sub">subprojects/ · gn_args/ · targets/</text>
+
+      <rect x="20" y="224" width="280" height="58" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="36" y="248" class="svg-step">settings.json · milestones.json</text>
+      <text x="36" y="268" class="svg-sub">declared in pkg.resources</text>
+
+      <rect x="20" y="294" width="280" height="58" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+      <text x="36" y="318" class="svg-step">lib/ — project constants</text>
+      <text x="36" y="338" class="svg-sub">luci.chromium.ci · 3 h · 250 RBE jobs</text>
+
+      <rect x="330" y="48" width="250" height="304" rx="10" fill="#f7f7f5" stroke="#b8b8b1"/>
+      <rect x="346" y="76" width="218" height="58" rx="8" fill="#ffffff" stroke="#deded9"/>
+      <text x="360" y="100" class="svg-step"><tspan class="svg-num">1</tspan> execute main.star</text>
+      <text x="360" y="120" class="svg-sub">after fetching @chromium-luci</text>
+      <rect x="346" y="148" width="218" height="58" rx="8" fill="#ffffff" stroke="#deded9"/>
+      <text x="360" y="172" class="svg-step"><tspan class="svg-num">2</tspan> build the config graph</text>
+      <text x="360" y="192" class="svg-sub">luci.builder · luci.console · …</text>
+      <rect x="346" y="220" width="218" height="58" rx="8" fill="#ffffff" stroke="#deded9"/>
+      <text x="360" y="244" class="svg-step"><tspan class="svg-num">3</tspan> emit into generated/</text>
+      <text x="360" y="264" class="svg-sub">tracked_files owns the output</text>
+      <text x="455" y="304" text-anchor="middle" class="svg-note">fail_on_warnings = True</text>
+      <text x="455" y="328" text-anchor="middle" class="svg-note">output outside the manifest is discarded</text>
+
+      <rect x="620" y="48" width="380" height="136" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="636" y="72" class="svg-step">luci/ — 21 files</text>
+      <text x="636" y="94" class="svg-sub">cr-buildbucket.cfg  139,286 lines / 5,544,282 B</text>
+      <text x="636" y="112" class="svg-sub">luci-milo.cfg  31,964 lines · 90 consoles</text>
+      <text x="636" y="130" class="svg-sub">luci-scheduler.cfg  7,092 · 697 jobs · 5 triggers</text>
+      <text x="636" y="148" class="svg-sub">luci-notify.cfg  6,013 · 252 notifiers · 133 closers</text>
+      <text x="636" y="166" class="svg-sub">commit-queue.cfg 9,451 · realms.cfg 933 · 27 realms</text>
+
+      <rect x="620" y="196" width="380" height="76" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="636" y="220" class="svg-step">builders/ — 3,429 files</text>
+      <text x="636" y="240" class="svg-sub">properties.json · shadow-properties.json</text>
+      <text x="636" y="258" class="svg-sub">gn-args.json · targets/&lt;group&gt;.json</text>
+
+      <rect x="620" y="284" width="380" height="68" rx="8" fill="#dfede5" stroke="#367f59"/>
+      <text x="636" y="308" class="svg-step">the rest — 105 files</text>
+      <text x="636" y="328" class="svg-sub">builder-owners/ 49 · builders-dev/ 28 · rotations 12</text>
+      <text x="636" y="346" class="svg-sub">cq-usage/ 6 · testing/ 5 · cq-builders.md · outages.pyl</text>
+
+      <line x1="300" y1="200" x2="330" y2="200" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-lucicfg-arr-blue)"/>
+      <line x1="580" y1="200" x2="620" y2="200" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-lucicfg-arr-ink)"/>
+      <text x="1012" y="20" text-anchor="end" class="svg-note">3,555 files · 36.5 MB · all committed</text>
+
+      <text x="20" y="386" class="svg-lane">AFTER THE CL LANDS · OUTSIDE THE TREE</text>
+      <rect x="20" y="400" width="280" height="66" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="36" y="424" class="svg-step">CL lands on refs/heads/main</text>
+      <text x="36" y="444" class="svg-sub">generated/ committed beside the .star</text>
+      <rect x="350" y="400" width="320" height="66" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="366" y="424" class="svg-step">LUCI Config import cron</text>
+      <text x="366" y="444" class="svg-sub">≤ 10 min window · ValidateConfigs gate</text>
+      <rect x="740" y="400" width="260" height="66" rx="8" fill="#ece6f3" stroke="#765b98"/>
+      <text x="756" y="424" class="svg-step">services poll</text>
+      <text x="756" y="444" class="svg-sub">Buildbucket · Scheduler · CV, 1 min</text>
+
+      <path d="M810 352 C810 392 260 376 160 400" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-lucicfg-arr-purple)"/>
+      <line x1="300" y1="433" x2="350" y2="433" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-lucicfg-arr-purple)"/>
+      <line x1="670" y1="433" x2="740" y2="433" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-lucicfg-arr-purple)"/>
+      <text x="510" y="492" text-anchor="middle" class="svg-note">thin blue = inputs read · thick black = generation · dashed purple = propagation after the commit</text>
+    </svg>
+  </div>
+  <p class="figure-caption">
+    Every count in the top three bands is measured at <code>f288fed6</code> by
+    <code>find</code>, <code>wc</code> and <code>grep -c</code> on
+    <code>/home/coder/chromium-ref/src/infra/config</code>
+    <span class="src">from the tree</span>; the 21 + 3,429 + 105 split sums to
+    3,555. The bottom band is <span class="recon">reconstruction</span> — the
+    timings are read off the cron constants and the poll intervals, not
+    observed end to end.
+  </p>
+</figure>
+
+<p>
+  The output is large and mechanical, and each of the thirteen generated
+  <code>luci/*.cfg</code> files opens with the same two-line banner:
+  "Auto-generated by lucicfg. / Do not modify manually." — the eight files in
+  <code>luci/</code> that do not are the hand-copied ones and the two email
+  templates. <code>cr-buildbucket.cfg</code> alone is 139,286 lines and
+  5,544,282 bytes — 5.29 MiB, which <code>ls -lh</code> rounds to 5.3M, and
+  5.54 MB decimal — holding 18 buckets and 1,211 builders. The figure’s
+  right-hand column carries the same reading for the other five large ones
+  <span class="src">from the tree</span>.
+</p>
+<p>
+  Getting that tree to the services involves no deploy step. LUCI Config
+  (<code>config.luci.app</code>) runs an import cron whose
+  <code>importAllConfigsInterval</code> is ten minutes; it enqueues one task per
+  config set at a deterministic offset inside that window, asks Gitiles for the
+  latest commit touching the configured path, and commits the new revision only
+  if every interested service's <code>ValidateConfigs</code> comes back without
+  an ERROR-severity message
+  [<code>luci-go config_service/internal/importer/importer.go:62-74,323-337,520-543</code>].
+  On 2026-09-22 the <code>projects/chromium</code> config set was imported from
+  <code>refs/heads/main</code>, path <code>infra/config/generated/luci</code>,
+  at revision <code>f7de74e13efc</code> (08:25:50Z), with
+  <code>lastImportAttempt</code> reading <code>Up-to-date</code> &mdash; a
+  reading off the live service, dated per &sect;01 rather than badged.
+  Consumers then poll on their own
+  clock — Buildbucket, Scheduler and CV each about once a minute — so a landed
+  <code>infra/config</code> CL is live in roughly one to eleven minutes,
+  dominated by the import window <span class="recon">reconstruction</span>: that
+  range is derived from the constants, not measured against a real change.
+</p>
+<p>
+  The validation that gates the import also runs long before it. depot_tools'
+  <code>CheckLucicfgGenOutput</code> builds a presubmit command that runs
+  <code>lucicfg validate &lt;entry_script&gt;</code>, which regenerates the
+  configs, diffs them against what is checked in, and ships each config set to
+  the same validation RPC the importer uses
+  [<code>depot_tools/presubmit_canned_checks.py:3744-3778</code>];
+  <code>infra/config/PRESUBMIT.py</code> calls it twice, once for
+  <code>main.star</code> and once for <code>dev.star</code>
+  [<code>src/infra/config/PRESUBMIT.py:74-84</code>]. Four dedicated trybots
+  guard the per-builder files that lucicfg writes under
+  <code>builders/</code> — <code>branch-config-verifier</code>,
+  <code>builder-config-verifier</code>, <code>targets-config-verifier</code>
+  and <code>gn-args-verifier</code>
+  [<code>src/infra/config/subprojects/chromium/try/presubmit.star:73,116,128,161</code>].
+  A misconfigured fleet is therefore a red trybot, reviewed and reverted like
+  any other bad CL. What that costs, and what one line of Starlark actually
+  expands into, is the next section.
+</p>

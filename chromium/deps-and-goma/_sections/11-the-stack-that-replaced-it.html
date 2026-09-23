@@ -1,0 +1,433 @@
+          <h2 id="the-stack-that-replaced-it"><span class="secnum">{{S}}</span>reclient, RBE and Siso</h2>
+          <p class="lede">
+            Three GN args decide everything. Siso is the default everywhere.
+            Reclient survives as plumbing for one consumer. The deepest
+            difference between the generations is not the transport — it is
+            how each decides what to upload.
+          </p>
+          <p>
+            <code>use_remoteexec</code> defaults to <code>false</code>.
+            <code>use_siso</code> defaults to <code>true</code> when three
+            conditions hold at once: gclient has written
+            <code>build/config/siso/.sisoenv</code>,
+            <code>build_with_chromium</code> is defined and set, and the out
+            dir holds no Ninja <code>.ninja_deps</code>. The third arg is not
+            a choice at all —
+            <code>use_reclient = use_remoteexec &amp;&amp; !use_siso</code>
+            [<code>src/build/toolchain/rbe.gni</code>:31]. The default is
+            computed in <code>src/build/toolchain/siso.gni</code>, lines 5–22
+            <span class="src">from the tree</span>:
+          </p>
+<pre><code># use_siso_default is default value of use_siso.
+# need to match with autoninja's logic.
+use_siso_default = false
+
+_is_ninja_used = path_exists(rebase_path(".ninja_deps", root_build_dir))
+
+if (path_exists("//build/config/siso/.sisoenv") &amp;&amp;
+    defined(build_with_chromium) &amp;&amp; build_with_chromium &amp;&amp; !_is_ninja_used) {
+  use_siso_default = true
+}
+
+declare_args() {
+  # Placeholder to allow having use_siso in args.gn file.
+  # Explicit `use_siso` in args.gn can override default.
+  # This is used only for autoninja (to dispatch siso or ninja),
+  # and for use_reclient's default.
+  use_siso = use_siso_default
+}</code></pre>
+          <p>
+            A file that <code>gclient sync</code> writes is the switch: no
+            <code>.sisoenv</code>, no Siso. The <code>.ninja_deps</code> test
+            refuses a tool change inside a populated out dir.
+          </p>
+          <p>
+            GN then refuses bad combinations. Four asserts:
+            <code>use_reclient</code> without <code>use_remoteexec</code>;
+            <code>use_remoteexec</code> with neither client
+            [<code>rbe.gni</code>:57–64]; <code>cc_wrapper</code> alongside
+            <code>use_remoteexec</code>
+            [<code>src/build/toolchain/cc_wrapper.gni</code>:36–37]; and an
+            out dir not exactly two levels below <code>src</code>, whose
+            comment reads "Different nesting levels technically work, but
+            cache hits are basically zero" [<code>src/BUILD.gn</code>:1649–1656].
+            Since 13 November 2025 <code>gn gen</code> also prints "WARNING:
+            crbug.com/424659245 - Reclient is deprecated."
+            [<code>rbe.gni</code>:66–69]. Its decisions land in
+            <code>out/&lt;dir&gt;/gn_logs.txt</code> as
+            <code>use_remoteexec=true</code>
+            [<code>rbe.gni</code>:71–81] — and that file, not
+            <code>args.gn</code>, is what Siso's starlark reads.
+          </p>
+          <p>
+            The documented setup is three lines in two files — in
+            <code>.gclient</code>, under <code>custom_vars</code>:
+            </p>
+<pre><code>"rbe_instance": "projects/rbe-chromium-untrusted/instances/default_instance"</code></pre>
+          <p>
+            — and
+            <code>use_remoteexec = true</code> with
+            <code>use_siso = true</code> in <code>args.gn</code>
+            [<code>src/docs/linux/build_instructions.md</code>:271, :375–376]
+            <span class="src">from the docs</span>. The bots generate the same
+            thing: of 914 <code>gn-args.json</code> files under
+            <code>src/infra/config/generated/builders/</code>, 867 carry
+            <code>use_remoteexec: true, use_siso: true, use_reclient: false</code>
+            inside their <code>gn_args</code> object, counted at
+            <code>f288fed6</code>
+            <span class="src">from the tree</span>.
+          </p>
+
+          <h3>Reclient, and the one consumer that keeps it</h3>
+          <p>
+            The binaries are downloaded only when
+            <code>download_reclient</code> is true, and its default is
+            <code>checkout_chromeos</code> [<code>src/DEPS</code>:300]. The
+            pin is <code>re_client_version:0.185.0.db415f21-gomaip</code>
+            [<code>src/DEPS</code>:307]. depot_tools carries a second, older
+            pin of the same package —
+            <code>re_client_version:0.124.1.13f78cc-gomaip</code>, under a
+            comment reading "reclient, currently this is only for ChromeOS
+            build" [<code>depot_tools/cipd_manifest.txt</code>:81–83]. Two
+            files, two versions, one surviving consumer.
+          </p>
+          <p>
+            Where it does run, the shape is Goma's.
+            <code>rewrapper -cfg=&lt;cfg&gt; -exec_root=&lt;root&gt;</code>
+            becomes the <code>compiler_prefix</code> on every compile command
+            [<code>src/build/toolchain/gcc_toolchain.gni</code>:200].
+            <code>reclient_helper.py</code> brackets it with
+            <code>bootstrap --re_proxy=&lt;reproxy&gt; --cfg=&lt;cfg&gt;</code>
+            and <code>bootstrap --shutdown</code> [:57–81], and sets racing
+            defaults
+            <code>RBE_local_resource_fraction=0.2</code> and
+            <code>RBE_racing_bias=0.95</code> [:288–290]. Racing is one of
+            reproxy's four <code>exec_strategy</code> values, beside
+            <code>local</code>, <code>remote</code> and
+            <code>remote_local_fallback</code>: when a remote action has not
+            come back in time and local resources are free, reproxy starts the
+            same action locally too, and "the results of the first to finish
+            are used" [reclient <code>docs/cmd-line-flags.md</code>:170–174]
+            <span class="src">from the docs</span>. Upstream sets the bias at
+            0.75; depot_tools overrides it to 0.95 and caps the local racer at
+            a fifth of the machine — except on Windows, which is given
+            <code>remote_local_fallback</code> instead, "while racing
+            performance on windows is addressed" [:304–319]. Even Siso-native
+            builds keep a foot in it:
+            <code>use_reclient_cfgs</code> is true whenever
+            <code>use_reclient</code> is, and also for Windows and macOS
+            <code>use_remoteexec</code> builds, because "Siso native also uses rewrapper cfg file to get remote
+            platform property" [<code>rbe.gni</code>:91–94].
+          </p>
+
+          <h3>Siso</h3>
+          <p>
+            A Ninja-compatible Go build tool with a REAPI client inside the
+            process, a digest-based filesystem and starlark configs, pinned
+            like any other dependency: CIPD
+            <code>build/siso/${platform}</code> at
+            <code>git_revision:22353054…</code>
+            [<code>src/DEPS</code>:292, 2783–2789]. The unconditional
+            <code>configure_siso</code> hook [<code>src/DEPS</code>:5100–5116]
+            writes <code>.sisoenv</code> and copies a backend config —
+            <code>google.star</code> for the eleven named Google RBE projects
+            [<code>configure_siso.py</code>:20–32, :105, :116–128] — which declares two
+            platforms on one pinned container image: <code>default</code>, and
+            <code>large</code> for "slow actions that can benefit from
+            multi-cores and/or faster disk I/O"
+            [<code>backend_config/google.star</code>:9–28].
+          </p>
+          <p>
+            <code>main.star</code> reads <code>gn_logs.txt</code> and sets
+            <code>remote = False</code> on every rule unless
+            <code>use_remoteexec</code> is the string <code>"true"</code>
+            [<code>src/build/config/siso/main.star</code>:37–43]. The rules
+            under it are specific. Clang compiles run remote with a 2 m
+            timeout [<code>clang_unix.star</code>:214–227]. Links get 10 m,
+            80 m under ThinLTO, and <code>remote_link = False</code> on darwin
+            [<code>clang_unix.star</code>:102–110]. Mojom generators take
+            <code>large</code>, justified by a measurement left in the
+            comment — "n2-highmem-8: exec: 880.202978ms" against
+            "n2-custom-2-3840: exec: 2.42808488s"
+            [<code>mojo.star</code>:15–20]. Sixty-four paths — 55 Python
+            scripts, eight node scripts, one binary — are denylisted back to
+            local [<code>denylist.star</code>]. Concurrency is derived, not
+            configured: step 512×CPUs, scandeps 2×, local = CPUs, remote
+            80×CPUs. On the bots, 866 of 1,066 generated
+            <code>properties.json</code> files carry
+            <code>$build/siso</code>; the five that carry
+            <code>$build/reclient</code> are all
+            <code>*-build-perf-developer</code> builders that A/B the old
+            stack <span class="src">from the tree</span>. Figure
+            {{fig-three-generations}} sets the three stacks against the same
+            five rows.
+          </p>
+
+          <figure class="figure wide" id="fig-three-generations">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Three generations of the same five layers, and when each one moved</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1100 686" role="img" aria-label="A table of three columns — Goma, Reclient, Siso — against five rows: wrapper, daemon, input discovery, transport, cache. Goma uses gomacc, compiler_proxy, a full C preprocessor, HTTP/1.1 with protobuf bodies, and its own backend cache. Reclient uses rewrapper, reproxy, the same include scanner under the name scandeps_server, gRPC REAPI, and the RBE action cache. Siso has no wrapper and no daemon, a forged scanner called scandeps, a built-in gRPC REAPI client, and the RBE action cache plus a local digest cache. Underneath, three timeline tracks on one axis from 2012 to 2026 mark goma described 2012-06, open-sourced 2018-01, backend moved to RBE 2020-11, deprecation PSA 2023-09, GN args deleted 2024-05; reclient landing 2020-12 and deprecated in GN 2025-11; Siso dogfood 2023-04, all CQ 2024-03, default on gLinux 2024-11, default for everyone 2025-06, fast-deps deleted 2026-04.">
+                <text x="16" y="20" class="svg-lane">FIVE LAYERS, THREE IMPLEMENTATIONS</text>
+
+                <rect x="156" y="30" width="300" height="28" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="170" y="49" class="svg-step">GOMA — deleted 2024-05</text>
+                <rect x="470" y="30" width="300" height="28" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="484" y="49" class="svg-step">RECLIENT — deprecated</text>
+                <rect x="784" y="30" width="300" height="28" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="798" y="49" class="svg-step">SISO — the default</text>
+
+                <text x="16" y="94" class="svg-lane">WRAPPER</text>
+                <rect x="156" y="68" width="300" height="60" rx="8" fill="#ffffff" stroke="#ad4b43"/>
+                <text x="170" y="92" class="svg-sub">gomacc</text>
+                <text x="170" y="112" class="svg-note">argv → ExecReq · masquerade mode</text>
+                <rect x="470" y="68" width="300" height="60" rx="8" fill="#ffffff" stroke="#d98226"/>
+                <text x="484" y="92" class="svg-sub">rewrapper</text>
+                <text x="484" y="112" class="svg-note">-cfg=… -exec_root=… per compile</text>
+                <rect x="784" y="68" width="300" height="60" rx="8" fill="#ffffff" stroke="#367f59"/>
+                <text x="798" y="92" class="svg-sub">none</text>
+                <text x="798" y="112" class="svg-note">siso is the build tool itself</text>
+
+                <text x="16" y="162" class="svg-lane">DAEMON</text>
+                <rect x="156" y="136" width="300" height="60" rx="8" fill="#ffffff" stroke="#ad4b43"/>
+                <text x="170" y="160" class="svg-sub">compiler_proxy</text>
+                <text x="170" y="180" class="svg-note">CompileTask state machine</text>
+                <rect x="470" y="136" width="300" height="60" rx="8" fill="#ffffff" stroke="#d98226"/>
+                <text x="484" y="160" class="svg-sub">reproxy</text>
+                <text x="484" y="180" class="svg-note">bootstrap starts it and shuts it down</text>
+                <rect x="784" y="136" width="300" height="60" rx="8" fill="#ffffff" stroke="#367f59"/>
+                <text x="798" y="160" class="svg-sub">none</text>
+                <text x="798" y="180" class="svg-note">REAPI client inside the process</text>
+
+                <text x="16" y="224" class="svg-lane">INPUT</text>
+                <text x="16" y="240" class="svg-lane">DISCOVERY</text>
+                <rect x="156" y="204" width="300" height="60" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="170" y="228" class="svg-sub">full C preprocessor</text>
+                <text x="170" y="248" class="svg-note">#if evaluated · exact input set</text>
+                <rect x="470" y="204" width="300" height="60" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="484" y="228" class="svg-sub">scandeps_server</text>
+                <text x="484" y="248" class="svg-note">same engine — the -gomaip suffix</text>
+                <rect x="784" y="204" width="300" height="60" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="798" y="228" class="svg-sub">scandeps — "forged"</text>
+                <text x="798" y="248" class="svg-note">no #if · superset + precomputed subtrees</text>
+
+                <text x="16" y="292" class="svg-lane">TRANSPORT</text>
+                <rect x="156" y="272" width="300" height="60" rx="8" fill="#ffffff" stroke="#ad4b43"/>
+                <text x="170" y="296" class="svg-sub">HTTP/1.1 + protobuf</text>
+                <text x="170" y="316" class="svg-note">goma.chromium.org/cxx-compiler-service</text>
+                <rect x="470" y="272" width="300" height="60" rx="8" fill="#ffffff" stroke="#d98226"/>
+                <text x="484" y="296" class="svg-sub">gRPC · REAPI</text>
+                <text x="484" y="316" class="svg-note">remotebuildexecution.googleapis.com:443</text>
+                <rect x="784" y="272" width="300" height="60" rx="8" fill="#ffffff" stroke="#367f59"/>
+                <text x="798" y="296" class="svg-sub">gRPC · REAPI, built in</text>
+                <text x="798" y="316" class="svg-note">same backend, no middleman</text>
+
+                <text x="16" y="360" class="svg-lane">CACHE</text>
+                <rect x="156" y="340" width="300" height="60" rx="8" fill="#ffffff" stroke="#ad4b43"/>
+                <text x="170" y="364" class="svg-sub">goma backend cache</text>
+                <text x="170" y="384" class="svg-note">keyed by goma's own request</text>
+                <rect x="470" y="340" width="300" height="60" rx="8" fill="#ffffff" stroke="#d98226"/>
+                <text x="484" y="364" class="svg-sub">RBE action cache + CAS</text>
+                <text x="484" y="384" class="svg-note">keyed by the action digest</text>
+                <rect x="784" y="340" width="300" height="60" rx="8" fill="#ffffff" stroke="#367f59"/>
+                <text x="798" y="364" class="svg-sub">RBE action cache + CAS</text>
+                <text x="798" y="384" class="svg-note">plus hashfs · .siso_fs_state</text>
+
+                <text x="16" y="432" class="svg-lane">TIMELINE — ONE AXIS, THREE TRACKS</text>
+                <line x1="90" y1="440" x2="90" y2="644" stroke="#deded9" stroke-width="1"/>
+                <line x1="223" y1="440" x2="223" y2="644" stroke="#deded9" stroke-width="1"/>
+                <line x1="356" y1="440" x2="356" y2="644" stroke="#deded9" stroke-width="1"/>
+                <line x1="489" y1="440" x2="489" y2="644" stroke="#deded9" stroke-width="1"/>
+                <line x1="622" y1="440" x2="622" y2="644" stroke="#deded9" stroke-width="1"/>
+                <line x1="755" y1="440" x2="755" y2="644" stroke="#deded9" stroke-width="1"/>
+                <line x1="888" y1="440" x2="888" y2="644" stroke="#deded9" stroke-width="1"/>
+                <line x1="1021" y1="440" x2="1021" y2="644" stroke="#deded9" stroke-width="1"/>
+                <text x="90" y="672" text-anchor="middle" class="svg-note">2012</text>
+                <text x="223" y="672" text-anchor="middle" class="svg-note">2014</text>
+                <text x="356" y="672" text-anchor="middle" class="svg-note">2016</text>
+                <text x="489" y="672" text-anchor="middle" class="svg-note">2018</text>
+                <text x="622" y="672" text-anchor="middle" class="svg-note">2020</text>
+                <text x="755" y="672" text-anchor="middle" class="svg-note">2022</text>
+                <text x="888" y="672" text-anchor="middle" class="svg-note">2024</text>
+                <text x="1021" y="672" text-anchor="middle" class="svg-note">2026</text>
+
+                <line x1="118" y1="452" x2="912" y2="452" stroke="#ad4b43" stroke-width="6" stroke-linecap="round" opacity="0.32"/>
+                <circle cx="118" cy="452" r="4" fill="#ad4b43"/>
+                <text x="118" y="470" text-anchor="middle" class="svg-sub">2012-06</text>
+                <text x="118" y="486" text-anchor="middle" class="svg-note">described</text>
+                <circle cx="489" cy="452" r="4" fill="#ad4b43"/>
+                <text x="489" y="470" text-anchor="middle" class="svg-sub">2018-01</text>
+                <text x="489" y="486" text-anchor="middle" class="svg-note">open-sourced</text>
+                <circle cx="679" cy="452" r="4" fill="#ad4b43"/>
+                <text x="679" y="470" text-anchor="middle" class="svg-sub">2020-11</text>
+                <text x="679" y="486" text-anchor="middle" class="svg-note">backend = RBE</text>
+                <circle cx="867" cy="452" r="4" fill="#ad4b43"/>
+                <text x="867" y="470" text-anchor="middle" class="svg-sub">2023-09</text>
+                <text x="867" y="486" text-anchor="middle" class="svg-note">deprecation PSA</text>
+                <circle cx="912" cy="452" r="4" fill="#ad4b43"/>
+                <line x1="912" y1="456" x2="912" y2="488" stroke="#ad4b43" stroke-width="1" stroke-dasharray="3 3"/>
+                <text x="912" y="500" text-anchor="middle" class="svg-sub">2024-05</text>
+                <text x="912" y="516" text-anchor="middle" class="svg-note">GN args deleted</text>
+
+                <line x1="685" y1="536" x2="1070" y2="536" stroke="#d98226" stroke-width="6" stroke-linecap="round" opacity="0.32"/>
+                <circle cx="685" cy="536" r="4" fill="#d98226"/>
+                <text x="685" y="554" text-anchor="middle" class="svg-sub">2020-12</text>
+                <text x="685" y="570" text-anchor="middle" class="svg-note">lands in rbe.gni</text>
+                <circle cx="1012" cy="536" r="4" fill="#d98226"/>
+                <text x="1012" y="554" text-anchor="middle" class="svg-sub">2025-11</text>
+                <text x="1012" y="570" text-anchor="middle" class="svg-note">deprecated in GN</text>
+
+                <line x1="840" y1="590" x2="1070" y2="590" stroke="#367f59" stroke-width="6" stroke-linecap="round" opacity="0.32"/>
+                <circle cx="840" cy="590" r="4" fill="#367f59"/>
+                <text x="840" y="608" text-anchor="middle" class="svg-sub">2023-04</text>
+                <text x="840" y="624" text-anchor="middle" class="svg-note">dogfood</text>
+                <circle cx="904" cy="590" r="4" fill="#367f59"/>
+                <line x1="904" y1="594" x2="904" y2="620" stroke="#367f59" stroke-width="1" stroke-dasharray="3 3"/>
+                <text x="904" y="640" text-anchor="middle" class="svg-sub">2024-03</text>
+                <text x="904" y="656" text-anchor="middle" class="svg-note">all CQ</text>
+                <circle cx="945" cy="590" r="4" fill="#367f59"/>
+                <text x="945" y="608" text-anchor="middle" class="svg-sub">2024-11</text>
+                <text x="945" y="624" text-anchor="middle" class="svg-note">default, gLinux</text>
+                <circle cx="984" cy="590" r="4" fill="#367f59"/>
+                <line x1="984" y1="594" x2="984" y2="620" stroke="#367f59" stroke-width="1" stroke-dasharray="3 3"/>
+                <text x="984" y="640" text-anchor="middle" class="svg-sub">2025-06</text>
+                <text x="984" y="656" text-anchor="middle" class="svg-note">default for all</text>
+                <circle cx="1039" cy="590" r="4" fill="#367f59"/>
+                <text x="1039" y="608" text-anchor="middle" class="svg-sub">2026-04</text>
+                <text x="1039" y="624" text-anchor="middle" class="svg-note">fast-deps gone</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Every cell is read from a file — the 2026 tree, Siso's own
+              source, the archived goma client — and every date is the one its
+              commit or announcement carries. The axis is linear in time. The
+              five-row decomposition is mine
+              <span class="recon">reconstruction</span>; Goma's transport row
+              is the only one whose service is gone and cannot be re-checked.
+            </p>
+          </figure>
+
+          <h3>What each generation uploads</h3>
+          <p>
+            Both survivors speak one protocol, so name its parts. REAPI is the
+            Remote Execution API, <code>build.bazel.remote.execution.v2</code>,
+            a gRPC service whose faces are Execution, ActionCache and
+            ContentAddressableStorage — the CAS, a store addressed by digest:
+            a
+            <code>&lt;hash, size_bytes&gt;</code> pair. A directory is itself a
+            blob: a <code>Directory</code> message naming its files and
+            subdirectories by digest, so a tree of them is a Merkle tree whose
+            root digest stands for the whole tree. An <code>Action</code>
+            carries a <code>command_digest</code> and an
+            <code>input_root_digest</code>, and actions "can be succinctly
+            identified by the digest of their wire format encoding"
+            [<code>remote_execution.proto</code>:141–147, :653–687]
+            <span class="src">from the docs</span>. That identity is the cache
+            key: the ActionCache maps an action digest to an
+            <code>ActionResult</code>, which is how one machine's compile
+            becomes another machine's hit. Siso builds the
+            message itself: <code>Action{CommandDigest, InputRootDigest,
+            Timeout, DoNotCache, Salt}</code>, the input root a
+            <code>treeDigest</code> over precomputed subtrees plus the hashfs
+            entries of every scanned input
+            [<code>siso/execute/cmd.go</code>:487–563]
+            <span class="src">from the tree</span>.
+          </p>
+          <p>
+            The input-root digest is half the action digest, so "which files
+            does this compile need" is the whole question. Goma answered it
+            exactly, with a preprocessor that evaluated <code>#if</code>.
+            Reclient kept that engine and renamed it:
+            <code>scandeps_server</code> is the <code>-gomaip</code> in both
+            version pins above — the goma-input-processor fork, still
+            linked.
+          </p>
+          <p>
+            Siso inverts the trade. Its scanner calls itself "forged", exists
+            "to construct inputs for remote execution", and is explicitly "not
+            used to check whether the action needs to re-execute". Lines
+            14–34 of <code>siso/scandeps/doc.go</code>, in
+            <code>go.chromium.org/build/siso</code>, state the choice in the
+            authors' own words <span class="src">from the docs</span>:
+          </p>
+<pre><code>// Compared with Goma's input processor, scandeps only supports simple
+// form of C preprocessor directives and uses precomputed subtree
+// for sysroots or complicated include dirs.
+//
+// Scandeps only checks the following forms of #include
+//
+//	#include "foo.h"
+//	#include &lt;foo.h&gt;
+//	#include FOO_H
+//
+// to support last case, it also checks the following forms of #define
+//
+//	#define FOO_H "foo.h"
+//	#define FOO_H &lt;foo.h&gt;
+//	#define FOO_H OTHER_FOO_H
+//
+// Since scandeps doesn't process `#if` or `#ifdef`, it expands all possible
+// values of macros for `#include FOO_H`.  Using extra inputs is
+// not problem, but may have potential cache miss issues, since
+// there is discrepancy between simple scandeps vs clang's *.d outputs.
+// TODO(b/283341125): fix cache miss issue.</code></pre>
+          <p>
+            Three include forms, three define forms, no conditional
+            evaluation, every recorded value of a macro expanded. The result
+            is a deliberate superset, and the comment names the price: a
+            discrepancy against clang's own <code>.d</code> output, filed as a
+            cache-miss bug.
+          </p>
+          <p>
+            The superset is affordable because of what is never scanned. A
+            directory carrying a <code>:headers</code> label in
+            <code>input_deps</code> — sysroots, the libc++ include tree, the
+            clang toolchain root — is attached whole as a precomputed Merkle
+            tree, digested once per build, with only its root digest probed
+            against the CAS; if the root is there, the rest is assumed there.
+            That assumption is bought by upload order, not by faith:
+            <code>subtree.init</code> uploads every non-root blob first and the
+            root <code>Directory</code> last, so a root that exists in the CAS
+            can only have got there after everything beneath it
+            [<code>siso/build/tree_input.go</code>:176–219]. The commit that
+            landed the root-only probe says what it saves: a subtree "would
+            have many files (~7k), so checking missing blobs for all of them
+            would take 2-3s". It measured a full Chromium build at
+            378.307 s ± 12.431 s before and 372.878 s ± 4.512 s after, over
+            ten runs <span class="src">from the tree</span>.
+          </p>
+          <p>
+            One repeated claim about this layer is now stale.
+            <em>fast-deps</em> — rebuilding a remote command's inputs from the
+            previous build's deps log so scandeps could be skipped — was
+            deleted on 10 April 2026, because "it's not possible to know
+            whether the cached dependency information is still safely usable".
+            Its successor, two-phase caching, is gated behind
+            <code>SISO_EXPERIMENTS=two-phase-caching</code>, and nothing under
+            <code>src/build/config/siso</code>, <code>src/infra</code> or
+            depot_tools sets it. Siso scans every time, and pays for it with a
+            superset it digests in one shot.
+          </p>
+          <p>
+            A superset of inputs still has to survive the worker.
+            <code>runRemote</code> is the ladder that decides: the first
+            <code>startLocal</code> steps run locally; then a cache lookup;
+            then, if local capacity is free, a local run; then remote
+            execution; and on failure, <code>fallbackLocal</code>
+            [<code>siso/build/run_remote.go</code>:27–40, :145–156]
+            <span class="src">from the tree</span>. That last rung is typed.
+            <code>PermissionDenied</code>, <code>Unauthenticated</code>,
+            <code>InvalidArgument</code> and <code>FailedPrecondition</code>
+            never take it — a missing credential or a bad container image is a
+            build error, because a build that quietly compiles everything
+            locally is §10's seven-to-eight-hour build. Exit 137 does, under
+            the comment "we still see unexpected SIGKILL (OOM?)", as do a
+            deadline, a scandeps timeout and an output-flush error [:55–109].
+            Each is reported by name — <code>fallback-on-SIGKILL</code>,
+            <code>fallback-on-scandeps-slow</code> — and too many stop the
+            build with <code>TooManyFallbackError</code>. Which is
+            <code>GOMA_HERMETIC=error</code> two generations on: a remote build
+            that silently becomes a local one is worse than one that stops.
+          </p>

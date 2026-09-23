@@ -1,0 +1,288 @@
+          <h2 id="what-goma-was"><span class="secnum">{{S}}</span>What goma was, and why it ended</h2>
+          <p class="lede">
+            Goma solved the right problem with a protocol it invented for
+            itself. The protocol is what killed it. The engineering that
+            outlived the system is the include scanner, still in the build
+            today under a suffix.
+          </p>
+          <p>
+            Everything so far has been the half of §01's seam above the line
+            where <code>gclient_args.gni</code> is imported into
+            <code>siso.gni</code>. Below it the subject changes: the files are
+            on disk, something has to compile them, and from 2012 to 2024 that
+            something was goma.
+          </p>
+          <p>
+            The README states the mechanism: "Goma hooks a compile request,
+            and sends it to a backend compile server", so a build could run at
+            <code>-j500</code>, and "the Goma backend caches the compile
+            result"
+            [<code>infra/goma/client@5de52a5ece34 README.md</code>:16–24]
+            <span class="src">from the docs</span>. Nico Weber had described
+            it publicly in June 2012, on the chromium.org clang list:
+            "similar to pump-mode distcc, but it's google-internal and not
+            available as open source". What it bought is in Chromium's own
+            transcripts: a clean build takes "seven to eight hours" on a
+            laptop, "a few minutes" on a Goma-backed workstation
+            [<code>src/docs/transcripts/wuwt-e06-open-source.md</code>:887–889]
+            <span class="src">from the tree</span>.
+          </p>
+          <p>
+            The client had two halves. <code>gomacc</code> — prepended to the
+            compiler command, or symlinked over it in "masquerade mode" —
+            parsed the flags, serialised an <code>ExecReq</code> and passed it
+            to a daemon over a unix socket, <code>goma.ipc</code>.
+            <code>compiler_proxy</code> was that daemon: one worker thread per
+            CPU, <code>MAX_ACTIVE_TASKS</code> 2,048, a status page on
+            <code>localhost:8088</code>. Every request became a
+            <code>CompileTask</code>; the task is the design. The states are
+            declared in <code>client/compile_task.h</code>, lines 62–75, at
+            <code>5de52a5ece34</code> — the last substantive commit that
+            repository took, 11 January 2024:
+          </p>
+<pre><code>  enum State {
+    // running state, or state at response sent if abort_ is true.
+    INIT,  // Initialize the task.  Run subprocess for fast fallback/verify.
+    SETUP,  // Setup the request. Run include processor.
+    FILE_REQ,  // Upload input files.
+    CALL_EXEC,  // Call Exec request.
+    LOCAL_OUTPUT,  // LocalOutputCache lookup succeeded.
+    FILE_RESP,  // Download output files.
+    // finished state:  response sent.
+    FINISHED,  // Finished.
+    LOCAL_RUN,  // Local run started and didn't issue goma call.
+    LOCAL_FINISHED,  // Local run finished for fast fallback.
+    NUM_STATE,
+  };</code></pre>
+          <p>
+            SETUP is where the good work happened. Goma ran its own
+            directive-level C preprocessor rather than asking the compiler for
+            a dependency list. A filter reduced each file to its <code>#</code>
+            lines, a parser turned those into directives, an optimiser dropped
+            what could not change the answer, an include-guard
+            detector marked files that need not be reopened
+            [<code>doc/include-processor.md</code>:55–75]
+            <span class="src">from the docs</span>;
+            <code>#if</code> and <code>#ifdef</code> were evaluated against a
+            real macro environment with a condition stack,
+            <code>#pragma once</code> and <code>#include_next</code> honoured,
+            and only files a compiler would open were inserted
+            [<code>client/cxx/include_processor/cpp_parser.cc</code>:119–198,
+            :602–635, :714–733;
+            <code>cpp_include_processor.cc</code>:124–186]
+            <span class="src">from the tree</span>. The cost is documented: a
+            macro table averaging about 4,000 entries on Linux, sometimes over
+            15,000 on Windows "since <code>windows.h</code> is large", and
+            200–300 MB in the <code>IncludeCache</code> after all of Chrome
+            [<code>doc/include-processor.md</code>:77–83, 106–115].
+            That cache holds 140,000 entries — "35000x4", because Chrome
+            needed "more than 35000 header files" as of 2018-08-21
+            [<code>client/goma_flags.cc</code>:372–379 in
+            <code>infra/goma-input-processor</code>, the fork reclient links].
+            A <code>DepsCache</code> keyed by a SHA-256 command identifier
+            skipped the walk whenever the file stats, then a hash of each
+            file's directive lines, still validated
+            [<code>client/deps_cache.h</code>:32–43].
+          </p>
+          <p>
+            FILE_REQ uploaded what SETUP found, content-addressed:
+            <code>hash_key = sha256(serialized FileBlob)</code>, files under
+            2 MB embedded, larger ones split into a
+            <code>FILE_META</code> blob referencing <code>FILE_CHUNK</code>s
+            [<code>lib/goma_data.proto</code>:19–36]. CALL_EXEC sent that as
+            protobuf over HTTP/1.1 — TLS on port 443, never HTTP/2 — to
+            <code>goma.chromium.org</code>, path prefix
+            <code>/cxx-compiler-service</code>
+            [<code>client/http.cc</code>:1813,
+            <code>client/goma_flags.cc</code>:206–222], where a
+            Go frontend routed
+            <code>/ping</code>, <code>/e</code>, <code>/blobs/</code>,
+            <code>/s</code>, <code>/l</code> and <code>/sl</code>
+            [<code>infra/goma/server@49e8b0076afc frontend/frontend.go</code>:131–157].
+            <code>GOMA_HERMETIC</code> defaulted to <code>"error"</code>: the
+            backend had to "use the compiler with the same version string and
+            binary hash", or the task failed and would "never try sending
+            request again for the same compiler"
+            [<code>client/goma_flags.cc</code>:280–289]
+            <span class="src">from the tree</span>.
+            Figure {{fig-goma-task}} is that path, with the state machine
+            beside it.
+          </p>
+
+          <figure class="figure wide" id="fig-goma-task">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One compile through goma, and the states it moved between</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1100 512" role="img" aria-label="Left two-thirds: ninja invokes gomacc, which passes an ExecReq over the unix socket goma.ipc to the compiler_proxy daemon holding the IncludeProcessor, DepsCache, FileHashCache and LocalOutputCache; compiler_proxy calls the goma backend at goma.chromium.org port 443 under /cxx-compiler-service over HTTP/1.1 with protobuf bodies, which routes to internal exec workers or to remoteexec_proxy in front of RBE. Right third: the CompileTask state chain INIT, SETUP, FILE_REQ, CALL_EXEC, FILE_RESP, FINISHED, with a parallel branch to LOCAL_RUN and LOCAL_FINISHED and a LOCAL_OUTPUT cache-hit shortcut, all rejoining FINISHED.">
+                <defs>
+                  <marker id="fig-goma-task-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-goma-task-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-goma-task-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="16" y="22" class="svg-lane">ONE COMPILE, END TO END</text>
+                <text x="660" y="22" class="svg-lane">CompileTask STATE</text>
+
+                <rect x="16" y="40" width="150" height="44" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="30" y="62" class="svg-step">ninja</text>
+                <text x="30" y="78" class="svg-sub">-j500</text>
+                <rect x="186" y="40" width="200" height="44" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="200" y="62" class="svg-step">gomacc</text>
+                <text x="200" y="78" class="svg-sub">argv → ExecReq · masquerade</text>
+                <line x1="166" y1="62" x2="186" y2="62" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-goma-task-ink)"/>
+                <line x1="286" y1="84" x2="286" y2="120" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-goma-task-blue)"/>
+                <text x="294" y="106" class="svg-sub">goma.ipc</text>
+
+                <rect x="16" y="120" width="290" height="250" rx="10" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="30" y="144" class="svg-step">compiler_proxy</text>
+                <text x="30" y="161" class="svg-sub">1 worker per CPU · 2,048 active tasks</text>
+                <rect x="28" y="172" width="266" height="42" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="42" y="190" class="svg-sub">IncludeProcessor</text>
+                <text x="42" y="206" class="svg-note">directives only · ~4,000 macros on Linux</text>
+                <rect x="28" y="222" width="266" height="42" rx="6" fill="#ffffff" stroke="#deded9"/>
+                <text x="42" y="240" class="svg-sub">DepsCache</text>
+                <text x="42" y="256" class="svg-note">sha256(command) → input list</text>
+                <rect x="28" y="272" width="266" height="42" rx="6" fill="#ffffff" stroke="#deded9"/>
+                <text x="42" y="290" class="svg-sub">FileHashCache</text>
+                <text x="42" y="306" class="svg-note">path → upload hash key</text>
+                <rect x="28" y="322" width="266" height="42" rx="6" fill="#ffffff" stroke="#deded9"/>
+                <text x="42" y="340" class="svg-sub">LocalOutputCache</text>
+                <text x="42" y="356" class="svg-note">30 GB · 100,000 outputs</text>
+
+                <line x1="306" y1="190" x2="350" y2="190" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-goma-task-ink)"/>
+
+                <rect x="350" y="120" width="290" height="250" rx="10" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="364" y="144" class="svg-step">goma backend</text>
+                <rect x="362" y="156" width="266" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="376" y="176" class="svg-sub">goma.chromium.org:443</text>
+                <text x="376" y="194" class="svg-note">/cxx-compiler-service · HTTP/1.1 protobuf</text>
+                <text x="376" y="212" class="svg-note">/ping /e /blobs/ /s /l /sl</text>
+                <rect x="362" y="240" width="128" height="56" rx="6" fill="#ffffff" stroke="#deded9"/>
+                <text x="374" y="262" class="svg-sub">exec workers</text>
+                <text x="374" y="280" class="svg-note">internal</text>
+                <rect x="500" y="240" width="128" height="56" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="512" y="262" class="svg-sub">remoteexec</text>
+                <text x="512" y="280" class="svg-note">proxy → RBE</text>
+                <line x1="426" y1="226" x2="426" y2="240" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-goma-task-ink)"/>
+                <line x1="564" y1="226" x2="564" y2="240" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-goma-task-purple)"/>
+                <text x="364" y="322" class="svg-note">From November 2020 the backend was RBE —</text>
+                <text x="364" y="340" class="svg-note">one protocol wrapping another.</text>
+
+                <rect x="660" y="40" width="160" height="44" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="674" y="62" class="svg-sub">INIT</text>
+                <text x="674" y="78" class="svg-note">fast-fallback subproc</text>
+                <rect x="660" y="100" width="160" height="44" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="674" y="122" class="svg-sub">SETUP</text>
+                <text x="674" y="138" class="svg-note">include processor</text>
+                <rect x="660" y="160" width="160" height="44" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="674" y="182" class="svg-sub">FILE_REQ</text>
+                <text x="674" y="198" class="svg-note">upload inputs</text>
+                <rect x="660" y="220" width="160" height="44" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="674" y="242" class="svg-sub">CALL_EXEC</text>
+                <text x="674" y="258" class="svg-note">Exec RPC</text>
+                <rect x="660" y="280" width="160" height="44" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="674" y="302" class="svg-sub">FILE_RESP</text>
+                <text x="674" y="318" class="svg-note">download outputs</text>
+                <rect x="660" y="372" width="160" height="44" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="674" y="394" class="svg-sub">FINISHED</text>
+                <text x="674" y="410" class="svg-note">response sent</text>
+
+                <line x1="740" y1="84" x2="740" y2="100" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-goma-task-ink)"/>
+                <line x1="740" y1="144" x2="740" y2="160" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-goma-task-ink)"/>
+                <line x1="740" y1="204" x2="740" y2="220" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-goma-task-ink)"/>
+                <line x1="740" y1="264" x2="740" y2="280" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-goma-task-ink)"/>
+                <line x1="740" y1="324" x2="740" y2="372" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-goma-task-ink)"/>
+
+                <rect x="880" y="100" width="170" height="44" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="894" y="122" class="svg-sub">LOCAL_RUN</text>
+                <text x="894" y="138" class="svg-note">no goma call issued</text>
+                <rect x="880" y="160" width="170" height="44" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="894" y="182" class="svg-sub">LOCAL_FINISHED</text>
+                <text x="894" y="198" class="svg-note">fast fallback won</text>
+                <rect x="880" y="280" width="170" height="44" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="894" y="302" class="svg-sub">LOCAL_OUTPUT</text>
+                <text x="894" y="318" class="svg-note">LocalOutputCache hit</text>
+
+                <path d="M820 62 L860 62 L860 122 L880 122" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-goma-task-purple)"/>
+                <line x1="965" y1="144" x2="965" y2="160" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-goma-task-purple)"/>
+                <path d="M1050 182 L1076 182 L1076 394 L820 394" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-goma-task-purple)"/>
+                <path d="M820 122 L838 122 L838 302 L880 302" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-goma-task-purple)"/>
+                <path d="M965 324 L965 352 L780 352 L780 372" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-goma-task-purple)"/>
+
+                <text x="16" y="440" class="svg-note">FILE_REQ ships each input as a FileBlob keyed by sha256 of the serialized blob — under 2 MB it is embedded in the request, larger files split into FILE_META plus FILE_CHUNKs.</text>
+                <text x="16" y="458" class="svg-note">CALL_EXEC carries hermetic_mode = "error": the backend must hold a compiler with the same version string and binary hash, or the task fails and is never retried for that compiler.</text>
+                <text x="16" y="476" class="svg-note">GOMA_USE_LOCAL compiles locally when the machine is idle; LOCAL_RUN_PREFERENCE = 3 stops the race if that local process started before the task reached this state.</text>
+                <text x="16" y="500" class="svg-note">thick black = control · thin blue = data · dashed purple = the local race and the RE-API detour</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Every box, port, path and constant on the left is quoted from
+              the archived goma client at <code>5de52a5ece34</code> and server
+              at <code>49e8b0076afc</code>. The right panel is the enum above,
+              laid out; where the local branches attach is my reading of the
+              state comments <span class="recon">reconstruction</span>,
+              not a graph either repository ships. Nothing here is measured:
+              no production timing or cache-hit rate was ever published.
+            </p>
+          </figure>
+
+          <p>
+            The transport is the pivot, and EngFlow named it three days after
+            the deprecation notice: "Goma uses plain HTTP/1, so it needs lots
+            of connections, and files need to be broken into chunks" — against
+            the Remote Execution API, which is gRPC over HTTP/2 and therefore
+            multiplexes every one of those requests down a single connection.
+            By November 2020 Goma's own backend was running on RBE — Remote
+            Build Execution, Google's hosted implementation of that API, at
+            <code>remotebuildexecution.googleapis.com:443</code> — leaving the
+            Goma protocol to translate in front of a standard one. The same team then wrote
+            reclient, mirroring the halves —
+            <code>gomacc</code> became <code>rewrapper</code>,
+            <code>compiler_proxy</code> became <code>reproxy</code> — and kept
+            the include scanner as the <code>-gomaip</code> build. §11 takes
+            that stack up.
+          </p>
+          <p>
+            The end was a dated ratchet. On 8 September 2023 — the archive
+            timestamp is UTC, so US Pacific readers date it the 7th — Takuto
+            Ikuta posted "PSA:Goma deprecation" to infra-dev, chromium-dev and
+            chrome-build-team: "Goma will be deprecated by the end of January
+            of next year"; Google would "delete support for goma in Chromium
+            builds around the beginning of 2024" and "stop maintaining the
+            goma client and server". Then: <code>gn gen</code> began warning on
+            26 September 2023; the last client roll landed on the 27th; a
+            five-second delay appeared on 23 January 2024;
+            <code>autoninja</code> began exiting for <code>use_goma</code> on
+            Linux and macOS on 13 February, Windows on the 21st; the CIPD
+            package went on 15 April; the
+            <code>use_goma</code> and <code>goma_dir</code> GN args on 15 May,
+            at <code>r1301182</code>; and on 21 May both repositories were
+            emptied to one line: "Goma is not maintained any more, please use
+            reclient instead."
+          </p>
+          <p>
+            Three fossils survive in the tree this post reads. The RBE project
+            list at <code>src/build/config/siso/configure_siso.py</code>:21
+            opens with <code>'goma-foundry-experiments'</code>; the clang
+            release doc at <code>src/docs/updating_clang.md</code>:28 names
+            <code>copy_staging_to_prod_and_goma.sh</code>;
+            <code>src/DEPS</code>:307 pins
+            <code>re_client_version:0.185.0.db415f21-gomaip</code>.
+            <code>use_goma</code> itself appears nowhere
+            <span class="src">from the tree</span>.
+          </p>
+          <p>
+            Two things this section will not claim. The "30 minutes to more
+            than 150 minutes" figure quoted when Goma was open-sourced on
+            9 January 2018 is not a Chrome measurement: its source is a June
+            2017 jumbo thread whose chart caption reads "Time to compile Opera
+            for Mac on one particular build machine"
+            <span class="recon">provenance check</span>. The numbers that would
+            settle whether Goma earned its protocol were never published:
+            fleet size, external user counts, production cache-hit rates, the
+            date <code>goma.chromium.org</code> was switched off. The public
+            record is anecdote and source code; this section is built on the
+            second half.
+          </p>

@@ -1,0 +1,323 @@
+          <h2 id="the-embedder-boundary"><span class="secnum">{{S}}</span>The boundary with the embedder</h2>
+          <p class="lede">
+            Page, frame, window: every noun §04 ended on has a counterpart in
+            the browser process, and the headers that name the pairs are the
+            public API. That API has exactly one intended consumer. As a
+            library interface it explains nothing. As the residue of the three
+            flows that cross a process line — input, navigation, loading — it
+            falls into shape.
+          </p>
+          <p>
+            The contract is sixteen lines of
+            <code>third_party/blink/public/README.md</code>
+            <span class="src">from the tree</span>: "we consider all other
+            files in Blink to be implementation details, which are subject to
+            change at any time without notice" (:4-7). "The primary consumer
+            of this API is Chromium's Content layer" (:9-11). There is no ABI; the API exists "to insulate the
+            rest of the Chromium project from internal changes to Blink"
+            (:16-19). One consumer, compiled together, renegotiable at will.
+          </p>
+          <p>
+            It is "organized into three parts" (:24-28).
+            <code>public/common</code> is shared by browser and renderer, the
+            only one dropping the <code>Web</code> prefix (:30-36, :87-89).
+            <code>public/platform</code> is the abstract sandboxed platform
+            Blink calls <em>down</em> into, centred on the pure-virtual
+            <code>Platform</code> (:38-43).
+            <code>public/web</code> is what the embedder calls <em>into</em>,
+            centred on <code>WebView</code> (:45-49). The fourth is named
+            inside the first: "public
+            <code>.mojom</code> files live in
+            <code>blink/public/mojom</code>" (:34-35).
+          </p>
+          <p>
+            Measured at <code>f288fed6</code>, <code>grep -c virtual</code>
+            returns 110 in
+            <code>public/platform/platform.h</code>, 115 in
+            <code>web_local_frame_client.h</code>, 166 in
+            <code>web_local_frame.h</code>, 69 in <code>web_view.h</code>.
+            <code>WebPreferences</code> is 178 top-level data members, 130 of
+            them <code>bool</code>. <code>public/mojom</code> holds 360
+            <code>.mojom</code> files across 150 directories
+            <span class="src">from the tree</span>.
+          </p>
+
+          <h3>Boot, then a page</h3>
+          <p>
+            <code>RenderThreadImpl::InitializeWebKit</code> constructs a
+            <code>RendererBlinkPlatformImpl</code>, calls
+            <code>blink::Initialize()</code>, then
+            <code>InitializeCompositorThread()</code> unless
+            <code>--disable-threaded-compositing</code>
+            (<code>content/renderer/render_thread_impl.cc</code>:810-851, on
+            <code>main</code>). Order matters: "Must be called on the thread
+            that will be the main thread"
+            (<code>public/web/blink.h</code>:52-61). A page arrives when the
+            browser asks.
+            <code>AgentSchedulingGroup::CreateWebView</code> calls
+            <code>WebView::Create</code>, handing it a
+            <code>PageBroadcast</code> associated receiver and the agent-group
+            scheduler; "The WebView is kept alive as long as the
+            <code>page_handle</code> mojo interface is alive"
+            (<code>public/web/web_view.h</code>:138-155, :103-104).
+          </p>
+          <p>
+            Each browser object has a counterpart.
+            <code>RenderFrameImpl</code> implements
+            <code>blink::WebLocalFrameClient</code>, one of its eight bases
+            (<code>content/renderer/render_frame_impl.h</code>:182-190, on
+            <code>main</code>); inside Blink <code>WebLocalFrameImpl</code>
+            wraps <code>LocalFrame</code>, and
+            <code>LocalFrameClientImpl</code> forwards back out. The seam
+            embedders customise is <code>ContentRendererClient</code>
+            (<code>content/public/renderer/content_renderer_client.h</code>:96-122),
+            where Chrome, <code>content_shell</code> and Android WebView
+            differ — and almost nowhere else.
+            Figure {{fig-mirror}} pairs five.
+          </p>
+
+          <figure class="figure wide" id="fig-mirror">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Five pairings across the process line</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Browser object</th><th>Mojo interface</th><th>Renderer / Blink object</th><th>What crosses</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td><code>RenderViewHostImpl</code></td><td><code>blink.mojom.PageBroadcast</code> — 12 methods</td><td><code>WebView</code> → <code>Page</code></td><td>Lifecycle state, <code>WebPreferences</code></td></tr>
+                  <tr><td><code>RenderFrameHostImpl</code></td><td><code>LocalFrame</code> (57) ↔ <code>LocalFrameHost</code> (77)</td><td><code>RenderFrameImpl</code> → <code>WebLocalFrameImpl</code> → <code>LocalFrame</code></td><td>"handled directly in Blink without passing through content"</td></tr>
+                  <tr><td><code>RenderWidgetHostImpl</code></td><td><code>blink.mojom.WidgetInputHandler</code></td><td><code>WidgetBase</code> → <code>WebFrameWidgetImpl</code></td><td>Events down, result state back</td></tr>
+                  <tr><td><code>NavigationRequest</code></td><td><code>content.mojom.NavigationClient</code></td><td><code>RenderFrameImpl</code> → <code>DocumentLoader</code></td><td>Response head, body pipe, factory bundle</td></tr>
+                  <tr><td><code>RenderFrameHostImpl</code></td><td><code>BrowserInterfaceBroker</code></td><td><code>blink::Platform</code>, frame brokers</td><td>Everything else, one at a time</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Method counts computed over the interface bodies declared at
+              <code>public/mojom/frame/frame.mojom</code>:283-291, :863-871
+              and <code>page/page.mojom</code>:99
+              <span class="src">from the tree</span>; the choice of rows is
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            One subtlety governs it. Mojo "guarantees strict ordering
+            within each message pipe" but not <em>between</em> pipes, which
+            "cannot necessarily share a common FIFO at all times"
+            (<code>docs/mojo_ipc_conversion.md</code>:88-91). Anything ordered
+            with navigation rides a channel-associated interface on the
+            <code>IPC::Channel</code> pipe (:105-116), and in Blink must be
+            posted to
+            <code>kInternalNavigationAssociated = 63</code>: "all
+            AssociatedRemotes/AssociatedReceivers should use this task type"
+            (<code>public/platform/task_type.h</code>:246-252). Ordering is
+            a property of which pipe and which task queue you picked, not of
+            the API.
+          </p>
+
+          <h3>Input</h3>
+          <p>
+            An input event crosses twice, on two threads.
+            <code>RenderWidgetHostImpl::Forward{Mouse,Wheel,Keyboard,Gesture}Event</code>
+            (<code>content/browser/renderer_host/render_widget_host_impl.h</code>:272-276, on
+            <code>main</code>) feeds
+            <code>InputRouterImpl</code>, client of the gesture, wheel, touch
+            and pinch queues and the <code>TouchActionFilter</code>
+            (<code>components/input/input_router_impl.h</code>:47-56, on
+            <code>main</code>), which
+            calls <code>WidgetInputHandler::DispatchEvent</code>. The reply is
+            the ack:
+            <code>(source, updated_latency, state, overscroll?, touch_action?)</code>
+            (<code>public/mojom/input/input_handler.mojom</code>:567-572).
+          </p>
+          <p>
+            The renderer receives it on the compositor thread.
+            <code>WidgetInputHandlerImpl</code> "will live on the compositor
+            thread and proxy events to the main thread … so that events stay
+            in order relative to other events"
+            (<code>platform/widget/input/widget_input_handler_impl.h</code>:26-29, on
+            <code>main</code>).
+            <code>InputHandlerProxy</code> asks <code>cc::InputHandler</code>
+            and returns one of six dispositions, the whole of that thread's
+            authority over an event
+            (<code>input_handler_proxy.h</code>:121-161, on <code>main</code>).
+            <code>DID_HANDLE</code> and <code>DROP_EVENT</code> both end the
+            event here, the second because the compositor "has determined the
+            main thread doesn't care about the event either".
+            <code>DID_NOT_HANDLE</code> forwards, and the browser waits.
+            <code>DID_NOT_HANDLE_NON_BLOCKING</code> forwards too, but "the
+            compositor has determined it shouldn't be cancellable (e.g. the
+            event handler is passive)", so the event is "acked to the browser"
+            before the main thread sees it — the mechanism behind
+            <code>{ passive: true }</code>: a passive listener cannot hold a
+            scroll. <code>DID_NOT_HANDLE_NON_BLOCKING_DUE_TO_FLING</code> is
+            that decision reached from a touchstart during a fling.
+            <code>REQUIRES_MAIN_THREAD_HIT_TEST</code> asks for a second try
+            "with an ElementId provided by a hit test in Blink". Three inputs
+            pick between them: the listener properties Blink pushed up, the
+            element's <code>touch-action</code>, and whether a scroll node is
+            already latched <span class="recon">reconstruction</span>.
+            That settles a contradiction in Chromium's accounts of
+            scrolling: the browser <em>synthesizes</em> the
+            <code>GestureScroll</code> stream, the renderer compositor
+            <em>latches</em> it
+            (<code>cc/input/input_handler.h</code>:301-307):
+          </p>
+<pre><code>  // Selects a ScrollNode to be "latched" for scrolling using the
+  // |scroll_state| start position. The selected node remains latched until the
+  // gesture is ended by a call to ScrollEnd.  Returns SCROLL_STARTED if a node
+  // at the coordinates can be scrolled and was latched, SCROLL_ON_MAIN_THREAD
+  // if the scroll event should instead be delegated to the main thread, or
+  // kScrollUnknown if there is nothing to be scrolled at the given
+  // coordinates.</code></pre>
+          <p>
+            What the compositor will not resolve goes up the
+            <code>MainThreadEventQueue</code> to
+            <code>WebFrameWidgetImpl::HandleInputEvent</code>,
+            <code>blink::EventHandler</code>,
+            <code>EventTarget::DispatchEvent</code> — where
+            <code>EventPath::Initialize</code> runs
+            <code>CalculatePath</code>, <code>CalculateAdjustedTargets</code>
+            (retargeting), and a numbering pass recording the nearest closed
+            shadow tree so <code>composedPath()</code> can hide it
+            (<code>core/dom/events/event_path.cc</code>:90-231). The
+            compositor knew in advance what was there: Blink pushes four
+            <code>EventListenerClass</code> values against four properties,
+            <code>kNone</code> through <code>kBlockingAndPassive</code>
+            (<code>cc/input/event_listener_properties.h</code>:12-34).
+            Figure {{fig-input-path}} draws the route.
+          </p>
+
+          <figure class="figure wide" id="fig-input-path">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One input event, three threads, and an ack that loses information twice</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 -18 980 404" role="img" aria-label="Three horizontal lanes. Browser main thread: RenderWidgetHostImpl forward methods into InputRouterImpl, which calls WidgetInputHandler DispatchEvent. Renderer compositor thread: WidgetInputHandlerImpl, then InputHandlerProxy and cc InputHandler. Renderer main thread: MainThreadEventQueue, then EventHandler and DOM dispatch. A blue ack path returns along the bottom to the browser.">
+                <defs>
+                  <marker id="fig-input-path-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-input-path-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-input-path-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <line x1="0" y1="106" x2="980" y2="106" stroke="#deded9"/>
+                <line x1="0" y1="210" x2="980" y2="210" stroke="#deded9"/>
+
+                <text x="16" y="14" class="svg-lane">BROWSER · MAIN THREAD</text>
+                <text x="16" y="118" class="svg-lane">RENDERER · COMPOSITOR THREAD</text>
+                <text x="16" y="222" class="svg-lane">RENDERER · MAIN THREAD</text>
+
+                <rect x="16" y="24" width="240" height="64" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="30" y="50" class="svg-step">RenderWidgetHostImpl</text>
+                <text x="30" y="70" class="svg-sub">Forward{Mouse,Wheel,Key,Gesture}</text>
+                <rect x="286" y="24" width="240" height="64" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="300" y="50" class="svg-step">InputRouterImpl</text>
+                <text x="300" y="70" class="svg-sub">queues + TouchActionFilter</text>
+
+                <rect x="556" y="128" width="180" height="64" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="570" y="154" class="svg-step">WidgetInputHandlerImpl</text>
+                <text x="570" y="174" class="svg-sub">bound here to keep order</text>
+                <rect x="756" y="128" width="190" height="64" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="770" y="154" class="svg-step">InputHandlerProxy → cc</text>
+                <text x="770" y="174" class="svg-sub">latches · 6 dispositions</text>
+
+                <rect x="556" y="232" width="180" height="64" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="570" y="258" class="svg-step">MainThreadEventQueue</text>
+                <text x="570" y="278" class="svg-sub">rAF-aligned or not</text>
+                <rect x="756" y="232" width="190" height="64" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="770" y="258" class="svg-step">EventHandler → DOM</text>
+                <text x="770" y="278" class="svg-sub">EventPath → listeners</text>
+
+                <line x1="256" y1="56" x2="286" y2="56" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-input-path-arr-ink)"/>
+                <path d="M526 60 C560 60 540 138 556 150" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-input-path-arr-ink)"/>
+                <text x="534" y="104" class="svg-note">WidgetInputHandler::DispatchEvent</text>
+                <line x1="736" y1="160" x2="756" y2="160" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-input-path-arr-ink)"/>
+                <line x1="646" y1="192" x2="646" y2="232" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-input-path-arr-ink)"/>
+                <text x="656" y="216" class="svg-note">DID_NOT_HANDLE</text>
+                <line x1="736" y1="264" x2="756" y2="264" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-input-path-arr-ink)"/>
+
+                <line x1="520" y1="250" x2="520" y2="172" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-input-path-arr-purple)"/>
+                <text x="508" y="206" text-anchor="end" class="svg-note">4 listener classes × 4 properties</text>
+
+                <path d="M946 160 L966 160 L966 356 L40 356 L40 92" fill="none" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-input-path-arr-blue)"/>
+                <line x1="946" y1="264" x2="966" y2="264" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="500" y="348" text-anchor="middle" class="svg-note">ack: DispatchEventResult (4) → WebInputEventResult (4) → InputEventResultState (7)</text>
+
+                <text x="56" y="316" class="svg-note">mousedown · mousemove · mouseleave: always kHandledSystem</text>
+                <text x="56" y="332" class="svg-note">click from pointerup: result discarded, never merged</text>
+
+                <text x="490" y="378" text-anchor="middle" class="svg-note">thick black = the event travelling · thin blue = the ack returning · dashed purple = state Blink pushes to cc</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Boxes, threads and enum sizes come from files cited here
+              <span class="src">from the tree</span>; the layout is
+              <span class="recon">reconstruction</span>. The notes under the
+              main-thread lane are where the ack stops being true.
+            </p>
+          </figure>
+
+          <p>
+            The ack narrows twice: <code>DispatchEventResult</code> →
+            <code>WebInputEventResult</code> (4 values) →
+            <code>InputEventResultState</code> (7); the browser mostly reads
+            one bit
+            (<code>public/platform/web_input_event_result.h</code>:10-20;
+            <code>public/mojom/input/input_event_result.mojom</code>:16-31).
+            Two losses. <code>WidgetEventHandler::HandleInputEvent</code>
+            returns <code>kHandledSystem</code> for every
+            <code>mousedown</code>, <code>mousemove</code> and
+            <code>mouseleave</code> whatever script did, under a "FIXME:
+            WebKit seems to always return false on mouse events processing
+            methods" (<code>core/input/widget_event_handler.cc</code>:53-121).
+            And the <code>click</code> from <code>pointerup</code> has its
+            result discarded, while the mouse event just above it is merged
+            (<code>core/input/pointer_event_manager.cc</code>:1220-1227, :1272-1286)
+            — so <code>preventDefault</code> on a click never reaches the
+            <code>mouseup</code> ack. The browser calls the
+            renderer hung after 15 seconds on desktop, 5 on Android
+            (<code>input::kHungRendererDelay</code>,
+            <code>components/input/input_constants.h</code>:12-21, on
+            <code>main</code>).
+          </p>
+
+          <h3>Navigation, then loading</h3>
+          <p>
+            Navigation crosses outward first:
+            <code>FrameLoader::StartNavigation</code> reaches
+            <code>WebLocalFrameClient::BeginNavigation</code>, which the
+            embedder may refuse — "totally valid to ignore the request and
+            abandon the navigation entirely"
+            (<code>public/web/web_local_frame_client.h</code>:343-361).
+            Usually it becomes <code>FrameHost::BeginNavigation</code>; a
+            <code>NavigationRequest</code> moves through a twelve-value
+            <code>NavigationState</code> machine to <code>DID_COMMIT</code>
+            (<code>content/browser/renderer_host/navigation_request.h</code>:150-210,
+            on <code>main</code>) and calls
+            <code>NavigationClient::CommitNavigation</code>; back down,
+            <code>RenderFrameImpl::CommitNavigation</code> →
+            <code>WebNavigationControl::CommitNavigation</code>
+            (<code>public/web/web_navigation_control.h</code>:43-50) →
+            <code>DocumentLoader::CommitNavigation</code>, which creates the
+            <code>Document</code>, <code>DocumentParser</code> and
+            <code>LocalDOMWindow</code>. The renderer's reply is the event:
+            the browser's "receipt of this acknowledgement … marks the
+            authoritative <em>commit</em> time"
+            (<code>docs/navigation.md</code>:82-88).
+          </p>
+          <p>
+            Loading is renderer-driven: a <code>ResourceFetcher</code> per
+            <code>DocumentLoader</code>, a <code>ResourceLoader</code> per
+            <code>Resource</code>, a <code>blink::URLLoader</code> over a
+            factory from the <code>ChildURLLoaderFactoryBundle</code> handed
+            over at commit — on unfreezable task runners, because "having
+            frozen loaders for a long time confuses the network service"
+            (<code>renderer/platform/loader/README.md</code>:5-24). The
+            browser decided where the document could go; the renderer fetches
+            the rest.
+          </p>

@@ -1,0 +1,460 @@
+          <h2 id="bindings-and-script"><span class="secnum">{{S}}</span>Bindings, contexts, and running script</h2>
+          <p class="lede">
+            Those two front doors are not the only generated surface in this
+            tree, or the largest. Blink's JavaScript-facing surface is
+            compiled, not written. The
+            build reads 2,242 <code>.idl</code> files — 892 core plus 1,350
+            modules — and emits 5,862 generated C++ paths. The question that
+            follows, what a <code>v8::Context</code> costs, was also answered
+            at build time and frozen into a blob.
+          </p>
+
+          <h3>The compiler</h3>
+          <p>
+            The input lists are <code>idl_in_core.gni</code> and
+            <code>idl_in_modules.gni</code>, declared at
+            <code>idl_in_core.gni</code>:7 and :874
+            <span class="src">from the tree</span>. A third list,
+            <code>idl_in_extensions_webview.gni</code>, adds four more when
+            <code>use_blink_extensions_webview</code> is on. The tree holds 893 core
+            <code>.idl</code> files. The extra one is
+            <code>core/css/css_nested_declarations_rule.idl</code>, which
+            appears in no build list — found by diffing
+            <code>git ls-files</code> against the <code>.gni</code>
+            <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            Three programs turn those into C++.
+            <code>collect_idl_files.py</code> parses each file with
+            <code>//tools/idl_parser</code> into <code>IDLNode</code> ASTs and
+            pickles them per component.
+            <code>build_web_idl_database.py</code> takes ASTs to mutable IRs
+            to immutable public objects, saved as one
+            <code>web_idl_database.pickle</code>
+            (<code>scripts/web_idl/README.md</code>:54-89).
+            <code>generate_bindings.py</code> reads that pickle and writes
+            <code>v8_*.{h,cc}</code> — split into eleven per-kind GN actions
+            (async iterator, callback function, callback interface,
+            dictionary, enumeration, interface, namespace, observable array,
+            sync iterator, typedef, union) because they "run in parallel on
+            RBE, each on its own worker, instead of generating all types in a
+            single monolithic action" (<code>bindings/BUILD.gn</code>:186-292).
+            Out come 2,243 core and 3,619 modules paths.
+          </p>
+          <p>
+            The middle step is a fixed phase order, and the driver prints it
+            in comments. From
+            <code>bindings/scripts/web_idl/idl_compiler.py</code>:99-152,
+            abridged:
+          </p>
+<pre><code>def build_database(self):
+    ...
+    # Merge partial definitions.
+    self._merge_partial_interface_likes()
+    self._merge_partial_dictionaries()
+    # Merge mixins.
+    self._merge_interface_mixins()
+    # Process inheritances.
+    self._process_interface_inheritances()
+    # Assign v8::CppHeapPointerTag values
+    self._assign_tags()
+    # Make groups of overloaded functions including inherited ones.
+    self._group_overloaded_functions()
+    self._calculate_group_exposure()
+    ...
+    return Database(self._db)</code></pre>
+          <p>
+            One extra input makes this more than a transliteration. The
+            database action is passed
+            <code>--runtime_enabled_features ../platform/runtime_enabled_features.json5</code>
+            (<code>bindings/BUILD.gn</code>:100-134), so the compiler can ask
+            <code>is_context_dependent()</code> — true when a feature is an
+            origin trial or carries
+            <code>browser_process_read_write_access</code>
+            (<code>web_idl/runtime_enabled_features.py</code>:47-73). That
+            answer routes each property into one of three installers. Every
+            generated <code>V8Foo</code> carries a
+            <code>WrapperTypeInfo</code>, an
+            <code>InstallInterfaceTemplate</code>, and the three installers
+            named at <code>bind_gen/interface.py</code>:4312-4320 —
+            unconditional, context-independent, context-dependent — plus an
+            <code>InstallPropertiesPerFeature(ScriptState*, mojom::blink::OriginTrialFeature)</code>
+            for properties that appear when a trial switches on mid-life
+            (:7421-7424). Figure {{fig-idl-pipeline}} lays the three programs
+            out in dependency order and opens one generated class.
+          </p>
+
+          <figure class="figure wide" id="fig-idl-pipeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">From <code>.idl</code> to <code>v8_*.cc</code>, and what one generated class contains</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 -14 1120 416" role="img" aria-label="A left-to-right pipeline of six boxes: IDL sources, collect_idl_files.py, per-component pickles, build_web_idl_database.py, web_idl_database.pickle, and generate_bindings.py in eleven GN actions, with runtime_enabled_features.json5 feeding the database step and the generated v8 files hanging off the last step. Below, one generated V8Foo class is exploded into six members: WrapperTypeInfo, InstallInterfaceTemplate, and four installers.">
+                <defs>
+                  <marker id="fig-idl-pipeline-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-idl-pipeline-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+
+                <text x="0" y="2" class="svg-lane">BUILD TIME · third_party/blink/renderer/bindings</text>
+
+                <rect x="0" y="24" width="160" height="64" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="12" y="47" class="svg-step">*.idl</text>
+                <text x="12" y="65" class="svg-sub">892 core</text>
+                <text x="12" y="81" class="svg-sub">1,350 modules</text>
+                <line x1="164" y1="56" x2="188" y2="56" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-idl-pipeline-arr-ink)"/>
+
+                <rect x="192" y="24" width="160" height="64" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="204" y="47" class="svg-step">collect_idl_files</text>
+                <text x="204" y="65" class="svg-sub">//tools/idl_parser</text>
+                <text x="204" y="81" class="svg-sub">→ IDLNode ASTs</text>
+                <line x1="356" y1="56" x2="380" y2="56" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-idl-pipeline-arr-ink)"/>
+
+                <rect x="384" y="24" width="160" height="64" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="396" y="47" class="svg-step">*.pickle</text>
+                <text x="396" y="65" class="svg-sub">one per component</text>
+                <text x="396" y="81" class="svg-sub">web_idl.AstGroup</text>
+                <line x1="548" y1="56" x2="572" y2="56" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-idl-pipeline-arr-ink)"/>
+
+                <rect x="576" y="24" width="160" height="64" rx="8" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="588" y="47" class="svg-step">build_web_idl_</text>
+                <text x="588" y="63" class="svg-step">database</text>
+                <text x="588" y="81" class="svg-sub">IRs, phase by phase</text>
+                <line x1="740" y1="56" x2="764" y2="56" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-idl-pipeline-arr-ink)"/>
+
+                <rect x="768" y="24" width="160" height="64" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="780" y="47" class="svg-step">web_idl_database</text>
+                <text x="780" y="63" class="svg-step">.pickle</text>
+                <text x="780" y="81" class="svg-sub">immutable objects</text>
+                <line x1="932" y1="56" x2="956" y2="56" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-idl-pipeline-arr-ink)"/>
+
+                <rect x="960" y="24" width="160" height="64" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="972" y="47" class="svg-step">generate_bindings</text>
+                <text x="972" y="65" class="svg-sub">11 GN actions</text>
+                <text x="972" y="81" class="svg-sub">parallel on RBE</text>
+
+                <rect x="380" y="124" width="356" height="46" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="394" y="145" class="svg-step">runtime_enabled_features.json5</text>
+                <text x="394" y="162" class="svg-sub">origin trial? browser_process_read_write_access?</text>
+                <line x1="656" y1="122" x2="656" y2="92" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-idl-pipeline-arr-blue)"/>
+
+                <rect x="768" y="124" width="352" height="46" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="782" y="145" class="svg-step">gen/…/bindings/{core,modules}/v8/v8_*.{h,cc}</text>
+                <text x="782" y="162" class="svg-sub">2,243 core + 3,619 modules paths</text>
+                <line x1="1040" y1="90" x2="1040" y2="122" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-idl-pipeline-arr-ink)"/>
+
+                <text x="0" y="212" class="svg-lane">ONE GENERATED V8Foo, EXPLODED</text>
+
+                <rect x="0" y="226" width="352" height="58" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="249" class="svg-step">WrapperTypeInfo</text>
+                <text x="14" y="267" class="svg-sub">the class's identity in every wrapper</text>
+                <rect x="384" y="226" width="352" height="58" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="398" y="249" class="svg-step">InstallInterfaceTemplate</text>
+                <text x="398" y="267" class="svg-sub">per-isolate v8::FunctionTemplate</text>
+                <rect x="768" y="226" width="352" height="58" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="782" y="249" class="svg-step">InstallUnconditionalProperties</text>
+                <text x="782" y="267" class="svg-sub">identical in every context</text>
+
+                <rect x="0" y="296" width="352" height="58" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="14" y="319" class="svg-step">InstallContextIndependentProperties</text>
+                <text x="14" y="337" class="svg-sub">settled once, per isolate</text>
+                <rect x="384" y="296" width="352" height="58" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="398" y="319" class="svg-step">InstallContextDependentProperties</text>
+                <text x="398" y="337" class="svg-sub">re-decided for each v8::Context</text>
+                <rect x="768" y="296" width="352" height="58" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="782" y="319" class="svg-step">InstallPropertiesPerFeature</text>
+                <text x="782" y="337" class="svg-sub">(ScriptState*, OriginTrialFeature)</text>
+
+                <text x="0" y="380" class="svg-note">"Context dependent" is decided at build time: an origin-trial or browser-controlled [RuntimeEnabled] feature, or [ContextEnabled],</text>
+                <text x="0" y="396" class="svg-note">[SecureContext], [CrossOriginIsolated], [IsolatedContext], [InjectionMitigated]</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Programs, file names and the eleven actions are
+              <span class="src">from the tree</span>; the counts are grep
+              totals over the four <code>.gni</code> lists at
+              <code>f288fed6</code>. Box order is the data dependency in
+              <code>BUILD.gn</code>, not a measured timeline — the eleven
+              actions are concurrent, and nothing here is drawn to duration.
+            </p>
+          </figure>
+
+          <h3>The context</h3>
+          <p>
+            A <code>ScriptState</code> is "in a 1:1 relationship with
+            <code>v8::Context</code>", and the header states the rule that
+            follows without hedging: "you cannot store ScriptState on a DOM
+            object that has an IDL interface because the DOM object can be
+            accessed from multiple worlds", and a leak between worlds means
+            "leaking any JavaScript objects from one Chrome extension to
+            another Chrome extension, which is a severe security bug"
+            (main <code>platform/bindings/script_state.h</code>:34-41,71-78)
+            <span class="src">from the tree</span>. The count is arithmetic:
+            N frames × M worlds, "one context is created for each pair of
+            (frame, world)" (<code>V8BindingDesign.md</code>:185-199).
+            Creation is lazy in one direction only —
+            <code>WindowProxyManager</code>'s constructor builds the main-world
+            proxy in its initializer list, isolated worlds live in a
+            <code>HeapHashMap&lt;int, Member&lt;WindowProxy&gt;&gt;</code>
+            filled on first lookup, and <code>GetWindowProxy()</code> calls
+            <code>InitializeIfNeeded()</code>, so merely asking for a world's
+            proxy creates its context
+            (<code>window_proxy_manager.h</code>:51-55,65,80-81;
+            <code>.cc</code>:97-106,125-140).
+          </p>
+          <p>
+            The global that context gets is a split window: V8's
+            <code>JSGlobalProxy</code>, plus a prototype chain Blink wires by
+            hand. The header draws it, at
+            <code>bindings/core/v8/window_proxy.h</code>:105-125:
+          </p>
+<pre><code>// ====== LocalWindowProxy ======
+// Since a LocalWindowProxy can represent a same-origin or cross-origin frame,
+// the entire prototype chain must be available:
+//
+//   outer global proxy
+//     -- has prototype --&gt; inner global object
+//     -- has prototype --&gt; Window.prototype
+//     -- has prototype --&gt; WindowProperties [1]
+//     -- has prototype --&gt; EventTarget.prototype
+//     -- has prototype --&gt; Object.prototype
+//     -- has prototype --&gt; null
+//
+// [1] WindowProperties is the named properties object of the Window interface.
+//
+// ====== RemoteWindowProxy ======
+// Since a RemoteWindowProxy only represents a cross-origin frame, it has a much
+// simpler prototype chain.
+//
+//   outer global proxy
+//     -- has prototype --&gt; inner global object
+//     -- has prototype --&gt; null</code></pre>
+          <p>
+            Seven entries against three. A <code>RemoteWindowProxy</code>
+            needs no more, because any access "will fail the security check,
+            by definition" and is redirected through the cross-origin
+            interceptors (:127-129). Six lifecycle states track the proxy
+            across that (:240-253). The inner global is 1:1 with a Document
+            with exactly one documented exception — the initial empty
+            document, reused if the new Document is same-origin (:64-68) —
+            and <code>ShouldReuseDOMWindow()</code> is that exception in code:
+            initial empty document, <code>CanAccess</code>, matching
+            cross-origin-isolation keys (main
+            <code>core/loader/document_loader.cc</code>:2663-2703). Its caller
+            explains why anyone would want it: "when a script calls
+            window.open("..."), the browser gives JavaScript a window
+            synchronously but kicks off the load in the window
+            asynchronously. Web sites expect that modifications that they make
+            to the window object synchronously won't be blown away when the
+            network load commits" (:2852-2859).
+          </p>
+          <p>
+            What all of this costs was settled in 2017. The V8 context
+            snapshot is a build-time blob of exactly two contexts
+            (<code>kNumOfWorlds = 2</code>: main world with a cached
+            <code>HTMLDocument</code> wrapper, one isolated world) plus the
+            <code>FunctionTemplate</code>s of six interfaces per world —
+            Window, WindowProperties, HTMLDocument, Document, Node,
+            EventTarget, which is the Window prototype chain plus the document
+            chain (<code>modules/v8/v8_context_snapshot_impl.cc</code>:62-92,117-149).
+            It is taken with stable, experimental and test features all turned
+            off, because "it's easier to add properties than removing ones"
+            (:418-452), and the generator is linked with identical-code
+            folding off: "ICF breaks 1:1 mappings of the external references
+            for V8 snapshot" (main
+            <code>tools/v8_context_snapshot/BUILD.gn</code>:113-127). The
+            intent to implement claimed context initialization
+            "1.6-3 times faster" <span class="src">from the docs</span>; the
+            1.6 MB it adds to an Android binary is why it is desktop-only.
+            Figure {{fig-split-window}} holds the two chains against each
+            other and shows which half of the pair a navigation replaces.
+          </p>
+
+          <figure class="figure wide" id="fig-split-window">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One proxy, many globals: what survives a navigation and what does not</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 -14 1120 420" role="img" aria-label="Three panels. Left: one outer global proxy sits above two inner global objects, one for a detached Document A still held by closures and one for the current Document B. Middle: the seven-object LocalWindowProxy prototype chain beside the three-object RemoteWindowProxy chain. Right: a grid of frames by worlds, with the main-world column eager and isolated-world cells created on demand.">
+                <defs>
+                  <marker id="fig-split-window-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-split-window-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="0" y="2" class="svg-lane">ONE FRAME, TWO DOCUMENTS</text>
+                <rect x="0" y="24" width="352" height="50" rx="8" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="14" y="45" class="svg-step">outer global proxy</text>
+                <text x="14" y="63" class="svg-sub">survives navigation · the frame's identity</text>
+                <line x1="88" y1="76" x2="88" y2="110" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4"/>
+                <line x1="264" y1="76" x2="264" y2="110" stroke="#765b98" stroke-width="1.5" marker-end="url(#fig-split-window-arr-purple)"/>
+                <rect x="0" y="112" width="166" height="62" rx="8" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+                <text x="14" y="134" class="svg-step">inner global A</text>
+                <text x="14" y="151" class="svg-sub">Document A · detached</text>
+                <text x="14" y="167" class="svg-sub">closures still hold it</text>
+                <rect x="186" y="112" width="166" height="62" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="200" y="134" class="svg-step">inner global B</text>
+                <text x="200" y="151" class="svg-sub">Document B · current</text>
+                <text x="200" y="167" class="svg-sub">globals live here</text>
+                <text x="0" y="196" class="svg-note">Reused only for the initial empty document, same-origin.</text>
+
+                <text x="384" y="2" class="svg-lane">PROTOTYPE CHAINS</text>
+                <rect x="384" y="24" width="166" height="26" rx="5" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="396" y="42" class="svg-sub">outer global proxy</text>
+                <rect x="384" y="56" width="166" height="26" rx="5" fill="#ece6f3" stroke="#765b98"/>
+                <text x="396" y="74" class="svg-sub">inner global object</text>
+                <rect x="384" y="88" width="166" height="26" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="396" y="106" class="svg-sub">Window.prototype</text>
+                <rect x="384" y="120" width="166" height="26" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="396" y="138" class="svg-sub">WindowProperties</text>
+                <rect x="384" y="152" width="166" height="26" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="396" y="170" class="svg-sub">EventTarget.prototype</text>
+                <rect x="384" y="184" width="166" height="26" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="396" y="202" class="svg-sub">Object.prototype</text>
+                <rect x="384" y="216" width="166" height="26" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="396" y="234" class="svg-sub">null</text>
+                <text x="384" y="258" class="svg-num">7</text>
+                <text x="404" y="258" class="svg-sub">LocalWindowProxy</text>
+
+                <rect x="570" y="24" width="166" height="26" rx="5" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="582" y="42" class="svg-sub">outer global proxy</text>
+                <rect x="570" y="56" width="166" height="26" rx="5" fill="#ece6f3" stroke="#765b98"/>
+                <text x="582" y="74" class="svg-sub">inner global object</text>
+                <rect x="570" y="88" width="166" height="26" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="582" y="106" class="svg-sub">null</text>
+                <rect x="570" y="120" width="166" height="90" rx="5" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="582" y="142" class="svg-sub">every access is</text>
+                <text x="582" y="159" class="svg-sub">redirected through the</text>
+                <text x="582" y="176" class="svg-sub">cross-origin interceptors:</text>
+                <text x="582" y="196" class="svg-sub">it fails by definition</text>
+                <text x="570" y="258" class="svg-num">3</text>
+                <text x="590" y="258" class="svg-sub">RemoteWindowProxy</text>
+
+                <text x="768" y="2" class="svg-lane">N FRAMES × M WORLDS = N×M CONTEXTS</text>
+                <rect x="768" y="24" width="112" height="26" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="780" y="42" class="svg-sub">main world</text>
+                <rect x="886" y="24" width="112" height="26" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="898" y="42" class="svg-sub">isolated 1</text>
+                <rect x="1004" y="24" width="112" height="26" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1016" y="42" class="svg-sub">isolated 2</text>
+
+                <text x="768" y="76" class="svg-sub">frame A</text>
+                <rect x="768" y="84" width="112" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="780" y="106" class="svg-sub">eager</text>
+                <rect x="886" y="84" width="112" height="34" rx="5" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+                <text x="898" y="106" class="svg-sub">on demand</text>
+                <rect x="1004" y="84" width="112" height="34" rx="5" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+                <text x="1016" y="106" class="svg-sub">on demand</text>
+
+                <text x="768" y="146" class="svg-sub">frame B</text>
+                <rect x="768" y="154" width="112" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="780" y="176" class="svg-sub">eager</text>
+                <rect x="886" y="154" width="112" height="34" rx="5" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+                <text x="898" y="176" class="svg-sub">on demand</text>
+                <rect x="1004" y="154" width="112" height="34" rx="5" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+                <text x="1016" y="176" class="svg-sub">on demand</text>
+
+                <text x="768" y="216" class="svg-sub">frame C</text>
+                <rect x="768" y="224" width="112" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="780" y="246" class="svg-sub">eager</text>
+                <rect x="886" y="224" width="112" height="34" rx="5" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+                <text x="898" y="246" class="svg-sub">on demand</text>
+                <rect x="1004" y="224" width="112" height="34" rx="5" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+                <text x="1016" y="246" class="svg-sub">on demand</text>
+                <text x="768" y="286" class="svg-note">Two of these shapes ship pre-built in v8_context_snapshot.bin.</text>
+
+                <rect x="0" y="312" width="1120" height="62" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="334" class="svg-lane">SIX LIFECYCLE STATES</text>
+                <text x="14" y="356" class="svg-sub">kContextIsUninitialized · kContextIsInitialized · kV8MemoryIsForciblyPurged · kGlobalObjectIsDetached · kFrameIsDetached · kFrameIsDetachedAndV8MemoryIsPurged</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Chains, state names and the eager/lazy split are
+              <span class="src">from the tree</span>
+              (<code>window_proxy.h</code>:64-68,105-129,240-253;
+              <code>window_proxy_manager.cc</code>:97-106,125-140). The 3×3
+              grid is an illustration at an arbitrary size
+              <span class="recon">reconstruction</span>; real N and M are
+              whatever the page and its extensions ask for.
+            </p>
+          </figure>
+
+          <h3>The script</h3>
+          <p>
+            Running a <code>&lt;script&gt;</code> is a queue with a compiler
+            decision at the end. <code>ScriptLoader::PrepareScript</code>
+            produces a <code>ClassicPendingScript</code> whose ready states run
+            <code>kWaitingForResource</code> →
+            <code>kWaitingForCacheConsumer</code> → <code>kReady</code>
+            (main <code>core/script/script_loader.cc</code>:512,864,999;
+            <code>core/script/classic_pending_script.h</code>:93-100);
+            <code>PendingScript::ExecuteScriptBlockInternal</code> pushes
+            <code>document.currentScript</code> and calls
+            <code>RunScript()</code> under a comment that says what it is:
+            "This is where the script is compiled and actually executed"
+            (main <code>core/script/pending_script.cc</code>:299-315). That
+            reaches <code>V8ScriptRunner::CompileAndRunScript</code>
+            (<code>bindings/core/v8/v8_script_runner.cc</code>:534),
+            which computes a tuple of <code>(CompileOptions,
+            ProduceCacheOptions, NoCacheReason)</code> (:613) and runs the
+            result inside a <code>V8RunMicrotasksScope</code> behind a depth
+            guard: <code>kMaxRecursionDepth = 44</code>, "arrived at
+            arbitrarily", crbug.com/449744
+            (<code>v8_script_runner.cc</code>:76-78,484-497).
+          </p>
+          <p>
+            Two decisions hang off that tuple. The first is whether V8 is
+            handed the source as a stream, and
+            <code>ResourceScriptStreamer::TryStartStreamingTask</code> lists
+            its refusals in the comment above itself: the encoding is
+            "invalid (not UTF-8 or one-byte data)", the script is "too small
+            to check for a byte-order
+            marker" — literally fewer than
+            <code>kMaximumLengthOfBOM = 4</code> bytes buffered — "a code
+            cache for this script already", and "V8 failed to create a script
+            streamer" <span class="src">from the tree</span>
+            (<code>script_streamer.cc</code>:914-927, one early return each at
+            :982, :1006 and :1073) — the third meaning streaming and the code
+            cache are alternatives, not a stack. Refusals are a histogram-stable enum:
+            <code>NotStreamingReason</code> has 30 numbered values, from
+            <code>kAlreadyLoaded</code> to
+            <code>kNonModuleWithWasmMimeType</code>, under a comment warning
+            that "the enum values were used in histograms and thus do not
+            change existing enum values when modifying"
+            (<code>script_streamer.h</code>:57-95); with
+            <code>kBackgroundResourceFetch</code>
+            <code>ENABLED_BY_DEFAULT</code> and
+            <code>background-script-response-processor</code> true (main
+            <code>blink/common/features.cc</code>:201-211), streaming now
+            starts from the loader's background thread rather than the main
+            one. The code cache is Blink-managed metadata on the HTTP-cache
+            entry, tagged code (0), timestamp (1) or compile hints (2) in
+            <code>kCacheTagKindSize = 2</code> bits beside V8's
+            <code>CachedDataVersionTag</code>
+            (<code>v8_code_cache.cc</code>:36-50). What
+            <code>GetCompileOptionsInternal</code> does with it is a ladder of
+            early returns (:352-526). No handler, caching off, or a non-inline
+            script shorter than
+            <code>kMinimalCodeLengthForNonInlineScript = 1024</code>
+            characters (:360, tested at :454-460): nothing. A cache entry
+            already present: <code>kConsumeCodeCache</code> (:466-471).
+            Otherwise a timestamp decides — hot means younger than
+            <code>kHotHours = 72</code> (:61-69) — a cold or missing one
+            returning <code>ProduceCacheOptions::kSetTimeStamp</code>
+            (:489-515) and a hot one <code>kProduceCodeCache</code>
+            (:519-526). That is three visits: the first writes a timestamp and
+            nothing else, a second within 72 hours writes the cache, a third
+            consumes it. Production runs after
+            execution — <code>GetCompileOptions</code> at
+            <code>v8_script_runner.cc</code>:613,
+            <code>RunCompiledScript</code> at :630,
+            <code>ProduceCache</code> at :667 — so the functions V8 compiled
+            lazily during that second run are the ones in the blob, and a
+            script loaded once and never again costs a timestamp.
+          </p>
+          <p>
+            A DOM call lands in a function generated at build time, installed into a context whose
+            shape was frozen into a blob at build time, invoked under a
+            counter that stops at 44. Almost nothing on that path was typed
+            by a person.
+          </p>
