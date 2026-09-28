@@ -1,0 +1,2356 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="How simple mobile games model their state — lazy timers, per-player documents, command sourcing, replays — and how the same structures produce the retention loop."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/game-timers/" />
+    <meta property="og:title" content="Nothing Runs While You're Gone" />
+    <meta property="og:description" content="Clash of Clans and its relatives store a village as a few kilobytes, run nothing in the background, resolve every timer lazily on login, and replay battles from a snapshot plus a command list. This note works through those structures, shows why they are orders of magnitude cheaper than a tick loop, and then argues that the same timestamp that makes the backend cheap is the appointment that brings the player back — with an honest section on where that becomes extractive." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/game-timers/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Nothing Runs While You're Gone" />
+    <meta name="twitter:description" content="The cheapest way to store a mobile game is a timestamp. So is the strongest way to schedule a player's return. A short note on why those are the same design." />
+    <title>Nothing Runs While You're Gone — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · One object, two jobs</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#one-object-two-jobs">01 · One object, two jobs</a>
+        <a class="toc-parent" href="#the-village-is-a-document">02 · The village is a small document</a>
+        <a class="toc-parent" href="#lazy-timers">03 · Nothing runs while you are gone</a>
+        <a class="toc-parent" href="#one-player-one-actor">04 · One player, one actor</a>
+        <a class="toc-parent" href="#commands-not-state">05 · Commands, not state</a>
+        <a class="toc-parent" href="#the-loops">06 · Loops inside loops</a>
+        <a class="toc-parent" href="#the-timer-economy">07 · The timer economy</a>
+        <a class="toc-parent" href="#where-it-turns">08 · Where it turns extractive</a>
+        <a class="toc-parent" href="#what-to-steal">09 · What the rest of us should steal</a>
+        <a class="toc-parent" href="#sources">10 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#one-object-two-jobs">01 · One object, two jobs</a>
+        <a href="#the-village-is-a-document">02 · A small document</a>
+        <a href="#lazy-timers">03 · Lazy timers</a>
+        <a href="#one-player-one-actor">04 · One player, one actor</a>
+        <a href="#commands-not-state">05 · Commands, not state</a>
+        <a href="#the-loops">06 · Loops inside loops</a>
+        <a href="#the-timer-economy">07 · The timer economy</a>
+        <a href="#where-it-turns">08 · Where it turns</a>
+        <a href="#what-to-steal">09 · What to steal</a>
+        <a href="#sources">10 · Sources</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Product Engineering</p>
+        <h1>Nothing Runs While You're Gone<span class="status-pill">Note</span></h1>
+        <p class="dek">
+          A build timer in Clash of Clans is one integer on one row. It is also the cheapest server design anyone has found for a game with a hundred million players, and the mechanism that decides when you next open the app. This is a short note on how the two halves are the same object: the state model that makes these games nearly free to run is the state model that makes them hard to put down — and where that stops being a fair trade.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 28 September 2026 · Inferred from shipped behaviour and public talks, not from anyone's source tree</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#one-object-two-jobs">One object, two jobs</a></li>
+          <li><a href="#the-village-is-a-document">The village is a small document</a></li>
+          <li><a href="#lazy-timers">Nothing runs while you are gone</a></li>
+          <li><a href="#one-player-one-actor">One player, one actor</a></li>
+          <li><a href="#commands-not-state">Commands, not state</a></li>
+          <li><a href="#the-loops">Loops inside loops</a></li>
+          <li><a href="#the-timer-economy">The timer economy</a></li>
+          <li><a href="#where-it-turns">Where it turns extractive</a></li>
+          <li><a href="#what-to-steal">What the rest of us should steal</a></li>
+          <li><a href="#sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              I have not seen any of these games' source. <span class="src">from the record</span>
+              marks something publicly documented or directly observable in a shipped client — a
+              published talk, a stated design, behaviour anyone can reproduce by playing.
+              <span class="recon">reconstruction</span> marks mechanism I have inferred from that
+              behaviour, which is a guess with reasons and may be wrong in its details.
+              <span class="recon">computed here</span> marks arithmetic done for this page from the
+              assumptions printed beside it. Where a number would have to come from a company's
+              internal dashboard, I have left it out rather than invent it.
+            </p>
+          </div>
+
+          <h2 id="one-object-two-jobs"><span class="secnum">01</span>One object, two jobs</h2>
+
+          <p class="lede">
+            When you start an upgrade in Clash of Clans, almost nothing happens. A
+            row acquires a field: <code>finish_at</code>, one integer, some seconds in
+            the future. No job is enqueued. No worker wakes up. Nothing on any server
+            will think about your barracks again until you come back and look at it.
+          </p>
+
+          <p>
+            That single field is doing two jobs at once, and the argument of this note
+            is that they are not really two.
+          </p>
+
+          <p>
+            To the backend, <code>finish_at</code> is the cheapest possible
+            representation of work in progress. It replaces a queue, a scheduler and a
+            worker pool with arithmetic performed on read. It is why a game with a
+            hundred million installs can keep every active player's entire world in
+            memory on a rack of ordinary machines, and why the servers are close to
+            idle while most of the player base is asleep.
+          </p>
+
+          <p>
+            To the player, the same field is an appointment. It is the answer to
+            "when should I open this again?", and it is the content of the push
+            notification that asks. The game's whole rhythm — the reason you check in
+            at lunch, the reason a three-day upgrade feels different from a
+            four-hour one — is a set of timestamps chosen by a designer.
+          </p>
+
+          <figure class="figure" id="fig-thesis">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">The same field, read from both sides</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 300" role="img" aria-label="A single database row containing a building id, a level and a finish-at timestamp, with an arrow to the left reading it as a server-side saving — no queue, no worker, state computed on read — and an arrow to the right reading it as a player-facing appointment: a countdown, a notification, and a session.">
+                <defs>
+                  <marker id="th-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <rect x="320" y="110" width="360" height="72" rx="8" fill="#f7e3c8" stroke="#d98226" stroke-width="2.2"/>
+                <text x="340" y="140" class="svg-sub">building 41 · level 7 →</text>
+                <text x="340" y="166" class="svg-sub">finish_at = 1790104320</text>
+                <text x="500" y="98" text-anchor="middle" class="svg-lane" style="fill:#d98226">ONE FIELD</text>
+
+                <line x1="312" y1="146" x2="244" y2="146" stroke="#252525" stroke-width="2" marker-end="url(#th-arr)"/>
+                <line x1="688" y1="146" x2="756" y2="146" stroke="#252525" stroke-width="2" marker-end="url(#th-arr)"/>
+
+                <text x="0" y="46" class="svg-lane">READ BY THE SERVER</text>
+                <rect x="0" y="60" width="236" height="172" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="16" y="88" class="svg-sub">no queue entry</text>
+                <text x="16" y="112" class="svg-sub">no scheduled job</text>
+                <text x="16" y="136" class="svg-sub">no worker process</text>
+                <text x="16" y="160" class="svg-sub">no wake-up at all</text>
+                <text x="16" y="196" class="svg-note">State is computed when</text>
+                <text x="16" y="216" class="svg-note">somebody asks for it.</text>
+
+                <text x="764" y="46" class="svg-lane">READ BY THE PLAYER</text>
+                <rect x="764" y="60" width="236" height="172" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="780" y="88" class="svg-sub">a countdown on screen</text>
+                <text x="780" y="112" class="svg-sub">a push notification</text>
+                <text x="780" y="136" class="svg-sub">a reason to return</text>
+                <text x="780" y="160" class="svg-sub">a price, in gems</text>
+                <text x="780" y="196" class="svg-note">An appointment the</text>
+                <text x="780" y="216" class="svg-note">designer chose.</text>
+
+                <text x="0" y="276" class="svg-note">The engineering decision and the retention decision are edits to the same column.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The economy of the design is exactly the source of its grip. That is
+              worth stating plainly before admiring either half.
+            </p>
+          </figure>
+
+          <p>
+            The first half of this note is about the data structures, because they are
+            genuinely good engineering and most of them transplant cleanly into
+            software that has nothing to do with games. The second half is about what
+            those structures are used for, where the line between a fair loop and an
+            extractive one falls, and why the line is easier to see from the schema
+            than from the marketing.
+          </p>
+
+          <p>
+            One caveat before starting, repeated from the badge note above: I have not
+            seen any of these games' source code. What follows is reconstructed from
+            behaviour anyone can observe by playing, from what the clients visibly
+            send and render, and from the general shape of how these backends are
+            publicly discussed. The reasoning is reproducible; the internals are a
+            guess with reasons.
+          </p>
+
+          <h2 id="the-village-is-a-document"><span class="secnum">02</span>The village is a small document</h2>
+
+          <p class="lede">
+            The natural way for a web engineer to model a village is a
+            <code>buildings</code> table with a foreign key to a player. For a hundred
+            million players that is forty billion rows, an index, and a transaction
+            every time anyone taps anything. These games do the opposite: the player
+            is the aggregate, the village is one document, and it is startlingly
+            small.
+          </p>
+
+          <p>
+            Everything a player can change belongs to that player. Nothing in the core
+            loop touches another player's state. That single ownership property is
+            what lets the whole village be stored, loaded, mutated and written back as
+            one value — no joins, no locks, no distributed transaction, no partial
+            write to reconcile.
+          </p>
+
+          <figure class="figure wide" id="fig-village">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">A whole village, field by field — and the table it points into</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 410" role="img" aria-label="On the left, a packed player record: one hundred buildings at nine bytes each, three hundred walls at four bytes each, thirty-two bytes of resources, two hundred bytes of army state and two hundred bytes of progression, totalling 2,532 bytes, against 18.2 kibibytes for the same thing as JSON. On the right, the shipped config table keyed by type and level holding cost, build time, capacity and hit points, with a note that the save stores only ids and levels.">
+                <text x="0" y="18" class="svg-lane">THE SAVE · WHAT IS PER PLAYER</text>
+                <rect x="0" y="32" width="470" height="40" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="14" y="58" class="svg-sub">100 buildings × 9 B</text>
+                <text x="330" y="58" class="svg-sub">900 B</text>
+                <rect x="0" y="80" width="470" height="40" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="14" y="106" class="svg-sub">300 walls × 4 B</text>
+                <text x="330" y="106" class="svg-sub">1,200 B</text>
+                <rect x="0" y="128" width="470" height="40" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="14" y="154" class="svg-sub">4 resources × (amount + last_collected)</text>
+                <text x="330" y="154" class="svg-sub">32 B</text>
+                <rect x="0" y="176" width="470" height="40" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="202" class="svg-sub">army, lab, hero levels</text>
+                <text x="330" y="202" class="svg-sub">200 B</text>
+                <rect x="0" y="224" width="470" height="40" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="250" class="svg-sub">progression counters, unlocks</text>
+                <text x="330" y="250" class="svg-sub">200 B</text>
+                <rect x="0" y="274" width="470" height="44" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <text x="14" y="302" class="svg-sub">packed total</text>
+                <text x="330" y="302" class="svg-sub">2,532 B</text>
+                <text x="14" y="344" class="svg-note">The same record as JSON with short keys: 18.2 KiB — 7.3× larger,</text>
+                <text x="14" y="364" class="svg-note">and still nothing. One building is nine bytes:</text>
+                <text x="14" y="390" class="svg-sub">type u16 · x u8 · y u8 · level u8 · finish_at u32</text>
+
+                <line x1="520" y1="10" x2="520" y2="410" stroke="#deded9"/>
+
+                <text x="550" y="18" class="svg-lane">THE CONFIG · WHAT IS SHIPPED, NOT SAVED</text>
+                <rect x="550" y="32" width="570" height="196" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="566" y="58" class="svg-sub">type  level   cost   build_time   capacity   hp</text>
+                <line x1="566" y1="68" x2="1104" y2="68" stroke="#b8b8b1"/>
+                <text x="566" y="92" class="svg-sub">  41      6   90,000       8 h        —      780</text>
+                <text x="566" y="116" class="svg-sub">  41      7  180,000      24 h        —      880</text>
+                <text x="566" y="140" class="svg-sub">  41      8  400,000      72 h        —      980</text>
+                <text x="566" y="164" class="svg-sub">  12      9  250,000      12 h   200,000     620</text>
+                <text x="566" y="196" class="svg-note">One row per (type, level), identical for every player,</text>
+                <text x="566" y="216" class="svg-note">shipped to the client and held by the server.</text>
+
+                <rect x="550" y="248" width="570" height="146" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="566" y="276" class="svg-lane">WHAT THE SPLIT BUYS</text>
+                <text x="566" y="304" class="svg-sub">· a balance change is a data deploy, not a migration</text>
+                <text x="566" y="328" class="svg-sub">· saves never store a number a designer might edit</text>
+                <text x="566" y="352" class="svg-sub">· client and server compute from the same table</text>
+                <text x="566" y="376" class="svg-sub">· the table is versioned, so old replays still resolve</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">computed here</span> — sizes from the encoding
+              printed in the figure, not measured from a shipped client. The exact
+              totals do not matter; the order of magnitude does, and it is kilobytes.
+            </p>
+          </figure>
+
+          <h3>Why the split is the important part</h3>
+
+          <p>
+            The save holds identity and progress — <em>which</em> building,
+            <em>where</em>, at <em>what level</em>, finishing <em>when</em>. It never
+            holds a number a designer might want to change. Cost, duration, capacity,
+            damage and hit points all live in a config table keyed by
+            <code>(type, level)</code>, identical for every player, shipped with the
+            client and held by the server. <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            Three consequences follow, and they are the reason these games can be
+            rebalanced weekly:
+          </p>
+
+          <ul>
+            <li>
+              <strong>Rebalancing touches no player data.</strong> Halving an upgrade
+              cost is an edit to a table, not a migration across a hundred million
+              documents. The old saves are still correct; they just mean something
+              different now.
+            </li>
+            <li>
+              <strong>The client can be trusted to render but not to decide.</strong>
+              Both sides hold the same table, so the client can draw an accurate
+              countdown and a correct cost without asking; the server recomputes
+              anyway before committing anything.
+            </li>
+            <li>
+              <strong>Config is versioned.</strong> A stored battle or an old save
+              resolves against the table version it was recorded under, which is what
+              keeps replays from quietly changing meaning after a patch — see
+              <a href="#commands-not-state">§5</a>.
+            </li>
+          </ul>
+
+          <p>
+            At this size the population arithmetic stops being interesting, which is
+            the point. A hundred million packed villages is about 253 GB; ten million
+            daily players is about 25 GB resident.
+            <span class="recon">computed here</span> Nobody would actually run that on
+            one machine, but the fact that they could is what makes the next section's
+            design available at all: if the working set fits in memory, you do not
+            need a database in the hot path — you need a way to write it down
+            occasionally.
+          </p>
+
+          <h2 id="lazy-timers"><span class="secnum">03</span>Nothing runs while you are gone</h2>
+
+          <p class="lede">
+            Here is the rule the whole genre runs on: never schedule work for
+            something that is a pure function of elapsed time. If the answer can be
+            computed from a timestamp and a rate, do not maintain it — derive it, at
+            the moment somebody asks.
+          </p>
+
+          <p>It shows up in exactly two shapes.</p>
+
+          <pre><code>// discrete — a thing finishes
+done = now &gt;= finish_at
+
+// continuous — a thing accumulates
+amount = min(capacity, stored + rate × (now − last_collected))</code></pre>
+
+          <p>
+            The second is the one worth staring at. A resource collector filling for
+            nine hours performs no writes during those nine hours and takes no memory
+            beyond the two numbers already in the record. The integral has a closed
+            form, so the loop that would have computed it is replaced by a multiply.
+            The purest shipped example is Candy Crush's lives: five maximum, one every
+            thirty minutes, which is exactly
+            <code>min(5, stored + (now − last) ÷ 30 min)</code> evaluated on open.
+            <span class="src">from the record</span> It is also why setting your
+            phone's clock forward used to refill them, and why every game that learned
+            that lesson now derives <code>now</code> from the server.
+          </p>
+
+          <figure class="figure wide" id="fig-lazy">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">Twelve hours offline, under two designs</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 400" role="img" aria-label="Two timelines over twelve hours of a player being offline. The top lane, a tick loop, shows continuous ticks across the whole period and costs four billion field updates per second across ten million daily players. The bottom lane, lazy resolution, is empty across the whole period and has a single resolve step at login, costing 347 resolutions per second in aggregate, or about 139 thousand field touches per second — 28,800 times less.">
+                <defs>
+                  <marker id="lz-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">DESIGN A · A TICK LOOP</text>
+                <rect x="0" y="34" width="880" height="64" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <g stroke="#ad4b43" stroke-width="1.4">
+                  <line x1="30" y1="46" x2="30" y2="86"/><line x1="70" y1="46" x2="70" y2="86"/><line x1="110" y1="46" x2="110" y2="86"/>
+                  <line x1="150" y1="46" x2="150" y2="86"/><line x1="190" y1="46" x2="190" y2="86"/><line x1="230" y1="46" x2="230" y2="86"/>
+                  <line x1="270" y1="46" x2="270" y2="86"/><line x1="310" y1="46" x2="310" y2="86"/><line x1="350" y1="46" x2="350" y2="86"/>
+                  <line x1="390" y1="46" x2="390" y2="86"/><line x1="430" y1="46" x2="430" y2="86"/><line x1="470" y1="46" x2="470" y2="86"/>
+                  <line x1="510" y1="46" x2="510" y2="86"/><line x1="550" y1="46" x2="550" y2="86"/><line x1="590" y1="46" x2="590" y2="86"/>
+                  <line x1="630" y1="46" x2="630" y2="86"/><line x1="670" y1="46" x2="670" y2="86"/><line x1="710" y1="46" x2="710" y2="86"/>
+                  <line x1="750" y1="46" x2="750" y2="86"/><line x1="790" y1="46" x2="790" y2="86"/><line x1="830" y1="46" x2="830" y2="86"/>
+                </g>
+                <text x="900" y="62" class="svg-sub">4,000,000,000</text>
+                <text x="900" y="84" class="svg-note">field updates / second</text>
+
+                <text x="0" y="146" class="svg-lane">DESIGN B · LAZY RESOLUTION</text>
+                <rect x="0" y="162" width="880" height="64" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="300" y="200" class="svg-note">— nothing at all —</text>
+                <line x1="866" y1="174" x2="866" y2="214" stroke="#367f59" stroke-width="3"/>
+                <text x="900" y="190" class="svg-sub">138,889</text>
+                <text x="900" y="212" class="svg-note">field touches / second</text>
+
+                <line x1="0" y1="250" x2="880" y2="250" stroke="#b8b8b1"/>
+                <text x="0" y="272" class="svg-sub">player closes app</text>
+                <text x="420" y="272" class="svg-sub">12 hours</text>
+                <text x="780" y="272" class="svg-sub">player opens app</text>
+
+                <rect x="0" y="296" width="540" height="98" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="16" y="322" class="svg-lane">ASSUMPTIONS</text>
+                <text x="16" y="346" class="svg-sub">100M installs · 10M daily · 400 objects each</text>
+                <text x="16" y="368" class="svg-sub">3 sessions/day · tick loop at 1 Hz over daily players only</text>
+                <text x="16" y="390" class="svg-sub">→ lazy is 28,800× cheaper; 288,000× against ticking everyone</text>
+
+                <rect x="570" y="296" width="550" height="98" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="586" y="322" class="svg-lane">AND THE WRITES</text>
+                <text x="586" y="346" class="svg-sub">Lazy: 30M persists/day = 347/s, one per session.</text>
+                <text x="586" y="368" class="svg-sub">A tick loop dirties every record every second, so the</text>
+                <text x="586" y="390" class="svg-sub">write path becomes the system rather than a detail.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">computed here</span> — from the stated assumptions,
+              not from anyone's capacity planning. The ratio is the point: the
+              difference between these two designs is not a percentage, it is four to
+              five orders of magnitude, and it is available for free to anything whose
+              state is a function of elapsed time.
+            </p>
+          </figure>
+
+          <h3>The parts that are not about cost</h3>
+
+          <p>
+            Cheapness is the obvious benefit and not the best one. Three others matter
+            more in operation:
+          </p>
+
+          <ul>
+            <li>
+              <strong>No drift.</strong> A tick loop that falls behind produces state
+              that is subtly wrong and stays wrong. Derived state is exact by
+              construction, because it is recomputed from the clock every time.
+            </li>
+            <li>
+              <strong>Outages cost nothing.</strong> If the service is down for an
+              hour, no timers are "missed" and there is no catch-up storm on recovery;
+              the arithmetic simply spans the gap. Compare a cron-driven design, where
+              an hour of downtime means an hour of backlog arriving at once.
+            </li>
+            <li>
+              <strong>No thundering herd.</strong> Nothing fires at midnight for
+              everybody, because nothing fires at all. Load follows players, and
+              players arrive smoothly.
+            </li>
+          </ul>
+
+          <h3>Where the trick stops working</h3>
+
+          <p>
+            Two honest limits. First, anything that must happen whether or not the
+            player shows up — a clan war ending, a season closing, a leaderboard
+            resetting — still needs a real scheduler. These games keep one; it just
+            runs global events, not per-player ones, so it is sized by the number of
+            clans and seasons rather than the number of players. Second, the clamp at
+            capacity destroys information on purpose: once a collector is full, the
+            record no longer knows how long it has been full. That loss is not an
+            oversight. It is the mechanism that turns a full collector into a reason
+            to come back, which is <a href="#the-timer-economy">§7</a>.
+          </p>
+
+          <h2 id="one-player-one-actor"><span class="secnum">04</span>One player, one actor</h2>
+
+          <p class="lede">
+            Once the working set fits in memory and every write is owner-scoped, a
+            third decision becomes available that most web backends cannot make: hold
+            the player's whole state in memory, in one place, and let exactly one
+            thread touch it.
+          </p>
+
+          <p>
+            The pattern is the actor model in its plainest form. A player is an object
+            with a mailbox. Commands arrive, are applied one at a time in arrival
+            order, and mutate in-memory state directly. Nothing else in the system has
+            a reference to that state. Periodically — on a timer, on session end, on
+            a significant event — the object is serialised and written down.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure" id="fig-actor">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">Ownership, and the one place it is shared</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 350" role="img" aria-label="Three player actors each own their own village state and write periodic snapshots to storage. Above them a clan actor owns chat, donations and war state. Messages flow between player actors and the clan actor, labelled as idempotent and eventually consistent. A caption notes that no player actor ever reads another player actor's memory.">
+                <defs>
+                  <marker id="ac-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                  <marker id="ac-arr-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <rect x="330" y="26" width="340" height="66" rx="10" fill="#ece6f3" stroke="#765b98" stroke-width="2.2"/>
+                <text x="500" y="54" text-anchor="middle" class="svg-step">Clan actor</text>
+                <text x="500" y="78" text-anchor="middle" class="svg-note">chat · donations · war — the only shared mutable state</text>
+
+                <rect x="20" y="160" width="260" height="76" rx="10" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="150" y="188" text-anchor="middle" class="svg-step">Player actor</text>
+                <text x="150" y="212" text-anchor="middle" class="svg-note">village in memory · one thread</text>
+                <rect x="370" y="160" width="260" height="76" rx="10" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="500" y="188" text-anchor="middle" class="svg-step">Player actor</text>
+                <text x="500" y="212" text-anchor="middle" class="svg-note">village in memory · one thread</text>
+                <rect x="720" y="160" width="260" height="76" rx="10" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="850" y="188" text-anchor="middle" class="svg-step">Player actor</text>
+                <text x="850" y="212" text-anchor="middle" class="svg-note">village in memory · one thread</text>
+
+                <line x1="200" y1="156" x2="330" y2="80" stroke="#765b98" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ac-arr)"/>
+                <line x1="500" y1="156" x2="500" y2="98" stroke="#765b98" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ac-arr)"/>
+                <line x1="800" y1="156" x2="670" y2="80" stroke="#765b98" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ac-arr)"/>
+                <text x="210" y="120" class="svg-sub" style="fill:#765b98">messages — idempotent, eventual</text>
+
+                <rect x="330" y="278" width="340" height="52" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="500" y="309" text-anchor="middle" class="svg-sub">durable storage · periodic snapshots</text>
+                <line x1="150" y1="240" x2="340" y2="278" stroke="#252525" stroke-width="1.6" marker-end="url(#ac-arr-k)"/>
+                <line x1="500" y1="240" x2="500" y2="272" stroke="#252525" stroke-width="1.6" marker-end="url(#ac-arr-k)"/>
+                <line x1="850" y1="240" x2="662" y2="278" stroke="#252525" stroke-width="1.6" marker-end="url(#ac-arr-k)"/>
+
+                <text x="20" y="270" class="svg-note">No player actor ever reads another's memory.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> — the shape is inferred from
+              behaviour: actions apply instantly and strictly in order, a lost
+              connection rolls back to a save point rather than leaving half a
+              transaction, and clan state is visibly a little behind. Those are the
+              symptoms of in-memory single-owner state with periodic persistence.
+            </p>
+          </figure>
+
+          <h3>What disappears</h3>
+
+          <p>
+            Locks, for a start. There is nothing to contend over, because there is
+            exactly one writer per piece of state and it is single-threaded. With them
+            go optimistic-concurrency retries, lost-update bugs, read-modify-write
+            races, and the entire category of "two taps arrived at once". A tap is a
+            message; messages are processed in order; the order is whatever arrived
+            first. Correctness by structure rather than by discipline.
+          </p>
+
+          <p>
+            The database also disappears from the hot path. It stops being the system
+            of record consulted on every action and becomes a place where snapshots go.
+            Read latency stops mattering because there are no reads; write throughput
+            becomes a function of session count rather than action count, which is the
+            347 writes per second from the previous section instead of one per tap.
+          </p>
+
+          <h3>The one place it is shared, and how that is handled</h3>
+
+          <p>
+            Clans are the exception and the design treats them as one. A clan is its
+            own owner with its own mailbox, and every interaction across the boundary
+            is a message rather than a shared read. Donations are the clearest case:
+            a request is a record, a fulfilment is a command against it, and if two
+            clanmates fill the last slot simultaneously one of them is told they were
+            too late. No two-phase commit, no cross-actor lock, and the failure mode is
+            a minor social disappointment rather than an inconsistency.
+            <span class="src">from the record</span>
+          </p>
+
+          <p>
+            The generalisable rule is not "use actors". It is: <strong>choose the
+            ownership boundary so that almost all writes are single-owner, and make
+            the remainder idempotent messages instead of transactions.</strong> Games
+            get to do this because a village genuinely belongs to one person. Most
+            business software has at least one genuinely shared object, and the useful
+            question is how small you can make it.
+          </p>
+
+          <p>
+            The honest cost: an in-memory actor with periodic persistence loses
+            whatever happened since the last snapshot if its host dies. Games accept
+            that — a few minutes of rebuilt progress is an annoyance, and they usually
+            re-grant it. A ledger cannot accept it at any price. The design is right
+            here precisely because the data is not money, and copying it into a system
+            where the data <em>is</em> money is how this pattern goes wrong.
+          </p>
+
+          <h2 id="commands-not-state"><span class="secnum">05</span>Commands, not state</h2>
+
+          <p class="lede">
+            The client never tells the server what is true. It tells the server what
+            the player did. "Place building 41 at (12, 30), at tick 9,412" — and the
+            server applies that to its own copy and works out the consequences itself.
+            That one discipline is simultaneously the anti-cheat boundary, the offline
+            story, and the reason a battle replay fits in three kilobytes.
+          </p>
+
+          <p>
+            Both sides run the same simulation over the same config table from
+            <a href="#the-village-is-a-document">§2</a>, so the client can apply a
+            command immediately and show the result without waiting for a round trip,
+            while the server recomputes the identical result at its own pace. The
+            client is a predictor, not an authority. If the two disagree, the server
+            is right and the client resynchronises — and a client that disagrees
+            repeatedly is interesting for other reasons.
+          </p>
+
+          <h3>A battle is a snapshot plus a list of taps</h3>
+
+          <p>
+            The payoff is clearest in combat. An attack is a sequence of placements:
+            at tick <em>t</em>, drop unit <em>u</em> at <em>(x, y)</em>. Roughly eight
+            bytes each, sixty of them in a busy raid. Because the engine is
+            deterministic, replaying that list against the defender's village snapshot
+            reproduces the battle exactly — every troop path, every wall break, every
+            percentage.
+          </p>
+
+          <figure class="figure wide" id="fig-replay">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">Three kilobytes that contain a three-minute battle</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 380" role="img" aria-label="A defender snapshot of 2,532 bytes plus a command list of 60 placements at 8 bytes each plus a deterministic engine reproduces the battle exactly, for a total replay size of about 3 kibibytes, against 45 megabytes for a 3-minute video at 2 megabits per second — a ratio of 14,629 to one. At ten million daily players and five attacks each, that is 154 gigabytes of replay traffic per day against 2,250 terabytes of video.">
+                <defs>
+                  <marker id="rp-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <rect x="0" y="40" width="250" height="90" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="16" y="68" class="svg-step">Defender snapshot</text>
+                <text x="16" y="94" class="svg-sub">the village, frozen</text>
+                <text x="16" y="118" class="svg-sub">2,532 B</text>
+
+                <text x="266" y="92" class="svg-step">+</text>
+
+                <rect x="300" y="40" width="290" height="90" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="316" y="68" class="svg-step">Command list</text>
+                <text x="316" y="94" class="svg-sub">(tick u32, unit u16, x u8, y u8)</text>
+                <text x="316" y="118" class="svg-sub">60 × 8 B = 480 B</text>
+
+                <text x="606" y="92" class="svg-step">+</text>
+
+                <rect x="640" y="40" width="250" height="90" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="656" y="68" class="svg-step">Deterministic engine</text>
+                <text x="656" y="94" class="svg-sub">already on every device</text>
+                <text x="656" y="118" class="svg-sub">0 B of payload</text>
+
+                <line x1="906" y1="85" x2="960" y2="85" stroke="#252525" stroke-width="2" marker-end="url(#rp-arr)"/>
+                <rect x="970" y="40" width="150" height="90" rx="8" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <text x="986" y="68" class="svg-step">The battle</text>
+                <text x="986" y="94" class="svg-sub">exactly, every</text>
+                <text x="986" y="118" class="svg-sub">time</text>
+
+                <line x1="0" y1="164" x2="1120" y2="164" stroke="#deded9"/>
+                <text x="0" y="190" class="svg-lane">WHAT THAT SAVES</text>
+                <text x="0" y="220" class="svg-sub">replay                  3.0 KiB</text>
+                <rect x="300" y="206" width="6" height="18" fill="#367f59"/>
+                <text x="0" y="248" class="svg-sub">the same 3 minutes as video, at 2 Mbps       45.0 MB</text>
+                <rect x="300" y="234" width="780" height="18" fill="#ad4b43"/>
+                <text x="0" y="278" class="svg-sub">ratio 14,629 : 1</text>
+
+                <rect x="0" y="296" width="540" height="78" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="16" y="322" class="svg-lane">AT 10M DAILY PLAYERS × 5 ATTACKS</text>
+                <text x="16" y="348" class="svg-sub">replays   154 GB/day   ·   video   2,250 TB/day</text>
+                <text x="16" y="370" class="svg-note">One is a line item. The other is the company.</text>
+
+                <rect x="570" y="296" width="550" height="78" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="586" y="322" class="svg-lane">AND IT IS NOT JUST BANDWIDTH</text>
+                <text x="586" y="348" class="svg-sub">The server can re-run the list and check the claimed result.</text>
+                <text x="586" y="370" class="svg-sub">A video proves nothing; a command list is evidence.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">computed here</span> — from the encoding stated in
+              the figure. That replays are re-simulations rather than recordings is
+              directly observable: they render at your device's frame rate, in your UI
+              language, and you can watch them at double speed.
+              <span class="src">from the record</span>
+            </p>
+          </figure>
+
+          <h3>Why nobody has to be online</h3>
+
+          <p>
+            The same property makes asynchronous player-versus-player possible, and
+            asynchronous PvP is what lets a game span every timezone at once. You do
+            not attack a person; you attack a <em>snapshot</em> of their village.
+            There is no matchmaking queue to join and no session to negotiate — the
+            server looks up a stored village near your rating in a sorted index, hands
+            you a copy, and you play against it. The defender finds out afterwards,
+            as a replay, which is itself a notification and therefore another
+            appointment.
+          </p>
+
+          <p>
+            This is why the loop scales so unreasonably well. Two players interacting
+            normally requires both online, a session, and a real-time transport.
+            Snapshot combat requires one player online and a read from an index. The
+            social experience is preserved; the coordination problem is deleted.
+          </p>
+
+          <h3>The tax determinism charges</h3>
+
+          <p>
+            It is not free, and the costs are the reason many teams do not attempt it.
+            Every source of non-determinism has to be hunted out of the simulation:
+            floating-point behaviour must be constrained or replaced with fixed-point
+            arithmetic, iteration order over collections must be stable, no wall clock
+            may be read inside the simulation, and randomness must come from a seeded
+            generator whose seed travels with the command list. Config must be
+            versioned so an old replay resolves against the numbers it was recorded
+            under rather than today's. And the simulation has to produce identical
+            results across every platform the client ships on, which makes "rewrite
+            this in the platform-native language" a permanent hazard.
+          </p>
+
+          <p>
+            What you buy for that tax is worth listing plainly, because it generalises
+            well beyond games: instant local response with server authority, cheat
+            detection by re-execution, replay as a first-class artefact, and an audit
+            trail that is the same size as the input rather than the size of the
+            output.
+          </p>
+
+          <h2 id="the-loops"><span class="secnum">06</span>Loops inside loops</h2>
+
+          <p class="lede">
+            A game like this is not one loop. It is five or six, running
+            simultaneously, with periods separated by roughly an order of magnitude
+            each. The design constraint that organises all of them is simple to state:
+            whenever the player opens the app, something should be finishing.
+          </p>
+
+          <figure class="figure wide" id="fig-loops">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">Six periods, placed on a log scale — what each one asks for and what it pays</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 430" role="img" aria-label="A logarithmic time axis from ten seconds to ninety days, with six loops marked: a thirty-second tap-to-collect loop, an eight-minute raid or level loop, an eight-hour collector and short-upgrade loop, a two-day building upgrade loop, a two-week season or war loop, and a multi-month progression tier. Each is annotated with what the player does and what they receive, and the reward magnitude grows with the period.">
+                <text x="0" y="18" class="svg-lane">PERIOD — LOGARITHMIC</text>
+                <line x1="120" y1="60" x2="1060" y2="60" stroke="#b8b8b1"/>
+                <g stroke="#deded9">
+                  <line x1="244" y1="56" x2="244" y2="330"/>
+                  <line x1="528" y1="56" x2="528" y2="330"/>
+                  <line x1="748" y1="56" x2="748" y2="330"/>
+                  <line x1="883" y1="56" x2="883" y2="330"/>
+                </g>
+                <text x="228" y="48" class="svg-sub">1 min</text>
+                <text x="514" y="48" class="svg-sub">1 hour</text>
+                <text x="736" y="48" class="svg-sub">1 day</text>
+                <text x="866" y="48" class="svg-sub">1 week</text>
+                <text x="1030" y="48" class="svg-sub">90 d</text>
+
+                <rect x="120" y="76" width="76" height="34" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="0" y="98" class="svg-step">30 seconds</text>
+                <text x="210" y="98" class="svg-sub">tap the collectors · one match · one spin</text>
+                <text x="700" y="98" class="svg-note">→ a small tick of resource. Makes a 20-second gap worth using.</text>
+
+                <rect x="120" y="126" width="268" height="34" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="0" y="148" class="svg-step">8 minutes</text>
+                <text x="402" y="148" class="svg-sub">a raid · a level attempt · a training batch</text>
+                <text x="790" y="148" class="svg-note">→ loot, or a stage cleared.</text>
+
+                <rect x="120" y="176" width="552" height="34" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="0" y="198" class="svg-step">8 hours</text>
+                <text x="686" y="198" class="svg-sub">collectors fill · lives refill · a short upgrade</text>
+                <text x="686" y="220" class="svg-note">→ an errand: come back before it overflows.</text>
+
+                <rect x="120" y="242" width="676" height="34" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="0" y="264" class="svg-step">1–3 days</text>
+                <text x="810" y="264" class="svg-sub">a building, a hero, a lab research</text>
+                <text x="810" y="286" class="svg-note">→ a visible jump in what you can do.</text>
+
+                <rect x="120" y="308" width="811" height="34" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="0" y="330" class="svg-step">2 weeks</text>
+                <text x="500" y="330" class="svg-sub">a war season · a pass · a live event</text>
+                <text x="500" y="364" class="svg-note">→ rank, exclusive rewards, and standing among people you know.</text>
+
+                <rect x="120" y="374" width="940" height="34" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="0" y="396" class="svg-step">months</text>
+                <text x="500" y="396" class="svg-sub">the next tier of the whole game</text>
+
+                <text x="0" y="424" class="svg-note">Reward magnitude rises with period, so something small is always close and something large is always coming.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Drawn to scale on a log axis, the structure is obvious: the periods are
+              spaced so that they rarely align. If every loop closed at once you would
+              get one enormous session and then a week of nothing.
+            </p>
+          </figure>
+
+          <h3>The rule of two timers</h3>
+
+          <p>
+            Strip the design down and a single heuristic remains: there should always
+            be at least one short timer and one long timer running. The short one is
+            the reason to open the app now — something is nearly ready, and waiting
+            four minutes is cheap. The long one is the reason to open it tomorrow.
+            Games that only have long timers feel dead between sessions; games that
+            only have short ones have nothing to look forward to and lose players the
+            moment the novelty fades.
+          </p>
+
+          <p>
+            This is why the periods are deliberately non-harmonic. A player who
+            finished everything simultaneously would have a clean exit — nothing
+            pending, nothing owed, a natural place to stop. Overlapping loops of
+            different lengths mean there is no such moment, which is the part to look
+            at squarely rather than to admire. It is an excellent piece of scheduling
+            and it is designed to remove the natural stopping point, and both of those
+            are true at once.
+          </p>
+
+          <h3>The loops are shorter when you are new</h3>
+
+          <p>
+            Open one of these games for the first time and everything takes seconds.
+            Upgrades finish while you watch, the first ten levels fall in a single
+            sitting, rewards land constantly. The periods stretch as you progress —
+            minutes, then hours, then days.
+          </p>
+
+          <p>
+            Half of that is honest teaching. A fast first session shows you the loop,
+            demonstrates that progress is real, and gets you to the point where the
+            game makes sense before asking you to wait for anything. The other half is
+            an escalation: by the time an upgrade takes three days, you have a base
+            you are attached to, a clan that notices when you are absent, and enough
+            invested that the wait is tolerable. The curve is tuned so that the cost of
+            waiting rises only as fast as your reason to accept it.
+            <a href="#where-it-turns">§8</a> is about where that stops being fair.
+          </p>
+
+          <h2 id="the-timer-economy"><span class="secnum">07</span>The timer economy</h2>
+
+          <p class="lede">
+            A timer is an appointment. It names a moment and asks you to be there.
+            Stack seven of them at different lengths and you have not built a feature —
+            you have built a schedule for somebody else's day, and the schedule is the
+            product.
+          </p>
+
+          <figure class="figure wide" id="fig-ladder">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">One day, seven concurrent timers, and the appointments they generate</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 400" role="img" aria-label="A 24-hour axis showing seven concurrent timers for a mid-game player: troop training every 15 minutes drawn as a dense band, builders finishing at 4, 8 and 24 hours, a collector overflowing at 16 hours, and longer builders at 48 and 72 hours falling outside the day. Counting everything, 108 completion events per day; excluding timers under an hour, 12.3 per day, one every 1.9 hours.">
+                <text x="0" y="18" class="svg-lane">A MID-GAME PLAYER'S CONCURRENT TIMERS, OVER ONE DAY</text>
+                <line x1="120" y1="300" x2="1060" y2="300" stroke="#b8b8b1"/>
+                <g stroke="#deded9">
+                  <line x1="120" y1="50" x2="120" y2="300"/>
+                  <line x1="277" y1="50" x2="277" y2="300"/>
+                  <line x1="433" y1="50" x2="433" y2="300"/>
+                  <line x1="590" y1="50" x2="590" y2="300"/>
+                  <line x1="747" y1="50" x2="747" y2="300"/>
+                  <line x1="903" y1="50" x2="903" y2="300"/>
+                  <line x1="1060" y1="50" x2="1060" y2="300"/>
+                </g>
+                <text x="112" y="322" class="svg-sub">0h</text>
+                <text x="269" y="322" class="svg-sub">4h</text>
+                <text x="425" y="322" class="svg-sub">8h</text>
+                <text x="582" y="322" class="svg-sub">12h</text>
+                <text x="739" y="322" class="svg-sub">16h</text>
+                <text x="895" y="322" class="svg-sub">20h</text>
+                <text x="1044" y="322" class="svg-sub">24h</text>
+
+                <text x="0" y="72" class="svg-sub">training 15 min</text>
+                <rect x="120" y="58" width="940" height="18" fill="#dfede5" stroke="#367f59"/>
+                <g stroke="#367f59" stroke-width="1">
+                  <line x1="159" y1="58" x2="159" y2="76"/><line x1="198" y1="58" x2="198" y2="76"/><line x1="237" y1="58" x2="237" y2="76"/>
+                  <line x1="277" y1="58" x2="277" y2="76"/><line x1="316" y1="58" x2="316" y2="76"/><line x1="355" y1="58" x2="355" y2="76"/>
+                  <line x1="394" y1="58" x2="394" y2="76"/><line x1="433" y1="58" x2="433" y2="76"/><line x1="473" y1="58" x2="473" y2="76"/>
+                  <line x1="512" y1="58" x2="512" y2="76"/><line x1="551" y1="58" x2="551" y2="76"/><line x1="590" y1="58" x2="590" y2="76"/>
+                  <line x1="629" y1="58" x2="629" y2="76"/><line x1="669" y1="58" x2="669" y2="76"/><line x1="708" y1="58" x2="708" y2="76"/>
+                  <line x1="747" y1="58" x2="747" y2="76"/><line x1="786" y1="58" x2="786" y2="76"/><line x1="825" y1="58" x2="825" y2="76"/>
+                  <line x1="865" y1="58" x2="865" y2="76"/><line x1="904" y1="58" x2="904" y2="76"/><line x1="943" y1="58" x2="943" y2="76"/>
+                  <line x1="982" y1="58" x2="982" y2="76"/><line x1="1021" y1="58" x2="1021" y2="76"/>
+                </g>
+
+                <text x="0" y="112" class="svg-sub">builder A · 4h</text>
+                <line x1="120" y1="104" x2="277" y2="104" stroke="#3c6f97" stroke-width="7"/>
+                <circle cx="277" cy="104" r="6" fill="#d98226"/>
+
+                <text x="0" y="152" class="svg-sub">builder B · 8h</text>
+                <line x1="120" y1="144" x2="433" y2="144" stroke="#3c6f97" stroke-width="7"/>
+                <circle cx="433" cy="144" r="6" fill="#d98226"/>
+
+                <text x="0" y="192" class="svg-sub">collector · 16h</text>
+                <line x1="120" y1="184" x2="747" y2="184" stroke="#367f59" stroke-width="7"/>
+                <circle cx="747" cy="184" r="6" fill="#d98226"/>
+                <text x="762" y="180" class="svg-note">overflows — production wasted from here</text>
+
+                <text x="0" y="232" class="svg-sub">builder C · 24h</text>
+                <line x1="120" y1="224" x2="1060" y2="224" stroke="#3c6f97" stroke-width="7"/>
+                <circle cx="1060" cy="224" r="6" fill="#d98226"/>
+
+                <text x="0" y="272" class="svg-sub">builders D, E</text>
+                <line x1="120" y1="264" x2="1060" y2="264" stroke="#c9c9c2" stroke-width="7"/>
+                <text x="440" y="260" class="svg-note">48h and 72h — still running, the reason tomorrow exists</text>
+
+                <rect x="0" y="342" width="540" height="56" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="16" y="366" class="svg-sub">counting everything:  108.3 completions / day</text>
+                <text x="16" y="388" class="svg-sub">ignoring sub-hour timers:  12.3 / day — one every 1.9 h</text>
+                <rect x="570" y="342" width="550" height="56" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="586" y="366" class="svg-note">There is no hour of the waking day in which nothing is ready,</text>
+                <text x="586" y="388" class="svg-note">and no day on which everything is done.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">computed here</span> — from the timer set printed in
+              the figure, which is my estimate of a mid-game player's state rather
+              than a measurement. The completion rate is just the sum of the
+              reciprocals of the durations; the structure is what matters.
+            </p>
+          </figure>
+
+          <h3>Caps: urgency without taking anything</h3>
+
+          <p>
+            The clamp at capacity from <a href="#lazy-timers">§3</a> is doing
+            motivational work. Because a collector stops when full, staying away costs
+            you <em>foregone</em> production rather than anything you already had. That
+            distinction is load-bearing. Losing stored progress makes people quit;
+            missing out on progress they never held makes people set an alarm. The cap
+            is therefore tuned to a target return interval: 200,000 capacity at 12,500
+            per hour overflows in 16 hours, which is roughly "once before bed and once
+            after". <span class="recon">computed here</span>
+          </p>
+
+          <h3>The second currency prices the first one's time</h3>
+
+          <p>
+            Soft currency is earned and spends time. Hard currency is bought and buys
+            time back. Every one of these economies converges on the same exchange:
+            gems, coins, whatever they are called, are fundamentally a price on
+            skipping a wait. Which means the <em>length of a timer is a pricing
+            decision</em>, and the price curve is worth looking at.
+          </p>
+
+          <figure class="figure" id="fig-gems">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">Time, priced — an illustrative skip curve</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 300" role="img" aria-label="A table of an illustrative skip-price model in which gems equal 74.28 times hours to the power 0.6. One hour costs 74 gems or 62 cents, at 62 cents per hour saved. Twenty-four hours costs 500 gems or 4 dollars 17, at 17 cents per hour saved. One hundred and sixty-eight hours costs 1,607 gems or 13 dollars 39, at 8 cents per hour saved. The price per hour falls as the wait grows.">
+                <text x="0" y="18" class="svg-lane">MODEL — NOT A SHIPPED TABLE:  gems = 74.28 × hours^0.6,  gems priced at $10 / 1,200</text>
+                <text x="0" y="56" class="svg-sub">remaining      gems     gems/hour        $        $ per hour saved</text>
+                <line x1="0" y1="66" x2="800" y2="66" stroke="#deded9"/>
+                <text x="0" y="90" class="svg-sub">1 hour           74       74.0       0.62          0.617</text>
+                <text x="0" y="114" class="svg-sub">6 hours         218       36.3       1.82          0.303</text>
+                <text x="0" y="138" class="svg-sub">12 hours        330       27.5       2.75          0.229</text>
+                <text x="0" y="162" class="svg-sub">1 day           500       20.8       4.17          0.174</text>
+                <text x="0" y="186" class="svg-sub">3 days          967       13.4       8.06          0.112</text>
+                <text x="0" y="210" class="svg-sub">7 days        1,607        9.6      13.39          0.080</text>
+
+                <rect x="0" y="232" width="1000" height="62" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="16" y="256" class="svg-sub">The curve is concave, so the longest waits are the cheapest per hour —</text>
+                <text x="16" y="280" class="svg-sub">which is how you would price it if you wanted the largest purchase to feel like the sensible one.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">computed here</span> — from the model stated in the
+              first line, chosen to reproduce the <em>shape</em> of published skip
+              prices rather than any actual table. Treat the numbers as illustrative
+              and the concavity as the observation.
+            </p>
+          </figure>
+
+          <p>
+            The pricing sets up a two-sided constraint on duration. A timer must be
+            long enough that skipping it is worth paying for, and short enough that
+            waiting is tolerable. That is a narrow band, and it explains why durations
+            in these games cluster in hours-to-days and almost never reach weeks.
+          </p>
+
+          <p>
+            Which makes the real lever the <em>builder count</em>, not the timer
+            length. Limiting how many upgrades can run in parallel sells capacity
+            rather than impatience: a second builder does not make any single wait
+            shorter, it doubles how much waiting you can do at once. It is a
+            structurally better product — the player gets a permanent improvement
+            instead of a one-off skip, and the studio sells something that raises the
+            value of every future timer. When one of these games has a single
+            best-value purchase, it is usually this one.
+          </p>
+
+          <h3>Why the daily loop gets so much attention</h3>
+
+          <p>
+            The commercial reason is arithmetic. If a player has a constant daily
+            probability <code>r</code> of returning, expected lifetime is
+            <code>1/(1 − r)</code> days, and that function is violently non-linear near
+            the top: <span class="recon">computed here</span>
+          </p>
+
+          <pre><code>daily retention   expected days   alive at d30   alive at d90   LTV at $0.05/day
+      93%              14.3           11.3%          0.15%          $0.71
+      95%              20.0           21.5%          0.99%          $1.00
+      96%              25.0           29.4%          2.54%          $1.25
+      97%              33.3           40.1%          6.45%          $1.67
+      98%              50.0           54.5%         16.23%          $2.50
+      99%             100.0           74.0%         40.47%          $5.00</code></pre>
+
+          <p>
+            One percentage point of daily retention, from 95% to 96%, is a 25% increase
+            in the value of every install; from 97% to 98% it is 50%. No feature in the
+            game is worth as much as a slightly better reason to open it tomorrow. That
+            is the whole economic logic of everything above, and it is also the
+            pressure that produces the mechanics in the next section.
+          </p>
+
+          <h2 id="where-it-turns"><span class="secnum">08</span>Where it turns extractive</h2>
+
+          <p class="lede">
+            Everything so far is value-neutral. A timestamp is not a moral object, and
+            a game that respects your time can be built out of exactly the same parts
+            as one that does not. The difference is not in the mechanic; it is in what
+            the mechanic is being paid to do.
+          </p>
+
+          <p>
+            Here is the test I find most useful, and it has the advantage of being
+            answerable from the schema rather than from intent: <strong>does the
+            mechanic make a promise the player can plan around, or does it manufacture
+            a penalty for not showing up?</strong> A build timer makes a promise. It
+            finishes at a known moment, it waits for you indefinitely, and ignoring it
+            costs nothing you had. A streak that resets does the opposite: it creates a
+            quantity out of nothing, hands it to you, and then threatens it.
+          </p>
+
+          <figure class="figure" id="fig-line">
+            <div class="figure-head">
+              <span class="figure-label">Figure 9</span>
+              <p class="figure-title">The same mechanic, on both sides of the line</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Mechanic</th><th>Promise-shaped version</th><th>Trap-shaped version</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Waiting</td><td>A timer that finishes at a stated moment and waits for you</td><td>A window in which the reward must be claimed or it is destroyed</td></tr>
+                  <tr><td>Accrual</td><td>A cap, so absence costs foregone production and nothing else</td><td>Decay, so absence costs progress you already earned</td></tr>
+                  <tr><td>Deadlines</td><td>A season with a published end date and a visible reward track</td><td>A countdown on an offer that reappears whenever you decline it</td></tr>
+                  <tr><td>Sessions</td><td>Energy that runs out at the end of a task</td><td>Energy calibrated to run out mid-task, with a refill button</td></tr>
+                  <tr><td>Purchases</td><td>A permanent capability at a stated price — the extra builder</td><td>A randomised reward at a stated price, with the odds unstated</td></tr>
+                  <tr><td>Protection</td><td>A shield granted automatically after you are beaten</td><td>A shield sold to you while you are being beaten</td></tr>
+                  <tr><td>Other people</td><td>A war you opted into, with a known start and finish</td><td>A loop where your absence visibly costs your friends something</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Every row is the same piece of engineering. What changes is whether the
+              value to the business comes from the player getting what they wanted, or
+              from the player failing to.
+            </p>
+          </figure>
+
+          <h3>A sharper version of the test</h3>
+
+          <p>
+            If the schedule, the odds and the prices were printed on the box, would
+            the mechanic still work?
+          </p>
+
+          <p>
+            Build timers pass easily. Publishing "this upgrade takes three days and
+            skipping it costs about four dollars" changes nothing; players already know
+            and plan around it. Season passes pass — the whole track is visible when you
+            buy it. Randomised paid rewards with undisclosed odds fail by construction:
+            their commercial performance depends on the buyer misjudging the
+            distribution, which is why disclosure requirements changed them materially
+            where they were imposed. Several regulators have acted on this since the
+            late 2010s — probability disclosure was mandated in China, Belgium's gaming
+            regulator took the position that certain paid random rewards fell under
+            gambling law, and various age-appropriate design codes have since
+            constrained how these mechanics may be aimed at children. The specifics
+            vary by jurisdiction and have moved repeatedly; the direction has not.
+            <span class="src">from the record</span>
+          </p>
+
+          <h3>The structural problem, not the individual trick</h3>
+
+          <p>
+            The uncomfortable part is not any one mechanic. It is the revenue shape.
+            Industry analyses routinely report that only a low single-digit percentage
+            of players in a free-to-play title ever pay, and that a small fraction of
+            those payers produce most of the revenue.
+            <span class="src">from the record</span> Whatever the exact numbers in a
+            given game, the consequence is structural: the design is optimised against
+            the behaviour of its heaviest spenders, and the population of heaviest
+            spenders is not a random sample of people. It over-represents exactly those
+            for whom "one more purchase to skip the wait" is hardest to refuse.
+          </p>
+
+          <p>
+            You do not need to attribute bad intent to anyone to see the problem. A
+            team doing ordinary, competent A/B testing against revenue will drift
+            toward mechanics that work on that tail, because those are the mechanics
+            that move the metric. The drift is emergent, and it is why the honest
+            guardrails in this space are structural too — spending caps, disclosed
+            odds, real cooling-off periods, age gates that actually gate — rather than
+            appeals to restraint.
+          </p>
+
+          <p>
+            My own position, briefly, because a note like this should state one: the
+            engineering in sections 2 through 5 is some of the best cost-per-user
+            design in the industry and deserves to be copied widely. The scheduling in
+            section 6 is legitimate when the thing being scheduled is real. The line is
+            crossed at the point where revenue depends on regret — and that point is
+            visible in the data model, because it is where you find a field whose only
+            purpose is to be taken away.
+          </p>
+
+          <h2 id="what-to-steal"><span class="secnum">09</span>What the rest of us should steal</h2>
+
+          <p class="lede">
+            The engineering half of this note transplants almost without modification,
+            and most of it costs nothing to adopt. Four things are worth taking, and
+            one is worth taking carefully.
+          </p>
+
+          <figure class="figure wide" id="fig-steal">
+            <div class="figure-head">
+              <span class="figure-label">Figure 10</span>
+              <p class="figure-title">Four transplants, and the class of bug each one deletes</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 350" role="img" aria-label="Four rows. Lazy accrual replaces cron jobs with a timestamp and a formula, and deletes backlog, drift and thundering herds. Commands with sequence numbers replace state PUTs and delete lost updates and unsafe retries. Owner-scoped documents replace cross-entity transactions and delete lock contention. A deterministic core makes replay possible and deletes the argument about what happened.">
+                <text x="0" y="18" class="svg-lane">TAKE THIS</text>
+                <text x="330" y="18" class="svg-lane">INSTEAD OF</text>
+                <text x="620" y="18" class="svg-lane">OUTSIDE GAMES, IT IS</text>
+                <text x="900" y="18" class="svg-lane">IT DELETES</text>
+                <line x1="0" y1="28" x2="1120" y2="28" stroke="#b8b8b1"/>
+
+                <rect x="0" y="38" width="1120" height="66" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="14" y="64" class="svg-step">Lazy accrual</text>
+                <text x="14" y="88" class="svg-note">a timestamp and a formula</text>
+                <text x="330" y="74" class="svg-sub">a job that runs every minute</text>
+                <text x="620" y="66" class="svg-sub">token buckets, trial expiry,</text>
+                <text x="620" y="88" class="svg-sub">credits, quotas, SLA burn</text>
+                <text x="900" y="66" class="svg-sub">backlog after an outage,</text>
+                <text x="900" y="88" class="svg-sub">drift, midnight herds</text>
+
+                <rect x="0" y="114" width="1120" height="66" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="14" y="140" class="svg-step">Commands + sequence</text>
+                <text x="14" y="164" class="svg-note">say what happened, not what is</text>
+                <text x="330" y="150" class="svg-sub">PUT the new state</text>
+                <text x="620" y="142" class="svg-sub">event sourcing, but with a</text>
+                <text x="620" y="164" class="svg-sub">reducer both sides run</text>
+                <text x="900" y="142" class="svg-sub">lost updates, unsafe</text>
+                <text x="900" y="164" class="svg-sub">retries, no audit trail</text>
+
+                <rect x="0" y="190" width="1120" height="66" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="14" y="216" class="svg-step">Owner-scoped documents</text>
+                <text x="14" y="240" class="svg-note">one writer per aggregate</text>
+                <text x="330" y="226" class="svg-sub">rows joined across owners</text>
+                <text x="620" y="218" class="svg-sub">the aggregate boundary you</text>
+                <text x="620" y="240" class="svg-sub">were going to need anyway</text>
+                <text x="900" y="218" class="svg-sub">lock contention, retry</text>
+                <text x="900" y="240" class="svg-sub">storms, partial writes</text>
+
+                <rect x="0" y="266" width="1120" height="66" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="14" y="292" class="svg-step">A deterministic core</text>
+                <text x="14" y="316" class="svg-note">same inputs, same outputs</text>
+                <text x="330" y="302" class="svg-sub">logs and hope</text>
+                <text x="620" y="294" class="svg-sub">replayable audit at the size</text>
+                <text x="620" y="316" class="svg-sub">of the input, not the output</text>
+                <text x="900" y="294" class="svg-sub">the argument about</text>
+                <text x="900" y="316" class="svg-sub">what actually happened</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              None of these is novel; all four are standard techniques. What the games
+              demonstrate is that you can adopt all four at once and end up with
+              <em>less</em> machinery than the conventional design, not more.
+            </p>
+          </figure>
+
+          <h3>Lazy accrual is the one most teams are missing</h3>
+
+          <p>
+            Look for any scheduled job whose output is a pure function of elapsed time
+            and delete it. Trial countdowns, credit top-ups, quota resets, subscription
+            entitlement, aging counters, anything that "fills up". Store the last
+            update and the rate; compute the value on read. Rate limiters already work
+            this way — a token bucket is exactly
+            <code>min(cap, tokens + rate × Δt)</code> — which is a good sign the
+            pattern holds up in infrastructure, and a strange one that it so rarely
+            escapes that corner of the stack.
+          </p>
+
+          <h3>The audit case, which is where I actually use this</h3>
+
+          <p>
+            The replay structure in <a href="#commands-not-state">§5</a> is the one
+            worth internalising if you work on agents. A battle is auditable because
+            it is a snapshot plus a command list plus a deterministic engine: three
+            kilobytes that can be re-executed to check a claim. A recording of the same
+            battle is fifteen thousand times larger and proves nothing, because you
+            cannot re-run it.
+          </p>
+
+          <p>
+            Agent sessions have the same shape and are usually stored the wrong way
+            round — a long transcript, which is a recording, rather than an
+            environment snapshot plus the commands that were issued against it. I made
+            this argument at more length in
+            <a href="../markov-processes/">The State Is Enough</a>: the transcript is
+            an observation, the environment is the state, and evidence has to be
+            captured from the state. The games got there first, for the entirely
+            mercenary reason that video is expensive and determinism is free.
+          </p>
+
+          <h3>And the product transplant, with care</h3>
+
+          <p>
+            Appointments are legitimate when the thing genuinely finishes and the user
+            asked for it. A long build completing, a large import finishing, a
+            scheduled report becoming ready — these are real events, and telling
+            someone about them respects their attention rather than competing for it.
+            The engineering test from <a href="#where-it-turns">§8</a> transfers
+            directly and is easy to apply in a code review: is there a
+            <code>finish_at</code> that corresponds to something actually finishing? If
+            the notification exists because engagement was down, there is no
+            <code>finish_at</code> — there is only a calendar entry with your
+            product's name on it, and the user will eventually work that out.
+          </p>
+
+          <h2 id="sources"><span class="secnum">10</span>Sources</h2>
+
+          <p class="lede">
+            This note has an unusual evidence profile and it is worth being blunt
+            about it. There is no checkout to cite. Almost everything here is either
+            behaviour anyone can reproduce, arithmetic done from stated assumptions,
+            or inference — and the three are not equally reliable.
+          </p>
+
+          <h3>A. Directly observable, by playing</h3>
+          <ul>
+            <li><strong>Clash of Clans</strong> (Supercell, 2012) — build timers with a stated finish time and a gem cost to skip, a fixed number of builders, resource collectors that fill to a cap, shields, clans with chat and donations, clan wars on a fixed schedule, and attacks against offline players.</li>
+            <li><strong>Battle replays</strong> — that these are re-simulations rather than video is observable: they render in your UI language at your device's frame rate, can be watched at increased speed, and are shared as small messages rather than files.</li>
+            <li><strong>Candy Crush Saga</strong> (King, 2012) — five lives, one regenerating every thirty minutes to a cap of five; the canonical clamped closed-form accrual, and historically the canonical device-clock exploit.</li>
+            <li><strong>Hay Day, Coin Master, Royal Match, Monopoly Go</strong> and the idle/AFK genre generally — the same two primitives (a finish time, a capped accrual rate) in different costumes, with offline progress computed on return.</li>
+            <li><strong>Client behaviour</strong> — actions applying instantly with no round trip, a lost connection rolling back to a save point rather than leaving partial state, and clan state visibly lagging your own.</li>
+          </ul>
+
+          <h3>B. Publicly discussed engineering</h3>
+          <ul>
+            <li>The general shape of these backends — in-memory per-player state, single-owner mutation, periodic persistence, deterministic simulation shared between client and server — has been described in conference talks and engineering write-ups by studios in this space over the last decade. I have summarised the pattern rather than any one talk, and I have not attributed any specific implementation detail to any specific company.</li>
+            <li><strong>Deterministic lockstep and command-list replays</strong> are long-standing, well-documented practice in real-time strategy games; the technique predates mobile free-to-play by roughly two decades and the constraints it imposes (fixed-point arithmetic, seeded randomness, stable iteration order) are standard.</li>
+          </ul>
+
+          <h3>C. The design and retention literature</h3>
+          <ul>
+            <li><strong>Appointment mechanics, variable-ratio reinforcement and loss aversion</strong> are standard vocabulary in game design and behavioural economics; the reinforcement-schedule results go back to the operant-conditioning literature of the mid twentieth century, and loss aversion to Kahneman and Tversky.</li>
+            <li><strong>Free-to-play revenue concentration</strong> — that a low single-digit percentage of players pay, and that a minority of those produce most revenue, is reported consistently across industry analyses. I have deliberately not quoted a precise figure, because the published ones vary by title, genre and year.</li>
+            <li><strong>Regulation of paid random rewards</strong> — probability disclosure requirements in China from 2017, the Belgian gaming regulator's 2018 position on certain loot boxes, and subsequent age-appropriate design codes in several jurisdictions. Details differ by jurisdiction and have changed more than once; treat the direction as the claim, not the specifics.</li>
+          </ul>
+
+          <h3>D. The computed numbers</h3>
+          <ul>
+            <li><code>game-timers/_compute.py</code> in this repository — pure-stdlib Python. It produces the record and fleet sizes of §2, the lazy-versus-tick comparison of §3, the replay arithmetic of §5, and the appointment density, overflow times, illustrative skip curve and retention table of §7. Every block states its own assumptions in the source; changing them changes the outputs and not the argument.</li>
+          </ul>
+
+          <p class="footnote">
+            <strong>Provenance.</strong> What is observed: everything in group A, which
+            you can reproduce by installing the games. What is computed: every figure
+            carrying a <span class="recon">computed here</span> badge, from the
+            assumptions printed in that figure — these are exact for the model and are
+            not measurements of any shipped system. In particular, the record sizes,
+            the traffic figures, the appointment density and the skip-price curve are
+            constructions of mine chosen to have the right shape and order of
+            magnitude; none of them is a number from a real game's telemetry, and the
+            skip curve explicitly is not any published price table. What is inferred:
+            everything about server internals — the actor-per-player model, the
+            config/save split, periodic persistence, the ownership boundary around
+            clans. These are badged <span class="recon">reconstruction</span> and are
+            guesses with reasons; they fit the observable behaviour, and so would
+            other designs. What I did not do: talk to anyone who works on these games,
+            inspect a binary, or capture network traffic. Where a claim would have
+            required a company's internal data, I have either left it out or marked
+            its range as uncertain rather than inventing a figure.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Writings</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../markov-processes/">The State Is Enough</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../what-is-quirq/">What is a unit of work?</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,115 @@
+          <h2 id="one-player-one-actor"><span class="secnum">{{S}}</span>One player, one actor</h2>
+
+          <p class="lede">
+            Once the working set fits in memory and every write is owner-scoped, a
+            third decision becomes available that most web backends cannot make: hold
+            the player's whole state in memory, in one place, and let exactly one
+            thread touch it.
+          </p>
+
+          <p>
+            The pattern is the actor model in its plainest form. A player is an object
+            with a mailbox. Commands arrive, are applied one at a time in arrival
+            order, and mutate in-memory state directly. Nothing else in the system has
+            a reference to that state. Periodically — on a timer, on session end, on
+            a significant event — the object is serialised and written down.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure" id="fig-actor">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Ownership, and the one place it is shared</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 350" role="img" aria-label="Three player actors each own their own village state and write periodic snapshots to storage. Above them a clan actor owns chat, donations and war state. Messages flow between player actors and the clan actor, labelled as idempotent and eventually consistent. A caption notes that no player actor ever reads another player actor's memory.">
+                <defs>
+                  <marker id="ac-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                  <marker id="ac-arr-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <rect x="330" y="26" width="340" height="66" rx="10" fill="#ece6f3" stroke="#765b98" stroke-width="2.2"/>
+                <text x="500" y="54" text-anchor="middle" class="svg-step">Clan actor</text>
+                <text x="500" y="78" text-anchor="middle" class="svg-note">chat · donations · war — the only shared mutable state</text>
+
+                <rect x="20" y="160" width="260" height="76" rx="10" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="150" y="188" text-anchor="middle" class="svg-step">Player actor</text>
+                <text x="150" y="212" text-anchor="middle" class="svg-note">village in memory · one thread</text>
+                <rect x="370" y="160" width="260" height="76" rx="10" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="500" y="188" text-anchor="middle" class="svg-step">Player actor</text>
+                <text x="500" y="212" text-anchor="middle" class="svg-note">village in memory · one thread</text>
+                <rect x="720" y="160" width="260" height="76" rx="10" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="850" y="188" text-anchor="middle" class="svg-step">Player actor</text>
+                <text x="850" y="212" text-anchor="middle" class="svg-note">village in memory · one thread</text>
+
+                <line x1="200" y1="156" x2="330" y2="80" stroke="#765b98" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ac-arr)"/>
+                <line x1="500" y1="156" x2="500" y2="98" stroke="#765b98" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ac-arr)"/>
+                <line x1="800" y1="156" x2="670" y2="80" stroke="#765b98" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ac-arr)"/>
+                <text x="210" y="120" class="svg-sub" style="fill:#765b98">messages — idempotent, eventual</text>
+
+                <rect x="330" y="278" width="340" height="52" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="500" y="309" text-anchor="middle" class="svg-sub">durable storage · periodic snapshots</text>
+                <line x1="150" y1="240" x2="340" y2="278" stroke="#252525" stroke-width="1.6" marker-end="url(#ac-arr-k)"/>
+                <line x1="500" y1="240" x2="500" y2="272" stroke="#252525" stroke-width="1.6" marker-end="url(#ac-arr-k)"/>
+                <line x1="850" y1="240" x2="662" y2="278" stroke="#252525" stroke-width="1.6" marker-end="url(#ac-arr-k)"/>
+
+                <text x="20" y="270" class="svg-note">No player actor ever reads another's memory.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> — the shape is inferred from
+              behaviour: actions apply instantly and strictly in order, a lost
+              connection rolls back to a save point rather than leaving half a
+              transaction, and clan state is visibly a little behind. Those are the
+              symptoms of in-memory single-owner state with periodic persistence.
+            </p>
+          </figure>
+
+          <h3>What disappears</h3>
+
+          <p>
+            Locks, for a start. There is nothing to contend over, because there is
+            exactly one writer per piece of state and it is single-threaded. With them
+            go optimistic-concurrency retries, lost-update bugs, read-modify-write
+            races, and the entire category of "two taps arrived at once". A tap is a
+            message; messages are processed in order; the order is whatever arrived
+            first. Correctness by structure rather than by discipline.
+          </p>
+
+          <p>
+            The database also disappears from the hot path. It stops being the system
+            of record consulted on every action and becomes a place where snapshots go.
+            Read latency stops mattering because there are no reads; write throughput
+            becomes a function of session count rather than action count, which is the
+            347 writes per second from the previous section instead of one per tap.
+          </p>
+
+          <h3>The one place it is shared, and how that is handled</h3>
+
+          <p>
+            Clans are the exception and the design treats them as one. A clan is its
+            own owner with its own mailbox, and every interaction across the boundary
+            is a message rather than a shared read. Donations are the clearest case:
+            a request is a record, a fulfilment is a command against it, and if two
+            clanmates fill the last slot simultaneously one of them is told they were
+            too late. No two-phase commit, no cross-actor lock, and the failure mode is
+            a minor social disappointment rather than an inconsistency.
+            <span class="src">from the record</span>
+          </p>
+
+          <p>
+            The generalisable rule is not "use actors". It is: <strong>choose the
+            ownership boundary so that almost all writes are single-owner, and make
+            the remainder idempotent messages instead of transactions.</strong> Games
+            get to do this because a village genuinely belongs to one person. Most
+            business software has at least one genuinely shared object, and the useful
+            question is how small you can make it.
+          </p>
+
+          <p>
+            The honest cost: an in-memory actor with periodic persistence loses
+            whatever happened since the last snapshot if its host dies. Games accept
+            that — a few minutes of rebuilt progress is an annoyance, and they usually
+            re-grant it. A ledger cannot accept it at any price. The design is right
+            here precisely because the data is not money, and copying it into a system
+            where the data <em>is</em> money is how this pattern goes wrong.
+          </p>
