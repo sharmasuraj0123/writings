@@ -1,0 +1,135 @@
+          <h2 id="the-sdk"><span class="secnum">{{S}}</span>The Agent SDK is the same protocol, wrapped</h2>
+          <p class="lede">
+            The Agent SDK is not a second runtime. <code>query()</code> spawns
+            the same <code>claude</code> binary, one subprocess per session,
+            and speaks the control protocol of the previous section on your
+            behalf. What it adds is a place for your code to live inside the
+            loop: permission callbacks, hook callbacks, and MCP tools that run
+            in your process instead of a subprocess.
+          </p>
+          <p>
+            The hosting guide states the model in one line: each agent session
+            is one CLI subprocess talking over stdio, and that subprocess owns
+            the shell, the working directory, and the transcript on local disk
+            [<a href="https://code.claude.com/docs/en/agent-sdk/hosting#the-subprocess-model">docs: Agent SDK hosting § The subprocess model</a>]
+            <span class="src">from the docs</span>. N concurrent sessions are
+            N processes, each needing on the order of a gigabyte of RAM as a
+            floor, and a session never times out on its own. Everything an OS
+            has to supervise for a raw CLI process, it still has to supervise
+            for an SDK session.
+          </p>
+
+          <h3>Options are flags; methods are control requests</h3>
+          <p>
+            Almost every SDK option lands on the spawned command line or in the
+            <code>initialize</code> request, and almost every method on the
+            returned <code>Query</code> object is one control request. Figure
+            {{fig-sdk-map}} pairs them; the right-hand names are the
+            <code>subtype</code> strings present in the 2.1.280 binary
+            <span class="src">from the binary</span>.
+          </p>
+
+          <figure class="figure" id="fig-sdk-map">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What the TypeScript SDK sends for each option and method</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead><tr><th>SDK surface</th><th>On the wire</th><th>Note</th></tr></thead>
+                <tbody>
+                  <tr><td><code>cwd</code></td><td>the subprocess's working directory</td><td>also the transcript's project folder</td></tr>
+                  <tr><td><code>model</code>, <code>effort</code>, <code>fallbackModel</code></td><td><code>--model</code>, <code>--effort</code>, <code>--fallback-model</code></td><td></td></tr>
+                  <tr><td><code>permissionMode</code>, <code>allowedTools</code>, <code>disallowedTools</code></td><td>the matching flags</td><td>bypass also needs <code>allowDangerouslySkipPermissions</code></td></tr>
+                  <tr><td><code>canUseTool</code></td><td>prompts arrive as <code>can_use_tool</code></td><td>stage 7 of the permission pipeline</td></tr>
+                  <tr><td><code>hooks</code></td><td>registered in <code>initialize</code>; fired as <code>hook_callback</code></td><td>same events as settings hooks</td></tr>
+                  <tr><td><code>mcpServers</code> (in-process)</td><td>tool traffic as <code>mcp_message</code></td><td>no subprocess for your tools</td></tr>
+                  <tr><td><code>resume</code>, <code>forkSession</code>, <code>continue</code>, <code>sessionId</code></td><td><code>--resume</code>, <code>--fork-session</code>, <code>--continue</code>, <code>--session-id</code></td><td></td></tr>
+                  <tr><td><code>resumeSessionAt</code></td><td>a resume that truncates at a message UUID</td><td>not in <code>--help</code></td></tr>
+                  <tr><td><code>persistSession: false</code></td><td><code>--no-session-persistence</code></td><td>TypeScript only</td></tr>
+                  <tr><td><code>outputFormat</code></td><td><code>--json-schema</code></td><td>result in <code>structured_output</code></td></tr>
+                  <tr><td><code>settingSources</code>, <code>settings</code></td><td><code>--setting-sources</code>, <code>--settings</code></td><td><code>[]</code> reads no settings files</td></tr>
+                  <tr><td><code>interrupt()</code></td><td><code>interrupt</code></td><td>returns a receipt of queued turns</td></tr>
+                  <tr><td><code>setModel()</code>, <code>setPermissionMode()</code></td><td><code>set_model</code>, <code>set_permission_mode</code></td><td>streaming input only</td></tr>
+                  <tr><td><code>applyFlagSettings()</code></td><td><code>apply_flag_settings</code></td><td>most keys apply next turn</td></tr>
+                  <tr><td><code>rewindFiles()</code></td><td><code>rewind_files</code></td><td>needs <code>enableFileCheckpointing</code></td></tr>
+                  <tr><td><code>getContextUsage()</code>, <code>readFile()</code></td><td><code>get_context_usage</code>, <code>read_file</code></td><td></td></tr>
+                  <tr><td><code>mcpServerStatus()</code>, <code>setMcpServers()</code>, <code>reconnectMcpServer()</code>, <code>toggleMcpServer()</code></td><td><code>mcp_status</code>, <code>mcp_set_servers</code>, <code>mcp_reconnect</code>, <code>mcp_toggle</code></td><td>MCP servers can change mid-session</td></tr>
+                  <tr><td><code>stopTask()</code>, <code>reloadSkills()</code></td><td><code>stop_task</code>, <code>reload_skills</code></td><td></td></tr>
+                  <tr><td><code>reinitialize()</code></td><td>a second <code>initialize</code></td><td>re-delivers pending prompts after a reconnect</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Left column from the TypeScript SDK reference; middle column
+              matched by name against the control subtypes in the binary. The
+              pairing itself is my reading of the two
+              <span class="recon">reconstruction</span>, and it means anything
+              the SDK can do, a host speaking stream-json can do too.
+            </p>
+          </figure>
+
+          <h3>Four options an OS should know by name</h3>
+          <p>
+            Beyond the flag equivalents, four options exist only because
+            hosts asked for them
+            [<a href="https://code.claude.com/docs/en/agent-sdk/typescript#options">docs: TypeScript reference § Options</a>]:
+          </p>
+          <ul>
+            <li><code>spawnClaudeCodeProcess</code> replaces the spawn itself,
+              so the subprocess can run in a container, a VM, or a remote
+              sandbox while the SDK keeps speaking to its stdio. This is the
+              seam for a Coder or Vercel Sandbox workspace.</li>
+            <li><code>toolAliases</code> maps a built-in tool to an MCP tool,
+              for example <code>{ Bash: 'mcp__workspace__bash' }</code>, so
+              Claude's shell calls run wherever the OS decides.</li>
+            <li><code>managedSettings</code> injects policy-tier settings from
+              the host, above the user's own files, unless an administrator's
+              managed settings say otherwise.</li>
+            <li><code>sessionStore</code> mirrors each transcript batch to an
+              external backend, so another host can resume the session. The
+              local file is still written first; a failed mirror emits
+              <code>system/mirror_error</code> and the run continues.</li>
+          </ul>
+          <p>
+            One default deserves a warning. With no <code>systemPrompt</code>
+            option the SDK uses a minimal prompt, not Claude Code's. A host
+            that wants Claude Code's behaviour, including its tool guidance and
+            CLAUDE.md handling, passes
+            <code>{ type: 'preset', preset: 'claude_code' }</code>, optionally
+            with <code>append</code>.
+          </p>
+
+          <h3>Sessions without parsing JSONL</h3>
+          <p>
+            The docs are explicit that the transcript format is internal and
+            may change on any release
+            [<a href="https://code.claude.com/docs/en/sessions#where-transcripts-are-stored">docs: sessions § Where transcripts are stored</a>].
+            The SDK ships the readers instead: <code>listSessions()</code>,
+            <code>getSessionMessages()</code>, <code>getSessionInfo()</code>,
+            <code>renameSession()</code>, <code>tagSession()</code>, and
+            <code>resolveSettings()</code>, which reports the effective
+            configuration and where each value came from, without running a
+            session. Python has the same set in snake case. xo-space reads the
+            files directly today, and has already paid for it: its reader
+            derives the project folder by replacing only <code>/</code>, while
+            Claude Code replaces every non-alphanumeric character. On this
+            machine, all seven project folders whose working directory
+            contains a dot resolve under XO's rule to a folder that does not
+            exist, so their sessions show no history
+            [<code>adapters/claude_code/_project_encoding.py</code>, <code>sessions.py</code>]
+            <span class="src">measured</span>.
+          </p>
+          <p>
+            The three hosting patterns in the SDK guide map directly onto an
+            OS's choices. <em>Ephemeral</em>: one container per task, destroyed
+            after. <em>Long-running</em>: containers that hold many live
+            subprocesses, fed with <code>streamInput()</code>, pre-warmed with
+            <code>startup()</code>, and pinned to a host by consistent hashing
+            on <code>sessionId</code>. <em>Hybrid</em>: ephemeral containers
+            that hydrate from a <code>sessionStore</code> when the user returns
+            [<a href="https://code.claude.com/docs/en/agent-sdk/hosting#choose-a-session-pattern">docs: Agent SDK hosting § Choose a session pattern</a>].
+            XO's per-turn spawn is the ephemeral pattern applied at the wrong
+            granularity: it destroys the process after every turn, not after
+            every task.
+          </p>

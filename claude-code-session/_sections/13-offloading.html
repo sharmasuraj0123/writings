@@ -1,0 +1,263 @@
+          <h2 id="offloading"><span class="secnum">{{S}}</span>How Claude hands work to your app</h2>
+          <p class="lede">
+            There are two ways to give Claude a capability: teach it to run
+            your program, or register your program as a tool. Everything else
+            in the extension system is packaging, policy, or timing layered on
+            one of those two. The design question for an app is how tightly it
+            wants to be coupled, and how it reports back when the work outlives
+            the turn.
+          </p>
+
+          <figure class="figure wide" id="fig-coupling">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Seven ways to hand work to an app, from loosest to tightest coupling</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 356" role="img" aria-label="A staircase of seven steps rising from left to right. One, a CLI on PATH called through Bash. Two, a skill that teaches Claude when to call it. Three, an MCP server with typed tools. Four, a channel or socket post for asynchronous completion. Five, hooks that observe and gate. Six, a plugin that packages the rest. Seven, the app as the session's host. Each step lists what it gives the app and what it costs.">
+                <defs>
+                  <marker id="fcp-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <line x1="14" y1="336" x2="1066" y2="36" stroke="#b8b8b1" stroke-width="1" stroke-dasharray="3 5"/>
+                <text x="14" y="352" class="svg-note">loose: Claude decides when and how</text>
+                <text x="1066" y="100" text-anchor="end" class="svg-note">tight: your app decides</text>
+
+                <rect x="14" y="262" width="142" height="66" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="24" y="282" class="svg-num">1</text>
+                <text x="38" y="282" class="svg-step">CLI on PATH</text>
+                <text x="24" y="300" class="svg-sub">Bash(mytool *)</text>
+                <text x="24" y="316" class="svg-sub">30k chars back</text>
+
+                <rect x="164" y="220" width="142" height="66" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="174" y="240" class="svg-num">2</text>
+                <text x="188" y="240" class="svg-step">Skill</text>
+                <text x="174" y="258" class="svg-sub">when to call it;</text>
+                <text x="174" y="274" class="svg-sub">allowed-tools</text>
+
+                <rect x="314" y="178" width="142" height="66" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="324" y="198" class="svg-num">3</text>
+                <text x="338" y="198" class="svg-step">MCP tools</text>
+                <text x="324" y="216" class="svg-sub">typed input;</text>
+                <text x="324" y="232" class="svg-sub">mcp__srv__tool</text>
+
+                <rect x="464" y="136" width="142" height="66" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="474" y="156" class="svg-num">4</text>
+                <text x="488" y="156" class="svg-step">Push back</text>
+                <text x="474" y="174" class="svg-sub">channel event or</text>
+                <text x="474" y="190" class="svg-sub">socket post</text>
+
+                <rect x="614" y="94" width="142" height="66" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="624" y="114" class="svg-num">5</text>
+                <text x="638" y="114" class="svg-step">Hooks</text>
+                <text x="624" y="132" class="svg-sub">observe and gate;</text>
+                <text x="624" y="148" class="svg-sub">33 events</text>
+
+                <rect x="764" y="52" width="142" height="66" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="774" y="72" class="svg-num">6</text>
+                <text x="788" y="72" class="svg-step">Plugin</text>
+                <text x="774" y="90" class="svg-sub">bundles 1 to 5;</text>
+                <text x="774" y="106" class="svg-sub">bin/ on PATH</text>
+
+                <rect x="914" y="10" width="152" height="66" rx="8" fill="#f7e3c8" stroke="#d98226" stroke-width="1.6"/>
+                <text x="924" y="30" class="svg-num">7</text>
+                <text x="938" y="30" class="svg-step">Be the host</text>
+                <text x="924" y="48" class="svg-sub">SDK or stream-json;</text>
+                <text x="924" y="64" class="svg-sub">in-process tools</text>
+
+                <text x="14" y="110" class="svg-lane">WHAT EACH STEP ADDS</text>
+                <text x="14" y="130" class="svg-sub">1 works today, no install</text>
+                <text x="14" y="146" class="svg-sub">2 Claude reaches for it unprompted</text>
+                <text x="14" y="162" class="svg-sub">3 schemas, per-tool permission rules</text>
+                <text x="614" y="208" class="svg-sub">4 the work may outlive the turn</text>
+                <text x="614" y="224" class="svg-sub">5 deterministic, not left to the model</text>
+                <text x="614" y="240" class="svg-sub">6 one install, versioned, shareable</text>
+                <text x="614" y="256" class="svg-sub">7 permissions, events and lifecycle are yours</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Blue steps are the tool path (data into the loop), purple is the
+              hook path (the loop calls out), orange is the host seat. The
+              limits on the steps are sourced: Bash output is read back up to
+              30,000 characters by default, MCP results up to 25,000 tokens
+              [<a href="https://code.claude.com/docs/en/env-vars">docs: environment variables</a>].
+              The ordering is my own <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <h3>Step 1: a command-line program is already a tool</h3>
+          <p>
+            Anything on <code>PATH</code> is callable through Bash, gated by a
+            rule like <code>Bash(mytool *)</code>; the space before the
+            asterisk matters, because without it the rule also matches
+            <code>mytool-admin</code>. What the program sees is documented and
+            stable enough to design against
+            [<a href="https://code.claude.com/docs/en/env-vars">docs: environment variables</a>]:
+          </p>
+          <table>
+            <thead><tr><th>Variable</th><th>Set in</th><th>Use it to</th></tr></thead>
+            <tbody>
+              <tr><td><code>CLAUDECODE=1</code></td><td>Bash, hooks, status line, stdio MCP servers</td><td>switch to machine-readable output</td></tr>
+              <tr><td><code>CLAUDE_CODE_CHILD_SESSION=1</code></td><td>Bash, Monitor, hooks; not MCP servers</td><td>tell a tool call from an IDE terminal</td></tr>
+              <tr><td><code>CLAUDE_CODE_SESSION_ID</code></td><td>Bash, hooks, stdio MCP servers</td><td>key your own state to the session</td></tr>
+              <tr><td><code>CLAUDE_CODE_MESSAGING_SOCKET</code>, <code>_TOKEN</code></td><td>Bash, hooks</td><td>post a result back later (door 2)</td></tr>
+              <tr><td><code>CLAUDE_PID</code>, <code>CLAUDE_EFFORT</code></td><td>Bash, hooks</td><td>find the parent; scale your own effort</td></tr>
+              <tr><td><code>CLAUDE_JOB_DIR</code></td><td>background sessions</td><td>write scratch files that never prompt</td></tr>
+            </tbody>
+          </table>
+          <p>
+            The costs are the defaults: a two-minute timeout that the model can
+            raise to ten, output truncated at 30,000 characters, and prose
+            parsing. Long work should run with <code>run_in_background</code>
+            and be watched with the <code>Monitor</code> tool, or should hand
+            back a job ID and post the result through the socket when done.
+          </p>
+
+          <h3>Step 2: a skill decides whether Claude ever calls you</h3>
+          <p>
+            A skill is a directory with a <code>SKILL.md</code>. Its
+            <code>description</code> sits in context all the time; its body
+            loads only when invoked. That split is what makes a skill the
+            routing layer: the description is the only thing Claude reads when
+            deciding whether your app is relevant. The frontmatter can
+            pre-approve the tools the skill needs (<code>allowed-tools</code>),
+            pin <code>model</code> and <code>effort</code>, run the skill in a
+            subagent (<code>context: fork</code>), gate it to file paths
+            (<code>paths</code>), and attach hooks
+            [<a href="https://code.claude.com/docs/en/claude-directory#frontmatter-fields-by-file">docs: .claude directory § Frontmatter fields</a>].
+            XO already uses this: xo-space turns an agent type into a
+            <code>/skill-name</code> prefix on the prompt
+            [<code>adapters/claude_code/adapter.py</code>, <code>_build_cmd</code>]
+            <span class="src">from the tree</span>.
+          </p>
+
+          <h3>Step 3: MCP gives the work a type</h3>
+          <p>
+            An MCP server turns each operation into a tool with a JSON Schema,
+            named <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>, with its own
+            permission rule. The limits to design around: startup waits up to
+            <code>MCP_TIMEOUT</code> (30 s); an HTTP or SSE request times out
+            after 60 s unless the per-server <code>timeout</code> is raised;
+            results over 10,000 tokens warn and over 25,000 are cut, unless the
+            tool declares <code>_meta["anthropic/maxResultSizeChars"]</code>. A
+            tool flagged <code>requiresUserInteraction</code> always prompts,
+            in every mode, and a server can ask the user a question in the
+            middle of a call through elicitation. When your app is itself the
+            host, the Agent SDK runs the server inside your process
+            (<code>createSdkMcpServer</code>) and no subprocess is needed
+            [<a href="https://code.claude.com/docs/en/agent-sdk/custom-tools">docs: Agent SDK § Custom tools</a>].
+          </p>
+
+          <h3>Step 4: when the work outlives the turn</h3>
+          <p>
+            A tool call blocks the loop. Real work (a build, a deploy, a
+            human review) should not. The pattern that fits Claude Code's
+            primitives is <em>acknowledge, then push</em>, and Figure
+            {{fig-async-offload}} traces it.
+          </p>
+
+          <figure class="figure wide" id="fig-async-offload">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Acknowledge, then push: a job that finishes after the turn has ended</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 376" role="img" aria-label="A sequence diagram with three lifelines: the session, your app's MCP server, and the job runner. The session calls submit_job and immediately receives a job ID, then ends its turn. The runner works for twenty minutes. On completion the MCP server emits a channel notification, or a child process posts to the inbox socket. The session starts a new turn, calls get_result, and continues.">
+                <defs>
+                  <marker id="fao-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fao-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fao-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <text x="160" y="22" text-anchor="middle" class="svg-lane">SESSION</text>
+                <text x="540" y="22" text-anchor="middle" class="svg-lane">YOUR MCP SERVER</text>
+                <text x="920" y="22" text-anchor="middle" class="svg-lane">JOB RUNNER</text>
+                <line x1="160" y1="32" x2="160" y2="366" stroke="#b8b8b1" stroke-width="1"/>
+                <line x1="540" y1="32" x2="540" y2="366" stroke="#b8b8b1" stroke-width="1"/>
+                <line x1="920" y1="32" x2="920" y2="366" stroke="#b8b8b1" stroke-width="1"/>
+
+                <rect x="146" y="44" width="28" height="100" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="20" y="62" class="svg-sub">turn 1</text>
+                <line x1="176" y1="64" x2="534" y2="64" stroke="#252525" stroke-width="2" marker-end="url(#fao-k)"/>
+                <text x="190" y="58" class="svg-sub">tools/call mcp__ci__submit_job {branch}</text>
+                <line x1="546" y1="80" x2="914" y2="80" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fao-b)"/>
+                <text x="560" y="74" class="svg-sub">enqueue</text>
+                <line x1="534" y1="100" x2="176" y2="100" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fao-b)"/>
+                <text x="190" y="94" class="svg-sub">{job_id: "j-412", eta: "20m"}, in 80 ms</text>
+                <text x="190" y="124" class="svg-note">Claude tells the user it is running and ends the turn</text>
+
+                <rect x="906" y="96" width="28" height="150" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="946" y="176" class="svg-sub">20 minutes</text>
+                <text x="190" y="190" class="svg-note">session idle: no tokens spent while waiting</text>
+
+                <line x1="914" y1="244" x2="546" y2="244" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fao-b)"/>
+                <text x="560" y="238" class="svg-sub">done: 2 failures</text>
+                <path d="M 534 262 L 176 262" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fao-p)"/>
+                <text x="190" y="256" class="svg-sub">notifications/claude/channel {content, meta: {job_id}}</text>
+
+                <rect x="146" y="270" width="28" height="86" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="20" y="290" class="svg-sub">turn 2</text>
+                <line x1="176" y1="306" x2="534" y2="306" stroke="#252525" stroke-width="2" marker-end="url(#fao-k)"/>
+                <text x="190" y="300" class="svg-sub">tools/call mcp__ci__get_result {job_id}</text>
+                <line x1="534" y1="330" x2="176" y2="330" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fao-b)"/>
+                <text x="190" y="324" class="svg-sub">structured result</text>
+                <text x="190" y="350" class="svg-note">without --channels: a child posts to $CLAUDE_CODE_MESSAGING_SOCKET instead</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The two push paths are sourced: channel notifications start a
+              new turn in an idle session and batch into the next turn in a
+              busy one, and the inbox socket does the same for a local child
+              process. The tool names are illustrative. What the pattern buys
+              is that the session holds no open tool call while it waits, so
+              the wait costs nothing. If the process is replaced in the
+              meantime, the app has to find the new one, by
+              <code>sessionId</code> in the registry, before it can push
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+          <p>
+            When the app is the host, a third path exists that needs no push
+            at all: <code>PreToolUse</code> returns <code>defer</code>, the
+            <code>-p</code> process exits with the call preserved, and the host
+            resumes the session when it has the answer. It trades the push for
+            a process restart, and it only works on single-call turns.
+          </p>
+
+          <h3>Steps 5 to 7: policy, packaging, and the host seat</h3>
+          <p>
+            <strong>Hooks</strong> are how an app watches or constrains work
+            without being asked. Five handler types exist: a shell
+            <code>command</code> fed JSON on stdin, an <code>http</code> POST,
+            an <code>mcp_tool</code> call to a connected server, a single-turn
+            <code>prompt</code> to a model, and an experimental
+            <code>agent</code>. Command, HTTP and MCP hooks time out after 600
+            seconds by default; <code>SessionEnd</code> hooks share a 1.5-second
+            budget. Only exit code 2 blocks; exit 1 is a non-blocking error,
+            which is the single most common way a policy hook silently fails
+            [<a href="https://code.claude.com/docs/en/hooks#exit-code-output">docs: hooks § Exit code output</a>].
+            For an OS, three events carry most of the value:
+            <code>SessionStart</code> to inject context and bind the session to
+            the OS's own records, <code>PostToolUse</code> to index what
+            changed, and <code>Stop</code> to capture the turn's final answer
+            from <code>last_assistant_message</code>.
+          </p>
+          <p>
+            <strong>A plugin</strong> is the unit of distribution: skills,
+            agents, hooks, MCP and LSP servers, monitors, default settings, and
+            a <code>bin/</code> directory that lands on <code>PATH</code>,
+            under one manifest, installable from a marketplace or loaded for
+            one session with <code>--plugin-dir</code> or
+            <code>--plugin-url</code>
+            [<a href="https://code.claude.com/docs/en/plugins-reference">docs: plugins reference</a>].
+            If XO ships one thing to every workspace, it should be a plugin,
+            because a plugin is the only artifact that carries steps 1 to 5
+            together and can be pinned to a version.
+          </p>
+          <p>
+            <strong>Being the host</strong> is the last step, covered in
+            <a href="#driving-a-session">the protocol section</a> and
+            <a href="#the-sdk">the SDK section</a>: the app that spawns the
+            session owns the permission seat, the event stream, and the
+            lifecycle, and can register tools in-process. The cost is that it must now
+            keep the process alive, which is exactly the job an OS exists to
+            do.
+          </p>

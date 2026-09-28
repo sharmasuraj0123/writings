@@ -1,0 +1,256 @@
+          <h2 id="driving-a-session"><span class="secnum">{{S}}</span>Driving a session: the stream-json protocol</h2>
+          <p class="lede">
+            Exactly one process can steer a session in full: its parent,
+            through stdin and stdout. The desktop app, the Agent SDK and
+            xo-space all use that pipe. The difference between them is whether
+            the process lives for one turn or for the whole conversation, and
+            whether the parent answers the questions the process sends back.
+          </p>
+
+          <h3>The reference host is already installed</h3>
+          <p>
+            The desktop app is the most complete host on this machine, and its
+            launch line can be read from the process table. Shortened, with the
+            model and effort it happened to use
+            <span class="src">measured</span>:
+          </p>
+<pre><code>claude --output-format stream-json --verbose --input-format stream-json
+       --include-partial-messages --replay-user-messages
+       --await-initialize --permission-prompt-tool stdio
+       --permission-mode auto --effort max --model claude-opus-5-5
+       --thinking-display omitted --setting-sources=user,project,local
+       --allowedTools &lt;38 of the app's own MCP tools&gt;
+       --disallowedTools SubscribePR
+       --settings '{"deniedMcpServers":[&lt;48 names&gt;]}'</code></pre>
+          <p>
+            Read flag by flag, it is a design. Stream-json in both directions
+            keeps one process alive for the whole conversation. With
+            <code>--await-initialize</code> the process reads the host's
+            <code>initialize</code> request before loading plugins, so the
+            host can hand over hooks, in-process MCP servers, agents and
+            plugins up front. <code>--permission-prompt-tool stdio</code> sends
+            every permission question back up the pipe as a control request.
+            <code>--replay-user-messages</code> echoes each input line as an
+            acknowledgement, and <code>--include-partial-messages</code> streams
+            tokens. The allowlist pre-approves the host's own tools, and the
+            denylist in <code>--settings</code> stops the user's configured MCP
+            servers from shadowing the app's built-in ones, such as
+            <code>computer-use</code> and <code>claude-in-chrome</code>. The Agent
+            SDK assembles the same line: it always passes the three stream
+            flags, turns a <code>canUseTool</code> callback into
+            <code>--permission-prompt-tool stdio</code>, and adds
+            <code>--await-initialize</code> when plugins travel in the
+            initialize request <span class="src">from the binary</span>.
+          </p>
+
+          <h3>The wire</h3>
+          <p>
+            Both directions carry one JSON object per line. The schema module
+            in the binary names the allowed stdin types:
+            <code>user</code> messages, <code>control_request</code>,
+            <code>control_response</code>, <code>control_cancel_request</code>,
+            <code>keep_alive</code>, <code>update_environment_variables</code>,
+            and three bookkeeping types. It adds two rules: the
+            <code>initialize</code> request is optional, and if the first line
+            is a user message the session initializes with defaults; and
+            closing stdin tells the process to finish the current turn and exit
+            <span class="src">from the binary</span>. Stdout carries 48
+            message types in the binary's schema, 36 of which the SDK reference
+            documents, plus a handful of internal ones, and the schema tells
+            consumers to ignore types they do not recognize, because the set
+            grows.
+          </p>
+<pre><code>host → claude   {"type":"control_request","request_id":"r1","request":{"subtype":"interrupt"}}
+claude → host   {"type":"control_response","response":{"subtype":"success","request_id":"r1",
+                 "response":{"still_queued":[]}}}
+either way      {"type":"control_response","response":{"subtype":"error","request_id":"r2",
+                 "error":"Unsupported control request subtype: …"}}
+either way      {"type":"keep_alive"}          {"type":"control_cancel_request","request_id":"r3"}</code></pre>
+          <p>
+            A user line is <code>{"type":"user","message":{"role":"user","content":…}}</code>
+            with optional <code>uuid</code>, <code>priority</code>
+            (<code>now</code>, <code>next</code>, <code>later</code>) and
+            <code>shouldQuery</code>. Setting <code>shouldQuery</code> to
+            <code>false</code> appends the message without starting a turn; it
+            is folded into the next message that does. That is the documented
+            way for a host to add context it gathered out of band without
+            paying for a model call
+            [<a href="https://code.claude.com/docs/en/agent-sdk/typescript#sdkusermessage">docs: TypeScript reference § SDKUserMessage</a>].
+          </p>
+
+          <figure class="figure wide" id="fig-protocol">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One turn over the pipe, as a host sees it, including a permission question</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 470" role="img" aria-label="A sequence diagram between the host on the left and the claude process on the right. The host spawns the process and sends initialize. Startup hook frames and the initialize response come back. The host sends a user message. The process reports it queued and started, emits system init, streams the assistant's tool call, and sends a can_use_tool control request. The host answers allow. The process emits the tool result, the final assistant text, the result message with usage and cost, and a completed lifecycle event. Later the host can send interrupt, and closing stdin ends the process.">
+                <defs>
+                  <marker id="fpr-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fpr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fpr-o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#d98226"/></marker>
+                </defs>
+                <text x="150" y="22" text-anchor="middle" class="svg-lane">HOST</text>
+                <text x="930" y="22" text-anchor="middle" class="svg-lane">CLAUDE PROCESS</text>
+                <line x1="150" y1="32" x2="150" y2="460" stroke="#b8b8b1"/>
+                <line x1="930" y1="32" x2="930" y2="460" stroke="#b8b8b1"/>
+
+                <line x1="152" y1="46" x2="926" y2="46" stroke="#252525" stroke-width="2" marker-end="url(#fpr-k)"/>
+                <text x="170" y="40" class="svg-sub">spawn: -p, stream-json in and out, --permission-prompt-tool stdio, --session-id</text>
+                <line x1="152" y1="74" x2="926" y2="74" stroke="#252525" stroke-width="2" marker-end="url(#fpr-k)"/>
+                <text x="170" y="68" class="svg-sub">control_request initialize {hooks, sdkMcpServers, agents, systemPrompt, plugins}</text>
+                <line x1="928" y1="100" x2="154" y2="100" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fpr-b)"/>
+                <text x="170" y="94" class="svg-sub">system/hook_started, hook_response   (SessionStart hooks)</text>
+                <line x1="928" y1="126" x2="154" y2="126" stroke="#252525" stroke-width="2" marker-end="url(#fpr-k)"/>
+                <text x="170" y="120" class="svg-sub">control_response success {commands, agents, models, account, pid, session_state}</text>
+
+                <line x1="152" y1="160" x2="926" y2="160" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fpr-b)"/>
+                <text x="170" y="154" class="svg-sub">{"type":"user", message, uuid, priority}</text>
+                <line x1="928" y1="186" x2="154" y2="186" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fpr-b)"/>
+                <text x="170" y="180" class="svg-sub">command_lifecycle queued, started; system/init (sent at the start of every turn)</text>
+                <line x1="928" y1="212" x2="154" y2="212" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fpr-b)"/>
+                <text x="170" y="206" class="svg-sub">stream_event deltas; assistant (one per content block): tool_use Bash</text>
+
+                <line x1="928" y1="246" x2="154" y2="246" stroke="#d98226" stroke-width="2" marker-end="url(#fpr-o)"/>
+                <text x="170" y="240" class="svg-sub">control_request can_use_tool {tool_name, input, permission_suggestions, blocked_path, …}</text>
+                <line x1="152" y1="272" x2="926" y2="272" stroke="#d98226" stroke-width="2" marker-end="url(#fpr-o)"/>
+                <text x="170" y="266" class="svg-sub">control_response {behavior: "allow", updatedInput}   or   {behavior: "deny", message}</text>
+
+                <line x1="928" y1="306" x2="154" y2="306" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fpr-b)"/>
+                <text x="170" y="300" class="svg-sub">user (tool_result); assistant (text)</text>
+                <line x1="928" y1="332" x2="154" y2="332" stroke="#252525" stroke-width="2" marker-end="url(#fpr-k)"/>
+                <text x="170" y="326" class="svg-sub">result {subtype, result, usage, total_cost_usd, num_turns, terminal_reason, permission_denials}</text>
+                <line x1="928" y1="358" x2="154" y2="358" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fpr-b)"/>
+                <text x="170" y="352" class="svg-sub">command_lifecycle completed; the process stays alive, idle</text>
+
+                <line x1="152" y1="396" x2="926" y2="396" stroke="#252525" stroke-width="2" marker-end="url(#fpr-k)"/>
+                <text x="170" y="390" class="svg-sub">later: control_request interrupt {cancel_queued}   ← receipt {still_queued, cancelled}</text>
+                <line x1="152" y1="432" x2="926" y2="432" stroke="#252525" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#fpr-k)"/>
+                <text x="170" y="426" class="svg-sub">close stdin: finish the current turn, run SessionEnd hooks, exit 0</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Observed on 2.1.280 with the short host below and in the other
+              protocol runs made for this post <span class="src">measured</span>: the
+              whole exchange took 7.1 seconds and cost about two cents on the
+              small model. Orange arrows are the permission round trip, the
+              part a per-turn host with <code>--dangerously-skip-permissions</code>
+              never sees. <code>system/init</code> is repeated at the start of
+              each turn in this mode, and the <code>command_lifecycle</code>
+              events appeared only in the run whose user line carried a
+              <code>uuid</code>.
+            </p>
+          </figure>
+
+          <p>
+            A host that holds the process can therefore do everything the SDK
+            does. A version of this loop, with a model and a budget flag added,
+            was run against 2.1.280 for this post. The <code>touch</code> it
+            asks for is not on the read-only command list, so it produced a
+            <code>can_use_tool</code> request, and the host's answer let it
+            run; the same run with <code>echo</code> produced no request at
+            all:
+          </p>
+<pre><code>import json, subprocess, uuid
+
+p = subprocess.Popen(["claude", "-p", "--input-format", "stream-json",
+        "--output-format", "stream-json", "--verbose",
+        "--permission-prompt-tool", "stdio", "--session-id", str(uuid.uuid4())],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+send = lambda m: (p.stdin.write(json.dumps(m) + "\n"), p.stdin.flush())
+
+send({"type": "control_request", "request_id": "init-1",
+      "request": {"subtype": "initialize"}})
+send({"type": "user", "message": {"role": "user",
+      "content": "Run: touch host-test.txt && echo created"}})
+
+for line in p.stdout:
+    m = json.loads(line)
+    if m["type"] == "control_request" and m["request"]["subtype"] == "can_use_tool":
+        req = m["request"]                       # tool_name, input, blocked_path, ...
+        verdict = ({"behavior": "allow", "updatedInput": req["input"]}
+                   if policy_allows(req) else {"behavior": "deny", "message": "policy"})
+        send({"type": "control_response", "response": {"subtype": "success",
+              "request_id": m["request_id"], "response": verdict}})
+    elif m["type"] == "result":
+        print(m["result"], m["total_cost_usd"])
+        break
+p.stdin.close(); p.wait()</code></pre>
+          <p>
+            <code>policy_allows</code> is the host's own function. A production
+            host also answers <code>hook_callback</code> and
+            <code>mcp_message</code> if its <code>initialize</code> registered
+            hooks or in-process MCP servers, replies with an error to any
+            control request it does not recognize, and keeps reading after the
+            result instead of breaking, since the process now waits for the
+            next user line.
+          </p>
+
+          <h3>Sixty-six control requests</h3>
+          <p>
+            The binary's schema table lists 66 control-request subtypes and
+            marks who sends each; the print loop handles about seventeen more
+            that the table omits <span class="src">from the binary</span>. The
+            direction is the useful split. The process asks its host for
+            permission decisions (<code>can_use_tool</code>), hook results
+            (<code>hook_callback</code>), MCP traffic for servers that live in
+            the host (<code>mcp_message</code>), answers to MCP elicitations and
+            other dialogs (<code>elicitation</code>,
+            <code>request_user_dialog</code>), and refreshed credentials
+            (<code>oauth_token_refresh</code>, <code>host_auth_token_refresh</code>).
+            Everything else flows the other way and maps onto the SDK methods
+            of the next section: <code>interrupt</code>,
+            <code>set_permission_mode</code>, <code>set_model</code>,
+            <code>apply_flag_settings</code>, <code>rewind_files</code>,
+            <code>get_context_usage</code>, <code>mcp_set_servers</code>,
+            <code>stop_task</code>, <code>reload_skills</code>, and some forty
+            more. A few of them are directly useful to an OS and absent from
+            the SDK's documented surface: <code>get_session_cost</code>,
+            <code>get_usage</code>, <code>get_settings</code> (the effective
+            settings with their sources), <code>get_hooks_listing</code>,
+            <code>list_permission_rules</code>, <code>register_repo_root</code>
+            to add a directory mid-session, and <code>end_session</code>.
+            Undocumented subtypes can change without notice; feature-detect
+            with the <code>capabilities</code> array in <code>system/init</code>,
+            which on 2.1.280 lists <code>interrupt_receipt_v1</code>,
+            <code>interrupt_cancel_queued_v1</code>, <code>msg_lifecycle_v1</code>,
+            <code>mcp_read_resource_v1</code> and <code>mcp_tool_ui_meta_v1</code>.
+          </p>
+          <p>
+            The <code>result</code> message is the host's ledger for the turn.
+            Beyond the documented fields it carries a
+            <code>terminal_reason</code> that says precisely why the turn
+            ended, one of nineteen values: <code>completed</code>,
+            <code>max_turns</code>, <code>budget_exhausted</code>,
+            <code>tool_deferred</code>, <code>aborted_streaming</code>,
+            <code>aborted_tools</code>, <code>stop_hook_prevented</code>,
+            <code>prompt_too_long</code>, <code>api_error</code>,
+            <code>model_error</code> and nine more
+            <span class="src">from the binary</span>. A host that records only
+            <code>is_error</code>, as xo-space does, cannot tell a budget stop
+            from a crash.
+          </p>
+
+          <h3>One process per turn, or one per conversation</h3>
+          <table>
+            <thead><tr><th></th><th>xo-space today: a process per turn</th><th>desktop app: a process per conversation</th></tr></thead>
+            <tbody>
+              <tr><td>prompt</td><td>argv, after <code>-p</code></td><td>a user line on stdin</td></tr>
+              <tr><td>boot cost</td><td>every turn: settings, hooks, MCP connections</td><td>once</td></tr>
+              <tr><td>permission prompts</td><td>bypassed</td><td><code>can_use_tool</code> answered by the app</td></tr>
+              <tr><td>stopping a turn</td><td>not implemented; the child is not killed on disconnect</td><td><code>interrupt</code>, with a receipt</td></tr>
+              <tr><td>changing model or mode</td><td>only on the next spawn (and <code>--model</code> is never passed)</td><td><code>set_model</code>, <code>set_permission_mode</code> mid-session</td></tr>
+              <tr><td>background work</td><td>shells stopped shortly after the result</td><td>continues and reports through <code>task_notification</code></td></tr>
+              <tr><td>inbox socket</td><td>exists only while a turn runs</td><td>always bound</td></tr>
+              <tr><td>session ID</td><td>pre-allocated, then <code>--resume</code></td><td>host record <code>local_&lt;uuid&gt;</code> mapped to the CLI's ID</td></tr>
+            </tbody>
+          </table>
+          <p>
+            The per-turn design is simpler to write and survives a server
+            restart without a supervisor, which is presumably why xo-space chose
+            it. It pays for that on every turn, and it cannot host anything
+            that needs the process to be there between turns: a permission
+            question, a background job's completion, a message from another
+            session. The long-lived design needs a process manager, which is
+            the first thing an OS provides.
+          </p>
