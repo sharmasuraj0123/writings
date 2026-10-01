@@ -1,0 +1,238 @@
+          <h2 id="trade-offs"><span class="secnum">{{S}}</span>The trade-offs nobody escapes</h2>
+
+          <p class="lede">
+            Under the product names there are a few mechanisms, and each has a cost
+            that no vendor removes. A storage engine trades read cost against write
+            cost against space. A distributed system trades latency against
+            consistency, even when nothing is broken. Knowing which trade a product
+            made tells you more than its feature page does.
+          </p>
+
+          <h3>Two storage engines</h3>
+
+          <p>
+            Almost every engine in §2 and §3 is one of two designs. A
+            <strong>B-tree</strong> keeps sorted, page-sized nodes on disk and updates
+            them in place (PostgreSQL's indexes, InnoDB's clustered index, SQLite). A
+            <strong>log-structured merge tree</strong> (LSM) never updates in place. It
+            buffers writes in a sorted in-memory <em>memtable</em>, flushes it as an
+            immutable sorted file (an SSTable), and merges those files in the
+            background through <em>compaction</em>. RocksDB, Cassandra and ScyllaDB are
+            LSM engines. ClickHouse's MergeTree follows the same idea for columns:
+            each insert becomes an immutable part, and parts are merged later.
+            <span class="src">from the docs</span>
+          </p>
+
+          <figure class="figure wide" id="fig-amplification">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">B-tree versus LSM-tree: where each one pays</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 400" role="img" aria-label="Left, a B-tree: a root page, two inner pages and four leaf pages. A write descends to one leaf and rewrites that page in place, plus a WAL record. Reads are cheap, one root-to-leaf path. Writes pay a whole page per small change, and pages are kept partly empty. Right, an LSM tree: writes go to a memtable and WAL, the memtable flushes to an immutable level-0 SSTable, and compaction merges level 0 into levels 1 and 2. Writes are sequential and cheap. Reads may check the memtable and several levels, helped by bloom filters, and compaction rewrites the same data several times. Space holds obsolete versions until compaction.">
+                <defs>
+                  <marker id="fig-amplification-blu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-amplification-pur" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">B-TREE · UPDATE IN PLACE</text>
+                <rect x="210" y="36" width="110" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="246" y="58" class="svg-sub">root</text>
+                <rect x="90" y="96" width="110" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="330" y="96" width="110" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <line x1="240" y1="70" x2="150" y2="96" stroke="#b8b8b1"/>
+                <line x1="290" y1="70" x2="380" y2="96" stroke="#b8b8b1"/>
+                <rect x="20" y="156" width="110" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="150" y="156" width="110" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="290" y="156" width="110" height="34" rx="5" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <rect x="420" y="156" width="110" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <line x1="130" y1="130" x2="75" y2="156" stroke="#b8b8b1"/>
+                <line x1="160" y1="130" x2="205" y2="156" stroke="#b8b8b1"/>
+                <line x1="370" y1="130" x2="345" y2="156" stroke="#3c6f97" stroke-width="1.6"/>
+                <line x1="410" y1="130" x2="475" y2="156" stroke="#b8b8b1"/>
+                <text x="296" y="178" class="svg-sub">rewrite</text>
+                <text x="20" y="222" class="svg-note">one write = one WAL record + one whole page, rewritten in place</text>
+
+                <line x1="560" y1="10" x2="560" y2="250" stroke="#deded9"/>
+
+                <text x="590" y="18" class="svg-lane">LSM-TREE · APPEND, THEN MERGE</text>
+                <rect x="590" y="36" width="150" height="40" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="604" y="61" class="svg-sub">memtable</text>
+                <line x1="740" y1="56" x2="796" y2="56" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-amplification-blu)"/>
+                <text x="746" y="48" class="svg-sub">flush</text>
+                <rect x="800" y="36" width="64" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="872" y="36" width="64" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="944" y="36" width="64" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1020" y="61" class="svg-sub">L0</text>
+                <rect x="800" y="106" width="208" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1020" y="131" class="svg-sub">L1</text>
+                <rect x="800" y="176" width="280" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1088" y="201" class="svg-sub">L2</text>
+                <path d="M790 66 Q760 90 790 120" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-amplification-pur)"/>
+                <path d="M790 136 Q760 160 790 190" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-amplification-pur)"/>
+                <text x="604" y="140" class="svg-sub">compaction</text>
+                <text x="604" y="160" class="svg-sub">rewrites data</text>
+                <text x="590" y="240" class="svg-note">one write = one WAL record + a memtable insert; merged later, repeatedly</text>
+
+                <rect x="0" y="266" width="1120" height="130" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="16" y="292" class="svg-lane">AMPLIFICATION</text>
+                <text x="200" y="292" class="svg-lane">B-TREE</text>
+                <text x="660" y="292" class="svg-lane">LSM-TREE</text>
+                <text x="16" y="320" class="svg-step">read</text>
+                <text x="200" y="320" class="svg-sub">low: one root-to-leaf path</text>
+                <text x="660" y="320" class="svg-sub">higher: memtable + levels, bloom filters help</text>
+                <text x="16" y="348" class="svg-step">write</text>
+                <text x="200" y="348" class="svg-sub">high: a page per small change, random I/O</text>
+                <text x="660" y="348" class="svg-sub">low on ingest, paid back by compaction</text>
+                <text x="16" y="376" class="svg-step">space</text>
+                <text x="200" y="376" class="svg-sub">pages kept partly empty to absorb inserts</text>
+                <text x="660" y="376" class="svg-sub">old versions linger until compaction</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span>: qualitative, no numbers
+              claimed. Neither design is faster in general. Each moves cost to a
+              different moment. B-trees pay at write time, and LSM trees pay in
+              background I/O and on reads that miss the memtable.
+            </p>
+          </figure>
+
+          <p>
+            The general form of this is the <strong>RUM conjecture</strong>
+            (Athanassoulis et al., EDBT 2016): an access method can minimise at most
+            two of read overhead, update overhead and memory (space) overhead.
+            <span class="src">from the docs</span> Indexes are the everyday case.
+            Every index you add makes some reads cheaper and every write more
+            expensive. §8 measures that on this machine: an expression index turns a
+            20,000-document filter from 22,062 µs into 9.2 µs.
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>Distribution: CAP is narrow, PACELC is useful</h3>
+
+          <p>
+            CAP says that during a network <em>partition</em>, a replicated system must
+            choose between availability and linearizable consistency. That is true,
+            and it only covers the partition case. Abadi's <strong>PACELC</strong>
+            (IEEE Computer, 2012) adds the case that runs all day: <em>else</em>, with
+            no partition, you still choose between <em>latency</em> and
+            <em>consistency</em>, because waiting for another replica to acknowledge
+            costs a round trip on every write. <span class="src">from the docs</span>
+            Cassandra with consistency level <code>ONE</code> is PA/EL. A
+            single-leader Postgres with synchronous replication is PC/EC. Most of the
+            cost of "distributed" is in the EL/EC half.
+          </p>
+
+          <figure class="figure" id="fig-consistency">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The consistency ladder, with where engines sit by default</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 410" role="img" aria-label="A ladder of seven rungs from weakest at the bottom to strongest at the top: eventual, read-your-writes, causal, read committed, snapshot, serializable, strict serializable. Defaults are marked: Cassandra at consistency level ONE and asynchronous Valkey replicas at eventual; MongoDB causally consistent sessions at causal; PostgreSQL default at read committed; PostgreSQL repeatable read and TiDB at snapshot; SQLite, PostgreSQL serializable, and CockroachDB default at serializable; FoundationDB and etcd at strict serializable or linearizable. Higher rungs cost more coordination latency.">
+                <defs>
+                  <marker id="fig-consistency-blk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">GUARANTEE</text>
+                <text x="400" y="18" class="svg-lane">WHO SITS HERE BY DEFAULT (OR ON ONE SETTING)</text>
+
+                <rect x="0" y="32" width="360" height="42" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="2"/>
+                <text x="16" y="59" class="svg-step">strict serializable</text>
+                <text x="400" y="59" class="svg-sub">FoundationDB; etcd (linearizable keys)</text>
+
+                <rect x="0" y="84" width="360" height="42" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="16" y="111" class="svg-step">serializable</text>
+                <text x="400" y="111" class="svg-sub">SQLite; CockroachDB default; Postgres SERIALIZABLE</text>
+
+                <rect x="0" y="136" width="360" height="42" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="16" y="163" class="svg-step">snapshot</text>
+                <text x="400" y="163" class="svg-sub">Postgres REPEATABLE READ; TiDB default</text>
+
+                <rect x="0" y="188" width="360" height="42" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="16" y="215" class="svg-step">read committed</text>
+                <text x="400" y="215" class="svg-sub">PostgreSQL default</text>
+
+                <rect x="0" y="240" width="360" height="42" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="16" y="267" class="svg-step">causal</text>
+                <text x="400" y="267" class="svg-sub">MongoDB causally consistent sessions</text>
+
+                <rect x="0" y="292" width="360" height="42" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="16" y="319" class="svg-step">read-your-writes</text>
+                <text x="400" y="319" class="svg-sub">read from the leader; sticky sessions</text>
+
+                <rect x="0" y="344" width="360" height="42" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="16" y="371" class="svg-step">eventual</text>
+                <text x="400" y="371" class="svg-sub">Cassandra at ONE; async Valkey replicas</text>
+
+                <line x1="380" y1="384" x2="380" y2="40" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-consistency-blk)"/>
+                <text x="400" y="402" class="svg-note">upward: more coordination per operation, so more latency and less availability under partition</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span>: a simplification. Replica
+              consistency (eventual, causal) and transaction isolation (read committed,
+              snapshot) are different axes, and the true hierarchy is a partial order,
+              not a ladder. Placements are <span class="src">from the docs</span> of
+              each engine. The useful lesson is that the default is a choice someone
+              made for you. Read it.
+            </p>
+          </figure>
+
+          <p>
+            Defaults vary by more than most teams realise. PostgreSQL runs
+            <code>READ COMMITTED</code> unless told otherwise, so two concurrent
+            read-modify-write transactions on a <code>jsonb</code> document can lose
+            an update without any error. Use <code>SELECT … FOR UPDATE</code>, a
+            version column, or an in-place <code>jsonb_set</code>. Cassandra lets each
+            query choose its consistency level, and reads and writes at
+            <code>QUORUM</code> overlap so a read sees the latest acknowledged write.
+            MongoDB has defaulted to write concern <code>majority</code> since 5.0.
+            <span class="src">from the docs</span> FerretDB inherits whatever its
+            PostgreSQL backend commits. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>What this means for JSON written all day</h3>
+
+          <p>
+            Two consequences follow for the workload this page is about. First, a
+            document updated in place on a B-tree engine pays for a whole new row
+            version each time, however small the change. PostgreSQL can make that a
+            HOT update, with no new index entries, when the new version fits on the
+            same page and no indexed column changed. <span class="src">from the
+            docs</span> Promoting a hot JSON field to an indexed column therefore has
+            a write cost as well as a read benefit. §7 and §9 return to this. Second,
+            an append-only event log is the access pattern LSM and columnar engines
+            were built for. The current document belongs in a B-tree engine, and its
+            history belongs in one that merges. That split is the shape of the stack
+            in §10. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Replication and sharding</h3>
+
+          <p>
+            Replication comes in three topologies. <strong>Single-leader</strong>
+            (Postgres, MySQL, Valkey) sends every write through one node: simple to
+            reason about, with a write ceiling at one machine.
+            <strong>Multi-leader</strong> (CouchDB, BDR-style setups) accepts writes in
+            several places and must resolve conflicts afterwards.
+            <strong>Leaderless</strong> (Cassandra, Dynamo-style) writes to N replicas
+            and relies on quorum overlap plus read repair. Sharding is a separate
+            decision. It splits data by key so writes scale out. The bill comes as
+            cross-shard joins, cross-shard transactions (two-phase commit or a
+            consensus layer), and rebalancing when a shard grows hot.
+          </p>
+
+          <h3>The rule</h3>
+
+          <p>
+            One well-tuned node handles far more than most products need. On this
+            machine, SQLite in WAL mode with <code>synchronous=FULL</code> committed
+            2,427 single-event inserts per second, each one durable. With
+            <code>synchronous=NORMAL</code> it committed 56,767, and batching 100 per
+            transaction reached 280,925 rows per second.
+            <span class="recon">measured here</span> PostgreSQL on a server-class
+            disk is in the same order of magnitude per node.
+            <span class="recon">reconstruction</span> Distribute when a measured limit
+            forces you to (write throughput, dataset size, or a regional latency
+            requirement), and not before. Each step up the ladder or out to more
+            shards is paid for on every request after it.
+          </p>

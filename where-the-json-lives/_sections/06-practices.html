@@ -1,0 +1,254 @@
+          <h2 id="practices"><span class="secnum">{{S}}</span>Best practices that survive production</h2>
+
+          <p class="lede">
+            Most database incidents trace back to a short list: a lock held too long, a
+            missing index, a migration that blocked writes, a backup nobody had restored, a
+            transaction left open over lunch. The practices below each prevent one item on
+            that list. They are written for PostgreSQL, and the SQLite equivalent is noted
+            where one exists.
+          </p>
+
+          <h3>Design: queries first, tables second</h3>
+
+          <p>
+            Write the queries down before you write the tables. List the five reads that run
+            most often and the one write that must never be lost. Then choose keys and
+            indexes to serve them. A schema designed from an entity diagram serves the diagram.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            <strong>Primary keys.</strong> Use <code>bigint GENERATED ALWAYS AS IDENTITY</code>
+            or a UUIDv7. PostgreSQL 18 ships <code>uuidv7()</code>.
+            <span class="src">from the docs</span> A UUIDv7 starts with a millisecond timestamp,
+            so consecutive inserts land on the right-most B-tree leaf, the way a sequence does.
+            A random UUIDv4 sends each insert to a random leaf. On a large, hot table that
+            means more pages dirtied per insert, more full-page images in WAL after each
+            checkpoint, and a working set as large as the whole index.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            <strong>Constraints are documentation that executes.</strong>
+            <code>NOT NULL</code>, <code>CHECK</code>, <code>UNIQUE</code> and foreign keys
+            enforced by the database hold even for the script someone runs at 2 a.m. without
+            going through your application. A <code>CHECK (jsonb_typeof(body) = 'object')</code>
+            costs almost nothing per write.
+          </p>
+
+          <p>
+            <strong>Indexes answer a measured query.</strong> Add one when
+            <code>EXPLAIN (ANALYZE, BUFFERS)</code> shows a sequential scan on a query you
+            actually run. In PostgreSQL 18, <code>ANALYZE</code> includes buffer counts by
+            default. <span class="src">from the docs</span> Every index is maintained on every
+            insert, and on every update that touches its column. An index can also disqualify
+            an update from the HOT path (<a href="#json-inside">next section</a>). Indexes
+            cost write throughput, so each one has to earn its place.
+          </p>
+
+          <h3>Migrations: expand, migrate, contract</h3>
+
+          <p>
+            A schema change and an application deploy are two clocks that never tick together.
+            During a rolling deploy, old and new code run side by side against the same schema.
+            So every schema state must work with the code version before it and the code
+            version after it. Expand/contract makes that true by splitting one breaking change
+            into several compatible ones (Figure {{fig-expand-contract}}).
+          </p>
+
+          <figure class="figure wide" id="fig-expand-contract">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Replacing <code>owner text</code> with <code>owner_id bigint</code> in six steps</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 420" role="img" aria-label="Expand, migrate, contract shown as six alternating steps on two lanes. Schema lane: step 1 expand, add nullable owner_id and create its index concurrently; step 3 backfill in batches with lock_timeout set and validate a NOT VALID foreign key; step 6 contract, drop the old owner column. Application lane: step 2 version 2 writes both columns and reads the old one; step 4 version 3 reads owner_id and still writes both; step 5 version 4 writes owner_id only. A bottom row shows the oldest app version you can still roll back to after each step: v1, v1, v2, v2, v3, and after the contract step none earlier than v4.">
+                <defs>
+                  <marker id="fig-expand-contract-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">SCHEMA CLOCK · MIGRATIONS</text>
+                <text x="0" y="198" class="svg-lane">DEPLOY CLOCK · APPLICATION</text>
+
+                <rect x="0" y="32" width="172" height="120" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="12" y="54" class="svg-num">1</text>
+                <text x="28" y="54" class="svg-step">Expand</text>
+                <text x="12" y="78" class="svg-sub">ADD COLUMN owner_id</text>
+                <text x="12" y="98" class="svg-sub">bigint, nullable</text>
+                <text x="12" y="118" class="svg-sub">CREATE INDEX</text>
+                <text x="12" y="138" class="svg-sub" style="white-space:pre">  CONCURRENTLY</text>
+
+                <rect x="190" y="212" width="172" height="120" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="202" y="234" class="svg-num">2</text>
+                <text x="218" y="234" class="svg-step">App v2</text>
+                <text x="202" y="258" class="svg-sub">writes owner AND</text>
+                <text x="202" y="278" class="svg-sub" style="white-space:pre">  owner_id</text>
+                <text x="202" y="298" class="svg-sub">reads owner</text>
+
+                <rect x="380" y="32" width="172" height="120" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="392" y="54" class="svg-num">3</text>
+                <text x="408" y="54" class="svg-step">Backfill</text>
+                <text x="392" y="78" class="svg-sub">5k-row batches</text>
+                <text x="392" y="98" class="svg-sub">lock_timeout = 2s</text>
+                <text x="392" y="118" class="svg-sub">FK … NOT VALID,</text>
+                <text x="392" y="138" class="svg-sub" style="white-space:pre">  then VALIDATE</text>
+
+                <rect x="570" y="212" width="172" height="120" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="582" y="234" class="svg-num">4</text>
+                <text x="598" y="234" class="svg-step">App v3</text>
+                <text x="582" y="258" class="svg-sub">reads owner_id</text>
+                <text x="582" y="278" class="svg-sub">still writes both</text>
+
+                <rect x="760" y="212" width="172" height="120" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="772" y="234" class="svg-num">5</text>
+                <text x="788" y="234" class="svg-step">App v4</text>
+                <text x="772" y="258" class="svg-sub">writes owner_id</text>
+                <text x="772" y="278" class="svg-sub" style="white-space:pre">  only</text>
+                <text x="772" y="298" class="svg-sub">owner is now dead</text>
+
+                <rect x="948" y="32" width="172" height="120" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="960" y="54" class="svg-num">6</text>
+                <text x="976" y="54" class="svg-step">Contract</text>
+                <text x="960" y="78" class="svg-sub">DROP COLUMN</text>
+                <text x="960" y="98" class="svg-sub" style="white-space:pre">  owner, once no</text>
+                <text x="960" y="118" class="svg-sub">v2/v3 pod runs</text>
+
+                <g stroke="#252525" stroke-width="2.4" fill="none" marker-end="url(#fig-expand-contract-arr)">
+                  <path d="M172 140 L196 206"/>
+                  <path d="M362 222 L386 158"/>
+                  <path d="M552 140 L576 206"/>
+                  <path d="M742 272 L754 272"/>
+                  <path d="M932 222 L954 158"/>
+                </g>
+
+                <line x1="0" y1="352" x2="1120" y2="352" stroke="#b8b8b1"/>
+                <text x="0" y="372" class="svg-lane">OLDEST SAFE ROLLBACK</text>
+                <rect x="0" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="12" y="402" class="svg-sub">v1</text>
+                <rect x="190" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="202" y="402" class="svg-sub">v1</text>
+                <rect x="380" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="392" y="402" class="svg-sub">v2</text>
+                <rect x="570" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="582" y="402" class="svg-sub">v2</text>
+                <rect x="760" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="772" y="402" class="svg-sub">v3</text>
+                <rect x="948" y="382" width="172" height="30" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="960" y="402" class="svg-sub">v4 only</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> This is the standard pattern applied to
+              one rename. Purple steps change the schema and blue steps change the code. Steps
+              alternate, and only the last one takes away a rollback option, so it runs last
+              and runs alone.
+            </p>
+          </figure>
+
+          <p>
+            Three PostgreSQL mechanics make each step non-blocking.
+            <code>CREATE INDEX CONCURRENTLY</code> builds an index without taking a lock that
+            blocks inserts, updates or deletes. It cannot run inside a transaction block, and
+            a failed build leaves an <code>INVALID</code> index that you must drop.
+            <span class="src">from the docs</span> Adding a foreign key or <code>CHECK</code> as
+            <code>NOT VALID</code> and running <code>VALIDATE CONSTRAINT</code> later moves the
+            full-table scan under a weaker lock. <span class="src">from the docs</span> And
+            <code>lock_timeout</code> stops the most common outage of all. An
+            <code>ALTER TABLE</code> waiting for its <code>ACCESS EXCLUSIVE</code> lock behind
+            one long transaction makes every later query on that table queue behind it.
+          </p>
+
+          <pre><code>SET lock_timeout = '2s';             -- fail fast, retry later; never queue
+ALTER TABLE sessions ADD COLUMN owner_id bigint;      -- nullable: no rewrite
+CREATE INDEX CONCURRENTLY sessions_owner_id ON sessions (owner_id);
+ALTER TABLE sessions ADD CONSTRAINT sessions_owner_fk
+  FOREIGN KEY (owner_id) REFERENCES users (id) NOT VALID;
+ALTER TABLE sessions VALIDATE CONSTRAINT sessions_owner_fk;</code></pre>
+
+          <h3>Connections and transactions</h3>
+
+          <p>
+            PostgreSQL starts one operating-system process per connection.
+            <span class="src">from the docs</span> Two thousand idle clients means two thousand
+            backends. Put PgBouncer in transaction mode in front, or rely on a bounded driver
+            pool when you have a single application. Transaction mode does not preserve
+            session state between transactions: <code>SET</code>, advisory locks, temporary
+            tables. Recent PgBouncer releases (1.21 and later) can track protocol-level
+            prepared statements. Keep transactions short, and never make a network call inside
+            one. Set <code>idle_in_transaction_session_timeout</code>, and on PostgreSQL 17 or
+            later <code>transaction_timeout</code>, so a stuck client cannot hold locks or
+            hold back vacuum indefinitely.
+          </p>
+
+          <h3>Backups, observability, security, lifecycle</h3>
+
+          <p>
+            A backup you have never restored is only a hope. Point-in-time recovery for
+            PostgreSQL means a base backup plus archived WAL. pgBackRest and WAL-G both do this
+            against S3-compatible storage. Litestream does the same for SQLite by streaming WAL
+            frames to an object store. Schedule a restore into a scratch instance and alert when
+            it fails. For observability, <code>pg_stat_statements</code> ranks queries by total
+            time, and <code>auto_explain</code> logs the plans of slow ones. For security, give
+            the application a role that owns nothing and is not a superuser. Require TLS.
+            Where tenants share tables, enable row-level security, keeping in mind that table
+            owners bypass it unless the table is <code>FORCE ROW LEVEL SECURITY</code>.
+            <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            Append-only tables need a retention plan from day one. Partition them by time with
+            declarative partitioning. Expiring a month is then
+            <code>DETACH PARTITION … CONCURRENTLY</code> followed by <code>DROP TABLE</code>:
+            a metadata change, with no <code>DELETE</code> leaving millions of dead tuples for
+            autovacuum. Autovacuum is how MVCC gives disk space back. Any transaction left open
+            pins the oldest row version every session might still need, so vacuum cannot
+            reclaim anything newer. Watch <code>pg_stat_activity</code> for
+            <code>xact_start</code> older than a few minutes.
+          </p>
+
+          <figure class="figure" id="fig-checklist">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The operating checklist, one row per concern, with the open-source tool</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row">
+                  <div class="stack-cell head">Design</div>
+                  <div class="stack-cell hl-blue">Write the queries first. Keys are <code>bigint</code> identity or <code>uuidv7()</code>. Constraints live in the database. Tool: PostgreSQL 18 itself.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Indexes</div>
+                  <div class="stack-cell hl-blue">Add one per measured query. Verify with <code>EXPLAIN (ANALYZE, BUFFERS)</code>. Drop indexes nobody uses; <code>pg_stat_user_indexes.idx_scan = 0</code> finds them.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Migrations</div>
+                  <div class="stack-cell hl-blue">Expand/contract. <code>CREATE INDEX CONCURRENTLY</code>, <code>NOT VALID</code> then <code>VALIDATE</code>, <code>lock_timeout</code>. Tools: plain SQL files in a migration runner such as sqitch or dbmate.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Connections</div>
+                  <div class="stack-cell hl-purple">PgBouncer in transaction mode. Short transactions. <code>idle_in_transaction_session_timeout</code> and <code>transaction_timeout</code>.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Observability</div>
+                  <div class="stack-cell hl-purple"><code>pg_stat_statements</code>, <code>auto_explain</code>, <code>log_min_duration_statement</code>. Export through postgres_exporter to Prometheus.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Security</div>
+                  <div class="stack-cell hl-purple">A least-privilege app role. No superuser. TLS required. Row-level security where tenants share tables.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Backups</div>
+                  <div class="stack-cell hl-green">pgBackRest or WAL-G for point-in-time recovery. Litestream for SQLite. Restore on a schedule and alert when a restore fails.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Retention</div>
+                  <div class="stack-cell hl-green">Partition append-only tables by time, then detach and drop. Archive old partitions to Parquet in object storage before dropping them.</div>
+                </div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              Blue rows are decided when you write the schema, purple rows apply while the
+              system runs, and green rows protect data over time. The tools are the ones this
+              guide uses later. Each is OSI-licensed. <span class="recon">reconstruction</span>
+            </p>
+          </figure>

@@ -1,0 +1,309 @@
+          <h2 id="hybrid-schema"><span class="secnum">{{S}}</span>The hybrid schema</h2>
+
+          <p class="lede">
+            Do not choose between columns and JSON. Put each field where its use puts it.
+            A field you filter, sort, join, aggregate, or constrain on gets a real column.
+            A field that changes far more often than the rest of the document also gets one.
+            Everything else stays in a JSONB body that can grow new keys without a migration.
+          </p>
+
+          <p>
+            That is the rule of promotion, and it is the whole design. It is the default
+            because the two halves fail in opposite ways. An all-columns schema turns every new
+            optional field into a migration on a hot table, which is the cost
+            <a href="#practices">§6</a> spends a figure avoiding. An all-JSON schema turns
+            every filter into a scan or a guessed GIN query, and it turns every counter bump
+            into a rewrite of the whole document, which is what <a href="#json-inside">§7</a>
+            showed and <a href="#measured">§8</a> measured.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure wide" id="fig-hybrid-row">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Anatomy of a hybrid row: typed columns, one JSONB body, and the history beside it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 540" role="img" aria-label="A documents row drawn as nine cells. Seven typed columns in blue: id as a uuidv7, tenant_id, kind, status, updated_at, and schema_version; version in orange because it carries optimistic concurrency. A green generated column owner_id is derived from the body by a thin blue arrow from the owner key. The body cell is purple, JSONB under 64 kB, holding the long tail: agent, usage, todos, tags, notes. To the right, three indexes: a partial B-tree on tenant, kind and updated_at for live rows, a GIN jsonb_path_ops index on the body for containment, and a B-tree on owner_id. Below, an append-only document_events table split into monthly partitions. A thick black arrow shows one transaction that updates the row and inserts an event together. A dashed purple arrow shows that the snapshot can be rebuilt by folding the events.">
+                <defs>
+                  <marker id="fig-hybrid-row-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-hybrid-row-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-hybrid-row-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="0" y="18" class="svg-lane">DOCUMENTS · ONE ROW PER THING, KEPT SMALL</text>
+                <rect x="0" y="32" width="120" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="12" y="58" class="svg-step">id</text>
+                <text x="12" y="84" class="svg-sub">uuid · v7</text>
+                <rect x="124" y="32" width="104" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="136" y="58" class="svg-step">tenant_id</text>
+                <text x="136" y="84" class="svg-sub">uuid</text>
+                <rect x="232" y="32" width="84" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="244" y="58" class="svg-step">kind</text>
+                <text x="244" y="84" class="svg-sub">text</text>
+                <rect x="320" y="32" width="84" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="332" y="58" class="svg-step">status</text>
+                <text x="332" y="84" class="svg-sub">text</text>
+                <rect x="408" y="32" width="96" height="70" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <text x="420" y="58" class="svg-step">version</text>
+                <text x="420" y="84" class="svg-sub">int · OCC</text>
+                <rect x="508" y="32" width="140" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="520" y="58" class="svg-step">schema_version</text>
+                <text x="520" y="84" class="svg-sub">smallint</text>
+                <rect x="652" y="32" width="118" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="664" y="58" class="svg-step">updated_at</text>
+                <text x="664" y="84" class="svg-sub">timestamptz</text>
+                <rect x="774" y="32" width="112" height="70" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="786" y="58" class="svg-step">owner_id</text>
+                <text x="786" y="84" class="svg-sub">generated</text>
+                <rect x="890" y="32" width="230" height="70" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="2"/>
+                <text x="902" y="58" class="svg-step">body</text>
+                <text x="902" y="84" class="svg-sub">jsonb · object · &lt; 64 kB</text>
+
+                <text x="0" y="146" class="svg-lane">BODY · THE LONG TAIL</text>
+                <rect x="0" y="160" width="540" height="176" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="16" y="186" class="svg-sub">{ "owner": "user-17",</text>
+                <text x="16" y="208" class="svg-sub" style="white-space:pre">  "agent": "claude_code",</text>
+                <text x="16" y="230" class="svg-sub" style="white-space:pre">  "usage": { "input_tokens": 41210, … },</text>
+                <text x="16" y="252" class="svg-sub" style="white-space:pre">  "todos": [ …24 items… ],</text>
+                <text x="16" y="274" class="svg-sub" style="white-space:pre">  "tags":  [ "xo", "space" ],</text>
+                <text x="16" y="296" class="svg-sub" style="white-space:pre">  "notes": "…600 chars…" }</text>
+                <text x="16" y="324" class="svg-note">new keys land here with no migration</text>
+                <path d="M200 182 H 830 V 104" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-hybrid-row-blue)"/>
+                <text x="600" y="174" class="svg-note">promoted: body -&gt;&gt; 'owner'</text>
+
+                <text x="580" y="214" class="svg-lane">INDEXES · EACH ONE FOR A NAMED QUERY</text>
+                <rect x="580" y="226" width="540" height="52" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="594" y="246" class="svg-step">Partial B-tree</text>
+                <text x="594" y="268" class="svg-sub">(tenant_id, kind, updated_at) WHERE status &lt;&gt; 'archived'</text>
+                <rect x="580" y="284" width="264" height="52" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="594" y="304" class="svg-step">GIN jsonb_path_ops</text>
+                <text x="594" y="326" class="svg-sub">body @&gt; '{"agent":"codex"}'</text>
+                <rect x="856" y="284" width="264" height="52" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="870" y="304" class="svg-step">B-tree on owner_id</text>
+                <text x="870" y="326" class="svg-sub">equality and range</text>
+
+                <text x="0" y="380" class="svg-lane">DOCUMENT_EVENTS · APPEND-ONLY, ONE PARTITION PER MONTH</text>
+                <rect x="0" y="394" width="200" height="84" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="420" class="svg-step">…_2026_08</text>
+                <text x="14" y="444" class="svg-sub">detach, archive</text>
+                <text x="14" y="464" class="svg-sub">to Parquet, drop</text>
+                <rect x="214" y="394" width="200" height="84" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="228" y="420" class="svg-step">…_2026_09</text>
+                <text x="228" y="444" class="svg-sub">read for audit</text>
+                <text x="228" y="464" class="svg-sub">and rebuilds</text>
+                <rect x="428" y="394" width="200" height="84" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="442" y="420" class="svg-step">…_2026_10</text>
+                <text x="442" y="444" class="svg-sub">current: inserts</text>
+                <text x="442" y="464" class="svg-sub">only, never UPDATE</text>
+
+                <rect x="720" y="394" width="400" height="84" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="736" y="420" class="svg-lane">ONE TRANSACTION</text>
+                <text x="736" y="444" class="svg-sub">UPDATE documents … version + 1</text>
+                <text x="736" y="464" class="svg-sub">INSERT INTO document_events …</text>
+                <path d="M920 394 V 356 H 560 V 120 H 470 V 106" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-hybrid-row-ink)"/>
+                <path d="M720 436 H 632" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-hybrid-row-ink)"/>
+                <path d="M520 394 V 340" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#fig-hybrid-row-purple)"/>
+                <text x="14" y="512" class="svg-note">snapshot = fold(events): the row can always be rebuilt from its history</text>
+                <text x="720" y="512" class="svg-note">both or neither; a reader never sees one without the other</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> — the recommended shape, not a
+              measured system. Blue cells are the relational contract, the purple body is
+              the part allowed to change shape, green is derived, orange carries
+              concurrency. The hot document stays small because its history lives beside
+              it, not inside it.
+            </p>
+          </figure>
+
+          <h3>The table</h3>
+
+          <p>
+            Here is the shape in PostgreSQL 18 DDL. <code>uuidv7()</code> is new in 18 and
+            gives time-ordered keys, so inserts land at the right edge of the primary-key
+            B-tree. <span class="src">from the docs</span> The body must be a JSON object and
+            must stay under 64 kB. The <code>pg_column_size</code> guard measures the value as
+            it is handed to the constraint, before the stored tuple is compressed, so treat it
+            as a rough ceiling rather than a byte-exact one. <span class="recon">reconstruction</span>
+          </p>
+
+          <pre><code>CREATE TABLE documents (
+  id             uuid        PRIMARY KEY DEFAULT uuidv7(),
+  tenant_id      uuid        NOT NULL,
+  kind           text        NOT NULL,
+  status         text        NOT NULL DEFAULT 'active',
+  version        integer     NOT NULL DEFAULT 1,
+  schema_version smallint    NOT NULL DEFAULT 1,
+  body           jsonb       NOT NULL
+                 CHECK (jsonb_typeof(body) = 'object')
+                 CHECK (pg_column_size(body) &lt; 65536),
+  owner_id       text        GENERATED ALWAYS AS (body -&gt;&gt; 'owner') STORED,
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX documents_live      ON documents (tenant_id, kind, updated_at DESC)
+                                 WHERE status &lt;&gt; 'archived';
+CREATE INDEX documents_owner     ON documents (tenant_id, owner_id);
+CREATE INDEX documents_body_path ON documents USING gin (body jsonb_path_ops);</code></pre>
+
+          <p>
+            Two details in that block are deliberate. First, <code>owner_id</code> says
+            <code>STORED</code>. PostgreSQL 18 made virtual the default for generated
+            columns, but a virtual generated column cannot carry an index in 18, and the only
+            reason to promote this path is to index it. <span class="src">from the docs</span>
+            Second, the GIN index uses <code>jsonb_path_ops</code>. It is smaller and faster
+            than the default <code>jsonb_ops</code>, but it answers only containment
+            (<code>@&gt;</code>) and jsonpath, not key-existence (<code>?</code>). Add it only
+            if you have ad-hoc containment queries over the long tail. If every filter is on a
+            promoted column, drop it and stop paying its write cost.
+            <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            The history is a separate table, append-only and range-partitioned by month, so
+            retention means detaching a partition, not running a <code>DELETE</code>:
+          </p>
+
+          <pre><code>CREATE TABLE document_events (
+  document_id uuid        NOT NULL REFERENCES documents (id),
+  seq         bigint      GENERATED ALWAYS AS IDENTITY,
+  at          timestamptz NOT NULL DEFAULT now(),
+  type        text        NOT NULL,
+  payload     jsonb       NOT NULL,
+  PRIMARY KEY (document_id, at, seq)
+) PARTITION BY RANGE (at);
+
+CREATE TABLE document_events_2026_10 PARTITION OF document_events
+  FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');</code></pre>
+
+          <p>
+            A primary key on a partitioned table has to include the partition key, which is
+            why <code>at</code> is in it. <span class="src">from the docs</span> Create next
+            month's partition ahead of time from a scheduled job; <code>pg_partman</code> does
+            this for you if you would rather not write the job.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Writes: patch with a version check</h3>
+
+          <p>
+            Every write states which version it read. If someone else wrote in between, zero
+            rows match and the caller re-reads and retries. No row lock is held across the
+            caller's think time, and the losing writer finds out instead of silently
+            overwriting the winner:
+          </p>
+
+          <pre><code>UPDATE documents
+   SET body       = body || $3::jsonb,      -- shallow merge of top-level keys
+       version    = version + 1,
+       updated_at = now()
+ WHERE id = $1 AND version = $2
+RETURNING version;                          -- no row back = conflict, re-read</code></pre>
+
+          <p>
+            Know what <code>||</code> does. On two JSONB objects it is a <em>shallow</em>
+            merge: top-level keys in the right operand replace the same keys on the left,
+            whole. A patch of <code>{"usage": {"input_tokens": 5}}</code> replaces the entire
+            <code>usage</code> object and drops <code>output_tokens</code>.
+            <span class="src">from the docs</span> For a nested field use
+            <code>jsonb_set(body, '{usage,input_tokens}', to_jsonb($3::bigint))</code>, or,
+            better, ask whether that field changes often enough to be a column.
+            A counter bumped on every model call is the clearest case for promotion. It changes
+            on every call while the rest of the document changes rarely, and
+            <a href="#json-inside">§7</a> showed that every change rewrites the whole value. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Validation lives in two places</h3>
+
+          <p>
+            The full contract belongs at the edge. A Pydantic v2 model or a JSON Schema
+            rejects bad input with a useful error before it reaches the database. The database
+            keeps a cheap guard that no code path can skip: the type and size
+            <code>CHECK</code>s above, plus <code>NOT NULL</code> on the promoted columns. If
+            you want the full schema enforced in the database too, Supabase's
+            <code>pg_jsonschema</code> extension (Apache 2.0) adds
+            <code>jsonb_matches_schema(schema, body)</code> for use in a <code>CHECK</code>.
+            <span class="src">from the docs</span> It validates on every write, so measure it
+            on your largest documents before you adopt it. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Schema versions: upgrade on read</h3>
+
+          <p>
+            <code>schema_version</code> lets the body change shape without a stop-the-world
+            backfill. Readers run a chain of small pure functions, one per version step, then
+            write the upgraded body back on their next write. Old rows migrate as they are
+            touched, and a background job sweeps up the rest. xo-space already stamps its
+            <code>todos.json</code> with <code>"schema": 1</code>
+            (<code>services/cowork_agent/visualizer/todos_store.py</code>, line 144), so the
+            habit exists. <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>def _v1_to_v2(body: dict) -&gt; dict:          # v2 made "tags" mandatory
+    return {**body, "tags": body.get("tags", [])}
+
+def _v2_to_v3(body: dict) -&gt; dict:          # v3 moved "tokens" under "usage"
+    body = dict(body)
+    tokens = body.pop("tokens", 0)
+    return {**body, "usage": {"input_tokens": tokens, **body.get("usage", {})}}
+
+UPGRADES = {1: _v1_to_v2, 2: _v2_to_v3}
+CURRENT = 3
+
+def upgrade(version: int, body: dict) -&gt; tuple[int, dict]:
+    while version &lt; CURRENT:
+        body = UPGRADES[version](body)
+        version += 1
+    return version, body</code></pre>
+
+          <h3>Snapshot plus events</h3>
+
+          <p>
+            The hot document holds current state only. Anything that grows without bound, such
+            as messages, tool calls, status transitions, or usage samples, goes to
+            <code>document_events</code> in the same transaction as the snapshot update
+            (Figure {{fig-hybrid-row}}). This keeps the snapshot small enough that a rewrite
+            stays cheap. It gives you an audit trail for free, and it means a corrupted or
+            mis-migrated snapshot can be rebuilt by folding its events. The event table is also
+            what feeds analytics in <a href="#the-stack">§10</a>.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>The same shape in SQLite</h3>
+
+          <p>
+            SQLite 3.45 and later store JSONB as a <code>BLOB</code>, so declare the body as
+            <code>BLOB</code> in a <code>STRICT</code> table and write it through
+            <code>jsonb()</code>. STRICT allows only <code>INT</code>, <code>INTEGER</code>,
+            <code>REAL</code>, <code>TEXT</code>, <code>BLOB</code> and <code>ANY</code> as
+            column types. <span class="src">from the docs</span> I ran this block on SQLite
+            3.46.1. A text JSON value inserted without <code>jsonb()</code> is rejected with
+            <code>cannot store TEXT value in BLOB column</code>, so STRICT does the format
+            check for you, and the filter on <code>(tenant_id, owner_id, status)</code> plans
+            as <code>SEARCH documents USING INDEX documents_owner_status</code>.
+            <span class="recon">measured here</span>
+          </p>
+
+          <pre><code>CREATE TABLE documents (
+  id             TEXT    PRIMARY KEY,
+  tenant_id      TEXT    NOT NULL,
+  kind           TEXT    NOT NULL,
+  status         TEXT    NOT NULL DEFAULT 'active',
+  version        INTEGER NOT NULL DEFAULT 1,
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  body           BLOB    NOT NULL
+                 CHECK (json_valid(body, 8) AND json_type(body) = 'object'),
+  updated_at     TEXT    NOT NULL,
+  owner_id       TEXT    GENERATED ALWAYS AS (body -&gt;&gt; '$.owner') VIRTUAL
+) STRICT;
+CREATE INDEX documents_owner_status ON documents (tenant_id, owner_id, status);</code></pre>
+
+          <p>
+            Unlike PostgreSQL 18, SQLite can index a <code>VIRTUAL</code> generated column, so
+            the promoted path costs no extra storage in the table itself, only in the index.
+            The <code>8</code> passed to <code>json_valid</code> asks whether the value is
+            well-formed JSONB. <span class="src">from the docs</span> Generate
+            <code>id</code> in the application as a UUIDv7 string. SQLite has no built-in
+            generator. <span class="recon">reconstruction</span>
+          </p>
