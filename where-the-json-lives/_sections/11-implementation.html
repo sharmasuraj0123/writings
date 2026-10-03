@@ -1,0 +1,382 @@
+          <h2 id="implementation"><span class="secnum">{{S}}</span>Implementing it: from JSON files to tables</h2>
+
+          <p class="lede">
+            xo-space keeps its state in JSON files today, and parts of it are written well.
+            The move to tables does not start with a database. It starts with an interface,
+            so the database can arrive behind it one phase at a time, and every phase can be
+            undone with a flag.
+          </p>
+
+          <h3>What the tree does now</h3>
+
+          <p>
+            The careful version is the machine-local state file. In
+            <code>services/cowork_agent/xo_cowork_state.py</code>, lines 54–68,
+            <code>_atomic_write</code> creates a temp file in the same directory, writes,
+            flushes, fsyncs the file, and only then renames it over the target:
+            <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>def _atomic_write(payload: dict[str, Any]) -&gt; None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise</code></pre>
+
+          <p>
+            That is the right recipe for one JSON file. <code>mkstemp</code> gives a unique
+            name, so two writers cannot share a temp file. The fsync puts the bytes on disk
+            before the rename publishes them, and a failure cleans up after itself. One step
+            is missing: nothing fsyncs the <em>directory</em>. On Linux the rename itself
+            becomes durable only when the directory entry is flushed, so after a power cut
+            the file can still show the old version. It will be whole, but stale.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            The manifest writer is lighter. In <code>services/xo_manifest.py</code>, lines
+            134–141, <code>_write_atomic</code> writes a fixed <code>.tmp</code> sibling and
+            renames it, with no fsync at all. Its docstring adds "Caller holds the lock", an
+            <code>asyncio.Lock</code> declared at line 75: <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>async def _write_atomic(manifest: dict) -&gt; Path:
+    """Write `manifest` to xo.json via temp-file + rename. Caller holds the lock."""
+    path = _xo_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path</code></pre>
+
+          <p>
+            This is atomic against a crashing <em>process</em>: a reader sees the old file or
+            the new one, never half of each. It is not durable against a crashing
+            <em>machine</em>. Without an fsync, the filesystem may persist the rename before
+            the data, and after power loss the file can come back empty or truncated.
+            <span class="recon">reconstruction</span> The watcher's shared helper,
+            <code>write_json_atomic</code> in
+            <code>services/cowork_agent/visualizer/atomic_write.py</code> (lines 22–38),
+            follows the same no-fsync pattern for <code>stats.json</code>,
+            <code>todos.json</code> and the session lists. Its JSONL sibling
+            <code>append_jsonl</code> does fsync after each batch (line 58).
+            <span class="src">from the tree</span>
+          </p>
+
+          <p>
+            Readers see a deliberately closed set. In
+            <code>services/cowork_agent/scopes.py</code>, lines 82–89, the BFF can read
+            exactly these paths under a project's <code>.xo/</code>, and nothing else:
+            <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>    # Closed set of portable files the BFF endpoints read. Activity is
+    # also a closed path, but lives outside _xo_root in _activity_path.
+    # P4 / P6 — the route layer can't ask for an arbitrary path.
+    _STATS:           str = "stats.json"
+    _TODOS:           str = "todos.json"
+    _TIMELINE:        str = "timeline.jsonl"
+    _SESSIONSLIST:    str = "sessions/sessionslist.json"
+    _SESSIONS_AUG:    str = "sessions/sessions-augment.json"</code></pre>
+
+          <p>
+            <code>todos.json</code> is the one file with two writers, the watcher's sink and
+            the agent-facing todo endpoints, and they coordinate through
+            <code>visualizer.flock.locked</code> (<code>scopes.py</code> line 168). The lock
+            is honest about its limits. In
+            <code>services/cowork_agent/visualizer/flock.py</code>, lines 88–101, it retries a
+            non-blocking <code>LOCK_EX</code> for <code>_DEADLINE_S = 2.0</code> seconds
+            (line 44), then proceeds anyway: <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>        deadline = time.monotonic() + _DEADLINE_S
+        while True:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break  # acquired
+            except BlockingIOError:
+                if time.monotonic() &gt;= deadline:
+                    logger.warning(
+                        "flock: could not acquire %s within %.1fs; proceeding without lock",
+                        lock_path, _DEADLINE_S,
+                    )
+                    break
+                time.sleep(_RETRY_INTERVAL_S)
+        yield</code></pre>
+
+          <p>
+            The docstring states the trade plainly: "the worst case is a single lost update
+            that the next tick / call recovers". <span class="src">from the tree</span> That is
+            a reasonable choice for a todo list. It is also the exact problem a version column
+            and a transaction remove.
+          </p>
+
+          <h3>What files do well, and where they stop</h3>
+
+          <p>
+            Files are inspectable with <code>cat</code>, diffable in git, readable by any
+            agent, and need no operations at all. Keep those properties wherever humans or
+            tools read the state. They stop in four places. Every change rewrites the whole
+            file, 1,464.5 µs per durable update in §8. There is one writer at a time, and the
+            lock can time out. There is no query without loading every file. And there is no
+            transaction across files, so <code>todos.json</code> and
+            <code>timeline.jsonl</code> can disagree after a crash.
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>Step one: a repository interface</h3>
+
+          <p>
+            Put every read and write behind five methods. Callers never see paths or SQL, and
+            each method states its concurrency contract in its signature: every write names the
+            version it read. <span class="recon">reconstruction</span>
+          </p>
+
+          <pre><code>from typing import Any, Protocol
+
+class Conflict(Exception):
+    """The caller's expected version is stale: re-read, re-apply, retry."""
+
+class DocumentStore(Protocol):
+    def get(self, doc_id: str) -&gt; tuple[int, dict[str, Any]] | None: ...
+    def put(self, doc_id: str, body: dict[str, Any], *, expected: int | None) -&gt; int: ...
+    def patch(self, doc_id: str, path: tuple[str, ...], value: Any, *, expected: int) -&gt; int: ...
+    def append_event(self, doc_id: str, type: str, payload: dict[str, Any]) -&gt; None: ...
+    def query(self, *, tenant_id: str, owner_id: str | None = None,
+              status: str | None = None, limit: int = 100) -&gt; list[dict[str, Any]]: ...</code></pre>
+
+          <p>
+            The first backend is the files themselves, wrapping today's helpers. It changes
+            nothing on disk, and it gives every caller the new contract before any database
+            exists.
+          </p>
+
+          <h3>The SQLite backend</h3>
+
+          <p>
+            Against the §9 SQLite tables, this is the constructor and <code>patch</code>. I ran
+            it on SQLite 3.46.1. A stale <code>expected</code> raises <code>Conflict</code>
+            and rolls back the event insert with it. <span class="recon">measured here</span>
+          </p>
+
+          <pre><code>class SqliteStore:
+    def __init__(self, path: str, *, durable: bool = True):
+        self.db = sqlite3.connect(path, isolation_level=None)   # we issue BEGIN ourselves
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=" + ("FULL" if durable else "NORMAL"))
+        self.db.execute("PRAGMA busy_timeout=5000")              # wait for the writer, don't fail
+
+    def patch(self, doc_id: str, path: tuple[str, ...], value: Any, *, expected: int) -&gt; int:
+        self.db.execute("BEGIN IMMEDIATE")                       # take the write lock up front
+        try:
+            cur = self.db.execute(
+                "UPDATE documents SET body = jsonb_set(body, ?, json(?)), version = version + 1,"
+                " updated_at = ? WHERE id = ? AND version = ?",
+                ("$." + ".".join(path), json.dumps(value), _now(), doc_id, expected))
+            if cur.rowcount != 1:
+                raise Conflict(doc_id, expected)
+            self.db.execute(
+                "INSERT INTO events (doc_id, at, type, payload) VALUES (?, ?, 'set', jsonb(?))",
+                (doc_id, _now(), json.dumps({"path": path, "value": value})))
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return expected + 1</code></pre>
+
+          <p>
+            Three choices in it are deliberate. <code>BEGIN IMMEDIATE</code> takes the write
+            lock at the start. A plain <code>BEGIN</code> starts as a reader and upgrades
+            on its first write. In WAL mode that upgrade fails at once with
+            <code>SQLITE_BUSY</code> if another writer committed in between, and
+            <code>busy_timeout</code> cannot help, because waiting would not change the
+            reader's snapshot. <span class="src">from the docs</span> The
+            <code>json(?)</code> wrapper makes the bound text be read as JSON, not stored as a
+            string. The <code>durable</code> flag is the §8 decision. <code>FULL</code> costs
+            about 0.4 ms per commit here and survives power loss. <code>NORMAL</code> costs
+            about 11 µs and survives an application crash, but the last commits can roll back
+            after an OS crash or power cut. <span class="recon">measured here</span> Use
+            <code>FULL</code> for the record and <code>NORMAL</code> for caches of something
+            you can recompute. Never paste field names from user input into
+            <code>path</code>.
+          </p>
+
+          <h3>The PostgreSQL backend</h3>
+
+          <p>
+            The same method with psycopg 3 and a <code>psycopg_pool.ConnectionPool</code>.
+            A Python list of strings binds as <code>text[]</code>, which is what
+            <code>jsonb_set</code> takes for a path. <span class="src">from the docs</span>
+          </p>
+
+          <pre><code>from psycopg.types.json import Jsonb
+
+def patch(self, doc_id, path, value, *, expected):
+    with self.pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            """UPDATE documents
+                  SET body = jsonb_set(body, %s, %s), version = version + 1,
+                      updated_at = now()
+                WHERE id = %s AND version = %s
+            RETURNING version""",
+            (list(path), Jsonb(value), doc_id, expected),
+        ).fetchone()
+        if row is None:
+            raise Conflict(doc_id, expected)
+        conn.execute(
+            "INSERT INTO document_events (document_id, type, payload) VALUES (%s, 'set', %s)",
+            (doc_id, Jsonb({"path": list(path), "value": value})),
+        )
+    return row[0]</code></pre>
+
+          <p>
+            Two caveats. <code>jsonb_set</code> creates a missing <em>last</em> key but not
+            missing parents, so <code>('usage', 'input_tokens')</code> silently does nothing
+            when <code>usage</code> is absent. Seed whole sub-objects in <code>put</code>.
+            And psycopg 3 prepares statements after five executions by default. Behind
+            PgBouncer in transaction mode, either run a PgBouncer release with
+            <code>max_prepared_statements</code> set or pass
+            <code>prepare_threshold=None</code>. <span class="src">from the docs</span>
+          </p>
+
+          <h3>Batch the hot counters</h3>
+
+          <p>
+            Usage counters and presence timestamps change on every model call. Do not give
+            each change its own commit. Accumulate increments in memory, keyed by document and
+            path, and flush every 250 ms or every 100 changes in one transaction. §8 shows the
+            reason. On this machine one durable SQLite commit costs about 412 µs, while 100
+            inserts sharing a commit cost 8.4 µs each, about 49 times cheaper.
+            <span class="recon">measured here</span> A crash loses at most one window of
+            counts, and the window is a number you choose. If that is not acceptable for a
+            field, the field is not a counter and should not be batched.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure wide" id="fig-migration">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Moving xo-space off flat files without downtime: five phases, each reversible</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 420" role="img" aria-label="Five phases left to right, joined by thick black sequence arrows. Phase 1, interface over files: reads and writes go to files and the change is only code. Phase 2, dual-write with the database as a shadow: reads from files, writes to files and the database, database errors only logged. Phase 3, backfill and compare: old files are loaded into the database and a nightly diff must reach zero. Phase 4, read from the database: files are still written, now as a projection. Phase 5, stop writing files: the database is the record and a read-only JSON export remains for humans. Underneath, a source-of-truth bar is orange for files across phases 1 to 3 and blue for the database across phases 4 and 5. Each phase has a red rollback box naming how to undo it.">
+                <defs>
+                  <marker id="fig-migration-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">PHASES · EACH SHIPS BEHIND A FLAG</text>
+
+                <rect x="0" y="32" width="200" height="200" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="56" class="svg-num">1</text>
+                <text x="30" y="56" class="svg-step">Interface over files</text>
+                <text x="14" y="88" class="svg-sub" style="white-space:pre">reads:  files</text>
+                <text x="14" y="108" class="svg-sub">writes: files</text>
+                <text x="14" y="140" class="svg-sub">ship DocumentStore;</text>
+                <text x="14" y="160" class="svg-sub">callers stop touching</text>
+                <text x="14" y="180" class="svg-sub">paths directly</text>
+
+                <rect x="230" y="32" width="200" height="200" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="244" y="56" class="svg-num">2</text>
+                <text x="260" y="56" class="svg-step">Dual-write, DB shadow</text>
+                <text x="244" y="88" class="svg-sub" style="white-space:pre">reads:  files</text>
+                <text x="244" y="108" class="svg-sub">writes: files, then DB</text>
+                <text x="244" y="140" class="svg-sub">DB failures logged,</text>
+                <text x="244" y="160" class="svg-sub">never surfaced; files</text>
+                <text x="244" y="180" class="svg-sub">still decide</text>
+
+                <rect x="460" y="32" width="200" height="200" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="474" y="56" class="svg-num">3</text>
+                <text x="490" y="56" class="svg-step">Backfill + compare</text>
+                <text x="474" y="88" class="svg-sub" style="white-space:pre">reads:  files</text>
+                <text x="474" y="108" class="svg-sub">writes: files, then DB</text>
+                <text x="474" y="140" class="svg-sub">load every old file;</text>
+                <text x="474" y="160" class="svg-sub">nightly diff of files</text>
+                <text x="474" y="180" class="svg-sub">vs rows must hit zero</text>
+
+                <rect x="690" y="32" width="200" height="200" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="704" y="56" class="svg-num">4</text>
+                <text x="720" y="56" class="svg-step">Read from DB</text>
+                <text x="704" y="88" class="svg-sub" style="white-space:pre">reads:  DB</text>
+                <text x="704" y="108" class="svg-sub">writes: DB, then files</text>
+                <text x="704" y="140" class="svg-sub">files become a</text>
+                <text x="704" y="160" class="svg-sub">projection; BFF reads</text>
+                <text x="704" y="180" class="svg-sub">go through the store</text>
+
+                <rect x="920" y="32" width="200" height="200" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="934" y="56" class="svg-num">5</text>
+                <text x="950" y="56" class="svg-step">Stop writing files</text>
+                <text x="934" y="88" class="svg-sub" style="white-space:pre">reads:  DB</text>
+                <text x="934" y="108" class="svg-sub">writes: DB</text>
+                <text x="934" y="140" class="svg-sub">read-only JSON export</text>
+                <text x="934" y="160" class="svg-sub">for humans and agents,</text>
+                <text x="934" y="180" class="svg-sub">marked generated</text>
+
+                <path d="M200 132 H 226" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-migration-ink)"/>
+                <path d="M430 132 H 456" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-migration-ink)"/>
+                <path d="M660 132 H 686" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-migration-ink)"/>
+                <path d="M890 132 H 916" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-migration-ink)"/>
+
+                <text x="0" y="266" class="svg-lane">SOURCE OF TRUTH</text>
+                <rect x="0" y="278" width="660" height="30" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="14" y="298" class="svg-sub">files (.xo/*.json, ~/.quirq/state.json)</text>
+                <rect x="690" y="278" width="430" height="30" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="704" y="298" class="svg-sub">database (SQLite or PostgreSQL)</text>
+
+                <text x="0" y="342" class="svg-lane">ROLLBACK POINT</text>
+                <rect x="0" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="14" y="376" class="svg-sub">revert the commit;</text>
+                <text x="14" y="394" class="svg-sub">no data touched</text>
+                <rect x="230" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="244" y="376" class="svg-sub">flag off; drop the</text>
+                <text x="244" y="394" class="svg-sub">shadow tables</text>
+                <rect x="460" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="474" y="376" class="svg-sub">same as 2; fix the</text>
+                <text x="474" y="394" class="svg-sub">diff, rerun backfill</text>
+                <rect x="690" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="704" y="376" class="svg-sub">flag back to file</text>
+                <text x="704" y="394" class="svg-sub">reads; files current</text>
+                <rect x="920" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="934" y="376" class="svg-sub">regenerate files</text>
+                <text x="934" y="394" class="svg-sub">from DB; back to 4</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> — a plan, not something xo-space has
+              done. The only irreversible moment is phase 5, and even that has a way back,
+              because the database can always regenerate the files. The cut-over in phase 4 is
+              safe only after phase 3's diff has stayed at zero for long enough to cover every
+              writer.
+            </p>
+          </figure>
+
+          <h3>The migration, phase by phase</h3>
+
+          <p>
+            Figure {{fig-migration}} is the plan. During phase 2 the files still decide what
+            is true, so a bug in the new path costs a log line, not data. Phase 3 is where you
+            learn what the files actually contain. Expect old schema versions, missing keys,
+            and the occasional empty or truncated file that a power cut left behind a no-fsync writer. The
+            upgrade-on-read functions from §9 earn their place here.
+            <span class="recon">reconstruction</span> The phase 4 cut-over flips reads per
+            file kind, starting with the least-read (<code>stats.json</code>) and ending with
+            <code>todos.json</code>, whose two writers become two transactions with version
+            checks and no lock file.
+          </p>
+
+          <p>
+            Keep exporting JSON after phase 5 if anything outside the service reads it.
+            Agents read <code>.xo/</code>, and humans <code>cat</code> it. Write the export
+            from the database with the existing <code>write_json_atomic</code>, add the
+            directory fsync, mark the file as generated, and stop treating it as an input.
+            The files remain a view of the data, not its source.
+            <span class="recon">reconstruction</span>
+          </p>

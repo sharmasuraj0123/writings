@@ -1,0 +1,262 @@
+          <h2 id="permissions"><span class="secnum">{{S}}</span>Permissions: the decision pipeline</h2>
+          <p class="lede">
+            Every tool call passes through one pipeline, and the last stage of
+            that pipeline is a question someone has to answer. Whoever answers
+            it owns the session's autonomy. For an OS built on Claude Code,
+            that seat is the most important one to take.
+          </p>
+          <p>
+            The pipeline has seven stages, and the order is fixed by the
+            permissions and hooks references
+            [<a href="https://code.claude.com/docs/en/permissions#extend-permissions-with-hooks">docs: permissions</a>,
+            <a href="https://code.claude.com/docs/en/hooks#permissionrequest">hooks § PermissionRequest</a>]
+            <span class="src">from the docs</span>. Figure {{fig-permission-pipeline}}
+            draws it. Three facts about the order matter more than the rest.
+          </p>
+          <p>
+            <strong>Deny wins everywhere.</strong> A deny rule from any scope
+            beats an allow from any other scope, including an allow passed on
+            the command line, and deny rules apply even in
+            <code>bypassPermissions</code>. Allow rules, on the other hand, do
+            nothing in <code>bypassPermissions</code>, because there is nothing
+            left for them to skip. Lists such as <code>permissions.allow</code>
+            merge across files rather than override each other
+            [<a href="https://code.claude.com/docs/en/settings#lists-merge-instead-of-overriding">docs: settings § Lists merge</a>].
+          </p>
+          <p>
+            <strong>Hooks run first, but cannot outvote a rule.</strong> A
+            <code>PreToolUse</code> hook sees every call before any rule is
+            checked. Exit code 2 blocks the call outright, before the rules
+            run. A hook that returns <code>allow</code> only skips the prompt:
+            deny and ask rules are still evaluated afterwards. The hook can
+            also rewrite the call with <code>updatedInput</code>, and the rules
+            then judge the rewritten input, not the one Claude produced
+            [<a href="https://code.claude.com/docs/en/hooks#pretooluse-decision-control">docs: hooks § PreToolUse decision control</a>].
+            When several hooks disagree, the order is
+            <code>deny</code> &gt; <code>defer</code> &gt; <code>ask</code> &gt; <code>allow</code>.
+          </p>
+          <p>
+            <strong>The last stage is a transport, not a dialog.</strong> In a
+            terminal the question becomes a dialog. Under <code>-p</code> it
+            goes to a <em>permission host</em>: an Agent SDK app's
+            <code>canUseTool</code> callback, or an MCP tool named with
+            <code>--permission-prompt-tool</code>. The desktop app passes the
+            literal value <code>stdio</code>, which routes each question over
+            the same stream-json pipe it already reads
+            [<a href="#driving-a-session">§ Driving a session</a>]
+            <span class="src">measured</span>. With
+            <code>--permission-prompts none</code> nobody is asked: anything that
+            would have prompted is denied, Claude is told not to retry, and
+            tools that need a human, such as <code>AskUserQuestion</code>, are
+            removed from the session
+            [<a href="https://code.claude.com/docs/en/headless#turn-off-permission-prompts-in-unattended-runs">docs: headless § Turn off permission prompts</a>].
+          </p>
+
+          <figure class="figure wide" id="fig-permission-pipeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One tool call, seven stages, three exits</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 372" role="img" aria-label="Seven stages from left to right: tool in context, PreToolUse hooks, permission rules, mode baseline, the auto-mode classifier, PermissionRequest hooks, and asking the host. Green arrows rise from stages three to seven to a top lane where the tool runs. Red arrows fall from every stage to a bottom lane where the call is denied and the reason goes to Claude. A dashed purple arrow from the PreToolUse stage leads to a deferred exit that only exists in print mode.">
+                <defs>
+                  <marker id="fpp-arr-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fpp-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#367f59"/></marker>
+                  <marker id="fpp-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#ad4b43"/></marker>
+                  <marker id="fpp-arr-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="10" y="22" class="svg-lane">RUNS</text>
+                <text x="62" y="22" class="svg-sub">the tool executes, then PostToolUse or PostToolUseFailure fires</text>
+                <line x1="10" y1="38" x2="1062" y2="38" stroke="#367f59" stroke-width="2"/>
+
+                <rect x="10" y="118" width="140" height="78" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="20" y="112" class="svg-num">1</text>
+                <text x="22" y="142" class="svg-step">In context?</text>
+                <text x="22" y="162" class="svg-sub">--tools, or a</text>
+                <text x="22" y="177" class="svg-sub">bare deny rule</text>
+
+                <rect x="162" y="118" width="140" height="78" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="172" y="112" class="svg-num">2</text>
+                <text x="174" y="142" class="svg-step">PreToolUse hooks</text>
+                <text x="174" y="162" class="svg-sub">exit 2 blocks;</text>
+                <text x="174" y="177" class="svg-sub">may rewrite input</text>
+
+                <rect x="314" y="118" width="140" height="78" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="324" y="112" class="svg-num">3</text>
+                <text x="326" y="142" class="svg-step">Rules, all scopes</text>
+                <text x="326" y="162" class="svg-sub">deny, then ask,</text>
+                <text x="326" y="177" class="svg-sub">then allow</text>
+
+                <rect x="466" y="118" width="140" height="78" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="476" y="112" class="svg-num">4</text>
+                <text x="478" y="142" class="svg-step">Mode baseline</text>
+                <text x="478" y="162" class="svg-sub">what runs without</text>
+                <text x="478" y="177" class="svg-sub">asking, per mode</text>
+
+                <rect x="618" y="118" width="140" height="78" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="628" y="112" class="svg-num">5</text>
+                <text x="630" y="142" class="svg-step">auto: classifier</text>
+                <text x="630" y="162" class="svg-sub">reviews the call;</text>
+                <text x="630" y="177" class="svg-sub">PermissionDenied</text>
+
+                <rect x="770" y="118" width="140" height="78" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="780" y="112" class="svg-num">6</text>
+                <text x="782" y="142" class="svg-step">PermissionRequest</text>
+                <text x="782" y="162" class="svg-sub">hooks decide for</text>
+                <text x="782" y="177" class="svg-sub">the user, or pass</text>
+
+                <rect x="922" y="118" width="140" height="78" rx="8" fill="#f7e3c8" stroke="#d98226" stroke-width="1.6"/>
+                <text x="932" y="112" class="svg-num">7</text>
+                <text x="934" y="142" class="svg-step">Ask the host</text>
+                <text x="934" y="162" class="svg-sub">terminal, SDK,</text>
+                <text x="934" y="177" class="svg-sub">prompt tool, relay</text>
+
+                <line x1="150" y1="157" x2="160" y2="157" stroke="#252525" stroke-width="2.2" marker-end="url(#fpp-arr-k)"/>
+                <line x1="302" y1="157" x2="312" y2="157" stroke="#252525" stroke-width="2.2" marker-end="url(#fpp-arr-k)"/>
+                <line x1="454" y1="157" x2="464" y2="157" stroke="#252525" stroke-width="2.2" marker-end="url(#fpp-arr-k)"/>
+                <line x1="606" y1="157" x2="616" y2="157" stroke="#252525" stroke-width="2.2" marker-end="url(#fpp-arr-k)"/>
+                <line x1="758" y1="157" x2="768" y2="157" stroke="#252525" stroke-width="2.2" marker-end="url(#fpp-arr-k)"/>
+                <line x1="910" y1="157" x2="920" y2="157" stroke="#252525" stroke-width="2.2" marker-end="url(#fpp-arr-k)"/>
+
+                <line x1="384" y1="116" x2="384" y2="42" stroke="#367f59" stroke-width="1.5" marker-end="url(#fpp-arr-g)"/>
+                <text x="390" y="86" class="svg-sub">allow rule</text>
+                <line x1="536" y1="116" x2="536" y2="42" stroke="#367f59" stroke-width="1.5" marker-end="url(#fpp-arr-g)"/>
+                <text x="542" y="86" class="svg-sub">mode permits</text>
+                <line x1="688" y1="116" x2="688" y2="42" stroke="#367f59" stroke-width="1.5" marker-end="url(#fpp-arr-g)"/>
+                <text x="694" y="86" class="svg-sub">approved</text>
+                <line x1="840" y1="116" x2="840" y2="42" stroke="#367f59" stroke-width="1.5" marker-end="url(#fpp-arr-g)"/>
+                <text x="846" y="86" class="svg-sub">behavior allow</text>
+                <line x1="992" y1="116" x2="992" y2="42" stroke="#367f59" stroke-width="1.5" marker-end="url(#fpp-arr-g)"/>
+                <text x="998" y="86" class="svg-sub">yes</text>
+
+                <line x1="80" y1="198" x2="80" y2="276" stroke="#ad4b43" stroke-width="1.5" marker-end="url(#fpp-arr-r)"/>
+                <text x="86" y="236" class="svg-sub">not callable</text>
+                <line x1="232" y1="198" x2="232" y2="276" stroke="#ad4b43" stroke-width="1.5" marker-end="url(#fpp-arr-r)"/>
+                <text x="238" y="236" class="svg-sub">deny, exit 2</text>
+                <line x1="384" y1="198" x2="384" y2="276" stroke="#ad4b43" stroke-width="1.5" marker-end="url(#fpp-arr-r)"/>
+                <text x="390" y="236" class="svg-sub">deny rule</text>
+                <line x1="536" y1="198" x2="536" y2="276" stroke="#ad4b43" stroke-width="1.5" marker-end="url(#fpp-arr-r)"/>
+                <text x="542" y="236" class="svg-sub">dontAsk</text>
+                <line x1="688" y1="198" x2="688" y2="276" stroke="#ad4b43" stroke-width="1.5" marker-end="url(#fpp-arr-r)"/>
+                <text x="694" y="236" class="svg-sub">blocked</text>
+                <line x1="840" y1="198" x2="840" y2="276" stroke="#ad4b43" stroke-width="1.5" marker-end="url(#fpp-arr-r)"/>
+                <text x="846" y="236" class="svg-sub">behavior deny</text>
+                <line x1="992" y1="198" x2="992" y2="276" stroke="#ad4b43" stroke-width="1.5" marker-end="url(#fpp-arr-r)"/>
+                <text x="998" y="236" class="svg-sub">no, or none</text>
+
+                <line x1="10" y1="280" x2="1062" y2="280" stroke="#ad4b43" stroke-width="2"/>
+                <text x="10" y="300" class="svg-lane">DENIED</text>
+                <text x="250" y="300" class="svg-sub">the reason goes to Claude; -p lists it in permission_denials</text>
+
+                <path d="M 190 198 C 190 250, 150 318, 120 334" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fpp-arr-p)"/>
+                <text x="10" y="352" class="svg-lane">DEFERRED</text>
+                <text x="90" y="352" class="svg-sub">-p only: the process exits with stop_reason tool_deferred; resuming re-fires the hook</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The order is sourced; the drawing is mine. Stages 2 and 6
+              (purple) are hooks, which an OS can install without touching
+              Claude Code. Stage 7 (orange) is the seat an OS should occupy: it
+              is the only stage that can bring a human, a policy engine, or a
+              phone into the loop. A hook's <code>allow</code> at stage 2 does
+              not skip stage 3, which is why deny rules are the one control a
+              hook can never undo.
+            </p>
+          </figure>
+
+          <h3>Six modes, one of which is not a mode</h3>
+          <p>
+            The mode sets the baseline at stage 4. <code>default</code>, which
+            the interface now labels Manual and which accepts
+            <code>manual</code> as an alias since 2.1.200, runs reads and asks
+            about everything else. <code>acceptEdits</code> adds file edits and
+            a set of filesystem commands inside the working directories.
+            <code>plan</code> keeps Claude read-only. <code>auto</code> sends
+            what would have prompted to a classifier instead of a person.
+            <code>dontAsk</code> denies whatever would have prompted, which is
+            the right mode for a locked-down CI job. <code>bypassPermissions</code>
+            skips prompts entirely
+            [<a href="https://code.claude.com/docs/en/permission-modes#available-modes">docs: permission modes</a>].
+          </p>
+          <p>
+            Even <code>bypassPermissions</code> keeps a short list of actions
+            that no mode approves on its own: calls matched by an explicit ask
+            rule, tools that need a human (<code>AskUserQuestion</code> and MCP
+            tools flagged <code>requiresUserInteraction</code>),
+            <code>rm</code> and <code>rmdir</code> on critical paths, and the
+            cross-session messaging safeguards. That last item bites an OS
+            directly, and <a href="#other-doors">the section on other doors</a>
+            returns to it: a session
+            running in <code>bypassPermissions</code> holds messages from other
+            sessions for approval by default, and a <code>-p</code> worker that
+            cannot show the approval dialog drops them after
+            <code>dialogExpiry</code>, five minutes unless changed
+            [<a href="https://code.claude.com/docs/en/cross-session-messaging#control-inbound-messages">docs: cross-session messaging § Control inbound messages</a>].
+          </p>
+          <p>
+            Which mode a new session starts in is decided by, in order: the
+            <code>--permission-mode</code> flag, <code>--dangerously-skip-permissions</code>,
+            <code>permissions.defaultMode</code> in settings, and then a
+            built-in default. For <code>-p</code> the built-in default is
+            Manual on every plan, so an unattended run that sets nothing will
+            stop at the first write
+            [<a href="https://code.claude.com/docs/en/headless#auto-approve-tools">docs: headless § Auto-approve tools</a>].
+            A resumed session restores its mode only on some paths: a terminal
+            <code>--resume</code> restores it, but <code>-p --resume</code>
+            starts in whatever a fresh <code>-p</code> run would, and a
+            session that ended in <code>bypassPermissions</code> never
+            restores that mode [<a href="https://code.claude.com/docs/en/sessions#permission-mode-on-resume">docs: sessions § Permission mode on resume</a>].
+            A host that resumes sessions must therefore pass the mode again on
+            every launch.
+          </p>
+
+          <h3>Who can sit in the host's seat</h3>
+          <table>
+            <thead>
+              <tr><th>Host</th><th>How the question arrives</th><th>How the answer returns</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Terminal</td><td>A dialog in the TUI</td><td>Keystroke; "don't ask again" writes a rule to <code>.claude/settings.local.json</code> at the repository root</td></tr>
+              <tr><td>Agent SDK app</td><td><code>control_request</code> with subtype <code>can_use_tool</code> on stdout</td><td><code>control_response</code> on stdin; the SDK surfaces it as the <code>canUseTool</code> callback</td></tr>
+              <tr><td>Desktop app</td><td>Same pipe, launched with <code>--permission-prompt-tool stdio</code></td><td>Same pipe <span class="src">measured</span></td></tr>
+              <tr><td>MCP prompt tool</td><td>A call to the tool named in <code>--permission-prompt-tool</code></td><td>The tool's result; it cannot approve tools that require user interaction</td></tr>
+              <tr><td>Channel relay</td><td>a channel <code>permission_request</code> notification with a five-letter <code>request_id</code></td><td>a channel <code>permission</code> notification with <code>behavior</code>; first answer wins against the terminal</td></tr>
+              <tr><td>Nobody</td><td><code>--permission-prompts none</code></td><td>Denied; a <code>PermissionRequest</code> hook can still allow</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Two hook-level escapes complete the picture. A
+            <code>PermissionRequest</code> hook fires exactly when a prompt is
+            about to open, and can answer for the user with
+            <code>decision.behavior</code>, attach <code>updatedPermissions</code>
+            that add rules or switch the mode, and choose whether those
+            changes persist to a settings file or last only for the session
+            [<a href="https://code.claude.com/docs/en/hooks#permission-update-entries">docs: hooks § Permission update entries</a>].
+            And under <code>-p</code>, a <code>PreToolUse</code> hook may return
+            <code>defer</code>: the tool does not run, the process exits with
+            <code>stop_reason: "tool_deferred"</code> and the pending call in
+            <code>deferred_tool_use</code>, and the caller resumes the session
+            later, when the same hook fires again and can answer. Deferral
+            has no timeout; it lasts until the transcript ages out. It only
+            works when the turn made a single tool call
+            [<a href="https://code.claude.com/docs/en/hooks#defer-a-tool-call-for-later">docs: hooks § Defer a tool call for later</a>].
+            That is the primitive an OS needs to turn a blocking question into
+            an inbox item that someone answers tomorrow.
+          </p>
+          <div class="callout">
+            <span class="k">What XO does today</span>
+            <p>
+              xo-space and xo-cowork-api launch every turn with
+              <code>--dangerously-skip-permissions</code>
+              [<code>xo-space/services/cowork_agent/adapters/claude_code/adapter.py</code>]
+              <span class="src">from the tree</span>. That collapses stages 4
+              to 7 into a single yes: hooks and deny rules still run, but
+              nothing is ever asked, and nobody could answer if it were. It
+              also puts every XO worker in the bypassing class for
+              cross-session messaging, so a message from a session that does
+              not bypass is held and, in a <code>-p</code> worker, dropped
+              after five minutes. The fix is not a different flag. It is to
+              take stage 7.
+            </p>
+          </div>

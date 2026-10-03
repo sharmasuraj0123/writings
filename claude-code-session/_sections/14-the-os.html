@@ -1,0 +1,225 @@
+          <h2 id="the-os"><span class="secnum">{{S}}</span>Friction, and what the OS should own</h2>
+          <p class="lede">
+            Almost every point of friction in the previous twelve sections has
+            one cause. Claude Code keeps exactly one thing durable, the
+            conversation file, and keeps everything else (configuration,
+            permissions, connections, background work) in a process that can
+            end at any moment. Each host then rebuilds the second from the
+            first, differently and incompletely. An OS reduces friction by
+            owning precisely the things the process forgets.
+          </p>
+          <p>
+            XO Space already describes itself as an operating system, with a
+            kernel, drivers, daemons, and agent sessions as its processes
+            [<a href="../xo-space-architecture/#project">XO Space: the architecture § The operating system</a>].
+            Read the other way round, a Claude Code session already has most
+            of an OS's parts. The work is to connect them, not to reinvent
+            them.
+          </p>
+          <table>
+            <thead><tr><th>OS concept</th><th>Its Claude Code counterpart</th></tr></thead>
+            <tbody>
+              <tr><td>process table</td><td><code>~/.claude/sessions/&lt;pid&gt;.json</code> (status <code>busy</code> or <code>idle</code>); <code>claude agents --json</code> with <code>state</code> and <code>waitingFor</code></td></tr>
+              <tr><td>supervisor</td><td>the background daemon: roster, restart on crash, park when idle, respawn onto a new version</td></tr>
+              <tr><td>system calls</td><td>tools, built-in and MCP, each passing the permission pipeline</td></tr>
+              <tr><td>capabilities</td><td>permission modes, rules, <code>PreToolUse</code> and <code>PermissionRequest</code> hooks, the permission host</td></tr>
+              <tr><td>signals</td><td><code>interrupt</code>, <code>stop_task</code>, SIGINT, SIGTERM (exit 143)</td></tr>
+              <tr><td>IPC</td><td>stream-json and the control protocol for the parent; the inbox socket for children and peers; channels for the outside</td></tr>
+              <tr><td>filesystem and namespaces</td><td>working directory, <code>--add-dir</code>, worktrees, <code>CLAUDE_CONFIG_DIR</code>, sandbox settings</td></tr>
+              <tr><td>logs and accounting</td><td>the transcript; <code>result</code> usage and <code>total_cost_usd</code>; OpenTelemetry</td></tr>
+              <tr><td>snapshots</td><td>file-history checkpoints, <code>rewind_files</code>, forks, <code>sessionStore</code></td></tr>
+              <tr><td>modules and drivers</td><td>plugins, MCP servers, skills</td></tr>
+              <tr><td>init scripts</td><td><code>Setup</code> and <code>SessionStart</code> hooks, <code>CLAUDE.md</code>, <code>--settings</code></td></tr>
+            </tbody>
+          </table>
+
+          <figure class="figure wide" id="fig-friction">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The friction map: symptom, cause in the anatomy, what the OS owns, and the primitive it builds on</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead><tr><th>Symptom</th><th>Cause</th><th>The OS owns</th><th>Primitive in 2.1.280</th></tr></thead>
+                <tbody>
+                  <tr><td>A resumed session behaves differently</td><td>resume restores the conversation, not the launch; <code>-p</code> resets the mode</td><td>a launch profile per session, re-applied on every launch</td><td><code>--settings</code> file per session; <code>--session-id</code>; the recorded system prompt</td></tr>
+                  <tr><td>Nobody can answer a prompt</td><td><code>-p</code> has no terminal</td><td>the permission broker, stage 7</td><td><code>--permission-prompt-tool stdio</code>, <code>canUseTool</code>, <code>defer</code>, channel relay</td></tr>
+                  <tr><td>Every turn is slow to start</td><td>boot is redone per launch, MCP included</td><td>long-lived processes, parked when idle</td><td>stream-json input; SDK <code>startup()</code>; supervisor parking</td></tr>
+                  <tr><td>Sessions go missing</td><td>the ID is learned late; hosts keep their own pointers</td><td>the ID, chosen before launch</td><td><code>--session-id</code>; <code>system/init</code>; <code>claude agents --json</code></td></tr>
+                  <tr><td>History readers break</td><td>internal format; forks copy; lossy folder names</td><td>live capture, one reader</td><td>stream events; <code>Stop</code> and <code>PostToolUse</code> hooks; <code>getSessionMessages()</code></td></tr>
+                  <tr><td>Indexed transcripts vanish</td><td>a 30-day, mtime-based sweep</td><td>retention and mirroring</td><td><code>cleanupPeriodDays</code>; <code>sessionStore</code></td></tr>
+                  <tr><td>The wrong account is billed</td><td>env tokens outrank <code>/login</code></td><td>one credential per workspace, injected explicitly</td><td><code>apiKeyHelper</code> in <code>--settings</code>; <code>CLAUDE_CONFIG_DIR</code>; env scrub</td></tr>
+                  <tr><td>A repo's hooks run unasked</td><td><code>-p</code> skips trust</td><td>the trust decision</td><td><code>--setting-sources</code>; <code>--bare</code>; <code>initialize.workspaceTrust</code></td></tr>
+                  <tr><td>Long work blocks the turn</td><td>tool calls are synchronous</td><td>an async job interface</td><td>inbox socket; channels; background tasks and <code>Monitor</code></td></tr>
+                  <tr><td>Parallel sessions collide</td><td>many conversations, one directory; two writers interleave</td><td>a lease per conversation, a worktree per writer</td><td><code>--worktree</code>; <code>isolation: worktree</code></td></tr>
+                  <tr><td>Spend is invisible until the bill</td><td>cost is only in results and transcripts</td><td>metering and budgets per task</td><td><code>total_cost_usd</code>; <code>--max-budget-usd</code>; <code>taskBudget</code></td></tr>
+                  <tr><td>Behaviour shifts between machines</td><td>two binaries here (2.1.260, 2.1.280); hidden flags</td><td>a pinned version per workspace</td><td><code>claude install &lt;version&gt;</code>; <code>capabilities</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Each cause is sourced in the section that covers it; the middle
+              columns are my synthesis <span class="recon">reconstruction</span>.
+              Read down the third column and it is a component list: launch
+              profiles, a permission broker, a process manager, an ID
+              authority, an event capture path, a retention policy, a
+              credential store, a trust policy, a job interface, a lease
+              manager, a meter, and a version pin.
+            </p>
+          </figure>
+
+          <h3>Where XO stands</h3>
+          <p>
+            Measured against that list, xo-space today owns three things well
+            and delegates the rest to <code>--dangerously-skip-permissions</code>.
+            It pre-allocates session IDs, it isolates each agent in its own
+            project directory, and it keeps an index that stores pointers
+            rather than messages. Against that: it spawns a new process per
+            turn, so every turn pays the full boot, MCP connection included;
+            nobody can answer a permission prompt; the <code>model</code> a
+            user picks never reaches the command line; the child's stderr and
+            exit code are not read on the streaming path; and nothing kills
+            the child when the client disconnects
+            [<code>adapters/claude_code/adapter.py</code>, <code>_build_cmd</code>, <code>stream</code>]
+            <span class="src">from the tree</span>. It reads history from the
+            JSONL files with a folder-name rule that breaks on any path
+            containing a dot, and it never reads <code>total_cost_usd</code>,
+            estimating cost from a separate tool instead. None of these are
+            hard to fix, and all of them come from treating the process as
+            the session.
+          </p>
+
+          <h3>A session manager, sketched</h3>
+          <p>
+            The design below uses only primitives this post has documented.
+            It is a proposal, not a description of anything built
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-session-os">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">A session manager for XO: what sits between the clients and the claude processes</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 450" role="img" aria-label="Three tiers. At the top, clients: the phone OS, the Space UI, the desktop, and schedules. In the middle, the XO session manager with six components: a process table, launch profiles, a permission broker, an event bus, a job interface, and a store for indexes and budgets. At the bottom, one claude process per active conversation, each speaking stream-json and the control protocol to the manager, posting hook events to it, and reaching XO apps through a plugin with MCP servers, skills and command-line tools. Apps report finished work back through the inbox socket or a channel.">
+                <defs>
+                  <marker id="fso-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fso-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fso-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <text x="16" y="24" class="svg-lane">CLIENTS</text>
+                <rect x="120" y="10" width="200" height="40" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="134" y="35" class="svg-step">xo-phone-os</text>
+                <rect x="340" y="10" width="200" height="40" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="354" y="35" class="svg-step">Space UI</text>
+                <rect x="560" y="10" width="200" height="40" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="574" y="35" class="svg-step">desktop, terminal</text>
+                <rect x="780" y="10" width="200" height="40" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="794" y="35" class="svg-step">schedules, inbox</text>
+                <line x1="550" y1="52" x2="550" y2="80" stroke="#252525" stroke-width="2.2" marker-start="url(#fso-k)" marker-end="url(#fso-k)"/>
+                <text x="560" y="72" class="svg-sub">HTTP, SSE, push</text>
+
+                <rect x="16" y="84" width="1048" height="170" rx="10" fill="#f7e3c8" stroke="#d98226" stroke-width="1.6"/>
+                <text x="32" y="106" class="svg-lane">XO SESSION MANAGER</text>
+                <rect x="32" y="118" width="320" height="58" rx="7" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="44" y="140" class="svg-step">Process table</text>
+                <text x="44" y="160" class="svg-sub">own spawns + claude agents --json</text>
+                <rect x="380" y="118" width="320" height="58" rx="7" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="392" y="140" class="svg-step">Launch profiles</text>
+                <text x="392" y="160" class="svg-sub">argv, --settings, config dir, version</text>
+                <rect x="728" y="118" width="320" height="58" rx="7" fill="#ffffff" stroke="#d98226"/>
+                <text x="740" y="140" class="svg-step">Permission broker</text>
+                <text x="740" y="160" class="svg-sub">policy, then silent, toast, or prompt</text>
+                <rect x="32" y="184" width="320" height="58" rx="7" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="44" y="206" class="svg-step">Event bus</text>
+                <text x="44" y="226" class="svg-sub">stream events + HTTP hook events</text>
+                <rect x="380" y="184" width="320" height="58" rx="7" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="392" y="206" class="svg-step">Job interface</text>
+                <text x="392" y="226" class="svg-sub">acknowledge, then push back</text>
+                <rect x="728" y="184" width="320" height="58" rx="7" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="740" y="206" class="svg-step">Store</text>
+                <text x="740" y="226" class="svg-sub">ID map, budgets, transcript mirror</text>
+
+                <text x="16" y="286" class="svg-lane">ONE PROCESS PER ACTIVE CONVERSATION</text>
+                <rect x="16" y="298" width="330" height="72" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="30" y="320" class="svg-step">claude · conversation A</text>
+                <text x="30" y="340" class="svg-sub">stream-json in and out</text>
+                <text x="30" y="358" class="svg-sub">--await-initialize, prompt tool stdio</text>
+                <rect x="376" y="298" width="330" height="72" rx="8" fill="#ffffff" stroke="#252525"/>
+                <text x="390" y="320" class="svg-step">claude · conversation B</text>
+                <text x="390" y="340" class="svg-sub">parked after idle; resumed with</text>
+                <text x="390" y="358" class="svg-sub">the same profile and ID</text>
+                <rect x="736" y="298" width="328" height="72" rx="8" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="750" y="320" class="svg-step">XO plugin</text>
+                <text x="750" y="340" class="svg-sub">skills, MCP servers, hooks, bin/</text>
+                <text x="750" y="358" class="svg-sub">apps that do the offloaded work</text>
+
+                <line x1="300" y1="256" x2="300" y2="294" stroke="#252525" stroke-width="2.2" marker-start="url(#fso-k)" marker-end="url(#fso-k)"/>
+                <text x="310" y="280" class="svg-sub">control protocol</text>
+                <line x1="540" y1="256" x2="540" y2="294" stroke="#252525" stroke-width="2.2" marker-start="url(#fso-k)" marker-end="url(#fso-k)"/>
+                <path d="M 180 372 L 180 388 L 900 388 L 900 376" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fso-b)"/>
+                <line x1="540" y1="372" x2="540" y2="388" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="600" y="402" class="svg-sub">tool calls</text>
+                <line x1="840" y1="296" x2="840" y2="258" stroke="#765b98" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#fso-p)"/>
+                <text x="850" y="282" class="svg-sub">job done: socket or channel</text>
+
+                <text x="16" y="412" class="svg-note">Every arrow is a documented or measured interface of Claude Code 2.1.280; the boxes in orange are XO's to build.</text>
+                <text x="16" y="430" class="svg-note">Nothing in this design parses a transcript to learn what is happening now; transcripts are read only to rebuild history.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The broker's three levels, silent, toast and prompt, are the
+              ones the xo-phone-os plan already specifies for agent actions
+              [<code>prototypes/xo-phone-os/AGENT_PLAN.md</code>]
+              <span class="src">from the tree</span>. Everything else is a
+              proposal assembled from the primitives above
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            Concretely, for each component:
+          </p>
+          <ul>
+            <li><strong>Process table.</strong> Spawn sessions the OS owns
+              itself, and read <code>claude agents --json</code> for the rest,
+              so a session started from a terminal or the desktop still shows
+              up with its <code>waitingFor</code>. Never parse
+              <code>jobs/</code>.</li>
+            <li><strong>Launch profiles.</strong> Store, per conversation, the
+              exact argv, a generated <code>--settings</code> file, the
+              credential source, the config directory and the pinned version,
+              and re-apply them on every launch. Choose the
+              <code>sessionId</code> before the first launch and never learn
+              it from the stream.</li>
+            <li><strong>Permission broker.</strong> Launch with
+              <code>--permission-prompt-tool stdio</code> (or through the SDK
+              with <code>canUseTool</code>), answer
+              <code>can_use_tool</code> from policy first, and only escalate
+              the remainder to a person; use <code>defer</code> for questions
+              that can wait a day, and <code>--permission-prompts none</code>
+              with <code>auto</code> for truly unattended work.</li>
+            <li><strong>Event bus.</strong> Take state from the stream
+              (<code>--include-partial-messages</code>,
+              <code>--include-hook-events</code>,
+              <code>--replay-user-messages</code>) and from
+              <code>http</code> hooks posted to the OS, not from tailing
+              files.</li>
+            <li><strong>Job interface.</strong> Give apps one contract:
+              return a job ID immediately, then post the outcome to the
+              session's inbox socket or through a channel, as in Figure
+              {{fig-async-offload}}.</li>
+            <li><strong>Store.</strong> Keep the ID map, per-task budgets, and
+              a transcript mirror or a raised <code>cleanupPeriodDays</code>,
+              and reconcile pointers against the files that actually exist.</li>
+          </ul>
+          <p>
+            The desktop app is evidence that this shape works: it already runs
+            every session as one long-lived process with stream-json in both
+            directions, an initialize handshake, stdio permission prompts, a
+            pre-approved tool list and a settings overlay, and it keeps its
+            own record per session that points at the transcript
+            <span class="src">measured</span>. The difference for XO is where
+            the processes run and who answers the questions.
+          </p>

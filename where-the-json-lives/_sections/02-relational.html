@@ -1,0 +1,210 @@
+          <h2 id="relational"><span class="secnum">{{S}}</span>The relational family</h2>
+
+          <p class="lede">
+            A relational database stores facts as rows in tables, enforces rules about
+            them, and lets you ask questions without saying how to answer them. The
+            model fits on an index card. The engine underneath is where the
+            engineering lives: a write-ahead log, B-tree indexes, multiversion
+            concurrency, and a cleanup process that never finishes.
+          </p>
+
+          <h3>The model</h3>
+
+          <p>
+            A <em>relation</em> is a set of tuples with the same named, typed
+            attributes. A <em>primary key</em> identifies each one. <em>Foreign
+            keys</em> point between relations, and the engine refuses writes that would
+            leave a dangling pointer. <code>CHECK</code>, <code>UNIQUE</code> and
+            <code>NOT NULL</code> constraints turn business rules into errors at write
+            time, not bugs at read time. <em>Normalization</em> stores each fact once,
+            so an update touches one row rather than every copy.
+          </p>
+
+          <p>
+            Queries are declarative. You state what you want in SQL, and a
+            cost-based <em>planner</em> chooses scan types, join order and join
+            algorithms from table statistics. This is the family's main advantage. A
+            query nobody planned for still runs and still returns the right answer,
+            just slowly until someone adds an index. Most of the specialised families
+            in §3 give that up.
+          </p>
+
+          <h3>What the engine does on commit</h3>
+
+          <p>
+            Figure {{fig-write-path}} follows one <code>UPDATE</code> through
+            PostgreSQL. The order matters. The change is described in the write-ahead
+            log (WAL) first. On commit, the WAL is flushed to disk; with the default
+            <code>synchronous_commit = on</code>, the client is not told "committed"
+            until that flush returns. <span class="src">from the docs</span> The table
+            page itself is changed only in memory, in <code>shared_buffers</code>, and
+            reaches its data file later, through the background writer or a
+            checkpoint (every <code>checkpoint_timeout</code>, 5 minutes by default, or
+            sooner when <code>max_wal_size</code> fills). <span class="src">from the
+            docs</span> After a crash, recovery replays WAL from the last checkpoint.
+            One sequential flush per commit buys durability for any number of random
+            page changes.
+          </p>
+
+          <figure class="figure wide" id="fig-write-path">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Anatomy of a committed write in PostgreSQL</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 430" role="img" aria-label="A client sends an UPDATE. Step one appends a WAL record to the WAL buffer, which is flushed with fsync to the WAL segment on disk before the commit is acknowledged. Step two writes a new tuple version into a heap page in shared buffers and, unless it is a HOT update, a new index entry. Step three, later and asynchronously, the background writer and checkpointer write dirty pages to the data files. Below, the MVCC detail: the old tuple version gets xmax set to the updating transaction, the new version has xmin set to it, and vacuum later reclaims the dead version once no snapshot can see it.">
+                <defs>
+                  <marker id="fig-write-path-blk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-write-path-blu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-write-path-pur" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">MEMORY</text>
+                <text x="0" y="250" class="svg-lane">DISK</text>
+                <line x1="0" y1="232" x2="1120" y2="232" stroke="#deded9" stroke-dasharray="4 4"/>
+
+                <rect x="0" y="40" width="170" height="70" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="16" y="68" class="svg-step">Client</text>
+                <text x="16" y="92" class="svg-sub">UPDATE … COMMIT</text>
+
+                <rect x="230" y="40" width="230" height="70" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="246" y="68" class="svg-num">1</text>
+                <text x="264" y="68" class="svg-step">WAL buffer</text>
+                <text x="246" y="92" class="svg-sub">record: what changed</text>
+
+                <rect x="230" y="268" width="230" height="70" rx="8" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="246" y="296" class="svg-step">pg_wal/ segment</text>
+                <text x="246" y="320" class="svg-sub">fsync before ack</text>
+
+                <rect x="520" y="40" width="270" height="160" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="536" y="68" class="svg-num">2</text>
+                <text x="554" y="68" class="svg-step">shared_buffers</text>
+                <text x="536" y="96" class="svg-sub">heap page (8 kB)</text>
+                <text x="536" y="120" class="svg-sub">+ index entry, unless</text>
+                <text x="536" y="144" class="svg-sub">HOT: same page and no</text>
+                <text x="536" y="168" class="svg-sub">indexed column changed</text>
+
+                <rect x="850" y="40" width="270" height="70" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="866" y="68" class="svg-num">3</text>
+                <text x="884" y="68" class="svg-step">bgwriter, checkpointer</text>
+                <text x="866" y="92" class="svg-sub">later, asynchronous</text>
+
+                <rect x="850" y="268" width="270" height="70" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="866" y="296" class="svg-step">base/ data files</text>
+                <text x="866" y="320" class="svg-sub">heap + index pages</text>
+
+                <line x1="170" y1="75" x2="226" y2="75" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-write-path-blk)"/>
+                <line x1="345" y1="110" x2="345" y2="264" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-write-path-blk)"/>
+                <text x="355" y="190" class="svg-note">commit = flush</text>
+                <path d="M230 320 L120 320 L120 114" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-write-path-blk)"/>
+                <text x="128" y="200" class="svg-note">ack returns</text>
+                <text x="128" y="218" class="svg-note">after the flush</text>
+                <line x1="460" y1="75" x2="516" y2="75" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-write-path-blu)"/>
+                <line x1="790" y1="75" x2="846" y2="75" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-write-path-blu)"/>
+                <line x1="985" y1="110" x2="985" y2="264" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-write-path-blu)"/>
+                <text x="995" y="190" class="svg-note">dirty pages</text>
+
+                <rect x="0" y="360" width="1120" height="66" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="16" y="384" class="svg-lane">MVCC · INSIDE THE HEAP PAGE</text>
+                <text x="16" y="410" class="svg-sub">old version: xmin=100 xmax=205</text>
+                <text x="330" y="410" class="svg-sub">new version: xmin=205 xmax=0</text>
+                <line x1="580" y1="405" x2="660" y2="405" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-write-path-pur)"/>
+                <text x="672" y="410" class="svg-sub">VACUUM frees the old one once no snapshot sees it</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="src">from the docs</span> for the mechanism; the layout is
+              mine. Durability comes from step 1 alone. Steps 2 and 3 are caching, which
+              is why an <code>UPDATE</code> costs one sequential fsync, not a random
+              page write. The purple band is the cost that shows up later: every update
+              leaves a dead tuple behind.
+            </p>
+          </figure>
+
+          <p>
+            Indexes are B-trees by default: balanced, page-sized nodes with a fan-out
+            in the hundreds, so a lookup in a billion-row table touches about four
+            pages. <span class="recon">reconstruction</span> PostgreSQL also ships GIN
+            (for <code>jsonb</code>, arrays and full text), GiST, BRIN and hash
+            indexes. <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            Concurrency is MVCC. An <code>UPDATE</code> never overwrites a row in
+            place. It writes a new tuple version stamped with the writer's transaction
+            id (<code>xmin</code>) and marks the old one with <code>xmax</code>. Readers
+            see whichever version their snapshot allows, so readers never block
+            writers. The default isolation level is <code>READ COMMITTED</code>: each
+            statement sees data committed before it began. <code>REPEATABLE
+            READ</code> and true <code>SERIALIZABLE</code> (serializable snapshot
+            isolation, since 9.1) are one <code>SET TRANSACTION</code> away.
+            <span class="src">from the docs</span> The price is <code>VACUUM</code>.
+            Dead versions stay in the heap until autovacuum reclaims them, and a table
+            updated faster than it is vacuumed bloats. This matters for JSON: §7 shows
+            that changing one field of a large <code>jsonb</code> value writes a whole
+            new version.
+          </p>
+
+          <h3>The open-source members, October 2026</h3>
+
+          <ul>
+            <li>
+              <strong>PostgreSQL</strong>: PostgreSQL Licence (BSD-style), run by the
+              PostgreSQL Global Development Group. Version 18 shipped on 25 September
+              2025. It added an asynchronous I/O subsystem, <code>uuidv7()</code>, and
+              virtual generated columns as the default kind. Version 19 reached Beta 4
+              on 24 September 2026, with a release candidate planned for October and no
+              GA yet. <span class="src">from the docs</span> 18 is the production pick
+              today.
+            </li>
+            <li>
+              <strong>MySQL</strong>: GPLv2, owned by Oracle. InnoDB is a clustered
+              B-tree that defaults to <code>REPEATABLE READ</code>.
+              <span class="src">from the docs</span> <strong>MariaDB</strong>: GPLv2,
+              stewarded by the MariaDB Foundation.
+            </li>
+            <li>
+              <strong>SQLite</strong>: public domain, a library rather than a server.
+              The database is one file and allows one writer at a time. In WAL mode,
+              readers keep reading the last committed state while that writer works.
+              <span class="src">from the docs</span> For a single-node service this is
+              not a toy. It is often the fastest option, because there is no network
+              hop.
+            </li>
+            <li>
+              <strong>Distributed SQL</strong>: YugabyteDB and TiDB are Apache 2.0 and
+              shard tables across nodes with Raft. CockroachDB retired its free Core
+              edition in late 2024 for a single Enterprise licence with a free tier.
+              <span class="src">from the docs</span> That licence is not open source,
+              so it drops out of this guide's stack.
+            </li>
+          </ul>
+
+          <h3>Where it shines, where it hurts</h3>
+
+          <p>
+            The family is strongest where data is shared and correctness spans more
+            than one row: orders and inventory, accounts and ledgers, permissions,
+            anything a report will join. It is weakest in three places.
+          </p>
+
+          <ul>
+            <li>
+              <strong>Schema changes on hot tables.</strong> Some
+              <code>ALTER TABLE</code> forms rewrite the table under an
+              <code>ACCESS EXCLUSIVE</code> lock. Adding a nullable column is cheap.
+              Changing a column's type is not. §6 covers the expand/contract pattern
+              that avoids this.
+            </li>
+            <li>
+              <strong>Horizontal write scaling.</strong> One primary takes every write.
+              Read replicas scale reads only. Past one machine you shard (Citus) or
+              move to distributed SQL, and both cost you cross-shard joins.
+            </li>
+            <li>
+              <strong>Impedance mismatch.</strong> Applications hold nested objects,
+              and tables hold flat rows. ORMs bridge the gap with N+1 queries and
+              migrations nobody reads. This is the honest reason document stores
+              exist. A <code>jsonb</code> column in the right place narrows the gap
+              without leaving the engine. <span class="recon">reconstruction</span>
+            </li>
+          </ul>

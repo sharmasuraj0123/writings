@@ -1,0 +1,271 @@
+          <h2 id="measured"><span class="secnum">{{S}}</span>Five ways to keep a document current, measured</h2>
+
+          <p class="lede">
+            One session document, updated 1,500 times, five ways, each update timed. The
+            result is plain. The cost of a durable write is the fsync, not the
+            format. Throughput depends on how many writes share one fsync.
+          </p>
+
+          <h3>Setup</h3>
+
+          <p>
+            The benchmark is <code>_compute.py</code>, beside this post. It uses only the
+            standard library and writes <code>_numbers.json</code>. The document is a
+            synthetic agent session (usage block, 24 todos, 600-byte notes), 2,879 bytes
+            serialised; the docstring's "~4 KB" is stale. Each write variant
+            runs 1,500 updates. The machine has 8 CPUs, Linux 6.12, Python 3.14.4 and SQLite
+            3.46.1, with fsync landing on a cloud block device. <span class="recon">measured here</span>
+            The five ways are a whole-file rewrite, a JSONL append, a whole-document
+            <code>UPDATE</code> in SQLite, an in-place <code>json_set</code> or
+            <code>jsonb_set</code> in SQLite, and an event-row <code>INSERT</code>. The SQLite
+            variants run in WAL mode under <code>synchronous=FULL</code> and
+            <code>NORMAL</code>, both per row and batched 100 to a transaction.
+          </p>
+
+          <p>
+            The file-rewrite variant copies the pattern xo-space uses for its own state file
+            (<code>services/cowork_agent/xo_cowork_state.py</code>, lines 54–62: write a temp
+            file, <code>fsync</code>, <code>os.replace</code>).
+            <span class="src">from the tree</span> In <code>_compute.py</code> it is lines
+            44–54:
+          </p>
+
+          <pre><code>def file_rewrite(fsync):
+    path = tmp / "state.json"; d = dict(BASE)
+    def run(n):
+        for k in range(n):
+            d["usage"]["input_tokens"] += 1; d["updated_at"] = time.time()
+            fd, t = tempfile.mkstemp(dir=tmp, suffix=".json")
+            with os.fdopen(fd, "w") as f:
+                json.dump(d, f)
+                if fsync: f.flush(); os.fsync(f.fileno())
+            os.replace(t, path)
+    return run</code></pre>
+
+          <h3>Writes</h3>
+
+          <figure class="figure wide" id="fig-writes">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Cost per update, fourteen variants, log scale</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 600" role="img" aria-label="Horizontal bar chart on a logarithmic axis from 1 microsecond to 10 milliseconds, cost per update for fourteen ways of keeping a 2,879-byte JSON document current, measured over 1,500 updates each. Values in microseconds per operation: file tmp + fsync + os.replace 1,464.5; JSONL append, fsync each line 1,153.9; SQLite FULL whole-doc UPDATE 991.0; SQLite FULL jsonb_set 417.6; SQLite FULL event INSERT 412.0; SQLite FULL json_set (text) 411.1; file tmp + os.replace, no fsync 241.3; SQLite NORMAL whole-doc UPDATE 34.1; SQLite NORMAL json_set (text) 21.3; SQLite NORMAL event INSERT 17.6; JSONL append, fsync every 100 14.0; SQLite NORMAL jsonb_set 10.8; SQLite FULL 100 INSERTs per txn 8.4; SQLite NORMAL 100 INSERTs per txn 3.6. Bars that fsync on every commit cluster between 411 and 1,465 microseconds; batched or non-fsyncing variants fall between 3.6 and 241 microseconds.">
+                <text x="0" y="18" class="svg-lane">MICROSECONDS PER UPDATE · LOG SCALE · 1,500 UPDATES EACH · 2,879-BYTE DOCUMENT</text>
+                <rect x="0" y="38" width="14" height="14" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="50" class="svg-sub">fsync on every commit</text>
+                <rect x="209" y="38" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="231" y="50" class="svg-sub">one fsync per 100 writes</text>
+                <rect x="439" y="38" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="461" y="50" class="svg-sub">no fsync at commit</text>
+                <line x1="360" y1="78" x2="360" y2="484" stroke="#deded9"/>
+                <text x="360" y="502" class="svg-sub" text-anchor="middle">1 µs</text>
+                <line x1="530" y1="78" x2="530" y2="484" stroke="#deded9"/>
+                <text x="530" y="502" class="svg-sub" text-anchor="middle">10 µs</text>
+                <line x1="700" y1="78" x2="700" y2="484" stroke="#deded9"/>
+                <text x="700" y="502" class="svg-sub" text-anchor="middle">100 µs</text>
+                <line x1="870" y1="78" x2="870" y2="484" stroke="#deded9"/>
+                <text x="870" y="502" class="svg-sub" text-anchor="middle">1 ms</text>
+                <line x1="1040" y1="78" x2="1040" y2="484" stroke="#deded9"/>
+                <text x="1040" y="502" class="svg-sub" text-anchor="middle">10 ms</text>
+                <line x1="360" y1="484" x2="1040" y2="484" stroke="#b8b8b1"/>
+                <text x="348" y="104" class="svg-sub" text-anchor="end">file · tmp + fsync + os.replace</text>
+                <rect x="360" y="92" width="538.2" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="906.2" y="104" class="svg-sub">1,464.5 µs</text>
+                <text x="348" y="132" class="svg-sub" text-anchor="end">JSONL · append, fsync each line</text>
+                <rect x="360" y="120" width="520.6" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="888.6" y="132" class="svg-sub">1,153.9 µs</text>
+                <text x="348" y="160" class="svg-sub" text-anchor="end">SQLite FULL · whole-doc UPDATE</text>
+                <rect x="360" y="148" width="509.3" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="877.3" y="160" class="svg-sub">991.0 µs</text>
+                <text x="348" y="188" class="svg-sub" text-anchor="end">SQLite FULL · jsonb_set</text>
+                <rect x="360" y="176" width="445.5" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="813.5" y="188" class="svg-sub">417.6 µs</text>
+                <text x="348" y="216" class="svg-sub" text-anchor="end">SQLite FULL · event INSERT</text>
+                <rect x="360" y="204" width="444.5" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="812.5" y="216" class="svg-sub">412.0 µs</text>
+                <text x="348" y="244" class="svg-sub" text-anchor="end">SQLite FULL · json_set (text)</text>
+                <rect x="360" y="232" width="444.4" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="812.4" y="244" class="svg-sub">411.1 µs</text>
+                <text x="348" y="272" class="svg-sub" text-anchor="end">file · tmp + os.replace, no fsync</text>
+                <rect x="360" y="260" width="405.0" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="773.0" y="272" class="svg-sub">241.3 µs</text>
+                <text x="348" y="300" class="svg-sub" text-anchor="end">SQLite NORMAL · whole-doc UPDATE</text>
+                <rect x="360" y="288" width="260.6" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="628.6" y="300" class="svg-sub">34.1 µs</text>
+                <text x="348" y="328" class="svg-sub" text-anchor="end">SQLite NORMAL · json_set (text)</text>
+                <rect x="360" y="316" width="225.8" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="593.8" y="328" class="svg-sub">21.3 µs</text>
+                <text x="348" y="356" class="svg-sub" text-anchor="end">SQLite NORMAL · event INSERT</text>
+                <rect x="360" y="344" width="211.7" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="579.7" y="356" class="svg-sub">17.6 µs</text>
+                <text x="348" y="384" class="svg-sub" text-anchor="end">JSONL · append, fsync every 100</text>
+                <rect x="360" y="372" width="194.8" height="16" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="562.8" y="384" class="svg-sub">14.0 µs</text>
+                <text x="348" y="412" class="svg-sub" text-anchor="end">SQLite NORMAL · jsonb_set</text>
+                <rect x="360" y="400" width="175.7" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="543.7" y="412" class="svg-sub">10.8 µs</text>
+                <text x="348" y="440" class="svg-sub" text-anchor="end">SQLite FULL · 100 INSERTs per txn</text>
+                <rect x="360" y="428" width="157.1" height="16" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="525.1" y="440" class="svg-sub">8.4 µs</text>
+                <text x="348" y="468" class="svg-sub" text-anchor="end">SQLite NORMAL · 100 INSERTs per txn</text>
+                <rect x="360" y="456" width="94.6" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="462.6" y="468" class="svg-sub">3.6 µs</text>
+                <text x="0" y="532" class="svg-note">A single durable commit costs 0.4–1.5 ms here, whatever the format. Sharing one fsync across 100 writes</text>
+                <text x="0" y="552" class="svg-note">cuts SQLite FULL from 412.0 to 8.4 µs per row (49×) and JSONL from 1,153.9 to 14.0 µs per line (82×).</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> Values are taken from
+              <code>_numbers.json → write</code>, each the mean over 1,500 operations, and bar
+              lengths are log<sub>10</sub> of microseconds. The blue bars sit on one plateau
+              because each pays one fsync. Nothing below that plateau is durable per write
+              against power loss.
+            </p>
+          </figure>
+
+          <p>
+            Read Figure {{fig-writes}} by colour. Every blue bar pays one fsync per update
+            and lands between 411.1 and 1,464.5 µs. The file rewrite is the most expensive.
+            Without the fsync it costs 241.3 µs, so the fsync accounts for about 1,223 µs, or
+            84% of the total. <span class="recon">measured here</span> A single-row SQLite
+            commit under <code>FULL</code> costs about 412 µs, whether it is a text
+            <code>json_set</code> (411.1), a <code>jsonb_set</code> (417.6) or a new event row
+            (412.0). At that level the format does not matter. One writer gets about 2,430
+            durable commits a second (1,000,000 ÷ 411.1).
+          </p>
+
+          <p>
+            Batching changes the result more than anything else does. A hundred
+            <code>INSERT</code>s in one transaction cost 8.4 µs each under
+            <code>FULL</code>. That is 840 µs per commit, one fsync shared by a hundred rows,
+            which works out to 49 times cheaper per row than committing each one. JSONL with
+            an fsync every 100 lines drops from 1,153.9 to 14.0 µs, 82 times cheaper.
+            PostgreSQL does the same thing for you under concurrency: many sessions commit
+            behind one WAL flush, and <code>commit_delay</code> can widen that window
+            deliberately. <span class="src">from the docs</span>
+          </p>
+
+          <h3>What <code>synchronous=NORMAL</code> buys, and what it costs</h3>
+
+          <p>
+            The orange bars skip the fsync at commit. SQLite in WAL mode with
+            <code>synchronous=NORMAL</code> syncs only at checkpoints. Its documentation says
+            WAL mode under NORMAL "is always consistent" but loses durability: "A transaction
+            committed in WAL mode with synchronous=NORMAL might roll back following a power
+            loss or system crash." Transactions still survive an application crash.
+            <span class="src">from the docs</span> That trade takes a single event insert from
+            412.0 to 17.6 µs, 23 times faster. PostgreSQL's equivalent is
+            <code>synchronous_commit = off</code>, which can be set per transaction. The
+            manual bounds the loss window at "three times wal_writer_delay", 600 ms at the
+            200 ms default, and is explicit that the risk "is of data loss, not data
+            corruption". <span class="src">from the docs</span> For usage counters and
+            heartbeats, losing the last half-second on power loss is usually acceptable. For
+            payments it is not.
+          </p>
+
+          <p>
+            The file rewrite without fsync (241.3 µs) is in a worse position. It costs seven
+            times more than a NORMAL-mode SQLite update and gives no clearer guarantee. Neither
+            this script nor <code>xo_cowork_state.py</code> fsyncs the directory after
+            <code>os.replace</code>, and without that the rename itself may not reach disk
+            before a power cut. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Partial versus whole</h3>
+
+          <p>
+            With the fsync removed, the format starts to show. Under NORMAL, a whole-document
+            <code>UPDATE</code> costs 34.1 µs, an in-database <code>json_set</code> on text
+            costs 21.3, and a <code>jsonb_set</code> on the binary form costs 10.8. The first
+            serialises 2,879 bytes in Python and ships them. The second parses and re-emits
+            text inside SQLite. The third does neither. Every variant still rewrites the whole
+            row in SQLite. The saving comes from not serialising and not parsing.
+            <span class="recon">measured here</span> Under FULL, whole-document updates cost
+            991.0 µs against about 412 for the others. That gap is far larger than
+            serialisation can explain. The whole-document test ran first on a fresh WAL file,
+            so part of the gap is probably WAL growth and should not be credited to the
+            format. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Reads</h3>
+
+          <figure class="figure" id="fig-reads">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Parse the file, or ask the database</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 356" role="img" aria-label="Bar chart on a logarithmic axis from 1 microsecond to 100 milliseconds. Point read of one field: parsing a whole JSON file takes 32.1 microseconds, extracting it from SQLite by id takes 7.1, 4.5 times less. Filter on owner and status across 20,000 documents: a full scan takes 22,061.9 microseconds, the same query with an expression index takes 9.2, about 2,400 times less. The query plan reads SEARCH docs USING INDEX docs_owner_status.">
+                <line x1="330" y1="40" x2="330" y2="208" stroke="#deded9"/>
+                <text x="330" y="226" class="svg-sub" text-anchor="middle">1 µs</text>
+                <line x1="450" y1="40" x2="450" y2="208" stroke="#deded9"/>
+                <text x="450" y="226" class="svg-sub" text-anchor="middle">10 µs</text>
+                <line x1="570" y1="40" x2="570" y2="208" stroke="#deded9"/>
+                <text x="570" y="226" class="svg-sub" text-anchor="middle">100 µs</text>
+                <line x1="690" y1="40" x2="690" y2="208" stroke="#deded9"/>
+                <text x="690" y="226" class="svg-sub" text-anchor="middle">1 ms</text>
+                <line x1="810" y1="40" x2="810" y2="208" stroke="#deded9"/>
+                <text x="810" y="226" class="svg-sub" text-anchor="middle">10 ms</text>
+                <line x1="930" y1="40" x2="930" y2="208" stroke="#deded9"/>
+                <text x="930" y="226" class="svg-sub" text-anchor="middle">100 ms</text>
+                <line x1="330" y1="208" x2="930" y2="208" stroke="#b8b8b1"/>
+                <text x="0" y="24" class="svg-lane">POINT READ · ONE FIELD OF ONE DOCUMENT</text>
+                <text x="318" y="55" class="svg-sub" text-anchor="end">read file, json.loads, take .status</text>
+                <rect x="330" y="42" width="180.8" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="518.8" y="55" class="svg-sub">32.1 µs</text>
+                <text x="318" y="85" class="svg-sub" text-anchor="end">SQLite · body-&gt;&gt;'$.status' by id</text>
+                <rect x="330" y="72" width="102.2" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="440.2" y="85" class="svg-sub">7.1 µs</text>
+                <text x="0" y="128" class="svg-lane">FILTER · owner = ? AND status = 'failed' · 20,000 DOCUMENTS</text>
+                <text x="318" y="159" class="svg-sub" text-anchor="end">SQLite · no index (full scan)</text>
+                <rect x="330" y="146" width="521.2" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="859.2" y="159" class="svg-sub">22,061.9 µs</text>
+                <text x="318" y="189" class="svg-sub" text-anchor="end">SQLite · expression index</text>
+                <rect x="330" y="176" width="115.7" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="453.7" y="189" class="svg-sub">9.2 µs</text>
+                <rect x="0" y="252" width="1000" height="96" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="16" y="278" class="svg-lane">WHAT CHANGED BETWEEN THE LAST TWO BARS</text>
+                <text x="16" y="302" class="svg-sub">CREATE INDEX docs_owner_status ON docs(body-&gt;&gt;'$.owner', body-&gt;&gt;'$.status')</text>
+                <text x="16" y="326" class="svg-sub">plan: SEARCH docs USING INDEX docs_owner_status (&lt;expr&gt;=? AND &lt;expr&gt;=?)</text>
+                <text x="996" y="85" class="svg-note" text-anchor="end">4.5× less</text>
+                <text x="996" y="189" class="svg-note" text-anchor="end">≈ 2,400× less</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> Values come from
+              <code>_numbers.json → read</code>: 5,000 point reads per variant, 20 unindexed
+              filters, and 2,000 indexed ones. Red bars read and parse everything. Green bars
+              let the database find the row.
+            </p>
+          </figure>
+
+          <p>
+            Reading one field from a file means reading and parsing all of it: 32.1 µs,
+            against 7.1 µs for <code>body-&gt;&gt;'$.status'</code> by primary key in SQLite,
+            4.5 times less. The filter is the larger lesson. Counting failed sessions for one
+            owner across 20,000 documents costs 22,061.9 µs as a full scan and 9.2 µs with an
+            expression index on the two paths. That is 2,398 times less, and the plan confirms
+            <code>SEARCH docs USING INDEX docs_owner_status</code>
+            (Figure {{fig-reads}}). <span class="recon">measured here</span> A directory of JSON
+            files has no index, so every filter is the 22 ms case, growing linearly with the
+            number of files.
+          </p>
+
+          <p>
+            Storage is not free. The 20,000-document SQLite file, including that index,
+            measured 82,550,784 bytes, against an estimated 57,662,100 bytes of text JSON.
+            A 2.9 KB row on a 4 KB page wastes much of each page.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Caveats</h3>
+
+          <p>
+            These results come from one machine, one document size, and one writer with no
+            concurrency. Python interpreter overhead is included in every number. The fsync
+            cost belongs to this cloud disk; a laptop NVMe with a volatile write cache will
+            report less. PostgreSQL was not measured. Its numbers will differ, but the same
+            logic applies: one fsync per commit sets the ceiling, and group commit is how you
+            raise it. <span class="recon">reconstruction</span>
+          </p>

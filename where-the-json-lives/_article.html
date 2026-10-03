@@ -1,0 +1,2796 @@
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the docs</span> marks a fact taken from a project's own
+              documentation, release notes, or licence text. <span class="src">from the tree</span>
+              marks something read from the <code>xo-space</code> source, quoted with its path.
+              <span class="recon">measured here</span> marks a number produced by
+              <code>_compute.py</code> beside this page, on one 8-CPU Linux machine with Python 3.14
+              and SQLite 3.46.1 — the ratios travel, the absolute microseconds do not.
+              <span class="recon">reconstruction</span> marks a judgement or mechanism I have worked
+              out rather than read. PostgreSQL was not benchmarked here; its behaviour is cited, not measured.
+            </p>
+          </div>
+
+          <h2 id="the-wrong-first-question"><span class="secnum">01</span>The wrong first question</h2>
+
+          <p class="lede">
+            "SQL or NoSQL?" is the question most teams ask first, and it is the wrong
+            one. It stands in for one of five decisions and says nothing about the
+            other four. JSON does not settle it either: JSON is a serialization format,
+            not a database category.
+          </p>
+
+          <p>
+            Both camps have spent a decade converging. PostgreSQL has stored binary
+            JSON in <code>jsonb</code> since 9.4, with GIN indexes over it.
+            <span class="src">from the docs</span> SQLite added its own binary JSONB in
+            3.45.0, January 2024. <span class="src">from the docs</span> MySQL has a
+            native <code>JSON</code> type. Going the other way, MongoDB enforces JSON
+            Schema validators and runs multi-document transactions, and ClickHouse
+            declared its <code>JSON</code> column type production-ready in 25.3.
+            <span class="src">from the docs</span> Every serious engine now stores
+            JSON. So "where does the JSON live" is not answered by picking a family.
+            It is answered by the five axes in Figure 1.
+          </p>
+
+          <figure class="figure wide" id="fig-axes">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">Five axes that decide where data lives — and the one "SQL vs NoSQL" covers</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 360" role="img" aria-label="Five vertical columns, one per decision axis: data shape, access pattern, consistency need, operational burden, and licence and governance. Each column lists the question it asks and two example poles. A bracket under the first column only, data shape, is labelled 'relational versus NoSQL lives here', showing that the familiar question is a proxy for one axis out of five.">
+                <text x="0" y="18" class="svg-lane">FIVE DECISIONS · ASK THEM IN THIS ORDER</text>
+
+                <rect x="0" y="36" width="208" height="220" rx="8" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="16" y="64" class="svg-num">1</text>
+                <text x="36" y="64" class="svg-step">Data shape</text>
+                <text x="16" y="94" class="svg-sub">rows, documents,</text>
+                <text x="16" y="114" class="svg-sub">graphs, series,</text>
+                <text x="16" y="134" class="svg-sub">vectors, blobs?</text>
+                <text x="16" y="176" class="svg-note">shared keys or</text>
+                <text x="16" y="196" class="svg-note">nested, sparse</text>
+                <text x="16" y="216" class="svg-note">fields?</text>
+
+                <rect x="228" y="36" width="208" height="220" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="244" y="64" class="svg-num">2</text>
+                <text x="264" y="64" class="svg-step">Access pattern</text>
+                <text x="244" y="94" class="svg-sub">point reads by key,</text>
+                <text x="244" y="114" class="svg-sub">ad-hoc filters,</text>
+                <text x="244" y="134" class="svg-sub">scans, appends?</text>
+                <text x="244" y="176" class="svg-note">which reads must</text>
+                <text x="244" y="196" class="svg-note">be fast, and how</text>
+                <text x="244" y="216" class="svg-note">often do writes land?</text>
+
+                <rect x="456" y="36" width="208" height="220" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="472" y="64" class="svg-num">3</text>
+                <text x="492" y="64" class="svg-step">Consistency</text>
+                <text x="472" y="94" class="svg-sub">what does a lost</text>
+                <text x="472" y="114" class="svg-sub">or stale write</text>
+                <text x="472" y="134" class="svg-sub">cost you?</text>
+                <text x="472" y="176" class="svg-note">a counter off by one,</text>
+                <text x="472" y="196" class="svg-note">or money moved</text>
+                <text x="472" y="216" class="svg-note">twice?</text>
+
+                <rect x="684" y="36" width="208" height="220" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="700" y="64" class="svg-num">4</text>
+                <text x="720" y="64" class="svg-step">Operations</text>
+                <text x="700" y="94" class="svg-sub">backups, upgrades,</text>
+                <text x="700" y="114" class="svg-sub">failover, on-call:</text>
+                <text x="700" y="134" class="svg-sub">who runs it?</text>
+                <text x="700" y="176" class="svg-note">one process, or</text>
+                <text x="700" y="196" class="svg-note">a cluster that</text>
+                <text x="700" y="216" class="svg-note">pages someone?</text>
+
+                <rect x="912" y="36" width="208" height="220" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="928" y="64" class="svg-num">5</text>
+                <text x="948" y="64" class="svg-step">Licence</text>
+                <text x="928" y="94" class="svg-sub">OSI licence, who</text>
+                <text x="928" y="114" class="svg-sub">governs it, can</text>
+                <text x="928" y="134" class="svg-sub">it change?</text>
+                <text x="928" y="176" class="svg-note">Redis, Elastic,</text>
+                <text x="928" y="196" class="svg-note">CockroachDB, Scylla</text>
+                <text x="928" y="216" class="svg-note">all moved since 2024</text>
+
+                <path d="M0 276 L0 290 L208 290 L208 276" fill="none" stroke="#3c6f97" stroke-width="2"/>
+                <text x="0" y="314" class="svg-sub">"relational vs NoSQL" lives here</text>
+                <text x="0" y="336" class="svg-note">a proxy for axis 1 only — silent on the other four</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> — my framing, not a standard
+              taxonomy. Choosing a family answers the first column. Most production
+              regret comes from the other four: a read path nobody indexed, a
+              consistency level nobody chose, a cluster nobody wanted to run, or a
+              licence that changed under the team.
+            </p>
+          </figure>
+
+          <h3>The answer, up front</h3>
+
+          <p>
+            You can stop reading after this paragraph. For a system that loads and
+            stores JSON all day, the default is <strong>PostgreSQL 18</strong> with
+            <code>jsonb</code> when there is a server, or <strong>SQLite in WAL
+            mode</strong> when there is one node and one process tree. Use a
+            <strong>hybrid schema</strong>: real columns for anything you filter, join,
+            or constrain, and <code>jsonb</code> for the long tail. Around it, add
+            <strong>Valkey</strong> for hot ephemeral state,
+            <strong>S3-compatible object storage</strong> for large blobs, and
+            <strong>ClickHouse or DuckDB</strong> for analysing the event history.
+            Every piece is free and under an OSI-approved licence as of 1 October 2026.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            Two of these choices are not obvious. The first is why the core is
+            relational at all, when the payload is documents. The reason is that
+            continuously written JSON almost never stays a pure document. Within
+            months someone needs every session for a project, every document in
+            status <code>failed</code>, or a count per tenant per day. Those are
+            filters, joins and aggregates over fields, which is what the relational
+            planner exists for. The second is why there are two defaults. A server
+            database costs a process, a port, backups and upgrades. When the whole
+            system is one machine, SQLite gives most of the same guarantees with none
+            of that. <span class="recon">reconstruction</span>
+          </p>
+
+          <p>The rest of the page has to earn that answer. It does so in three parts:</p>
+
+          <ul>
+            <li>
+              <strong>The field guide</strong> (§2–§5) covers both families, the
+              trade-offs neither escapes, and the licence changes of 2024–2026.
+            </li>
+            <li>
+              <strong>The JSON question</strong> (§6–§9) covers the practices that
+              survive production, what an engine does when you change one field, five
+              write strategies measured on this machine, and the hybrid schema.
+            </li>
+            <li>
+              <strong>The build</strong> (§10–§12) covers the stack, the migration, and
+              where this advice stops.
+            </li>
+          </ul>
+
+          <h3>The running example</h3>
+
+          <p>
+            The example throughout is <code>xo-space</code>, the XO agent workspace
+            server. It keeps its state as JSON files. The cowork state writer in
+            <code>services/cowork_agent/xo_cowork_state.py</code> (lines 54–62) dumps
+            the whole dict to a temp file in the same directory, calls
+            <code>fsync</code>, then <code>os.replace</code>s it over
+            <code>state.json</code>. <span class="src">from the tree</span> The
+            per-project timeline is append-only JSONL at <code>.xo/timeline.jsonl</code>
+            (<code>services/cowork_agent/scopes.py</code>, line 87).
+            <span class="src">from the tree</span> Neither choice is a mistake. A
+            rename is atomic on POSIX, so a crash leaves either the old file or the new
+            one, never half of each. The costs show up elsewhere. Every change rewrites
+            the whole document. Every query parses it. Two writers race and the last
+            one wins. §8 measures what that costs, and §11 moves it to tables without
+            downtime.
+          </p>
+
+          <h2 id="relational"><span class="secnum">02</span>The relational family</h2>
+
+          <p class="lede">
+            A relational database stores facts as rows in tables, enforces rules about
+            them, and lets you ask questions without saying how to answer them. The
+            model fits on an index card. The engine underneath is where the
+            engineering lives: a write-ahead log, B-tree indexes, multiversion
+            concurrency, and a cleanup process that never finishes.
+          </p>
+
+          <h3>The model</h3>
+
+          <p>
+            A <em>relation</em> is a set of tuples with the same named, typed
+            attributes. A <em>primary key</em> identifies each one. <em>Foreign
+            keys</em> point between relations, and the engine refuses writes that would
+            leave a dangling pointer. <code>CHECK</code>, <code>UNIQUE</code> and
+            <code>NOT NULL</code> constraints turn business rules into errors at write
+            time, not bugs at read time. <em>Normalization</em> stores each fact once,
+            so an update touches one row rather than every copy.
+          </p>
+
+          <p>
+            Queries are declarative. You state what you want in SQL, and a
+            cost-based <em>planner</em> chooses scan types, join order and join
+            algorithms from table statistics. This is the family's main advantage. A
+            query nobody planned for still runs and still returns the right answer,
+            just slowly until someone adds an index. Most of the specialised families
+            in §3 give that up.
+          </p>
+
+          <h3>What the engine does on commit</h3>
+
+          <p>
+            Figure 2 follows one <code>UPDATE</code> through
+            PostgreSQL. The order matters. The change is described in the write-ahead
+            log (WAL) first. On commit, the WAL is flushed to disk; with the default
+            <code>synchronous_commit = on</code>, the client is not told "committed"
+            until that flush returns. <span class="src">from the docs</span> The table
+            page itself is changed only in memory, in <code>shared_buffers</code>, and
+            reaches its data file later, through the background writer or a
+            checkpoint (every <code>checkpoint_timeout</code>, 5 minutes by default, or
+            sooner when <code>max_wal_size</code> fills). <span class="src">from the
+            docs</span> After a crash, recovery replays WAL from the last checkpoint.
+            One sequential flush per commit buys durability for any number of random
+            page changes.
+          </p>
+
+          <figure class="figure wide" id="fig-write-path">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">Anatomy of a committed write in PostgreSQL</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 430" role="img" aria-label="A client sends an UPDATE. Step one appends a WAL record to the WAL buffer, which is flushed with fsync to the WAL segment on disk before the commit is acknowledged. Step two writes a new tuple version into a heap page in shared buffers and, unless it is a HOT update, a new index entry. Step three, later and asynchronously, the background writer and checkpointer write dirty pages to the data files. Below, the MVCC detail: the old tuple version gets xmax set to the updating transaction, the new version has xmin set to it, and vacuum later reclaims the dead version once no snapshot can see it.">
+                <defs>
+                  <marker id="fig-write-path-blk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-write-path-blu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-write-path-pur" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">MEMORY</text>
+                <text x="0" y="250" class="svg-lane">DISK</text>
+                <line x1="0" y1="232" x2="1120" y2="232" stroke="#deded9" stroke-dasharray="4 4"/>
+
+                <rect x="0" y="40" width="170" height="70" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="16" y="68" class="svg-step">Client</text>
+                <text x="16" y="92" class="svg-sub">UPDATE … COMMIT</text>
+
+                <rect x="230" y="40" width="230" height="70" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="246" y="68" class="svg-num">1</text>
+                <text x="264" y="68" class="svg-step">WAL buffer</text>
+                <text x="246" y="92" class="svg-sub">record: what changed</text>
+
+                <rect x="230" y="268" width="230" height="70" rx="8" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="246" y="296" class="svg-step">pg_wal/ segment</text>
+                <text x="246" y="320" class="svg-sub">fsync before ack</text>
+
+                <rect x="520" y="40" width="270" height="160" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="536" y="68" class="svg-num">2</text>
+                <text x="554" y="68" class="svg-step">shared_buffers</text>
+                <text x="536" y="96" class="svg-sub">heap page (8 kB)</text>
+                <text x="536" y="120" class="svg-sub">+ index entry, unless</text>
+                <text x="536" y="144" class="svg-sub">HOT: same page and no</text>
+                <text x="536" y="168" class="svg-sub">indexed column changed</text>
+
+                <rect x="850" y="40" width="270" height="70" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="866" y="68" class="svg-num">3</text>
+                <text x="884" y="68" class="svg-step">bgwriter, checkpointer</text>
+                <text x="866" y="92" class="svg-sub">later, asynchronous</text>
+
+                <rect x="850" y="268" width="270" height="70" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="866" y="296" class="svg-step">base/ data files</text>
+                <text x="866" y="320" class="svg-sub">heap + index pages</text>
+
+                <line x1="170" y1="75" x2="226" y2="75" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-write-path-blk)"/>
+                <line x1="345" y1="110" x2="345" y2="264" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-write-path-blk)"/>
+                <text x="355" y="190" class="svg-note">commit = flush</text>
+                <path d="M230 320 L120 320 L120 114" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-write-path-blk)"/>
+                <text x="128" y="200" class="svg-note">ack returns</text>
+                <text x="128" y="218" class="svg-note">after the flush</text>
+                <line x1="460" y1="75" x2="516" y2="75" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-write-path-blu)"/>
+                <line x1="790" y1="75" x2="846" y2="75" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-write-path-blu)"/>
+                <line x1="985" y1="110" x2="985" y2="264" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-write-path-blu)"/>
+                <text x="995" y="190" class="svg-note">dirty pages</text>
+
+                <rect x="0" y="360" width="1120" height="66" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="16" y="384" class="svg-lane">MVCC · INSIDE THE HEAP PAGE</text>
+                <text x="16" y="410" class="svg-sub">old version: xmin=100 xmax=205</text>
+                <text x="330" y="410" class="svg-sub">new version: xmin=205 xmax=0</text>
+                <line x1="580" y1="405" x2="660" y2="405" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-write-path-pur)"/>
+                <text x="672" y="410" class="svg-sub">VACUUM frees the old one once no snapshot sees it</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="src">from the docs</span> for the mechanism; the layout is
+              mine. Durability comes from step 1 alone. Steps 2 and 3 are caching, which
+              is why an <code>UPDATE</code> costs one sequential fsync, not a random
+              page write. The purple band is the cost that shows up later: every update
+              leaves a dead tuple behind.
+            </p>
+          </figure>
+
+          <p>
+            Indexes are B-trees by default: balanced, page-sized nodes with a fan-out
+            in the hundreds, so a lookup in a billion-row table touches about four
+            pages. <span class="recon">reconstruction</span> PostgreSQL also ships GIN
+            (for <code>jsonb</code>, arrays and full text), GiST, BRIN and hash
+            indexes. <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            Concurrency is MVCC. An <code>UPDATE</code> never overwrites a row in
+            place. It writes a new tuple version stamped with the writer's transaction
+            id (<code>xmin</code>) and marks the old one with <code>xmax</code>. Readers
+            see whichever version their snapshot allows, so readers never block
+            writers. The default isolation level is <code>READ COMMITTED</code>: each
+            statement sees data committed before it began. <code>REPEATABLE
+            READ</code> and true <code>SERIALIZABLE</code> (serializable snapshot
+            isolation, since 9.1) are one <code>SET TRANSACTION</code> away.
+            <span class="src">from the docs</span> The price is <code>VACUUM</code>.
+            Dead versions stay in the heap until autovacuum reclaims them, and a table
+            updated faster than it is vacuumed bloats. This matters for JSON: §7 shows
+            that changing one field of a large <code>jsonb</code> value writes a whole
+            new version.
+          </p>
+
+          <h3>The open-source members, October 2026</h3>
+
+          <ul>
+            <li>
+              <strong>PostgreSQL</strong>: PostgreSQL Licence (BSD-style), run by the
+              PostgreSQL Global Development Group. Version 18 shipped on 25 September
+              2025. It added an asynchronous I/O subsystem, <code>uuidv7()</code>, and
+              virtual generated columns as the default kind. Version 19 reached Beta 4
+              on 24 September 2026, with a release candidate planned for October and no
+              GA yet. <span class="src">from the docs</span> 18 is the production pick
+              today.
+            </li>
+            <li>
+              <strong>MySQL</strong>: GPLv2, owned by Oracle. InnoDB is a clustered
+              B-tree that defaults to <code>REPEATABLE READ</code>.
+              <span class="src">from the docs</span> <strong>MariaDB</strong>: GPLv2,
+              stewarded by the MariaDB Foundation.
+            </li>
+            <li>
+              <strong>SQLite</strong>: public domain, a library rather than a server.
+              The database is one file and allows one writer at a time. In WAL mode,
+              readers keep reading the last committed state while that writer works.
+              <span class="src">from the docs</span> For a single-node service this is
+              not a toy. It is often the fastest option, because there is no network
+              hop.
+            </li>
+            <li>
+              <strong>Distributed SQL</strong>: YugabyteDB and TiDB are Apache 2.0 and
+              shard tables across nodes with Raft. CockroachDB retired its free Core
+              edition in late 2024 for a single Enterprise licence with a free tier.
+              <span class="src">from the docs</span> That licence is not open source,
+              so it drops out of this guide's stack.
+            </li>
+          </ul>
+
+          <h3>Where it shines, where it hurts</h3>
+
+          <p>
+            The family is strongest where data is shared and correctness spans more
+            than one row: orders and inventory, accounts and ledgers, permissions,
+            anything a report will join. It is weakest in three places.
+          </p>
+
+          <ul>
+            <li>
+              <strong>Schema changes on hot tables.</strong> Some
+              <code>ALTER TABLE</code> forms rewrite the table under an
+              <code>ACCESS EXCLUSIVE</code> lock. Adding a nullable column is cheap.
+              Changing a column's type is not. §6 covers the expand/contract pattern
+              that avoids this.
+            </li>
+            <li>
+              <strong>Horizontal write scaling.</strong> One primary takes every write.
+              Read replicas scale reads only. Past one machine you shard (Citus) or
+              move to distributed SQL, and both cost you cross-shard joins.
+            </li>
+            <li>
+              <strong>Impedance mismatch.</strong> Applications hold nested objects,
+              and tables hold flat rows. ORMs bridge the gap with N+1 queries and
+              migrations nobody reads. This is the honest reason document stores
+              exist. A <code>jsonb</code> column in the right place narrows the gap
+              without leaving the engine. <span class="recon">reconstruction</span>
+            </li>
+          </ul>
+
+          <h2 id="non-relational"><span class="secnum">03</span>The non-relational families</h2>
+
+          <p class="lede">
+            "NoSQL" is not one thing. It is at least eight families, each built around
+            one access pattern and each paying for it by giving up something a
+            relational engine provides: joins, ad-hoc queries, strong consistency, or
+            transactions across keys. You choose one when that pattern dominates your
+            load and has outgrown a general engine. Not before.
+          </p>
+
+          <p>
+            Figure 3 is the map, one row per family. The open-source
+            pick in each row is under an OSI-approved licence as of October 2026. Where
+            the best-known product is not, the row says so.
+          </p>
+
+          <figure class="figure wide" id="fig-families">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">Eight families: what each is built for, and what it gives up</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Family</th><th>Data model</th><th>Built for</th><th>Gives up</th><th>Open-source pick · licence</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Key-value</td><td>opaque value under a key; in-memory variants add typed structures</td><td>sub-millisecond get/set by exact key; counters, sessions, queues</td><td>queries by value, joins; durability is optional in memory stores</td><td>Valkey 9 · BSD-3 (Linux Foundation); RocksDB, etcd, FoundationDB as embedded/building blocks</td></tr>
+                  <tr><td>Document</td><td>nested JSON/BSON per key, grouped in collections</td><td>load and save one aggregate by id; filter on its fields</td><td>joins across collections are awkward; denormalised copies drift</td><td>FerretDB 2 · Apache 2.0, over DocumentDB · MIT; CouchDB · Apache 2.0. MongoDB is SSPL, not OSI</td></tr>
+                  <tr><td>Wide-column</td><td>partition key → rows sorted by clustering key</td><td>very high write rates; reads by known partition</td><td>ad-hoc queries, joins; secondary indexes are limited</td><td>Apache Cassandra 5 · Apache 2.0. ScyllaDB is source-available since 2025.1</td></tr>
+                  <tr><td>Graph</td><td>nodes and typed edges with properties</td><td>multi-hop traversals: paths, neighbours, fraud rings</td><td>bulk scans and aggregates; sharding a graph is hard</td><td>Apache AGE (on Postgres) · Apache 2.0; Neo4j Community · GPLv3</td></tr>
+                  <tr><td>Time-series</td><td>(series, timestamp) → values, partitioned by time</td><td>append-mostly ingest; range and downsample queries</td><td>updates and deletes of old points; general joins</td><td>QuestDB, VictoriaMetrics · Apache 2.0; TimescaleDB core · Apache 2.0, extras TSL</td></tr>
+                  <tr><td>Search</td><td>inverted index over analysed text and fields</td><td>relevance-ranked full text, facets, log search</td><td>it is not a system of record; refresh lag; no transactions</td><td>OpenSearch · Apache 2.0. Elasticsearch added AGPLv3 as an option in 2024</td></tr>
+                  <tr><td>Vector</td><td>embedding arrays with ANN indexes (HNSW, IVF)</td><td>nearest-neighbour similarity at recall below 100%</td><td>exactness; it is usually a second index on other data</td><td>pgvector · PostgreSQL Licence; Qdrant · Apache 2.0</td></tr>
+                  <tr><td>Columnar analytics</td><td>each column stored and compressed separately</td><td>scans and aggregates over billions of rows</td><td>point updates and single-row reads are expensive</td><td>ClickHouse · Apache 2.0; DuckDB (embedded) · MIT</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              <span class="src">from the docs</span> for licences;
+              <span class="recon">reconstruction</span> for the "built for / gives up"
+              columns. Read the fourth column first. Each family is a general engine
+              with something removed, and what was removed is the bill.
+            </p>
+          </figure>
+
+          <h3>Key-value</h3>
+
+          <p>
+            The simplest contract is <code>get(key)</code> and <code>set(key,
+            value)</code>. In-memory stores add lists, hashes, sorted sets, TTLs and
+            pub/sub, which is why they end up holding sessions, rate limits and
+            caches. The licence history decides the pick here. Redis moved from BSD
+            to RSALv2/SSPLv1 in March 2024, and Redis 8 (May 2025) added AGPLv3 as a
+            third option. <span class="src">from the docs</span> Valkey forked from the
+            last BSD release and reached 9.0 on 21 October 2025, still BSD-3, under the
+            Linux Foundation. <span class="src">from the docs</span> Both are fine to
+            run. Only Valkey keeps the permissive licence the ecosystem was built on.
+            Underneath many systems sit embedded key-value engines: RocksDB (an LSM
+            library), etcd (Raft-replicated, for configuration) and FoundationDB
+            (ordered keys with strict-serializable multi-key transactions). All three
+            are Apache-licensed. <span class="src">from the docs</span>
+          </p>
+
+          <h3>Document</h3>
+
+          <p>
+            A document store keeps one aggregate, such as an order with its lines or a
+            user with their settings, as one nested value. That matches application
+            objects and saves the joins. The cost appears when two aggregates share a
+            fact. You either copy it into both and accept drift, or store a reference
+            and join in application code. MongoDB is the reference product, but its
+            Server Side Public License (since 2018) is not OSI-approved.
+            <span class="src">from the docs</span> FerretDB 2.0 speaks the MongoDB
+            wire protocol under Apache 2.0, storing data through Microsoft's
+            DocumentDB extension for PostgreSQL. DocumentDB is MIT-licensed and joined
+            the Linux Foundation on 25 August 2025. <span class="src">from the
+            docs</span> In other words, the open-source document database of 2026 is
+            Postgres in disguise. CouchDB (Apache 2.0) remains the choice when you
+            need multi-master replication and offline sync.
+          </p>
+
+          <h3>Wide-column, graph, time-series</h3>
+
+          <p>
+            Wide-column stores (Cassandra, its ancestor Bigtable) model a table as
+            partitions. A partition key picks the node, and a clustering key orders
+            rows within it. You design one table per query, write fast because every
+            write is an append to an LSM tree, and give up the queries you did not
+            design for. Apache Cassandra 5.0 is Apache 2.0. ScyllaDB's last AGPL
+            release was 6.2, and from 2025.1 it is source-available with a free tier
+            capped at 10 TB and 50 vCPUs. <span class="src">from the docs</span>
+            Graph engines make multi-hop traversal cheap by storing adjacency
+            directly. Apache AGE adds openCypher to Postgres, so a graph can share a
+            database with everything else. Time-series engines partition by time,
+            compress columns, and assume old points rarely change. TimescaleDB needs
+            care: its core is Apache 2.0, but compression, continuous aggregates and
+            other features are under the Timescale Licence (TSL). The TSL is free to
+            use except for offering TimescaleDB as a hosted database service, and it is
+            not OSI-approved. <span class="src">from the docs</span>
+          </p>
+
+          <h3>Search, vector, columnar</h3>
+
+          <p>
+            These three are usually second stores. A primary database owns the truth
+            and feeds them. Search engines build inverted indexes. OpenSearch is
+            Apache 2.0 under the Linux Foundation, and Elasticsearch added AGPLv3
+            alongside SSPL and ELv2 in August 2024. <span class="src">from the
+            docs</span> Vector search is an index type more than a database: pgvector
+            puts HNSW and IVFFlat inside Postgres, and Qdrant is a standalone engine.
+            Columnar engines (ClickHouse server-side, DuckDB in-process) store each
+            column separately, so an aggregate over three columns of a hundred-column
+            event never reads the other ninety-seven. They are where the event history
+            from §10 ends up.
+          </p>
+
+          <h3>One record, four models</h3>
+
+          <p>
+            Figure 4 shows the same agent-session record in four models.
+            The data does not change, only the access pattern each layout makes cheap.
+          </p>
+
+          <figure class="figure" id="fig-shapes">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">The same session record, laid out four ways</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 470" role="img" aria-label="Four panels show one agent session stored four ways. Key-value: the key session:s42 maps to an opaque blob, cheap to get by id and blind to its contents. Document: a nested object with id, project, status, model and an array of turns, queryable by field. Wide-column: partition key project p7 with rows clustered by started_at, so one read returns a project's sessions in time order. Graph: nodes for user, session, project and file with edges ran, in, and edited, so traversal from a file to the users who touched it is cheap.">
+                <defs>
+                  <marker id="fig-shapes-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">KEY-VALUE</text>
+                <rect x="0" y="30" width="480" height="180" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="16" y="56" width="150" height="40" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="28" y="81" class="svg-sub">session:s42</text>
+                <line x1="166" y1="76" x2="210" y2="76" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-shapes-arr)"/>
+                <rect x="214" y="56" width="250" height="40" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="226" y="81" class="svg-sub" style="white-space:pre">0x7b2269…  (2.8 KB)</text>
+                <text x="16" y="138" class="svg-note">cheap: GET by exact id, TTL, overwrite</text>
+                <text x="16" y="162" class="svg-note">blind: "all running sessions" is a full scan</text>
+                <text x="16" y="186" class="svg-note">of every value, done in the application</text>
+
+                <text x="520" y="18" class="svg-lane">DOCUMENT</text>
+                <rect x="520" y="30" width="480" height="180" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="536" y="56" class="svg-sub">{ "id": "s42", "project": "p7",</text>
+                <text x="536" y="78" class="svg-sub" style="white-space:pre">  "status": "running",</text>
+                <text x="536" y="100" class="svg-sub" style="white-space:pre">  "model": "…", "turns": [</text>
+                <text x="536" y="122" class="svg-sub" style="white-space:pre">    { "role": "user", … }, … ] }</text>
+                <text x="536" y="162" class="svg-note">cheap: load the aggregate; filter on fields</text>
+                <text x="536" y="186" class="svg-note">awkward: anything shared with another doc</text>
+
+                <text x="0" y="248" class="svg-lane">WIDE-COLUMN</text>
+                <rect x="0" y="260" width="480" height="200" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="16" y="286" class="svg-sub">partition: project = p7</text>
+                <line x1="16" y1="296" x2="464" y2="296" stroke="#b8b8b1"/>
+                <text x="16" y="318" class="svg-sub" style="white-space:pre">started_at ↑   session  status</text>
+                <text x="16" y="342" class="svg-sub" style="white-space:pre">09:02:11       s40      done</text>
+                <text x="16" y="364" class="svg-sub" style="white-space:pre">09:40:57       s41      done</text>
+                <text x="16" y="386" class="svg-sub" style="white-space:pre">10:15:03       s42      running</text>
+                <text x="16" y="422" class="svg-note">cheap: one partition, in clustering order</text>
+                <text x="16" y="446" class="svg-note">absent: "all running, any project" — new table</text>
+
+                <text x="520" y="248" class="svg-lane">GRAPH</text>
+                <rect x="520" y="260" width="480" height="200" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <circle cx="580" cy="320" r="30" fill="#ffffff" stroke="#367f59" stroke-width="2"/>
+                <text x="562" y="325" class="svg-sub">user</text>
+                <circle cx="730" cy="320" r="30" fill="#ffffff" stroke="#367f59" stroke-width="2"/>
+                <text x="709" y="325" class="svg-sub">s42</text>
+                <circle cx="900" cy="300" r="34" fill="#ffffff" stroke="#367f59" stroke-width="2"/>
+                <text x="875" y="305" class="svg-sub">proj</text>
+                <circle cx="900" cy="400" r="30" fill="#ffffff" stroke="#367f59" stroke-width="2"/>
+                <text x="879" y="405" class="svg-sub">file</text>
+                <line x1="610" y1="320" x2="696" y2="320" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-shapes-arr)"/>
+                <text x="630" y="310" class="svg-sub">ran</text>
+                <line x1="760" y1="316" x2="862" y2="304" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-shapes-arr)"/>
+                <text x="800" y="298" class="svg-sub">in</text>
+                <line x1="756" y1="336" x2="872" y2="390" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-shapes-arr)"/>
+                <text x="782" y="380" class="svg-sub">edited</text>
+                <text x="536" y="422" class="svg-note">cheap: file → sessions → users,</text>
+                <text x="536" y="446" class="svg-note">any number of hops</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span>: an illustrative record, not
+              <code>xo-space</code>'s actual schema. Each layout makes one question
+              cheap and leaves the others to the application. A relational table with a
+              <code>jsonb</code> column answers all four questions, none of them
+              optimally, which is usually the right trade until one of them dominates.
+            </p>
+          </figure>
+
+          <h2 id="trade-offs"><span class="secnum">04</span>The trade-offs nobody escapes</h2>
+
+          <p class="lede">
+            Under the product names there are a few mechanisms, and each has a cost
+            that no vendor removes. A storage engine trades read cost against write
+            cost against space. A distributed system trades latency against
+            consistency, even when nothing is broken. Knowing which trade a product
+            made tells you more than its feature page does.
+          </p>
+
+          <h3>Two storage engines</h3>
+
+          <p>
+            Almost every engine in §2 and §3 is one of two designs. A
+            <strong>B-tree</strong> keeps sorted, page-sized nodes on disk and updates
+            them in place (PostgreSQL's indexes, InnoDB's clustered index, SQLite). A
+            <strong>log-structured merge tree</strong> (LSM) never updates in place. It
+            buffers writes in a sorted in-memory <em>memtable</em>, flushes it as an
+            immutable sorted file (an SSTable), and merges those files in the
+            background through <em>compaction</em>. RocksDB, Cassandra and ScyllaDB are
+            LSM engines. ClickHouse's MergeTree follows the same idea for columns:
+            each insert becomes an immutable part, and parts are merged later.
+            <span class="src">from the docs</span>
+          </p>
+
+          <figure class="figure wide" id="fig-amplification">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">B-tree versus LSM-tree: where each one pays</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 400" role="img" aria-label="Left, a B-tree: a root page, two inner pages and four leaf pages. A write descends to one leaf and rewrites that page in place, plus a WAL record. Reads are cheap, one root-to-leaf path. Writes pay a whole page per small change, and pages are kept partly empty. Right, an LSM tree: writes go to a memtable and WAL, the memtable flushes to an immutable level-0 SSTable, and compaction merges level 0 into levels 1 and 2. Writes are sequential and cheap. Reads may check the memtable and several levels, helped by bloom filters, and compaction rewrites the same data several times. Space holds obsolete versions until compaction.">
+                <defs>
+                  <marker id="fig-amplification-blu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-amplification-pur" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">B-TREE · UPDATE IN PLACE</text>
+                <rect x="210" y="36" width="110" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="246" y="58" class="svg-sub">root</text>
+                <rect x="90" y="96" width="110" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="330" y="96" width="110" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <line x1="240" y1="70" x2="150" y2="96" stroke="#b8b8b1"/>
+                <line x1="290" y1="70" x2="380" y2="96" stroke="#b8b8b1"/>
+                <rect x="20" y="156" width="110" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="150" y="156" width="110" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="290" y="156" width="110" height="34" rx="5" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <rect x="420" y="156" width="110" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <line x1="130" y1="130" x2="75" y2="156" stroke="#b8b8b1"/>
+                <line x1="160" y1="130" x2="205" y2="156" stroke="#b8b8b1"/>
+                <line x1="370" y1="130" x2="345" y2="156" stroke="#3c6f97" stroke-width="1.6"/>
+                <line x1="410" y1="130" x2="475" y2="156" stroke="#b8b8b1"/>
+                <text x="296" y="178" class="svg-sub">rewrite</text>
+                <text x="20" y="222" class="svg-note">one write = one WAL record + one whole page, rewritten in place</text>
+
+                <line x1="560" y1="10" x2="560" y2="250" stroke="#deded9"/>
+
+                <text x="590" y="18" class="svg-lane">LSM-TREE · APPEND, THEN MERGE</text>
+                <rect x="590" y="36" width="150" height="40" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="604" y="61" class="svg-sub">memtable</text>
+                <line x1="740" y1="56" x2="796" y2="56" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-amplification-blu)"/>
+                <text x="746" y="48" class="svg-sub">flush</text>
+                <rect x="800" y="36" width="64" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="872" y="36" width="64" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="944" y="36" width="64" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1020" y="61" class="svg-sub">L0</text>
+                <rect x="800" y="106" width="208" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1020" y="131" class="svg-sub">L1</text>
+                <rect x="800" y="176" width="280" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1088" y="201" class="svg-sub">L2</text>
+                <path d="M790 66 Q760 90 790 120" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-amplification-pur)"/>
+                <path d="M790 136 Q760 160 790 190" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-amplification-pur)"/>
+                <text x="604" y="140" class="svg-sub">compaction</text>
+                <text x="604" y="160" class="svg-sub">rewrites data</text>
+                <text x="590" y="240" class="svg-note">one write = one WAL record + a memtable insert; merged later, repeatedly</text>
+
+                <rect x="0" y="266" width="1120" height="130" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="16" y="292" class="svg-lane">AMPLIFICATION</text>
+                <text x="200" y="292" class="svg-lane">B-TREE</text>
+                <text x="660" y="292" class="svg-lane">LSM-TREE</text>
+                <text x="16" y="320" class="svg-step">read</text>
+                <text x="200" y="320" class="svg-sub">low: one root-to-leaf path</text>
+                <text x="660" y="320" class="svg-sub">higher: memtable + levels, bloom filters help</text>
+                <text x="16" y="348" class="svg-step">write</text>
+                <text x="200" y="348" class="svg-sub">high: a page per small change, random I/O</text>
+                <text x="660" y="348" class="svg-sub">low on ingest, paid back by compaction</text>
+                <text x="16" y="376" class="svg-step">space</text>
+                <text x="200" y="376" class="svg-sub">pages kept partly empty to absorb inserts</text>
+                <text x="660" y="376" class="svg-sub">old versions linger until compaction</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span>: qualitative, no numbers
+              claimed. Neither design is faster in general. Each moves cost to a
+              different moment. B-trees pay at write time, and LSM trees pay in
+              background I/O and on reads that miss the memtable.
+            </p>
+          </figure>
+
+          <p>
+            The general form of this is the <strong>RUM conjecture</strong>
+            (Athanassoulis et al., EDBT 2016): an access method can minimise at most
+            two of read overhead, update overhead and memory (space) overhead.
+            <span class="src">from the docs</span> Indexes are the everyday case.
+            Every index you add makes some reads cheaper and every write more
+            expensive. §8 measures that on this machine: an expression index turns a
+            20,000-document filter from 22,062 µs into 9.2 µs.
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>Distribution: CAP is narrow, PACELC is useful</h3>
+
+          <p>
+            CAP says that during a network <em>partition</em>, a replicated system must
+            choose between availability and linearizable consistency. That is true,
+            and it only covers the partition case. Abadi's <strong>PACELC</strong>
+            (IEEE Computer, 2012) adds the case that runs all day: <em>else</em>, with
+            no partition, you still choose between <em>latency</em> and
+            <em>consistency</em>, because waiting for another replica to acknowledge
+            costs a round trip on every write. <span class="src">from the docs</span>
+            Cassandra with consistency level <code>ONE</code> is PA/EL. A
+            single-leader Postgres with synchronous replication is PC/EC. Most of the
+            cost of "distributed" is in the EL/EC half.
+          </p>
+
+          <figure class="figure" id="fig-consistency">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">The consistency ladder, with where engines sit by default</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 410" role="img" aria-label="A ladder of seven rungs from weakest at the bottom to strongest at the top: eventual, read-your-writes, causal, read committed, snapshot, serializable, strict serializable. Defaults are marked: Cassandra at consistency level ONE and asynchronous Valkey replicas at eventual; MongoDB causally consistent sessions at causal; PostgreSQL default at read committed; PostgreSQL repeatable read and TiDB at snapshot; SQLite, PostgreSQL serializable, and CockroachDB default at serializable; FoundationDB and etcd at strict serializable or linearizable. Higher rungs cost more coordination latency.">
+                <defs>
+                  <marker id="fig-consistency-blk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">GUARANTEE</text>
+                <text x="400" y="18" class="svg-lane">WHO SITS HERE BY DEFAULT (OR ON ONE SETTING)</text>
+
+                <rect x="0" y="32" width="360" height="42" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="2"/>
+                <text x="16" y="59" class="svg-step">strict serializable</text>
+                <text x="400" y="59" class="svg-sub">FoundationDB; etcd (linearizable keys)</text>
+
+                <rect x="0" y="84" width="360" height="42" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="16" y="111" class="svg-step">serializable</text>
+                <text x="400" y="111" class="svg-sub">SQLite; CockroachDB default; Postgres SERIALIZABLE</text>
+
+                <rect x="0" y="136" width="360" height="42" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="16" y="163" class="svg-step">snapshot</text>
+                <text x="400" y="163" class="svg-sub">Postgres REPEATABLE READ; TiDB default</text>
+
+                <rect x="0" y="188" width="360" height="42" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="16" y="215" class="svg-step">read committed</text>
+                <text x="400" y="215" class="svg-sub">PostgreSQL default</text>
+
+                <rect x="0" y="240" width="360" height="42" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="16" y="267" class="svg-step">causal</text>
+                <text x="400" y="267" class="svg-sub">MongoDB causally consistent sessions</text>
+
+                <rect x="0" y="292" width="360" height="42" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="16" y="319" class="svg-step">read-your-writes</text>
+                <text x="400" y="319" class="svg-sub">read from the leader; sticky sessions</text>
+
+                <rect x="0" y="344" width="360" height="42" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="16" y="371" class="svg-step">eventual</text>
+                <text x="400" y="371" class="svg-sub">Cassandra at ONE; async Valkey replicas</text>
+
+                <line x1="380" y1="384" x2="380" y2="40" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-consistency-blk)"/>
+                <text x="400" y="402" class="svg-note">upward: more coordination per operation, so more latency and less availability under partition</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span>: a simplification. Replica
+              consistency (eventual, causal) and transaction isolation (read committed,
+              snapshot) are different axes, and the true hierarchy is a partial order,
+              not a ladder. Placements are <span class="src">from the docs</span> of
+              each engine. The useful lesson is that the default is a choice someone
+              made for you. Read it.
+            </p>
+          </figure>
+
+          <p>
+            Defaults vary by more than most teams realise. PostgreSQL runs
+            <code>READ COMMITTED</code> unless told otherwise, so two concurrent
+            read-modify-write transactions on a <code>jsonb</code> document can lose
+            an update without any error. Use <code>SELECT … FOR UPDATE</code>, a
+            version column, or an in-place <code>jsonb_set</code>. Cassandra lets each
+            query choose its consistency level, and reads and writes at
+            <code>QUORUM</code> overlap so a read sees the latest acknowledged write.
+            MongoDB has defaulted to write concern <code>majority</code> since 5.0.
+            <span class="src">from the docs</span> FerretDB inherits whatever its
+            PostgreSQL backend commits. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>What this means for JSON written all day</h3>
+
+          <p>
+            Two consequences follow for the workload this page is about. First, a
+            document updated in place on a B-tree engine pays for a whole new row
+            version each time, however small the change. PostgreSQL can make that a
+            HOT update, with no new index entries, when the new version fits on the
+            same page and no indexed column changed. <span class="src">from the
+            docs</span> Promoting a hot JSON field to an indexed column therefore has
+            a write cost as well as a read benefit. §7 and §9 return to this. Second,
+            an append-only event log is the access pattern LSM and columnar engines
+            were built for. The current document belongs in a B-tree engine, and its
+            history belongs in one that merges. That split is the shape of the stack
+            in §10. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Replication and sharding</h3>
+
+          <p>
+            Replication comes in three topologies. <strong>Single-leader</strong>
+            (Postgres, MySQL, Valkey) sends every write through one node: simple to
+            reason about, with a write ceiling at one machine.
+            <strong>Multi-leader</strong> (CouchDB, BDR-style setups) accepts writes in
+            several places and must resolve conflicts afterwards.
+            <strong>Leaderless</strong> (Cassandra, Dynamo-style) writes to N replicas
+            and relies on quorum overlap plus read repair. Sharding is a separate
+            decision. It splits data by key so writes scale out. The bill comes as
+            cross-shard joins, cross-shard transactions (two-phase commit or a
+            consensus layer), and rebalancing when a shard grows hot.
+          </p>
+
+          <h3>The rule</h3>
+
+          <p>
+            One well-tuned node handles far more than most products need. On this
+            machine, SQLite in WAL mode with <code>synchronous=FULL</code> committed
+            2,427 single-event inserts per second, each one durable. With
+            <code>synchronous=NORMAL</code> it committed 56,767, and batching 100 per
+            transaction reached 280,925 rows per second.
+            <span class="recon">measured here</span> PostgreSQL on a server-class
+            disk is in the same order of magnitude per node.
+            <span class="recon">reconstruction</span> Distribute when a measured limit
+            forces you to (write throughput, dataset size, or a regional latency
+            requirement), and not before. Each step up the ladder or out to more
+            shards is paid for on every request after it.
+          </p>
+
+          <h2 id="licences"><span class="secnum">05</span>Free and open source, checked</h2>
+
+          <p class="lede">
+            "Free and open source" is checkable. A licence is on the Open Source
+            Initiative's approved list or it is not. Between March 2024 and May 2025 that
+            answer changed for several databases people run every day. Licence text tells
+            you what you may do today. Governance tells you whether the text can change.
+          </p>
+
+          <h3>The definition this guide uses</h3>
+
+          <p>
+            Open source here means an OSI-approved licence: PostgreSQL Licence, MIT,
+            BSD-3-Clause, Apache 2.0, the GPL family, AGPLv3. Public domain (SQLite) also
+            qualifies. Source-available licences publish the code but restrict who may run it
+            and for what. That list includes the Server Side Public License (SSPL), the
+            Business Source License (BSL), RSALv2, the Elastic License v2 and ScyllaDB's 2025
+            licence. Each restricts a use, usually "do not offer this as a service", which
+            criterion 6 of the Open Source Definition, "No Discrimination Against Fields of
+            Endeavor", forbids. <span class="src">from the docs</span> MongoDB withdrew the
+            SSPL from OSI review in 2019. <span class="src">from the docs</span> BSL code turns
+            open source on a "change date" up to four years after release: a delay, not a
+            promise about the next release.
+          </p>
+
+          <figure class="figure wide" id="fig-ledger">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">The licence ledger, March 2024 to October 2026</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Project</th>
+                    <th>Before</th>
+                    <th>After</th>
+                    <th>When</th>
+                    <th>Governed by</th>
+                    <th>Self-hosting it behind your SaaS</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td><strong>Redis</strong></td><td>BSD-3</td><td>RSALv2 / SSPLv1, then AGPLv3 added as a third option in Redis 8</td><td>Mar 2024; May 2025</td><td>Redis Ltd.</td><td>Open source again via AGPLv3; modify-and-serve means publishing patches.</td></tr>
+                  <tr><td><strong>Valkey</strong></td><td>fork of Redis 7.2.4</td><td>BSD-3; 9.0 GA 21 Oct 2025</td><td>Mar 2024</td><td>Linux Foundation</td><td>No conditions beyond attribution. Same protocol, so swapping is cheap.</td></tr>
+                  <tr><td><strong>Elasticsearch</strong></td><td>Apache 2.0, then SSPL / ELv2 (2021)</td><td>AGPLv3 added as an option</td><td>Aug 2024</td><td>Elastic N.V.</td><td>AGPLv3 rule applies. OpenSearch (Apache 2.0) is the foundation fork.</td></tr>
+                  <tr><td><strong>MongoDB</strong></td><td>AGPLv3</td><td>SSPL</td><td>Oct 2018</td><td>MongoDB Inc.</td><td>Not open source. Offering it as a service triggers SSPL §13.</td></tr>
+                  <tr><td><strong>DocumentDB</strong> (Postgres extension)</td><td>new, MIT</td><td>MIT; FerretDB 2.0 builds on it (Apache 2.0)</td><td>joined LF 25 Aug 2025</td><td>Linux Foundation</td><td>Open source; MongoDB wire protocol via FerretDB, on PostgreSQL.</td></tr>
+                  <tr><td><strong>CockroachDB</strong></td><td>BSL + CCL, with a free Core build</td><td>Core retired; one Enterprise licence</td><td>late 2024</td><td>Cockroach Labs</td><td>Not open source. Free terms are a revocable grant.</td></tr>
+                  <tr><td><strong>ScyllaDB</strong></td><td>AGPLv3 (6.2 is the last)</td><td>source-available from 2025.1; free tier capped at 10 TB / 50 vCPU</td><td>announced 18 Dec 2024</td><td>ScyllaDB Inc.</td><td>Not open source from 2025.1. Pinning 6.2 means no fixes.</td></tr>
+                  <tr><td><strong>MinIO</strong></td><td>AGPLv3 (Apache 2.0 before 2021)</td><td>community edition in maintenance mode; repository archived</td><td>Dec 2025; early 2026</td><td>MinIO Inc.</td><td>Licence intact, project gone. Garage (AGPLv3) or SeaweedFS (Apache 2.0).</td></tr>
+                  <tr><td><strong>NATS</strong></td><td>Apache 2.0</td><td>Apache 2.0. Synadia's move to BSL was blocked.</td><td>Apr 2025; settled 1 May 2025</td><td>CNCF (trademark held by LF)</td><td>Unchanged: foundation governance working.</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              <span class="src">from the docs</span> Dates and licence names come from each
+              project's announcements and licence files. <span class="recon">reconstruction</span>
+              The last column is my reading, not legal advice. Every row that left open
+              source has one company in the "governed by" column.
+            </p>
+          </figure>
+
+          <h3>Governance outranks licence text</h3>
+
+          <p>
+            A company holding all the copyrights, through a contributor licence agreement or
+            its own staff, can ship the next version under any terms. Redis, Elasticsearch,
+            MongoDB, CockroachDB and ScyllaDB did. The PostgreSQL Global Development Group has
+            no owner who could relicense; copyright is spread across thousands of contributors.
+            Apache, Linux Foundation and CNCF projects hold the trademark apart from the
+            companies employing the maintainers.
+          </p>
+
+          <p>
+            NATS is the proof. In April 2025 Synadia, the main NATS developer, moved to take
+            the project out of the CNCF and ship future versions under the BSL. The Linux
+            Foundation held the trademark, so a relicensed NATS could not keep the name. On
+            1 May 2025 they settled: NATS stays in the CNCF under Apache 2.0.
+            <span class="src">from the docs</span> The licence text did not stop the change.
+            The trademark did.
+          </p>
+
+          <h3>AGPLv3, precisely</h3>
+
+          <p>
+            The AGPL is an OSI-approved copyleft licence with one extra clause. Section 13
+            says that if you <em>modify</em> the program, your modified version must offer its
+            Corresponding Source to every user who interacts with it over a network.
+            <span class="src">from the docs</span> You may run an unmodified AGPL server
+            internally, or behind your own network service, without publishing anything. Your
+            application talks to it over a protocol and is not a derivative work.
+            <span class="recon">reconstruction</span> If you patch the server and expose it,
+            you owe your patches to its users. Garage, Redis 8 under its AGPL option, and
+            Elasticsearch under its AGPL option fall here. Some companies ban AGPL outright;
+            check policy before code.
+          </p>
+
+          <h3>The rule this guide follows</h3>
+
+          <p>
+            Put the <strong>system of record</strong> on an OSI-licensed,
+            foundation-governed or public-domain project: PostgreSQL, SQLite, DuckDB (MIT,
+            stewarded by the non-profit DuckDB Foundation). Accept single-vendor projects
+            only where swapping is cheap: a wire-compatible alternative exists, or the data
+            can be rebuilt. Valkey fits the hot path; anything speaking RESP replaces it, and a
+            cache refills. ClickHouse, Apache 2.0 but one company, fits event history; its
+            tables reload from Parquet in object storage.
+            <span class="recon">reconstruction</span> MinIO showed that losing a vendor is
+            survivable when the interface is a standard. You lose the tool, not the data.
+          </p>
+
+          <h2 id="practices"><span class="secnum">06</span>Best practices that survive production</h2>
+
+          <p class="lede">
+            Most database incidents trace back to a short list: a lock held too long, a
+            missing index, a migration that blocked writes, a backup nobody had restored, a
+            transaction left open over lunch. The practices below each prevent one item on
+            that list. They are written for PostgreSQL, and the SQLite equivalent is noted
+            where one exists.
+          </p>
+
+          <h3>Design: queries first, tables second</h3>
+
+          <p>
+            Write the queries down before you write the tables. List the five reads that run
+            most often and the one write that must never be lost. Then choose keys and
+            indexes to serve them. A schema designed from an entity diagram serves the diagram.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            <strong>Primary keys.</strong> Use <code>bigint GENERATED ALWAYS AS IDENTITY</code>
+            or a UUIDv7. PostgreSQL 18 ships <code>uuidv7()</code>.
+            <span class="src">from the docs</span> A UUIDv7 starts with a millisecond timestamp,
+            so consecutive inserts land on the right-most B-tree leaf, the way a sequence does.
+            A random UUIDv4 sends each insert to a random leaf. On a large, hot table that
+            means more pages dirtied per insert, more full-page images in WAL after each
+            checkpoint, and a working set as large as the whole index.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            <strong>Constraints are documentation that executes.</strong>
+            <code>NOT NULL</code>, <code>CHECK</code>, <code>UNIQUE</code> and foreign keys
+            enforced by the database hold even for the script someone runs at 2 a.m. without
+            going through your application. A <code>CHECK (jsonb_typeof(body) = 'object')</code>
+            costs almost nothing per write.
+          </p>
+
+          <p>
+            <strong>Indexes answer a measured query.</strong> Add one when
+            <code>EXPLAIN (ANALYZE, BUFFERS)</code> shows a sequential scan on a query you
+            actually run. In PostgreSQL 18, <code>ANALYZE</code> includes buffer counts by
+            default. <span class="src">from the docs</span> Every index is maintained on every
+            insert, and on every update that touches its column. An index can also disqualify
+            an update from the HOT path (<a href="#json-inside">next section</a>). Indexes
+            cost write throughput, so each one has to earn its place.
+          </p>
+
+          <h3>Migrations: expand, migrate, contract</h3>
+
+          <p>
+            A schema change and an application deploy are two clocks that never tick together.
+            During a rolling deploy, old and new code run side by side against the same schema.
+            So every schema state must work with the code version before it and the code
+            version after it. Expand/contract makes that true by splitting one breaking change
+            into several compatible ones (Figure 8).
+          </p>
+
+          <figure class="figure wide" id="fig-expand-contract">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">Replacing <code>owner text</code> with <code>owner_id bigint</code> in six steps</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 420" role="img" aria-label="Expand, migrate, contract shown as six alternating steps on two lanes. Schema lane: step 1 expand, add nullable owner_id and create its index concurrently; step 3 backfill in batches with lock_timeout set and validate a NOT VALID foreign key; step 6 contract, drop the old owner column. Application lane: step 2 version 2 writes both columns and reads the old one; step 4 version 3 reads owner_id and still writes both; step 5 version 4 writes owner_id only. A bottom row shows the oldest app version you can still roll back to after each step: v1, v1, v2, v2, v3, and after the contract step none earlier than v4.">
+                <defs>
+                  <marker id="fig-expand-contract-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">SCHEMA CLOCK · MIGRATIONS</text>
+                <text x="0" y="198" class="svg-lane">DEPLOY CLOCK · APPLICATION</text>
+
+                <rect x="0" y="32" width="172" height="120" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="12" y="54" class="svg-num">1</text>
+                <text x="28" y="54" class="svg-step">Expand</text>
+                <text x="12" y="78" class="svg-sub">ADD COLUMN owner_id</text>
+                <text x="12" y="98" class="svg-sub">bigint, nullable</text>
+                <text x="12" y="118" class="svg-sub">CREATE INDEX</text>
+                <text x="12" y="138" class="svg-sub" style="white-space:pre">  CONCURRENTLY</text>
+
+                <rect x="190" y="212" width="172" height="120" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="202" y="234" class="svg-num">2</text>
+                <text x="218" y="234" class="svg-step">App v2</text>
+                <text x="202" y="258" class="svg-sub">writes owner AND</text>
+                <text x="202" y="278" class="svg-sub" style="white-space:pre">  owner_id</text>
+                <text x="202" y="298" class="svg-sub">reads owner</text>
+
+                <rect x="380" y="32" width="172" height="120" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="392" y="54" class="svg-num">3</text>
+                <text x="408" y="54" class="svg-step">Backfill</text>
+                <text x="392" y="78" class="svg-sub">5k-row batches</text>
+                <text x="392" y="98" class="svg-sub">lock_timeout = 2s</text>
+                <text x="392" y="118" class="svg-sub">FK … NOT VALID,</text>
+                <text x="392" y="138" class="svg-sub" style="white-space:pre">  then VALIDATE</text>
+
+                <rect x="570" y="212" width="172" height="120" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="582" y="234" class="svg-num">4</text>
+                <text x="598" y="234" class="svg-step">App v3</text>
+                <text x="582" y="258" class="svg-sub">reads owner_id</text>
+                <text x="582" y="278" class="svg-sub">still writes both</text>
+
+                <rect x="760" y="212" width="172" height="120" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="772" y="234" class="svg-num">5</text>
+                <text x="788" y="234" class="svg-step">App v4</text>
+                <text x="772" y="258" class="svg-sub">writes owner_id</text>
+                <text x="772" y="278" class="svg-sub" style="white-space:pre">  only</text>
+                <text x="772" y="298" class="svg-sub">owner is now dead</text>
+
+                <rect x="948" y="32" width="172" height="120" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="960" y="54" class="svg-num">6</text>
+                <text x="976" y="54" class="svg-step">Contract</text>
+                <text x="960" y="78" class="svg-sub">DROP COLUMN</text>
+                <text x="960" y="98" class="svg-sub" style="white-space:pre">  owner, once no</text>
+                <text x="960" y="118" class="svg-sub">v2/v3 pod runs</text>
+
+                <g stroke="#252525" stroke-width="2.4" fill="none" marker-end="url(#fig-expand-contract-arr)">
+                  <path d="M172 140 L196 206"/>
+                  <path d="M362 222 L386 158"/>
+                  <path d="M552 140 L576 206"/>
+                  <path d="M742 272 L754 272"/>
+                  <path d="M932 222 L954 158"/>
+                </g>
+
+                <line x1="0" y1="352" x2="1120" y2="352" stroke="#b8b8b1"/>
+                <text x="0" y="372" class="svg-lane">OLDEST SAFE ROLLBACK</text>
+                <rect x="0" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="12" y="402" class="svg-sub">v1</text>
+                <rect x="190" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="202" y="402" class="svg-sub">v1</text>
+                <rect x="380" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="392" y="402" class="svg-sub">v2</text>
+                <rect x="570" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="582" y="402" class="svg-sub">v2</text>
+                <rect x="760" y="382" width="172" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="772" y="402" class="svg-sub">v3</text>
+                <rect x="948" y="382" width="172" height="30" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="960" y="402" class="svg-sub">v4 only</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> This is the standard pattern applied to
+              one rename. Purple steps change the schema and blue steps change the code. Steps
+              alternate, and only the last one takes away a rollback option, so it runs last
+              and runs alone.
+            </p>
+          </figure>
+
+          <p>
+            Three PostgreSQL mechanics make each step non-blocking.
+            <code>CREATE INDEX CONCURRENTLY</code> builds an index without taking a lock that
+            blocks inserts, updates or deletes. It cannot run inside a transaction block, and
+            a failed build leaves an <code>INVALID</code> index that you must drop.
+            <span class="src">from the docs</span> Adding a foreign key or <code>CHECK</code> as
+            <code>NOT VALID</code> and running <code>VALIDATE CONSTRAINT</code> later moves the
+            full-table scan under a weaker lock. <span class="src">from the docs</span> And
+            <code>lock_timeout</code> stops the most common outage of all. An
+            <code>ALTER TABLE</code> waiting for its <code>ACCESS EXCLUSIVE</code> lock behind
+            one long transaction makes every later query on that table queue behind it.
+          </p>
+
+          <pre><code>SET lock_timeout = '2s';             -- fail fast, retry later; never queue
+ALTER TABLE sessions ADD COLUMN owner_id bigint;      -- nullable: no rewrite
+CREATE INDEX CONCURRENTLY sessions_owner_id ON sessions (owner_id);
+ALTER TABLE sessions ADD CONSTRAINT sessions_owner_fk
+  FOREIGN KEY (owner_id) REFERENCES users (id) NOT VALID;
+ALTER TABLE sessions VALIDATE CONSTRAINT sessions_owner_fk;</code></pre>
+
+          <h3>Connections and transactions</h3>
+
+          <p>
+            PostgreSQL starts one operating-system process per connection.
+            <span class="src">from the docs</span> Two thousand idle clients means two thousand
+            backends. Put PgBouncer in transaction mode in front, or rely on a bounded driver
+            pool when you have a single application. Transaction mode does not preserve
+            session state between transactions: <code>SET</code>, advisory locks, temporary
+            tables. Recent PgBouncer releases (1.21 and later) can track protocol-level
+            prepared statements. Keep transactions short, and never make a network call inside
+            one. Set <code>idle_in_transaction_session_timeout</code>, and on PostgreSQL 17 or
+            later <code>transaction_timeout</code>, so a stuck client cannot hold locks or
+            hold back vacuum indefinitely.
+          </p>
+
+          <h3>Backups, observability, security, lifecycle</h3>
+
+          <p>
+            A backup you have never restored is only a hope. Point-in-time recovery for
+            PostgreSQL means a base backup plus archived WAL. pgBackRest and WAL-G both do this
+            against S3-compatible storage. Litestream does the same for SQLite by streaming WAL
+            frames to an object store. Schedule a restore into a scratch instance and alert when
+            it fails. For observability, <code>pg_stat_statements</code> ranks queries by total
+            time, and <code>auto_explain</code> logs the plans of slow ones. For security, give
+            the application a role that owns nothing and is not a superuser. Require TLS.
+            Where tenants share tables, enable row-level security, keeping in mind that table
+            owners bypass it unless the table is <code>FORCE ROW LEVEL SECURITY</code>.
+            <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            Append-only tables need a retention plan from day one. Partition them by time with
+            declarative partitioning. Expiring a month is then
+            <code>DETACH PARTITION … CONCURRENTLY</code> followed by <code>DROP TABLE</code>:
+            a metadata change, with no <code>DELETE</code> leaving millions of dead tuples for
+            autovacuum. Autovacuum is how MVCC gives disk space back. Any transaction left open
+            pins the oldest row version every session might still need, so vacuum cannot
+            reclaim anything newer. Watch <code>pg_stat_activity</code> for
+            <code>xact_start</code> older than a few minutes.
+          </p>
+
+          <figure class="figure" id="fig-checklist">
+            <div class="figure-head">
+              <span class="figure-label">Figure 9</span>
+              <p class="figure-title">The operating checklist, one row per concern, with the open-source tool</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row">
+                  <div class="stack-cell head">Design</div>
+                  <div class="stack-cell hl-blue">Write the queries first. Keys are <code>bigint</code> identity or <code>uuidv7()</code>. Constraints live in the database. Tool: PostgreSQL 18 itself.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Indexes</div>
+                  <div class="stack-cell hl-blue">Add one per measured query. Verify with <code>EXPLAIN (ANALYZE, BUFFERS)</code>. Drop indexes nobody uses; <code>pg_stat_user_indexes.idx_scan = 0</code> finds them.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Migrations</div>
+                  <div class="stack-cell hl-blue">Expand/contract. <code>CREATE INDEX CONCURRENTLY</code>, <code>NOT VALID</code> then <code>VALIDATE</code>, <code>lock_timeout</code>. Tools: plain SQL files in a migration runner such as sqitch or dbmate.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Connections</div>
+                  <div class="stack-cell hl-purple">PgBouncer in transaction mode. Short transactions. <code>idle_in_transaction_session_timeout</code> and <code>transaction_timeout</code>.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Observability</div>
+                  <div class="stack-cell hl-purple"><code>pg_stat_statements</code>, <code>auto_explain</code>, <code>log_min_duration_statement</code>. Export through postgres_exporter to Prometheus.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Security</div>
+                  <div class="stack-cell hl-purple">A least-privilege app role. No superuser. TLS required. Row-level security where tenants share tables.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Backups</div>
+                  <div class="stack-cell hl-green">pgBackRest or WAL-G for point-in-time recovery. Litestream for SQLite. Restore on a schedule and alert when a restore fails.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Retention</div>
+                  <div class="stack-cell hl-green">Partition append-only tables by time, then detach and drop. Archive old partitions to Parquet in object storage before dropping them.</div>
+                </div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              Blue rows are decided when you write the schema, purple rows apply while the
+              system runs, and green rows protect data over time. The tools are the ones this
+              guide uses later. Each is OSI-licensed. <span class="recon">reconstruction</span>
+            </p>
+          </figure>
+
+          <h2 id="json-inside"><span class="secnum">07</span>What a database does with JSON</h2>
+
+          <p class="lede">
+            Every database that accepts JSON turns it into something else on disk. What it
+            turns it into decides three things: what a query can find without reading the
+            whole value, what an index can cover, and how many bytes one changed field costs.
+            The last of these surprises people most. No mainstream engine edits a stored
+            document in place.
+          </p>
+
+          <h3>Text or binary</h3>
+
+          <p>
+            PostgreSQL has two JSON types. <code>json</code> stores an exact copy of the input
+            text, including whitespace, key order and duplicate keys, and must reparse it on
+            every function call. <code>jsonb</code> stores a decomposed binary form. It does
+            not keep whitespace or key order, and for a duplicate key only the last value
+            survives. The manual describes it as "slightly slower to input due to added
+            conversion overhead, but significantly faster to process, since no reparsing is
+            needed." <span class="src">from the docs</span> Use <code>jsonb</code> unless you
+            must reproduce the input byte for byte, as with a signed webhook payload.
+          </p>
+
+          <h3>There is no partial update</h3>
+
+          <p>
+            <code>jsonb_set(body, '{usage,input_tokens}', '42')</code> looks like a field edit.
+            It is a function that returns a new <code>jsonb</code> value. The <code>UPDATE</code>
+            then writes that value into a new row version, because PostgreSQL's MVCC never
+            overwrites a row in place. Large values make this expensive. TOAST is triggered
+            "when a row value to be stored in a table is wider than TOAST_TUPLE_THRESHOLD bytes
+            (normally 2 kB)". <span class="src">from the docs</span> Wide fields are first
+            compressed with <code>pglz</code> or <code>lz4</code>, whichever
+            <code>default_toast_compression</code> or the column says. If the row is still too
+            wide, they are moved out of line into chunk rows of about 2 kB in a side table. An
+            <code>UPDATE</code> that leaves a TOASTed column alone pays no TOAST cost.
+            <span class="src">from the docs</span> An update to the document itself
+            <em>is</em> a change to that column, so the whole value is recompressed and
+            rewritten (Figure 10).
+          </p>
+
+          <figure class="figure wide" id="fig-jsonb-update">
+            <div class="figure-head">
+              <span class="figure-label">Figure 10</span>
+              <p class="figure-title">What one changed integer costs in a 40 KB PostgreSQL <code>jsonb</code> document</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 430" role="img" aria-label="Five steps for an UPDATE that calls jsonb_set to change one integer in a 40 kilobyte jsonb document. One: the whole value is detoasted, decompressed and rebuilt as a new 40 kilobyte value. Two: MVCC writes a new tuple version and marks the old one dead; this is a HOT update only if no indexed column changes and the page has room. Three: because the row exceeds the 2 kilobyte TOAST threshold, the new value is compressed with pglz or lz4 and stored out of line in new chunks of about 2 kilobytes. Four: WAL records cover the heap tuple, every new TOAST chunk and any index entries, with full-page images on the first touch of a page after a checkpoint. Five: the old tuple and old chunks remain until vacuum reclaims them. Below, the alternative: promote the hot counter to its own bigint column, so one update writes one narrow tuple and can be HOT.">
+                <defs>
+                  <marker id="fig-jsonb-update-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">UPDATE sessions SET body = jsonb_set(body, '{usage,input_tokens}', '42') WHERE id = $1</text>
+
+                <rect x="0" y="36" width="206" height="176" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="12" y="60" class="svg-num">1</text>
+                <text x="28" y="60" class="svg-step">Rebuild the value</text>
+                <text x="12" y="88" class="svg-sub">fetch all TOAST chunks</text>
+                <text x="12" y="110" class="svg-sub">decompress 40 KB</text>
+                <text x="12" y="132" class="svg-sub">set one integer</text>
+                <text x="12" y="154" class="svg-sub">emit a new 40 KB jsonb</text>
+                <text x="12" y="192" class="svg-note">8 bytes of meaning</text>
+
+                <rect x="228" y="36" width="206" height="176" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="240" y="60" class="svg-num">2</text>
+                <text x="256" y="60" class="svg-step">New tuple version</text>
+                <text x="240" y="88" class="svg-sub">MVCC: never in place</text>
+                <text x="240" y="110" class="svg-sub">old tuple gets xmax</text>
+                <text x="240" y="132" class="svg-sub">HOT only if no indexed</text>
+                <text x="240" y="154" class="svg-sub">column changed and</text>
+                <text x="240" y="176" class="svg-sub">the page has room</text>
+
+                <rect x="456" y="36" width="206" height="176" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="468" y="60" class="svg-num">3</text>
+                <text x="484" y="60" class="svg-step">TOAST</text>
+                <text x="468" y="88" class="svg-sub">row &gt; 2 kB threshold</text>
+                <text x="468" y="110" class="svg-sub">compress: pglz or lz4</text>
+                <text x="468" y="132" class="svg-sub">still wide: out of line</text>
+                <text x="468" y="154" class="svg-sub">~2 kB chunks, all new</text>
+                <text x="468" y="192" class="svg-note">≤ 20 chunks uncompressed</text>
+
+                <rect x="684" y="36" width="206" height="176" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="696" y="60" class="svg-num">4</text>
+                <text x="712" y="60" class="svg-step">WAL</text>
+                <text x="696" y="88" class="svg-sub">heap tuple record</text>
+                <text x="696" y="110" class="svg-sub">+ every new chunk</text>
+                <text x="696" y="132" class="svg-sub">+ index entries</text>
+                <text x="696" y="154" class="svg-sub">full-page image on the</text>
+                <text x="696" y="176" class="svg-sub">first touch after ckpt</text>
+
+                <rect x="912" y="36" width="208" height="176" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="924" y="60" class="svg-num">5</text>
+                <text x="940" y="60" class="svg-step">Dead versions</text>
+                <text x="924" y="88" class="svg-sub">old tuple and old</text>
+                <text x="924" y="110" class="svg-sub">chunks stay on disk</text>
+                <text x="924" y="132" class="svg-sub">until autovacuum</text>
+                <text x="924" y="154" class="svg-sub">long transactions</text>
+                <text x="924" y="176" class="svg-sub">delay reclaim</text>
+
+                <g stroke="#252525" stroke-width="2.4" fill="none" marker-end="url(#fig-jsonb-update-arr)">
+                  <path d="M206 124 L226 124"/>
+                  <path d="M434 124 L454 124"/>
+                  <path d="M662 124 L682 124"/>
+                  <path d="M890 124 L910 124"/>
+                </g>
+
+                <text x="0" y="250" class="svg-lane">WHAT ONE EDIT WRITES · SCHEMATIC, NOT TO SCALE</text>
+                <rect x="0" y="262" width="60" height="22" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="72" y="278" class="svg-sub">the change: one bigint</text>
+                <rect x="0" y="294" width="840" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="852" y="310" class="svg-sub">compressed 40 KB value</text>
+                <rect x="0" y="326" width="960" height="22" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="972" y="342" class="svg-sub">+ WAL for it</text>
+
+                <rect x="0" y="366" width="1120" height="58" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="16" y="388" class="svg-lane">THE ALTERNATIVE · PROMOTE THE HOT FIELD</text>
+                <text x="16" y="410" class="svg-sub">UPDATE sessions SET input_tokens = input_tokens + 1: one narrow tuple, TOAST untouched, HOT if the column is not indexed</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="src">from the docs</span> The 2 kB threshold, the HOT conditions and
+              the rule that unchanged TOAST values are not rewritten come from the PostgreSQL
+              manual's Database Physical Storage chapter (the TOAST and Heap-Only Tuples sections). <span class="recon">reconstruction</span>
+              The 40 KB document and the chunk count (40 KB ÷ ~2 kB) are illustrative. The
+              practical point is that bytes written scale with document size, not with the
+              size of the edit.
+            </p>
+          </figure>
+
+          <p>
+            So incrementing one counter in a 1 MB document rewrites the compressed size of
+            that megabyte, plus the WAL to describe it, plus a dead copy for vacuum to clean
+            up. <span class="recon">reconstruction</span> The manual says the same thing about
+            locking: "any update acquires a row-level lock on the whole row. Consider limiting
+            JSON documents to a manageable size". <span class="src">from the docs</span>
+          </p>
+
+          <h3>Indexing a document</h3>
+
+          <p>
+            PostgreSQL offers three tools, from widest to narrowest. A GIN index with the
+            default <code>jsonb_ops</code> class indexes every key and value. It serves
+            <code>?</code>, <code>?|</code>, <code>?&amp;</code>, <code>@&gt;</code>,
+            <code>@?</code> and <code>@@</code>. A GIN index with <code>jsonb_path_ops</code>
+            serves only <code>@&gt;</code>, <code>@?</code> and <code>@@</code>, but "is
+            usually much smaller … and the specificity of searches is better".
+            <span class="src">from the docs</span> For a path you already know you will filter
+            on, a B-tree expression index is smaller still and supports ranges and sorting.
+            Alternatively, promote the path to a generated column. PostgreSQL 18 makes
+            generated columns <code>VIRTUAL</code> by default, and virtual columns cannot be
+            indexed, so declare it <code>STORED</code>. <span class="src">from the docs</span>
+          </p>
+
+          <pre><code>CREATE INDEX sessions_body_gin  ON sessions USING gin (body jsonb_path_ops);
+CREATE INDEX sessions_status    ON sessions ((body-&gt;&gt;'status'));
+ALTER TABLE sessions ADD COLUMN owner text
+  GENERATED ALWAYS AS (body-&gt;&gt;'owner') STORED;
+
+-- PostgreSQL 17+: SQL/JSON, including JSON_TABLE
+SELECT t.* FROM sessions s,
+  JSON_TABLE(s.body, '$.todos[*]'
+    COLUMNS (id int PATH '$.id', done boolean PATH '$.done')) AS t
+WHERE NOT t.done;</code></pre>
+
+          <p>
+            On the query side, jsonpath arrived in PostgreSQL 12. PostgreSQL 17 added the
+            SQL-standard <code>JSON_TABLE</code>, <code>JSON_EXISTS</code>,
+            <code>JSON_QUERY</code> and <code>JSON_VALUE</code>. <code>JSON_TABLE</code>
+            "presents the results as a relational view, which can be accessed as a regular SQL
+            table". <span class="src">from the docs</span>
+          </p>
+
+          <h3>The other engines</h3>
+
+          <p>
+            SQLite has built-in JSON functions and the <code>-&gt;</code> /
+            <code>-&gt;&gt;</code> operators. Since 3.45.0 (January 2024) it also has JSONB, a
+            binary encoding stored in a <code>BLOB</code> that the <code>jsonb_*</code>
+            functions read without reparsing. Expression indexes and generated columns work
+            the same way as in PostgreSQL. <span class="src">from the docs</span> MongoDB stores
+            BSON, a typed binary format with length prefixes, and caps a document at 16 MiB.
+            FerretDB 2 stores BSON inside PostgreSQL through the DocumentDB extension.
+            ClickHouse's <code>JSON</code> type, production-ready since 25.3, infers a type for
+            every path and stores each path as its own subcolumn. Analytics over JSON events
+            then reads only the columns a query names.
+            <span class="src">from the docs</span>
+          </p>
+
+          <figure class="figure" id="fig-formats">
+            <div class="figure-head">
+              <span class="figure-label">Figure 11</span>
+              <p class="figure-title">Five on-disk representations of the same JSON</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row">
+                  <div class="stack-cell head">Text JSON</div>
+                  <div class="stack-cell hl-red">The bytes as sent: PostgreSQL <code>json</code>, SQLite <code>TEXT</code>, a <code>.json</code> file. Every read reparses the whole value, and no index can see inside it without an expression.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">PostgreSQL jsonb</div>
+                  <div class="stack-cell hl-blue">Decomposed binary. Keys are deduplicated and stored in an internal order, and there is no whitespace. Values are TOASTed above about 2 kB. GIN, B-tree expression and generated-column indexes all work. Any edit rewrites the whole value.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">SQLite JSONB</div>
+                  <div class="stack-cell hl-blue">A binary encoding of the JSON tree, stored as a <code>BLOB</code> (3.45.0+). It skips reparsing but is internal to SQLite, not an interchange format. Expression indexes work. An edit rewrites the row.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">BSON</div>
+                  <div class="stack-cell hl-purple">MongoDB, and FerretDB on DocumentDB. Typed (dates, int64, decimal128), length-prefixed and traversable. 16 MiB per document. Indexes are per path.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">ClickHouse JSON</div>
+                  <div class="stack-cell hl-green">Each path is a typed subcolumn (25.3+). The format is columnar and compressed per path, and built for append and scan. Changing a stored row is a heavyweight operation, not the hot path.</div>
+                </div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              Red means parsed on every read. Blue is a row-store binary that can be queried by
+              path. Purple is a document-store binary. Green is columnar.
+              <span class="src">from the docs</span> The point is the one-way trade: the more a
+              format is built for querying paths, the less it suits growing one document
+              forever.
+            </p>
+          </figure>
+
+          <h3>The rule</h3>
+
+          <p>
+            Keep documents small and stable in shape. Anything that grows without bound,
+            such as messages, log lines, tool calls or usage ticks, belongs in rows, one per
+            event, keyed to the document. Then each new event is an <code>INSERT</code> of a
+            few hundred bytes, not a rewrite of everything that came before.
+            <span class="recon">reconstruction</span> The <a href="#measured">next section</a>
+            measures what that difference costs.
+          </p>
+
+          <h2 id="measured"><span class="secnum">08</span>Five ways to keep a document current, measured</h2>
+
+          <p class="lede">
+            One session document, updated 1,500 times, five ways, each update timed. The
+            result is plain. The cost of a durable write is the fsync, not the
+            format. Throughput depends on how many writes share one fsync.
+          </p>
+
+          <h3>Setup</h3>
+
+          <p>
+            The benchmark is <code>_compute.py</code>, beside this post. It uses only the
+            standard library and writes <code>_numbers.json</code>. The document is a
+            synthetic agent session (usage block, 24 todos, 600-byte notes), 2,879 bytes
+            serialised; the docstring's "~4 KB" is stale. Each write variant
+            runs 1,500 updates. The machine has 8 CPUs, Linux 6.12, Python 3.14.4 and SQLite
+            3.46.1, with fsync landing on a cloud block device. <span class="recon">measured here</span>
+            The five ways are a whole-file rewrite, a JSONL append, a whole-document
+            <code>UPDATE</code> in SQLite, an in-place <code>json_set</code> or
+            <code>jsonb_set</code> in SQLite, and an event-row <code>INSERT</code>. The SQLite
+            variants run in WAL mode under <code>synchronous=FULL</code> and
+            <code>NORMAL</code>, both per row and batched 100 to a transaction.
+          </p>
+
+          <p>
+            The file-rewrite variant copies the pattern xo-space uses for its own state file
+            (<code>services/cowork_agent/xo_cowork_state.py</code>, lines 54–62: write a temp
+            file, <code>fsync</code>, <code>os.replace</code>).
+            <span class="src">from the tree</span> In <code>_compute.py</code> it is lines
+            44–54:
+          </p>
+
+          <pre><code>def file_rewrite(fsync):
+    path = tmp / "state.json"; d = dict(BASE)
+    def run(n):
+        for k in range(n):
+            d["usage"]["input_tokens"] += 1; d["updated_at"] = time.time()
+            fd, t = tempfile.mkstemp(dir=tmp, suffix=".json")
+            with os.fdopen(fd, "w") as f:
+                json.dump(d, f)
+                if fsync: f.flush(); os.fsync(f.fileno())
+            os.replace(t, path)
+    return run</code></pre>
+
+          <h3>Writes</h3>
+
+          <figure class="figure wide" id="fig-writes">
+            <div class="figure-head">
+              <span class="figure-label">Figure 12</span>
+              <p class="figure-title">Cost per update, fourteen variants, log scale</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 600" role="img" aria-label="Horizontal bar chart on a logarithmic axis from 1 microsecond to 10 milliseconds, cost per update for fourteen ways of keeping a 2,879-byte JSON document current, measured over 1,500 updates each. Values in microseconds per operation: file tmp + fsync + os.replace 1,464.5; JSONL append, fsync each line 1,153.9; SQLite FULL whole-doc UPDATE 991.0; SQLite FULL jsonb_set 417.6; SQLite FULL event INSERT 412.0; SQLite FULL json_set (text) 411.1; file tmp + os.replace, no fsync 241.3; SQLite NORMAL whole-doc UPDATE 34.1; SQLite NORMAL json_set (text) 21.3; SQLite NORMAL event INSERT 17.6; JSONL append, fsync every 100 14.0; SQLite NORMAL jsonb_set 10.8; SQLite FULL 100 INSERTs per txn 8.4; SQLite NORMAL 100 INSERTs per txn 3.6. Bars that fsync on every commit cluster between 411 and 1,465 microseconds; batched or non-fsyncing variants fall between 3.6 and 241 microseconds.">
+                <text x="0" y="18" class="svg-lane">MICROSECONDS PER UPDATE · LOG SCALE · 1,500 UPDATES EACH · 2,879-BYTE DOCUMENT</text>
+                <rect x="0" y="38" width="14" height="14" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="50" class="svg-sub">fsync on every commit</text>
+                <rect x="209" y="38" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="231" y="50" class="svg-sub">one fsync per 100 writes</text>
+                <rect x="439" y="38" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="461" y="50" class="svg-sub">no fsync at commit</text>
+                <line x1="360" y1="78" x2="360" y2="484" stroke="#deded9"/>
+                <text x="360" y="502" class="svg-sub" text-anchor="middle">1 µs</text>
+                <line x1="530" y1="78" x2="530" y2="484" stroke="#deded9"/>
+                <text x="530" y="502" class="svg-sub" text-anchor="middle">10 µs</text>
+                <line x1="700" y1="78" x2="700" y2="484" stroke="#deded9"/>
+                <text x="700" y="502" class="svg-sub" text-anchor="middle">100 µs</text>
+                <line x1="870" y1="78" x2="870" y2="484" stroke="#deded9"/>
+                <text x="870" y="502" class="svg-sub" text-anchor="middle">1 ms</text>
+                <line x1="1040" y1="78" x2="1040" y2="484" stroke="#deded9"/>
+                <text x="1040" y="502" class="svg-sub" text-anchor="middle">10 ms</text>
+                <line x1="360" y1="484" x2="1040" y2="484" stroke="#b8b8b1"/>
+                <text x="348" y="104" class="svg-sub" text-anchor="end">file · tmp + fsync + os.replace</text>
+                <rect x="360" y="92" width="538.2" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="906.2" y="104" class="svg-sub">1,464.5 µs</text>
+                <text x="348" y="132" class="svg-sub" text-anchor="end">JSONL · append, fsync each line</text>
+                <rect x="360" y="120" width="520.6" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="888.6" y="132" class="svg-sub">1,153.9 µs</text>
+                <text x="348" y="160" class="svg-sub" text-anchor="end">SQLite FULL · whole-doc UPDATE</text>
+                <rect x="360" y="148" width="509.3" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="877.3" y="160" class="svg-sub">991.0 µs</text>
+                <text x="348" y="188" class="svg-sub" text-anchor="end">SQLite FULL · jsonb_set</text>
+                <rect x="360" y="176" width="445.5" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="813.5" y="188" class="svg-sub">417.6 µs</text>
+                <text x="348" y="216" class="svg-sub" text-anchor="end">SQLite FULL · event INSERT</text>
+                <rect x="360" y="204" width="444.5" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="812.5" y="216" class="svg-sub">412.0 µs</text>
+                <text x="348" y="244" class="svg-sub" text-anchor="end">SQLite FULL · json_set (text)</text>
+                <rect x="360" y="232" width="444.4" height="16" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="812.4" y="244" class="svg-sub">411.1 µs</text>
+                <text x="348" y="272" class="svg-sub" text-anchor="end">file · tmp + os.replace, no fsync</text>
+                <rect x="360" y="260" width="405.0" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="773.0" y="272" class="svg-sub">241.3 µs</text>
+                <text x="348" y="300" class="svg-sub" text-anchor="end">SQLite NORMAL · whole-doc UPDATE</text>
+                <rect x="360" y="288" width="260.6" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="628.6" y="300" class="svg-sub">34.1 µs</text>
+                <text x="348" y="328" class="svg-sub" text-anchor="end">SQLite NORMAL · json_set (text)</text>
+                <rect x="360" y="316" width="225.8" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="593.8" y="328" class="svg-sub">21.3 µs</text>
+                <text x="348" y="356" class="svg-sub" text-anchor="end">SQLite NORMAL · event INSERT</text>
+                <rect x="360" y="344" width="211.7" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="579.7" y="356" class="svg-sub">17.6 µs</text>
+                <text x="348" y="384" class="svg-sub" text-anchor="end">JSONL · append, fsync every 100</text>
+                <rect x="360" y="372" width="194.8" height="16" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="562.8" y="384" class="svg-sub">14.0 µs</text>
+                <text x="348" y="412" class="svg-sub" text-anchor="end">SQLite NORMAL · jsonb_set</text>
+                <rect x="360" y="400" width="175.7" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="543.7" y="412" class="svg-sub">10.8 µs</text>
+                <text x="348" y="440" class="svg-sub" text-anchor="end">SQLite FULL · 100 INSERTs per txn</text>
+                <rect x="360" y="428" width="157.1" height="16" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="525.1" y="440" class="svg-sub">8.4 µs</text>
+                <text x="348" y="468" class="svg-sub" text-anchor="end">SQLite NORMAL · 100 INSERTs per txn</text>
+                <rect x="360" y="456" width="94.6" height="16" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="462.6" y="468" class="svg-sub">3.6 µs</text>
+                <text x="0" y="532" class="svg-note">A single durable commit costs 0.4–1.5 ms here, whatever the format. Sharing one fsync across 100 writes</text>
+                <text x="0" y="552" class="svg-note">cuts SQLite FULL from 412.0 to 8.4 µs per row (49×) and JSONL from 1,153.9 to 14.0 µs per line (82×).</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> Values are taken from
+              <code>_numbers.json → write</code>, each the mean over 1,500 operations, and bar
+              lengths are log<sub>10</sub> of microseconds. The blue bars sit on one plateau
+              because each pays one fsync. Nothing below that plateau is durable per write
+              against power loss.
+            </p>
+          </figure>
+
+          <p>
+            Read Figure 12 by colour. Every blue bar pays one fsync per update
+            and lands between 411.1 and 1,464.5 µs. The file rewrite is the most expensive.
+            Without the fsync it costs 241.3 µs, so the fsync accounts for about 1,223 µs, or
+            84% of the total. <span class="recon">measured here</span> A single-row SQLite
+            commit under <code>FULL</code> costs about 412 µs, whether it is a text
+            <code>json_set</code> (411.1), a <code>jsonb_set</code> (417.6) or a new event row
+            (412.0). At that level the format does not matter. One writer gets about 2,430
+            durable commits a second (1,000,000 ÷ 411.1).
+          </p>
+
+          <p>
+            Batching changes the result more than anything else does. A hundred
+            <code>INSERT</code>s in one transaction cost 8.4 µs each under
+            <code>FULL</code>. That is 840 µs per commit, one fsync shared by a hundred rows,
+            which works out to 49 times cheaper per row than committing each one. JSONL with
+            an fsync every 100 lines drops from 1,153.9 to 14.0 µs, 82 times cheaper.
+            PostgreSQL does the same thing for you under concurrency: many sessions commit
+            behind one WAL flush, and <code>commit_delay</code> can widen that window
+            deliberately. <span class="src">from the docs</span>
+          </p>
+
+          <h3>What <code>synchronous=NORMAL</code> buys, and what it costs</h3>
+
+          <p>
+            The orange bars skip the fsync at commit. SQLite in WAL mode with
+            <code>synchronous=NORMAL</code> syncs only at checkpoints. Its documentation says
+            WAL mode under NORMAL "is always consistent" but loses durability: "A transaction
+            committed in WAL mode with synchronous=NORMAL might roll back following a power
+            loss or system crash." Transactions still survive an application crash.
+            <span class="src">from the docs</span> That trade takes a single event insert from
+            412.0 to 17.6 µs, 23 times faster. PostgreSQL's equivalent is
+            <code>synchronous_commit = off</code>, which can be set per transaction. The
+            manual bounds the loss window at "three times wal_writer_delay", 600 ms at the
+            200 ms default, and is explicit that the risk "is of data loss, not data
+            corruption". <span class="src">from the docs</span> For usage counters and
+            heartbeats, losing the last half-second on power loss is usually acceptable. For
+            payments it is not.
+          </p>
+
+          <p>
+            The file rewrite without fsync (241.3 µs) is in a worse position. It costs seven
+            times more than a NORMAL-mode SQLite update and gives no clearer guarantee. Neither
+            this script nor <code>xo_cowork_state.py</code> fsyncs the directory after
+            <code>os.replace</code>, and without that the rename itself may not reach disk
+            before a power cut. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Partial versus whole</h3>
+
+          <p>
+            With the fsync removed, the format starts to show. Under NORMAL, a whole-document
+            <code>UPDATE</code> costs 34.1 µs, an in-database <code>json_set</code> on text
+            costs 21.3, and a <code>jsonb_set</code> on the binary form costs 10.8. The first
+            serialises 2,879 bytes in Python and ships them. The second parses and re-emits
+            text inside SQLite. The third does neither. Every variant still rewrites the whole
+            row in SQLite. The saving comes from not serialising and not parsing.
+            <span class="recon">measured here</span> Under FULL, whole-document updates cost
+            991.0 µs against about 412 for the others. That gap is far larger than
+            serialisation can explain. The whole-document test ran first on a fresh WAL file,
+            so part of the gap is probably WAL growth and should not be credited to the
+            format. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Reads</h3>
+
+          <figure class="figure" id="fig-reads">
+            <div class="figure-head">
+              <span class="figure-label">Figure 13</span>
+              <p class="figure-title">Parse the file, or ask the database</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 356" role="img" aria-label="Bar chart on a logarithmic axis from 1 microsecond to 100 milliseconds. Point read of one field: parsing a whole JSON file takes 32.1 microseconds, extracting it from SQLite by id takes 7.1, 4.5 times less. Filter on owner and status across 20,000 documents: a full scan takes 22,061.9 microseconds, the same query with an expression index takes 9.2, about 2,400 times less. The query plan reads SEARCH docs USING INDEX docs_owner_status.">
+                <line x1="330" y1="40" x2="330" y2="208" stroke="#deded9"/>
+                <text x="330" y="226" class="svg-sub" text-anchor="middle">1 µs</text>
+                <line x1="450" y1="40" x2="450" y2="208" stroke="#deded9"/>
+                <text x="450" y="226" class="svg-sub" text-anchor="middle">10 µs</text>
+                <line x1="570" y1="40" x2="570" y2="208" stroke="#deded9"/>
+                <text x="570" y="226" class="svg-sub" text-anchor="middle">100 µs</text>
+                <line x1="690" y1="40" x2="690" y2="208" stroke="#deded9"/>
+                <text x="690" y="226" class="svg-sub" text-anchor="middle">1 ms</text>
+                <line x1="810" y1="40" x2="810" y2="208" stroke="#deded9"/>
+                <text x="810" y="226" class="svg-sub" text-anchor="middle">10 ms</text>
+                <line x1="930" y1="40" x2="930" y2="208" stroke="#deded9"/>
+                <text x="930" y="226" class="svg-sub" text-anchor="middle">100 ms</text>
+                <line x1="330" y1="208" x2="930" y2="208" stroke="#b8b8b1"/>
+                <text x="0" y="24" class="svg-lane">POINT READ · ONE FIELD OF ONE DOCUMENT</text>
+                <text x="318" y="55" class="svg-sub" text-anchor="end">read file, json.loads, take .status</text>
+                <rect x="330" y="42" width="180.8" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="518.8" y="55" class="svg-sub">32.1 µs</text>
+                <text x="318" y="85" class="svg-sub" text-anchor="end">SQLite · body-&gt;&gt;'$.status' by id</text>
+                <rect x="330" y="72" width="102.2" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="440.2" y="85" class="svg-sub">7.1 µs</text>
+                <text x="0" y="128" class="svg-lane">FILTER · owner = ? AND status = 'failed' · 20,000 DOCUMENTS</text>
+                <text x="318" y="159" class="svg-sub" text-anchor="end">SQLite · no index (full scan)</text>
+                <rect x="330" y="146" width="521.2" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="859.2" y="159" class="svg-sub">22,061.9 µs</text>
+                <text x="318" y="189" class="svg-sub" text-anchor="end">SQLite · expression index</text>
+                <rect x="330" y="176" width="115.7" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="453.7" y="189" class="svg-sub">9.2 µs</text>
+                <rect x="0" y="252" width="1000" height="96" rx="8" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="16" y="278" class="svg-lane">WHAT CHANGED BETWEEN THE LAST TWO BARS</text>
+                <text x="16" y="302" class="svg-sub">CREATE INDEX docs_owner_status ON docs(body-&gt;&gt;'$.owner', body-&gt;&gt;'$.status')</text>
+                <text x="16" y="326" class="svg-sub">plan: SEARCH docs USING INDEX docs_owner_status (&lt;expr&gt;=? AND &lt;expr&gt;=?)</text>
+                <text x="996" y="85" class="svg-note" text-anchor="end">4.5× less</text>
+                <text x="996" y="189" class="svg-note" text-anchor="end">≈ 2,400× less</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> Values come from
+              <code>_numbers.json → read</code>: 5,000 point reads per variant, 20 unindexed
+              filters, and 2,000 indexed ones. Red bars read and parse everything. Green bars
+              let the database find the row.
+            </p>
+          </figure>
+
+          <p>
+            Reading one field from a file means reading and parsing all of it: 32.1 µs,
+            against 7.1 µs for <code>body-&gt;&gt;'$.status'</code> by primary key in SQLite,
+            4.5 times less. The filter is the larger lesson. Counting failed sessions for one
+            owner across 20,000 documents costs 22,061.9 µs as a full scan and 9.2 µs with an
+            expression index on the two paths. That is 2,398 times less, and the plan confirms
+            <code>SEARCH docs USING INDEX docs_owner_status</code>
+            (Figure 13). <span class="recon">measured here</span> A directory of JSON
+            files has no index, so every filter is the 22 ms case, growing linearly with the
+            number of files.
+          </p>
+
+          <p>
+            Storage is not free. The 20,000-document SQLite file, including that index,
+            measured 82,550,784 bytes, against an estimated 57,662,100 bytes of text JSON.
+            A 2.9 KB row on a 4 KB page wastes much of each page.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Caveats</h3>
+
+          <p>
+            These results come from one machine, one document size, and one writer with no
+            concurrency. Python interpreter overhead is included in every number. The fsync
+            cost belongs to this cloud disk; a laptop NVMe with a volatile write cache will
+            report less. PostgreSQL was not measured. Its numbers will differ, but the same
+            logic applies: one fsync per commit sets the ceiling, and group commit is how you
+            raise it. <span class="recon">reconstruction</span>
+          </p>
+
+          <h2 id="hybrid-schema"><span class="secnum">09</span>The hybrid schema</h2>
+
+          <p class="lede">
+            Do not choose between columns and JSON. Put each field where its use puts it.
+            A field you filter, sort, join, aggregate, or constrain on gets a real column.
+            A field that changes far more often than the rest of the document also gets one.
+            Everything else stays in a JSONB body that can grow new keys without a migration.
+          </p>
+
+          <p>
+            That is the rule of promotion, and it is the whole design. It is the default
+            because the two halves fail in opposite ways. An all-columns schema turns every new
+            optional field into a migration on a hot table, which is the cost
+            <a href="#practices">§6</a> spends a figure avoiding. An all-JSON schema turns
+            every filter into a scan or a guessed GIN query, and it turns every counter bump
+            into a rewrite of the whole document, which is what <a href="#json-inside">§7</a>
+            showed and <a href="#measured">§8</a> measured.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure wide" id="fig-hybrid-row">
+            <div class="figure-head">
+              <span class="figure-label">Figure 14</span>
+              <p class="figure-title">Anatomy of a hybrid row: typed columns, one JSONB body, and the history beside it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 540" role="img" aria-label="A documents row drawn as nine cells. Seven typed columns in blue: id as a uuidv7, tenant_id, kind, status, updated_at, and schema_version; version in orange because it carries optimistic concurrency. A green generated column owner_id is derived from the body by a thin blue arrow from the owner key. The body cell is purple, JSONB under 64 kB, holding the long tail: agent, usage, todos, tags, notes. To the right, three indexes: a partial B-tree on tenant, kind and updated_at for live rows, a GIN jsonb_path_ops index on the body for containment, and a B-tree on owner_id. Below, an append-only document_events table split into monthly partitions. A thick black arrow shows one transaction that updates the row and inserts an event together. A dashed purple arrow shows that the snapshot can be rebuilt by folding the events.">
+                <defs>
+                  <marker id="fig-hybrid-row-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-hybrid-row-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-hybrid-row-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="0" y="18" class="svg-lane">DOCUMENTS · ONE ROW PER THING, KEPT SMALL</text>
+                <rect x="0" y="32" width="120" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="12" y="58" class="svg-step">id</text>
+                <text x="12" y="84" class="svg-sub">uuid · v7</text>
+                <rect x="124" y="32" width="104" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="136" y="58" class="svg-step">tenant_id</text>
+                <text x="136" y="84" class="svg-sub">uuid</text>
+                <rect x="232" y="32" width="84" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="244" y="58" class="svg-step">kind</text>
+                <text x="244" y="84" class="svg-sub">text</text>
+                <rect x="320" y="32" width="84" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="332" y="58" class="svg-step">status</text>
+                <text x="332" y="84" class="svg-sub">text</text>
+                <rect x="408" y="32" width="96" height="70" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <text x="420" y="58" class="svg-step">version</text>
+                <text x="420" y="84" class="svg-sub">int · OCC</text>
+                <rect x="508" y="32" width="140" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="520" y="58" class="svg-step">schema_version</text>
+                <text x="520" y="84" class="svg-sub">smallint</text>
+                <rect x="652" y="32" width="118" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="664" y="58" class="svg-step">updated_at</text>
+                <text x="664" y="84" class="svg-sub">timestamptz</text>
+                <rect x="774" y="32" width="112" height="70" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="786" y="58" class="svg-step">owner_id</text>
+                <text x="786" y="84" class="svg-sub">generated</text>
+                <rect x="890" y="32" width="230" height="70" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="2"/>
+                <text x="902" y="58" class="svg-step">body</text>
+                <text x="902" y="84" class="svg-sub">jsonb · object · &lt; 64 kB</text>
+
+                <text x="0" y="146" class="svg-lane">BODY · THE LONG TAIL</text>
+                <rect x="0" y="160" width="540" height="176" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="16" y="186" class="svg-sub">{ "owner": "user-17",</text>
+                <text x="16" y="208" class="svg-sub" style="white-space:pre">  "agent": "claude_code",</text>
+                <text x="16" y="230" class="svg-sub" style="white-space:pre">  "usage": { "input_tokens": 41210, … },</text>
+                <text x="16" y="252" class="svg-sub" style="white-space:pre">  "todos": [ …24 items… ],</text>
+                <text x="16" y="274" class="svg-sub" style="white-space:pre">  "tags":  [ "xo", "space" ],</text>
+                <text x="16" y="296" class="svg-sub" style="white-space:pre">  "notes": "…600 chars…" }</text>
+                <text x="16" y="324" class="svg-note">new keys land here with no migration</text>
+                <path d="M200 182 H 830 V 104" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-hybrid-row-blue)"/>
+                <text x="600" y="174" class="svg-note">promoted: body -&gt;&gt; 'owner'</text>
+
+                <text x="580" y="214" class="svg-lane">INDEXES · EACH ONE FOR A NAMED QUERY</text>
+                <rect x="580" y="226" width="540" height="52" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="594" y="246" class="svg-step">Partial B-tree</text>
+                <text x="594" y="268" class="svg-sub">(tenant_id, kind, updated_at) WHERE status &lt;&gt; 'archived'</text>
+                <rect x="580" y="284" width="264" height="52" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="594" y="304" class="svg-step">GIN jsonb_path_ops</text>
+                <text x="594" y="326" class="svg-sub">body @&gt; '{"agent":"codex"}'</text>
+                <rect x="856" y="284" width="264" height="52" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="870" y="304" class="svg-step">B-tree on owner_id</text>
+                <text x="870" y="326" class="svg-sub">equality and range</text>
+
+                <text x="0" y="380" class="svg-lane">DOCUMENT_EVENTS · APPEND-ONLY, ONE PARTITION PER MONTH</text>
+                <rect x="0" y="394" width="200" height="84" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="420" class="svg-step">…_2026_08</text>
+                <text x="14" y="444" class="svg-sub">detach, archive</text>
+                <text x="14" y="464" class="svg-sub">to Parquet, drop</text>
+                <rect x="214" y="394" width="200" height="84" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="228" y="420" class="svg-step">…_2026_09</text>
+                <text x="228" y="444" class="svg-sub">read for audit</text>
+                <text x="228" y="464" class="svg-sub">and rebuilds</text>
+                <rect x="428" y="394" width="200" height="84" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="442" y="420" class="svg-step">…_2026_10</text>
+                <text x="442" y="444" class="svg-sub">current: inserts</text>
+                <text x="442" y="464" class="svg-sub">only, never UPDATE</text>
+
+                <rect x="720" y="394" width="400" height="84" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="736" y="420" class="svg-lane">ONE TRANSACTION</text>
+                <text x="736" y="444" class="svg-sub">UPDATE documents … version + 1</text>
+                <text x="736" y="464" class="svg-sub">INSERT INTO document_events …</text>
+                <path d="M920 394 V 356 H 560 V 120 H 470 V 106" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-hybrid-row-ink)"/>
+                <path d="M720 436 H 632" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-hybrid-row-ink)"/>
+                <path d="M520 394 V 340" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#fig-hybrid-row-purple)"/>
+                <text x="14" y="512" class="svg-note">snapshot = fold(events): the row can always be rebuilt from its history</text>
+                <text x="720" y="512" class="svg-note">both or neither; a reader never sees one without the other</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> — the recommended shape, not a
+              measured system. Blue cells are the relational contract, the purple body is
+              the part allowed to change shape, green is derived, orange carries
+              concurrency. The hot document stays small because its history lives beside
+              it, not inside it.
+            </p>
+          </figure>
+
+          <h3>The table</h3>
+
+          <p>
+            Here is the shape in PostgreSQL 18 DDL. <code>uuidv7()</code> is new in 18 and
+            gives time-ordered keys, so inserts land at the right edge of the primary-key
+            B-tree. <span class="src">from the docs</span> The body must be a JSON object and
+            must stay under 64 kB. The <code>pg_column_size</code> guard measures the value as
+            it is handed to the constraint, before the stored tuple is compressed, so treat it
+            as a rough ceiling rather than a byte-exact one. <span class="recon">reconstruction</span>
+          </p>
+
+          <pre><code>CREATE TABLE documents (
+  id             uuid        PRIMARY KEY DEFAULT uuidv7(),
+  tenant_id      uuid        NOT NULL,
+  kind           text        NOT NULL,
+  status         text        NOT NULL DEFAULT 'active',
+  version        integer     NOT NULL DEFAULT 1,
+  schema_version smallint    NOT NULL DEFAULT 1,
+  body           jsonb       NOT NULL
+                 CHECK (jsonb_typeof(body) = 'object')
+                 CHECK (pg_column_size(body) &lt; 65536),
+  owner_id       text        GENERATED ALWAYS AS (body -&gt;&gt; 'owner') STORED,
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX documents_live      ON documents (tenant_id, kind, updated_at DESC)
+                                 WHERE status &lt;&gt; 'archived';
+CREATE INDEX documents_owner     ON documents (tenant_id, owner_id);
+CREATE INDEX documents_body_path ON documents USING gin (body jsonb_path_ops);</code></pre>
+
+          <p>
+            Two details in that block are deliberate. First, <code>owner_id</code> says
+            <code>STORED</code>. PostgreSQL 18 made virtual the default for generated
+            columns, but a virtual generated column cannot carry an index in 18, and the only
+            reason to promote this path is to index it. <span class="src">from the docs</span>
+            Second, the GIN index uses <code>jsonb_path_ops</code>. It is smaller and faster
+            than the default <code>jsonb_ops</code>, but it answers only containment
+            (<code>@&gt;</code>) and jsonpath, not key-existence (<code>?</code>). Add it only
+            if you have ad-hoc containment queries over the long tail. If every filter is on a
+            promoted column, drop it and stop paying its write cost.
+            <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            The history is a separate table, append-only and range-partitioned by month, so
+            retention means detaching a partition, not running a <code>DELETE</code>:
+          </p>
+
+          <pre><code>CREATE TABLE document_events (
+  document_id uuid        NOT NULL REFERENCES documents (id),
+  seq         bigint      GENERATED ALWAYS AS IDENTITY,
+  at          timestamptz NOT NULL DEFAULT now(),
+  type        text        NOT NULL,
+  payload     jsonb       NOT NULL,
+  PRIMARY KEY (document_id, at, seq)
+) PARTITION BY RANGE (at);
+
+CREATE TABLE document_events_2026_10 PARTITION OF document_events
+  FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');</code></pre>
+
+          <p>
+            A primary key on a partitioned table has to include the partition key, which is
+            why <code>at</code> is in it. <span class="src">from the docs</span> Create next
+            month's partition ahead of time from a scheduled job; <code>pg_partman</code> does
+            this for you if you would rather not write the job.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Writes: patch with a version check</h3>
+
+          <p>
+            Every write states which version it read. If someone else wrote in between, zero
+            rows match and the caller re-reads and retries. No row lock is held across the
+            caller's think time, and the losing writer finds out instead of silently
+            overwriting the winner:
+          </p>
+
+          <pre><code>UPDATE documents
+   SET body       = body || $3::jsonb,      -- shallow merge of top-level keys
+       version    = version + 1,
+       updated_at = now()
+ WHERE id = $1 AND version = $2
+RETURNING version;                          -- no row back = conflict, re-read</code></pre>
+
+          <p>
+            Know what <code>||</code> does. On two JSONB objects it is a <em>shallow</em>
+            merge: top-level keys in the right operand replace the same keys on the left,
+            whole. A patch of <code>{"usage": {"input_tokens": 5}}</code> replaces the entire
+            <code>usage</code> object and drops <code>output_tokens</code>.
+            <span class="src">from the docs</span> For a nested field use
+            <code>jsonb_set(body, '{usage,input_tokens}', to_jsonb($3::bigint))</code>, or,
+            better, ask whether that field changes often enough to be a column.
+            A counter bumped on every model call is the clearest case for promotion. It changes
+            on every call while the rest of the document changes rarely, and
+            <a href="#json-inside">§7</a> showed that every change rewrites the whole value. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Validation lives in two places</h3>
+
+          <p>
+            The full contract belongs at the edge. A Pydantic v2 model or a JSON Schema
+            rejects bad input with a useful error before it reaches the database. The database
+            keeps a cheap guard that no code path can skip: the type and size
+            <code>CHECK</code>s above, plus <code>NOT NULL</code> on the promoted columns. If
+            you want the full schema enforced in the database too, Supabase's
+            <code>pg_jsonschema</code> extension (Apache 2.0) adds
+            <code>jsonb_matches_schema(schema, body)</code> for use in a <code>CHECK</code>.
+            <span class="src">from the docs</span> It validates on every write, so measure it
+            on your largest documents before you adopt it. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Schema versions: upgrade on read</h3>
+
+          <p>
+            <code>schema_version</code> lets the body change shape without a stop-the-world
+            backfill. Readers run a chain of small pure functions, one per version step, then
+            write the upgraded body back on their next write. Old rows migrate as they are
+            touched, and a background job sweeps up the rest. xo-space already stamps its
+            <code>todos.json</code> with <code>"schema": 1</code>
+            (<code>services/cowork_agent/visualizer/todos_store.py</code>, line 144), so the
+            habit exists. <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>def _v1_to_v2(body: dict) -&gt; dict:          # v2 made "tags" mandatory
+    return {**body, "tags": body.get("tags", [])}
+
+def _v2_to_v3(body: dict) -&gt; dict:          # v3 moved "tokens" under "usage"
+    body = dict(body)
+    tokens = body.pop("tokens", 0)
+    return {**body, "usage": {"input_tokens": tokens, **body.get("usage", {})}}
+
+UPGRADES = {1: _v1_to_v2, 2: _v2_to_v3}
+CURRENT = 3
+
+def upgrade(version: int, body: dict) -&gt; tuple[int, dict]:
+    while version &lt; CURRENT:
+        body = UPGRADES[version](body)
+        version += 1
+    return version, body</code></pre>
+
+          <h3>Snapshot plus events</h3>
+
+          <p>
+            The hot document holds current state only. Anything that grows without bound, such
+            as messages, tool calls, status transitions, or usage samples, goes to
+            <code>document_events</code> in the same transaction as the snapshot update
+            (Figure 14). This keeps the snapshot small enough that a rewrite
+            stays cheap. It gives you an audit trail for free, and it means a corrupted or
+            mis-migrated snapshot can be rebuilt by folding its events. The event table is also
+            what feeds analytics in <a href="#the-stack">§10</a>.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>The same shape in SQLite</h3>
+
+          <p>
+            SQLite 3.45 and later store JSONB as a <code>BLOB</code>, so declare the body as
+            <code>BLOB</code> in a <code>STRICT</code> table and write it through
+            <code>jsonb()</code>. STRICT allows only <code>INT</code>, <code>INTEGER</code>,
+            <code>REAL</code>, <code>TEXT</code>, <code>BLOB</code> and <code>ANY</code> as
+            column types. <span class="src">from the docs</span> I ran this block on SQLite
+            3.46.1. A text JSON value inserted without <code>jsonb()</code> is rejected with
+            <code>cannot store TEXT value in BLOB column</code>, so STRICT does the format
+            check for you, and the filter on <code>(tenant_id, owner_id, status)</code> plans
+            as <code>SEARCH documents USING INDEX documents_owner_status</code>.
+            <span class="recon">measured here</span>
+          </p>
+
+          <pre><code>CREATE TABLE documents (
+  id             TEXT    PRIMARY KEY,
+  tenant_id      TEXT    NOT NULL,
+  kind           TEXT    NOT NULL,
+  status         TEXT    NOT NULL DEFAULT 'active',
+  version        INTEGER NOT NULL DEFAULT 1,
+  schema_version INTEGER NOT NULL DEFAULT 1,
+  body           BLOB    NOT NULL
+                 CHECK (json_valid(body, 8) AND json_type(body) = 'object'),
+  updated_at     TEXT    NOT NULL,
+  owner_id       TEXT    GENERATED ALWAYS AS (body -&gt;&gt; '$.owner') VIRTUAL
+) STRICT;
+CREATE INDEX documents_owner_status ON documents (tenant_id, owner_id, status);</code></pre>
+
+          <p>
+            Unlike PostgreSQL 18, SQLite can index a <code>VIRTUAL</code> generated column, so
+            the promoted path costs no extra storage in the table itself, only in the index.
+            The <code>8</code> passed to <code>json_valid</code> asks whether the value is
+            well-formed JSONB. <span class="src">from the docs</span> Generate
+            <code>id</code> in the application as a UUIDv7 string. SQLite has no built-in
+            generator. <span class="recon">reconstruction</span>
+          </p>
+
+          <h2 id="the-stack"><span class="secnum">10</span>A free stack for loading and storing JSON all day</h2>
+
+          <p class="lede">
+            One database of record and three helpers, each with one job. Everything below is
+            under an OSI-approved licence. The database of record is the one part you cannot
+            swap cheaply, so it is the part where foundation governance matters most.
+          </p>
+
+          <p>
+            Figure 15 is the whole design. The rest of this section takes it one
+            box at a time: what the box does, its licence, and the one setting that matters.
+          </p>
+
+          <figure class="figure wide" id="fig-stack">
+            <div class="figure-head">
+              <span class="figure-label">Figure 15</span>
+              <p class="figure-title">The recommended architecture: one system of record, three helpers, one history pipe</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 610" role="img" aria-label="An application box on the left, running FastAPI with Pydantic v2, orjson and psycopg 3. A dashed purple edge goes to Valkey 9, which holds sessions, presence, rate limits, pub/sub and caches, all with TTLs. A thin blue edge goes through PgBouncer in transaction mode to PostgreSQL 18, which holds hybrid documents, monthly event partitions, an outbox, and blob pointer rows. PostgreSQL ships WAL to pgBackRest, which stores backups in S3-compatible object storage. A second thin blue edge sends large blobs from the application straight to object storage: SeaweedFS, Garage or Ceph RGW. Below PostgreSQL, the outbox feeds Debezium or logical replication into NATS JetStream or Kafka 4, which loads ClickHouse with its JSON type or Parquet files that DuckDB reads in place from object storage.">
+                <defs>
+                  <marker id="fig-stack-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-stack-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-stack-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <rect x="0" y="30" width="200" height="510" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="20" class="svg-lane">APPLICATION</text>
+                <text x="14" y="58" class="svg-step">FastAPI service</text>
+                <text x="14" y="82" class="svg-sub">pydantic v2: validate</text>
+                <text x="14" y="102" class="svg-sub">orjson / msgspec</text>
+                <text x="14" y="122" class="svg-sub">psycopg 3 / asyncpg</text>
+                <text x="14" y="160" class="svg-note">validates at the edge,</text>
+                <text x="14" y="178" class="svg-note">coalesces hot counters,</text>
+                <text x="14" y="196" class="svg-note">writes snapshot + event</text>
+                <text x="14" y="214" class="svg-note">+ outbox row together</text>
+
+                <text x="260" y="20" class="svg-lane">HOT, EPHEMERAL</text>
+                <rect x="260" y="30" width="330" height="86" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="276" y="54" class="svg-step">Valkey 9 · BSD-3 · Linux Foundation</text>
+                <text x="276" y="78" class="svg-sub">sessions · presence · rate limits</text>
+                <text x="276" y="98" class="svg-sub">pub/sub · caches · every key has a TTL</text>
+                <path d="M200 72 H 256" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#fig-stack-purple)"/>
+
+                <text x="260" y="152" class="svg-lane">SYSTEM OF RECORD</text>
+                <rect x="260" y="188" width="150" height="78" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="274" y="214" class="svg-step">PgBouncer</text>
+                <text x="274" y="238" class="svg-sub">ISC · pool_mode</text>
+                <text x="274" y="256" class="svg-sub">= transaction</text>
+                <rect x="460" y="162" width="340" height="140" rx="8" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="476" y="188" class="svg-step">PostgreSQL 18 · PostgreSQL licence · PGDG</text>
+                <text x="476" y="214" class="svg-sub" style="white-space:pre">documents        hybrid rows (§9)</text>
+                <text x="476" y="234" class="svg-sub" style="white-space:pre">document_events  monthly partitions</text>
+                <text x="476" y="254" class="svg-sub" style="white-space:pre">outbox           rows for the relay</text>
+                <text x="476" y="274" class="svg-sub" style="white-space:pre">blob_refs        key, sha256, bytes</text>
+                <path d="M200 227 H 256" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-stack-blue)"/>
+                <path d="M410 227 H 456" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-stack-blue)"/>
+
+                <rect x="860" y="188" width="260" height="78" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="876" y="214" class="svg-step">pgBackRest · MIT</text>
+                <text x="876" y="238" class="svg-sub">WAL archive + full/diff</text>
+                <text x="876" y="256" class="svg-sub">backups · tested PITR</text>
+                <path d="M800 227 H 856" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-stack-blue)"/>
+
+                <text x="460" y="340" class="svg-lane">HISTORY PIPE</text>
+                <rect x="460" y="352" width="340" height="86" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="476" y="376" class="svg-step">Outbox relay</text>
+                <text x="476" y="400" class="svg-sub">Debezium or logical replication</text>
+                <text x="476" y="420" class="svg-sub">→ NATS JetStream (or Kafka 4)</text>
+                <path d="M630 302 V 348" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-stack-ink)"/>
+                <text x="640" y="330" class="svg-note">after commit</text>
+
+                <rect x="860" y="352" width="200" height="86" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="876" y="376" class="svg-step">ClickHouse · JSON</text>
+                <text x="876" y="400" class="svg-sub">or DuckDB over</text>
+                <text x="876" y="420" class="svg-sub">Parquet in place</text>
+                <path d="M800 395 H 856" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-stack-blue)"/>
+
+                <text x="260" y="470" class="svg-lane">LARGE, WRITE-ONCE</text>
+                <rect x="260" y="480" width="860" height="60" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="276" y="504" class="svg-step">Object storage, S3 API · SeaweedFS (Apache 2.0) · Garage (AGPLv3) · Ceph RGW</text>
+                <text x="276" y="526" class="svg-sub">blobs over ~1 MB, addressed by a pointer row · pgBackRest repository · Parquet exports</text>
+                <path d="M1100 266 V 476" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-stack-blue)"/>
+                <path d="M960 438 V 476" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-stack-blue)"/>
+                <path d="M200 510 H 256" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-stack-blue)"/>
+
+                <line x1="0" y1="566" x2="1120" y2="566" stroke="#deded9"/>
+                <line x1="0" y1="590" x2="40" y2="590" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="50" y="594" class="svg-sub">data</text>
+                <line x1="130" y1="590" x2="170" y2="590" stroke="#252525" stroke-width="2.6"/>
+                <text x="180" y="594" class="svg-sub">sequence: only after commit</text>
+                <line x1="420" y1="590" x2="460" y2="590" stroke="#765b98" stroke-width="1.6" stroke-dasharray="6 4"/>
+                <text x="470" y="594" class="svg-sub">ephemeral state, safe to lose</text>
+                <text x="760" y="594" class="svg-note">blue box = record · purple = cache · green = durable copies</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> — a recommended design, not a deployed
+              one. Only the blue boxes hold the truth. Everything purple can be wiped and
+              rebuilt, everything green is a copy or a blob addressed from a row, and the
+              orange pipe runs strictly after commit, so analytics can lag but never disagree
+              with the record.
+            </p>
+          </figure>
+
+          <h3>System of record: PostgreSQL 18</h3>
+
+          <p>
+            PostgreSQL licence, governed by the PostgreSQL Global Development Group; no company
+            can relicense it. 18 (25 September 2025) is the production pick. 19 is at Beta 4
+            (24 September 2026), not yet GA. <span class="src">from the docs</span> It holds the hybrid tables
+            from <a href="#hybrid-schema">§9</a>, the events, the outbox, and pointer rows for
+            blobs. The one setting to decide on purpose is <code>synchronous_commit</code>. Leave
+            it <code>on</code> for the record. Set it to <code>off</code> per transaction
+            (<code>SET LOCAL</code>) only for writes you can afford to lose in a crash; the
+            loss window is bounded and the database is never corrupted.
+            <span class="src">from the docs</span> Put PgBouncer (ISC) in front in transaction
+            mode, because PostgreSQL forks a process per connection. Back up with pgBackRest
+            (MIT) to object storage, and restore on a schedule. <span class="src">from the docs</span>
+          </p>
+
+          <h3>Embedded or single process: SQLite in WAL mode</h3>
+
+          <p>
+            If one process owns the data, SQLite (public domain) in WAL mode is the record, and
+            there is no server to run. §8 measured it here at 411 µs per durable
+            <code>json_set</code> with <code>synchronous=FULL</code> and 8.4 µs per event when
+            100 share a transaction. <span class="recon">measured here</span> Litestream
+            (Apache 2.0) streams the WAL to S3-compatible storage for point-in-time recovery.
+            It runs as a separate process beside the application, and shipped its 0.5.x
+            releases through late 2025. <span class="src">from the docs</span>
+          </p>
+
+          <h3>If you need the MongoDB API: FerretDB on PostgreSQL</h3>
+
+          <p>
+            If existing drivers or tools speak the MongoDB wire protocol, the open answer is
+            FerretDB 2 (Apache 2.0), which translates that protocol onto PostgreSQL with the DocumentDB extension (MIT, Linux Foundation since August
+            2025). MongoDB itself is under SSPL, which is source-available, not open source.
+            <span class="src">from the docs</span> Backups, roles and WAL stay PostgreSQL's.
+            Check FerretDB's compatibility list against the commands you use.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Hot, ephemeral JSON: Valkey 9</h3>
+
+          <p>
+            Sessions, presence, rate limits, pub/sub and caches change constantly and are
+            worthless an hour later. That is Valkey's job. It is
+            BSD-3-licensed under the Linux Foundation, and 9.0 went GA on 21 October 2025.
+            <span class="src">from the docs</span> The <code>valkey-bundle</code> image ships a
+            JSON module if you want path-level reads and writes, but plain strings holding
+            orjson output are usually enough. <span class="src">from the docs</span> The
+            settings that matter are <code>maxmemory</code> with an explicit
+            <code>maxmemory-policy</code> (<code>allkeys-lru</code> for a cache,
+            <code>volatile-lru</code> if keys without a TTL must never be evicted). Turn on
+            <code>appendonly yes</code> with <code>appendfsync everysec</code> only if a restart
+            must not empty it, and accept that it can still lose about a second.
+            <span class="src">from the docs</span> Redis 8 is also an option now that it offers
+            AGPLv3, but Valkey's foundation governance is the safer bet for something you will
+            not want to migrate twice. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Large JSON and artefacts: object storage plus a pointer row</h3>
+
+          <p>
+            Anything over roughly 1 MB and written once, such as transcripts, exports, model
+            outputs, or uploaded files, goes to S3-compatible storage under a content-addressed
+            key. A row in <code>blob_refs</code> holds the key, the SHA-256, the size and the
+            owner, so the database still answers "what exists and who owns it" without holding
+            the bytes. <span class="recon">reconstruction</span> MinIO's community edition went
+            into maintenance mode in December 2025 and the repository was archived in early
+            2026, so do not start there. <span class="src">from the docs</span> SeaweedFS
+            (Apache 2.0) is the default for one site. Garage (AGPLv3, v2.0 in June 2025) is
+            built for small geo-distributed clusters; running it unmodified carries no
+            obligation, while modifying it and serving it over a network does. Ceph RGW suits sites
+            that already run Ceph. RustFS (Apache 2.0) is newer and not yet a default. <span class="src">from the docs</span>
+          </p>
+
+          <h3>History out: outbox, CDC, and a stream</h3>
+
+          <p>
+            Never write to the database and then publish to a stream as two separate steps.
+            One of them will fail alone. Write an <code>outbox</code> row in the same
+            transaction as the change, and let a relay publish it after commit. The relay can
+            be Debezium (Apache 2.0, moving from Red Hat to the Commonhaus Foundation since late 2024) reading the
+            WAL, or PostgreSQL's native logical replication. <span class="src">from the docs</span>
+            Fan out through NATS JetStream (Apache 2.0, CNCF), which stays open after the 2025
+            relicensing attempt failed. If you already operate Kafka, Apache Kafka 4 runs
+            without ZooKeeper (KRaft only, March 2025). <span class="src">from the docs</span>
+            Consumers must be idempotent, because every relay here delivers at least once.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Analytics on the JSON events: ClickHouse or DuckDB</h3>
+
+          <p>
+            Keep analytical scans off the operational tables. ClickHouse (Apache 2.0)
+            has a production-ready <code>JSON</code> column type from 25.3. It stores each
+            path as its own typed subcolumn, so a <code>GROUP BY</code> over one field of a
+            billion events reads one column. <span class="src">from the docs</span> If the
+            volume fits one machine, DuckDB (MIT) queries Parquet or NDJSON in place, with no
+            server. Export closed monthly partitions to Parquet and point DuckDB at the bucket. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>The thin layers</h3>
+
+          <p>
+            PostgREST (MIT) puts an HTTP API over tables if you want one without writing
+            handlers. In Python, use psycopg 3 (LGPL-3.0, which allows use from
+            code under any licence) or asyncpg (Apache 2.0). Use orjson
+            (Apache 2.0 or MIT) or msgspec (BSD-3) for fast encoding and decoding, and
+            Pydantic v2 (MIT) for validation at the edge. <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            None of this has to be built on day one. Figure 16 shows the same design
+            at three sizes.
+          </p>
+
+          <figure class="figure" id="fig-tiers">
+            <div class="figure-head">
+              <span class="figure-label">Figure 16</span>
+              <p class="figure-title">Three sizes of the same design: move up only when a measured limit forces it</p>
+            </div>
+            <div class="figure-body">
+              <div class="tier-grid">
+                <div class="tier-card pr">
+                  <h4>Single node</h4>
+                  <p class="sub">ONE PROCESS OWNS THE DATA</p>
+                  <p>SQLite in WAL mode with the §9 tables. Litestream streams the WAL to object
+                  storage. An in-process dict or <code>functools.lru_cache</code> instead of
+                  Valkey. DuckDB over exported Parquet for analysis. Nothing to operate but a
+                  file and a sidecar.</p>
+                </div>
+                <div class="tier-card ep">
+                  <h4>One team server</h4>
+                  <p class="sub">SEVERAL PROCESSES, ONE BOX OR VM</p>
+                  <p>PostgreSQL 18 behind PgBouncer, pgBackRest to object storage with a tested
+                  restore, Valkey for sessions and caches, an outbox table with a small relay.
+                  This tier covers most products for their whole life.</p>
+                </div>
+                <div class="tier-card se">
+                  <h4>Scale-out</h4>
+                  <p class="sub">A MEASURED CEILING, NOT A FEAR OF ONE</p>
+                  <p>Add streaming read replicas, then time partitioning everywhere, then CDC
+                  into ClickHouse for analytics. Shard writes with Citus or move to YugabyteDB
+                  only when one primary's write rate is the measured limit.</p>
+                </div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> — the schema and the repository
+              interface (<a href="#implementation">§11</a>) stay the same across all three.
+              That is what makes it safe to start small: moving up a tier swaps a backend, not
+              a data model.
+            </p>
+          </figure>
+
+          <h3>Do not</h3>
+
+          <ul>
+            <li><strong>Use Valkey or Redis as the database of record.</strong> They are memory-first, and their persistence is a recovery aid, not a durability contract.</li>
+            <li><strong>Put unbounded arrays in one document.</strong> Messages, events and samples are rows. A document that grows forever makes every update slower than the last.</li>
+            <li><strong>Store multi-megabyte blobs in JSONB.</strong> Every change rewrites the TOASTed value and its WAL (<a href="#json-inside">§7</a>). Put the bytes in object storage and keep a pointer row.</li>
+            <li><strong>Pick a single-vendor, source-available engine for the system of record.</strong> The licence can change under you, as <a href="#licences">§5</a> shows it has for several since 2018.</li>
+          </ul>
+
+          <h2 id="implementation"><span class="secnum">11</span>Implementing it: from JSON files to tables</h2>
+
+          <p class="lede">
+            xo-space keeps its state in JSON files today, and parts of it are written well.
+            The move to tables does not start with a database. It starts with an interface,
+            so the database can arrive behind it one phase at a time, and every phase can be
+            undone with a flag.
+          </p>
+
+          <h3>What the tree does now</h3>
+
+          <p>
+            The careful version is the machine-local state file. In
+            <code>services/cowork_agent/xo_cowork_state.py</code>, lines 54–68,
+            <code>_atomic_write</code> creates a temp file in the same directory, writes,
+            flushes, fsyncs the file, and only then renames it over the target:
+            <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>def _atomic_write(payload: dict[str, Any]) -&gt; None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise</code></pre>
+
+          <p>
+            That is the right recipe for one JSON file. <code>mkstemp</code> gives a unique
+            name, so two writers cannot share a temp file. The fsync puts the bytes on disk
+            before the rename publishes them, and a failure cleans up after itself. One step
+            is missing: nothing fsyncs the <em>directory</em>. On Linux the rename itself
+            becomes durable only when the directory entry is flushed, so after a power cut
+            the file can still show the old version. It will be whole, but stale.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            The manifest writer is lighter. In <code>services/xo_manifest.py</code>, lines
+            134–141, <code>_write_atomic</code> writes a fixed <code>.tmp</code> sibling and
+            renames it, with no fsync at all. Its docstring adds "Caller holds the lock", an
+            <code>asyncio.Lock</code> declared at line 75: <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>async def _write_atomic(manifest: dict) -&gt; Path:
+    """Write `manifest` to xo.json via temp-file + rename. Caller holds the lock."""
+    path = _xo_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path</code></pre>
+
+          <p>
+            This is atomic against a crashing <em>process</em>: a reader sees the old file or
+            the new one, never half of each. It is not durable against a crashing
+            <em>machine</em>. Without an fsync, the filesystem may persist the rename before
+            the data, and after power loss the file can come back empty or truncated.
+            <span class="recon">reconstruction</span> The watcher's shared helper,
+            <code>write_json_atomic</code> in
+            <code>services/cowork_agent/visualizer/atomic_write.py</code> (lines 22–38),
+            follows the same no-fsync pattern for <code>stats.json</code>,
+            <code>todos.json</code> and the session lists. Its JSONL sibling
+            <code>append_jsonl</code> does fsync after each batch (line 58).
+            <span class="src">from the tree</span>
+          </p>
+
+          <p>
+            Readers see a deliberately closed set. In
+            <code>services/cowork_agent/scopes.py</code>, lines 82–89, the BFF can read
+            exactly these paths under a project's <code>.xo/</code>, and nothing else:
+            <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>    # Closed set of portable files the BFF endpoints read. Activity is
+    # also a closed path, but lives outside _xo_root in _activity_path.
+    # P4 / P6 — the route layer can't ask for an arbitrary path.
+    _STATS:           str = "stats.json"
+    _TODOS:           str = "todos.json"
+    _TIMELINE:        str = "timeline.jsonl"
+    _SESSIONSLIST:    str = "sessions/sessionslist.json"
+    _SESSIONS_AUG:    str = "sessions/sessions-augment.json"</code></pre>
+
+          <p>
+            <code>todos.json</code> is the one file with two writers, the watcher's sink and
+            the agent-facing todo endpoints, and they coordinate through
+            <code>visualizer.flock.locked</code> (<code>scopes.py</code> line 168). The lock
+            is honest about its limits. In
+            <code>services/cowork_agent/visualizer/flock.py</code>, lines 88–101, it retries a
+            non-blocking <code>LOCK_EX</code> for <code>_DEADLINE_S = 2.0</code> seconds
+            (line 44), then proceeds anyway: <span class="src">from the tree</span>
+          </p>
+
+          <pre><code>        deadline = time.monotonic() + _DEADLINE_S
+        while True:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break  # acquired
+            except BlockingIOError:
+                if time.monotonic() &gt;= deadline:
+                    logger.warning(
+                        "flock: could not acquire %s within %.1fs; proceeding without lock",
+                        lock_path, _DEADLINE_S,
+                    )
+                    break
+                time.sleep(_RETRY_INTERVAL_S)
+        yield</code></pre>
+
+          <p>
+            The docstring states the trade plainly: "the worst case is a single lost update
+            that the next tick / call recovers". <span class="src">from the tree</span> That is
+            a reasonable choice for a todo list. It is also the exact problem a version column
+            and a transaction remove.
+          </p>
+
+          <h3>What files do well, and where they stop</h3>
+
+          <p>
+            Files are inspectable with <code>cat</code>, diffable in git, readable by any
+            agent, and need no operations at all. Keep those properties wherever humans or
+            tools read the state. They stop in four places. Every change rewrites the whole
+            file, 1,464.5 µs per durable update in §8. There is one writer at a time, and the
+            lock can time out. There is no query without loading every file. And there is no
+            transaction across files, so <code>todos.json</code> and
+            <code>timeline.jsonl</code> can disagree after a crash.
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>Step one: a repository interface</h3>
+
+          <p>
+            Put every read and write behind five methods. Callers never see paths or SQL, and
+            each method states its concurrency contract in its signature: every write names the
+            version it read. <span class="recon">reconstruction</span>
+          </p>
+
+          <pre><code>from typing import Any, Protocol
+
+class Conflict(Exception):
+    """The caller's expected version is stale: re-read, re-apply, retry."""
+
+class DocumentStore(Protocol):
+    def get(self, doc_id: str) -&gt; tuple[int, dict[str, Any]] | None: ...
+    def put(self, doc_id: str, body: dict[str, Any], *, expected: int | None) -&gt; int: ...
+    def patch(self, doc_id: str, path: tuple[str, ...], value: Any, *, expected: int) -&gt; int: ...
+    def append_event(self, doc_id: str, type: str, payload: dict[str, Any]) -&gt; None: ...
+    def query(self, *, tenant_id: str, owner_id: str | None = None,
+              status: str | None = None, limit: int = 100) -&gt; list[dict[str, Any]]: ...</code></pre>
+
+          <p>
+            The first backend is the files themselves, wrapping today's helpers. It changes
+            nothing on disk, and it gives every caller the new contract before any database
+            exists.
+          </p>
+
+          <h3>The SQLite backend</h3>
+
+          <p>
+            Against the §9 SQLite tables, this is the constructor and <code>patch</code>. I ran
+            it on SQLite 3.46.1. A stale <code>expected</code> raises <code>Conflict</code>
+            and rolls back the event insert with it. <span class="recon">measured here</span>
+          </p>
+
+          <pre><code>class SqliteStore:
+    def __init__(self, path: str, *, durable: bool = True):
+        self.db = sqlite3.connect(path, isolation_level=None)   # we issue BEGIN ourselves
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=" + ("FULL" if durable else "NORMAL"))
+        self.db.execute("PRAGMA busy_timeout=5000")              # wait for the writer, don't fail
+
+    def patch(self, doc_id: str, path: tuple[str, ...], value: Any, *, expected: int) -&gt; int:
+        self.db.execute("BEGIN IMMEDIATE")                       # take the write lock up front
+        try:
+            cur = self.db.execute(
+                "UPDATE documents SET body = jsonb_set(body, ?, json(?)), version = version + 1,"
+                " updated_at = ? WHERE id = ? AND version = ?",
+                ("$." + ".".join(path), json.dumps(value), _now(), doc_id, expected))
+            if cur.rowcount != 1:
+                raise Conflict(doc_id, expected)
+            self.db.execute(
+                "INSERT INTO events (doc_id, at, type, payload) VALUES (?, ?, 'set', jsonb(?))",
+                (doc_id, _now(), json.dumps({"path": path, "value": value})))
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        return expected + 1</code></pre>
+
+          <p>
+            Three choices in it are deliberate. <code>BEGIN IMMEDIATE</code> takes the write
+            lock at the start. A plain <code>BEGIN</code> starts as a reader and upgrades
+            on its first write. In WAL mode that upgrade fails at once with
+            <code>SQLITE_BUSY</code> if another writer committed in between, and
+            <code>busy_timeout</code> cannot help, because waiting would not change the
+            reader's snapshot. <span class="src">from the docs</span> The
+            <code>json(?)</code> wrapper makes the bound text be read as JSON, not stored as a
+            string. The <code>durable</code> flag is the §8 decision. <code>FULL</code> costs
+            about 0.4 ms per commit here and survives power loss. <code>NORMAL</code> costs
+            about 11 µs and survives an application crash, but the last commits can roll back
+            after an OS crash or power cut. <span class="recon">measured here</span> Use
+            <code>FULL</code> for the record and <code>NORMAL</code> for caches of something
+            you can recompute. Never paste field names from user input into
+            <code>path</code>.
+          </p>
+
+          <h3>The PostgreSQL backend</h3>
+
+          <p>
+            The same method with psycopg 3 and a <code>psycopg_pool.ConnectionPool</code>.
+            A Python list of strings binds as <code>text[]</code>, which is what
+            <code>jsonb_set</code> takes for a path. <span class="src">from the docs</span>
+          </p>
+
+          <pre><code>from psycopg.types.json import Jsonb
+
+def patch(self, doc_id, path, value, *, expected):
+    with self.pool.connection() as conn, conn.transaction():
+        row = conn.execute(
+            """UPDATE documents
+                  SET body = jsonb_set(body, %s, %s), version = version + 1,
+                      updated_at = now()
+                WHERE id = %s AND version = %s
+            RETURNING version""",
+            (list(path), Jsonb(value), doc_id, expected),
+        ).fetchone()
+        if row is None:
+            raise Conflict(doc_id, expected)
+        conn.execute(
+            "INSERT INTO document_events (document_id, type, payload) VALUES (%s, 'set', %s)",
+            (doc_id, Jsonb({"path": list(path), "value": value})),
+        )
+    return row[0]</code></pre>
+
+          <p>
+            Two caveats. <code>jsonb_set</code> creates a missing <em>last</em> key but not
+            missing parents, so <code>('usage', 'input_tokens')</code> silently does nothing
+            when <code>usage</code> is absent. Seed whole sub-objects in <code>put</code>.
+            And psycopg 3 prepares statements after five executions by default. Behind
+            PgBouncer in transaction mode, either run a PgBouncer release with
+            <code>max_prepared_statements</code> set or pass
+            <code>prepare_threshold=None</code>. <span class="src">from the docs</span>
+          </p>
+
+          <h3>Batch the hot counters</h3>
+
+          <p>
+            Usage counters and presence timestamps change on every model call. Do not give
+            each change its own commit. Accumulate increments in memory, keyed by document and
+            path, and flush every 250 ms or every 100 changes in one transaction. §8 shows the
+            reason. On this machine one durable SQLite commit costs about 412 µs, while 100
+            inserts sharing a commit cost 8.4 µs each, about 49 times cheaper.
+            <span class="recon">measured here</span> A crash loses at most one window of
+            counts, and the window is a number you choose. If that is not acceptable for a
+            field, the field is not a counter and should not be batched.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure wide" id="fig-migration">
+            <div class="figure-head">
+              <span class="figure-label">Figure 17</span>
+              <p class="figure-title">Moving xo-space off flat files without downtime: five phases, each reversible</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 420" role="img" aria-label="Five phases left to right, joined by thick black sequence arrows. Phase 1, interface over files: reads and writes go to files and the change is only code. Phase 2, dual-write with the database as a shadow: reads from files, writes to files and the database, database errors only logged. Phase 3, backfill and compare: old files are loaded into the database and a nightly diff must reach zero. Phase 4, read from the database: files are still written, now as a projection. Phase 5, stop writing files: the database is the record and a read-only JSON export remains for humans. Underneath, a source-of-truth bar is orange for files across phases 1 to 3 and blue for the database across phases 4 and 5. Each phase has a red rollback box naming how to undo it.">
+                <defs>
+                  <marker id="fig-migration-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">PHASES · EACH SHIPS BEHIND A FLAG</text>
+
+                <rect x="0" y="32" width="200" height="200" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="56" class="svg-num">1</text>
+                <text x="30" y="56" class="svg-step">Interface over files</text>
+                <text x="14" y="88" class="svg-sub" style="white-space:pre">reads:  files</text>
+                <text x="14" y="108" class="svg-sub">writes: files</text>
+                <text x="14" y="140" class="svg-sub">ship DocumentStore;</text>
+                <text x="14" y="160" class="svg-sub">callers stop touching</text>
+                <text x="14" y="180" class="svg-sub">paths directly</text>
+
+                <rect x="230" y="32" width="200" height="200" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="244" y="56" class="svg-num">2</text>
+                <text x="260" y="56" class="svg-step">Dual-write, DB shadow</text>
+                <text x="244" y="88" class="svg-sub" style="white-space:pre">reads:  files</text>
+                <text x="244" y="108" class="svg-sub">writes: files, then DB</text>
+                <text x="244" y="140" class="svg-sub">DB failures logged,</text>
+                <text x="244" y="160" class="svg-sub">never surfaced; files</text>
+                <text x="244" y="180" class="svg-sub">still decide</text>
+
+                <rect x="460" y="32" width="200" height="200" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="474" y="56" class="svg-num">3</text>
+                <text x="490" y="56" class="svg-step">Backfill + compare</text>
+                <text x="474" y="88" class="svg-sub" style="white-space:pre">reads:  files</text>
+                <text x="474" y="108" class="svg-sub">writes: files, then DB</text>
+                <text x="474" y="140" class="svg-sub">load every old file;</text>
+                <text x="474" y="160" class="svg-sub">nightly diff of files</text>
+                <text x="474" y="180" class="svg-sub">vs rows must hit zero</text>
+
+                <rect x="690" y="32" width="200" height="200" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="704" y="56" class="svg-num">4</text>
+                <text x="720" y="56" class="svg-step">Read from DB</text>
+                <text x="704" y="88" class="svg-sub" style="white-space:pre">reads:  DB</text>
+                <text x="704" y="108" class="svg-sub">writes: DB, then files</text>
+                <text x="704" y="140" class="svg-sub">files become a</text>
+                <text x="704" y="160" class="svg-sub">projection; BFF reads</text>
+                <text x="704" y="180" class="svg-sub">go through the store</text>
+
+                <rect x="920" y="32" width="200" height="200" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="934" y="56" class="svg-num">5</text>
+                <text x="950" y="56" class="svg-step">Stop writing files</text>
+                <text x="934" y="88" class="svg-sub" style="white-space:pre">reads:  DB</text>
+                <text x="934" y="108" class="svg-sub">writes: DB</text>
+                <text x="934" y="140" class="svg-sub">read-only JSON export</text>
+                <text x="934" y="160" class="svg-sub">for humans and agents,</text>
+                <text x="934" y="180" class="svg-sub">marked generated</text>
+
+                <path d="M200 132 H 226" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-migration-ink)"/>
+                <path d="M430 132 H 456" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-migration-ink)"/>
+                <path d="M660 132 H 686" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-migration-ink)"/>
+                <path d="M890 132 H 916" fill="none" stroke="#252525" stroke-width="2.6" marker-end="url(#fig-migration-ink)"/>
+
+                <text x="0" y="266" class="svg-lane">SOURCE OF TRUTH</text>
+                <rect x="0" y="278" width="660" height="30" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="14" y="298" class="svg-sub">files (.xo/*.json, ~/.quirq/state.json)</text>
+                <rect x="690" y="278" width="430" height="30" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="704" y="298" class="svg-sub">database (SQLite or PostgreSQL)</text>
+
+                <text x="0" y="342" class="svg-lane">ROLLBACK POINT</text>
+                <rect x="0" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="14" y="376" class="svg-sub">revert the commit;</text>
+                <text x="14" y="394" class="svg-sub">no data touched</text>
+                <rect x="230" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="244" y="376" class="svg-sub">flag off; drop the</text>
+                <text x="244" y="394" class="svg-sub">shadow tables</text>
+                <rect x="460" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="474" y="376" class="svg-sub">same as 2; fix the</text>
+                <text x="474" y="394" class="svg-sub">diff, rerun backfill</text>
+                <rect x="690" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="704" y="376" class="svg-sub">flag back to file</text>
+                <text x="704" y="394" class="svg-sub">reads; files current</text>
+                <rect x="920" y="354" width="200" height="50" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="934" y="376" class="svg-sub">regenerate files</text>
+                <text x="934" y="394" class="svg-sub">from DB; back to 4</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> — a plan, not something xo-space has
+              done. The only irreversible moment is phase 5, and even that has a way back,
+              because the database can always regenerate the files. The cut-over in phase 4 is
+              safe only after phase 3's diff has stayed at zero for long enough to cover every
+              writer.
+            </p>
+          </figure>
+
+          <h3>The migration, phase by phase</h3>
+
+          <p>
+            Figure 17 is the plan. During phase 2 the files still decide what
+            is true, so a bug in the new path costs a log line, not data. Phase 3 is where you
+            learn what the files actually contain. Expect old schema versions, missing keys,
+            and the occasional empty or truncated file that a power cut left behind a no-fsync writer. The
+            upgrade-on-read functions from §9 earn their place here.
+            <span class="recon">reconstruction</span> The phase 4 cut-over flips reads per
+            file kind, starting with the least-read (<code>stats.json</code>) and ending with
+            <code>todos.json</code>, whose two writers become two transactions with version
+            checks and no lock file.
+          </p>
+
+          <p>
+            Keep exporting JSON after phase 5 if anything outside the service reads it.
+            Agents read <code>.xo/</code>, and humans <code>cat</code> it. Write the export
+            from the database with the existing <code>write_json_atomic</code>, add the
+            directory fsync, mark the file as generated, and stop treating it as an input.
+            The files remain a view of the data, not its source.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h2 id="where-it-breaks"><span class="secnum">12</span>Where this advice stops</h2>
+
+          <p class="lede">
+            The stack in §10 assumes one primary, one region, and an access pattern that a
+            general engine serves well. Each of those assumptions has a breaking point. Past
+            it, you add a specialised system next to PostgreSQL rather than replace it.
+          </p>
+
+          <ul>
+            <li>
+              <strong>Low-latency writes in several regions at once.</strong> One primary means
+              one region takes every write, and every other region pays a round trip. If users
+              on two continents must both commit in milliseconds, look at YugabyteDB or TiDB
+              (both Apache 2.0), or at CRDT-based designs that merge concurrent edits. Either
+              way you take on clock, conflict, and operational complexity that §4 described.
+              <span class="recon">reconstruction</span>
+            </li>
+            <li>
+              <strong>Billions of events a day.</strong> At that rate the event table stops
+              being a side table and becomes the system. Make Kafka the log and ClickHouse the
+              store you query. Keep PostgreSQL for the metadata and the documents that people
+              edit. <span class="recon">reconstruction</span>
+            </li>
+            <li>
+              <strong>Deep graph traversal.</strong> Recursive CTEs and Apache AGE handle a few
+              hops. Queries that walk six or more hops over a large, dense graph belong in a
+              graph engine. <span class="recon">reconstruction</span>
+            </li>
+            <li>
+              <strong>Relevance-ranked full-text search.</strong> PostgreSQL's
+              <code>tsvector</code> finds matches, but tuned relevance, faceting, and typo
+              tolerance are a search engine's job. Run OpenSearch (Apache 2.0) beside the
+              record and feed it from the same outbox. Never write to it directly.
+              <span class="recon">reconstruction</span>
+            </li>
+            <li>
+              <strong>Vectors at hundreds of millions.</strong> pgvector (PostgreSQL licence)
+              is the right default below that, because embeddings stay in the same transaction
+              as the rows they describe. Above it, a dedicated engine such as Qdrant
+              (Apache 2.0) handles index build and memory better.
+              <span class="recon">reconstruction</span>
+            </li>
+          </ul>
+
+          <p>
+            The evidence has limits too. Every number in §8 comes from one 8-CPU machine, one
+            2,879-byte document, a single Python thread, and no concurrency. The ratios travel;
+            the microseconds do not. PostgreSQL was not run here. Its behaviour in this
+            post is cited from its documentation, not measured. <span class="recon">measured here</span>
+            And licences move. The ledger in §5 is correct as of 1 October 2026, and its MinIO
+            entry changed within the last year. Check the date before relying on it.
+          </p>
+
+          <div class="callout">
+            <span class="k">The decision rule</span>
+            <p>
+              If one process owns the data, use SQLite in WAL mode with Litestream. Otherwise
+              use PostgreSQL 18. In either, put each JSON path in a real column if you
+              filter, join, constrain, or update it often, and keep the rest in a small JSONB
+              body. Append history as rows, never inside the document. Put ephemeral state in
+              Valkey, large blobs in object storage behind a pointer row, and analytics in
+              ClickHouse or DuckDB fed from an outbox. Batch what can share an fsync. Choose
+              foundation-governed projects for anything you cannot swap in a week. Add
+              anything else only when a measured limit forces it, and name that limit when
+              you do. <span class="recon">reconstruction</span>
+            </p>
+          </div>
+
+          <h2 id="sources"><span class="secnum">13</span>Sources</h2>
+
+          <h3>PostgreSQL</h3>
+          <ul>
+            <li><a href="https://www.postgresql.org/about/news/postgresql-18-released-3142/">PostgreSQL 18 Released!</a> (25 September 2025): asynchronous I/O, <code>uuidv7()</code>, virtual generated columns as the default.</li>
+            <li><a href="https://www.postgresql.org/about/news/postgresql-19-beta-1-released-3313/">PostgreSQL 19 Beta 1 Released!</a> and <a href="https://www.postgresql.org/about/news/postgresql-19-beta-4-released-3386/">PostgreSQL 19 Beta 4 Released!</a> (24 September 2026): the 19 status and the features reverted before GA.</li>
+            <li>PostgreSQL 18 documentation: <a href="https://www.postgresql.org/docs/18/datatype-json.html">JSON types</a> (json vs jsonb, <code>jsonb_ops</code> vs <code>jsonb_path_ops</code>), <a href="https://www.postgresql.org/docs/18/functions-json.html">JSON functions and operators</a> (<code>||</code>, <code>jsonb_set</code>, jsonpath, SQL/JSON), <a href="https://www.postgresql.org/docs/18/gin.html">GIN indexes</a>, <a href="https://www.postgresql.org/docs/18/storage-toast.html">TOAST</a>, <a href="https://www.postgresql.org/docs/18/wal-async-commit.html">asynchronous commit</a> (<code>synchronous_commit</code> and its loss window), <a href="https://www.postgresql.org/docs/18/functions-uuid.html">UUID functions</a>, <a href="https://www.postgresql.org/docs/18/ddl-generated-columns.html">generated columns</a>, <a href="https://www.postgresql.org/docs/18/ddl-partitioning.html">table partitioning</a>.</li>
+          </ul>
+
+          <h3>SQLite</h3>
+          <ul>
+            <li><a href="https://sqlite.org/json1.html">JSON functions</a> and <a href="https://sqlite.org/jsonb.html">the JSONB format</a> (3.45+): <code>jsonb()</code>, <code>jsonb_set</code>, <code>-&gt;</code>/<code>-&gt;&gt;</code>, <code>json_valid</code> flags.</li>
+            <li><a href="https://sqlite.org/wal.html">Write-ahead logging</a> and <a href="https://sqlite.org/pragma.html#pragma_synchronous">PRAGMA synchronous</a>: what <code>NORMAL</code> does and does not survive in WAL mode.</li>
+            <li><a href="https://sqlite.org/stricttables.html">STRICT tables</a>, <a href="https://sqlite.org/gencol.html">generated columns</a>, <a href="https://sqlite.org/lang_transaction.html">transactions</a> (<code>BEGIN IMMEDIATE</code>).</li>
+          </ul>
+
+          <h3>Other engines and licences</h3>
+          <ul>
+            <li><a href="https://clickhouse.com/blog/clickhouse-release-25-03">ClickHouse 25.3 release</a> and <a href="https://clickhouse.com/docs/sql-reference/data-types/object-data-type">JSON data type</a>: production-ready JSON with per-path subcolumns.</li>
+            <li><a href="https://blog.ferretdb.io/ferretdb-releases-v2-faster-more-compatible-mongodb-alternative/">FerretDB 2.0</a> and <a href="https://opensource.microsoft.com/blog/2025/08/25/documentdb-joins-the-linux-foundation/">DocumentDB joins the Linux Foundation</a> (25 August 2025).</li>
+            <li><a href="https://redis.io/blog/agplv3/">Redis is now available under the AGPLv3 open source license</a> (Redis 8, May 2025).</li>
+            <li><a href="https://www.linuxfoundation.org/press/valkey-9.0-delivers-performance-and-resiliency-for-real-time-workloads">Valkey 9.0 GA</a> (21 October 2025) and <a href="https://valkey.io/topics/valkey-bundle/">valkey-bundle</a> (the JSON module).</li>
+            <li><a href="https://www.scylladb.com/2024/12/18/why-were-moving-to-a-source-available-license/">ScyllaDB: why we're moving to a source-available license</a> (18 December 2024).</li>
+            <li><a href="https://www.infoq.com/news/2024/09/cockroachdb-license-concerns/">CockroachDB ends its free Core edition</a> (InfoQ, September 2024).</li>
+            <li><a href="https://www.elastic.co/blog/elasticsearch-is-open-source-again">Elasticsearch is open source, again</a> (AGPL option, 29 August 2024).</li>
+            <li><a href="https://infoq.com/news/2025/12/minio-s3-api-alternatives/">MinIO community edition in maintenance mode, and S3 alternatives</a> (InfoQ, December 2025).</li>
+            <li><a href="https://www.theregister.com/2025/05/02/cncf_synadia_nats/">CNCF and Synadia settle; NATS stays Apache 2.0</a> (The Register, 2 May 2025).</li>
+            <li><a href="https://www.confluent.io/blog/latest-apache-kafka-release/">Apache Kafka 4.0</a>: ZooKeeper removed, KRaft only.</li>
+          </ul>
+
+          <h3>Components in the stack</h3>
+          <ul>
+            <li><a href="https://github.com/benbjohnson/litestream">Litestream</a> (Apache 2.0): SQLite WAL replication to S3-compatible storage.</li>
+            <li><a href="https://pgbackrest.org/">pgBackRest</a> (MIT) and <a href="https://www.pgbouncer.org/">PgBouncer</a> (ISC): backups with PITR and connection pooling, including <code>max_prepared_statements</code>.</li>
+            <li><a href="https://debezium.io/blog/2024/11/04/debezium-moving-to-commonhaus/">Debezium moving to the Commonhaus Foundation</a> (Apache 2.0, CDC).</li>
+            <li><a href="https://github.com/seaweedfs/seaweedfs">SeaweedFS</a> (Apache 2.0) and <a href="https://garagehq.deuxfleurs.fr/">Garage</a> (AGPLv3): self-hosted S3-compatible object storage.</li>
+            <li><a href="https://duckdb.org/">DuckDB</a> (MIT): in-process analytics over Parquet and NDJSON.</li>
+            <li><a href="https://github.com/supabase/pg_jsonschema">pg_jsonschema</a> (Apache 2.0) and <a href="https://github.com/PostgREST/postgrest">PostgREST</a> (MIT).</li>
+            <li><a href="https://www.psycopg.org/psycopg3/docs/advanced/prepare.html">psycopg 3: prepared statements</a> (<code>prepare_threshold</code>), <a href="https://github.com/ijl/orjson">orjson</a>, <a href="https://github.com/msgspec/msgspec">msgspec</a>.</li>
+          </ul>
+
+          <h3>xo-space files read (read-only)</h3>
+          <ul>
+            <li><code>services/cowork_agent/xo_cowork_state.py</code>: <code>_atomic_write</code>, lines 54–68.</li>
+            <li><code>services/xo_manifest.py</code>: <code>_write_atomic</code>, lines 134–141, and the <code>asyncio.Lock</code> at line 75.</li>
+            <li><code>services/cowork_agent/scopes.py</code>: the closed file set, lines 82–89, and the flock note at line 168.</li>
+            <li><code>services/cowork_agent/visualizer/flock.py</code>: <code>_DEADLINE_S</code> at line 44 and the bounded wait, lines 88–101.</li>
+            <li><code>services/cowork_agent/visualizer/atomic_write.py</code>: <code>write_json_atomic</code> (lines 22–38) and <code>append_jsonl</code> (fsync at line 58).</li>
+            <li><code>services/cowork_agent/visualizer/todos_store.py</code>: the <code>"schema": 1</code> stamp, line 144.</li>
+          </ul>
+
+          <p class="footnote">
+            <strong>Provenance.</strong> Engine behaviour, release dates, and licence terms are
+            taken from the project documentation, release notes, and coverage listed above,
+            and are stated as of 1 October 2026. Licences and governance change, so check them
+            again before you rely on them. The xo-space excerpts are quoted verbatim from its
+            tree with line numbers, and the tree was not modified. Every number marked
+            <em>measured here</em> comes from <code>_compute.py</code> on one 8-CPU Linux
+            machine, Python 3.14.4 and SQLite 3.46.1: one 2,879-byte document, 1,500 updates
+            per method, one thread, no concurrent writers, on a cloud block device whose fsync
+            latency sets most of the results. The SQLite DDL and the <code>SqliteStore</code>
+            code in §9 and §11 were run on that SQLite version. PostgreSQL was not installed or
+            run here. Its DDL, the psycopg 3 code, and all PostgreSQL performance behaviour
+            follow the documentation and have not been executed, so they need a test against a
+            real PostgreSQL 18 before use. The recommendations, the stack, the tier boundaries,
+            the migration plan, and the decision rule are judgement, marked
+            <em>reconstruction</em>. They are not claims about what any named project or
+            company does.
+          </p>
+        </section>
+      </article>

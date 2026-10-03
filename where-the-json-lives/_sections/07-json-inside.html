@@ -1,0 +1,235 @@
+          <h2 id="json-inside"><span class="secnum">{{S}}</span>What a database does with JSON</h2>
+
+          <p class="lede">
+            Every database that accepts JSON turns it into something else on disk. What it
+            turns it into decides three things: what a query can find without reading the
+            whole value, what an index can cover, and how many bytes one changed field costs.
+            The last of these surprises people most. No mainstream engine edits a stored
+            document in place.
+          </p>
+
+          <h3>Text or binary</h3>
+
+          <p>
+            PostgreSQL has two JSON types. <code>json</code> stores an exact copy of the input
+            text, including whitespace, key order and duplicate keys, and must reparse it on
+            every function call. <code>jsonb</code> stores a decomposed binary form. It does
+            not keep whitespace or key order, and for a duplicate key only the last value
+            survives. The manual describes it as "slightly slower to input due to added
+            conversion overhead, but significantly faster to process, since no reparsing is
+            needed." <span class="src">from the docs</span> Use <code>jsonb</code> unless you
+            must reproduce the input byte for byte, as with a signed webhook payload.
+          </p>
+
+          <h3>There is no partial update</h3>
+
+          <p>
+            <code>jsonb_set(body, '{usage,input_tokens}', '42')</code> looks like a field edit.
+            It is a function that returns a new <code>jsonb</code> value. The <code>UPDATE</code>
+            then writes that value into a new row version, because PostgreSQL's MVCC never
+            overwrites a row in place. Large values make this expensive. TOAST is triggered
+            "when a row value to be stored in a table is wider than TOAST_TUPLE_THRESHOLD bytes
+            (normally 2 kB)". <span class="src">from the docs</span> Wide fields are first
+            compressed with <code>pglz</code> or <code>lz4</code>, whichever
+            <code>default_toast_compression</code> or the column says. If the row is still too
+            wide, they are moved out of line into chunk rows of about 2 kB in a side table. An
+            <code>UPDATE</code> that leaves a TOASTed column alone pays no TOAST cost.
+            <span class="src">from the docs</span> An update to the document itself
+            <em>is</em> a change to that column, so the whole value is recompressed and
+            rewritten (Figure {{fig-jsonb-update}}).
+          </p>
+
+          <figure class="figure wide" id="fig-jsonb-update">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What one changed integer costs in a 40 KB PostgreSQL <code>jsonb</code> document</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 430" role="img" aria-label="Five steps for an UPDATE that calls jsonb_set to change one integer in a 40 kilobyte jsonb document. One: the whole value is detoasted, decompressed and rebuilt as a new 40 kilobyte value. Two: MVCC writes a new tuple version and marks the old one dead; this is a HOT update only if no indexed column changes and the page has room. Three: because the row exceeds the 2 kilobyte TOAST threshold, the new value is compressed with pglz or lz4 and stored out of line in new chunks of about 2 kilobytes. Four: WAL records cover the heap tuple, every new TOAST chunk and any index entries, with full-page images on the first touch of a page after a checkpoint. Five: the old tuple and old chunks remain until vacuum reclaims them. Below, the alternative: promote the hot counter to its own bigint column, so one update writes one narrow tuple and can be HOT.">
+                <defs>
+                  <marker id="fig-jsonb-update-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">UPDATE sessions SET body = jsonb_set(body, '{usage,input_tokens}', '42') WHERE id = $1</text>
+
+                <rect x="0" y="36" width="206" height="176" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="12" y="60" class="svg-num">1</text>
+                <text x="28" y="60" class="svg-step">Rebuild the value</text>
+                <text x="12" y="88" class="svg-sub">fetch all TOAST chunks</text>
+                <text x="12" y="110" class="svg-sub">decompress 40 KB</text>
+                <text x="12" y="132" class="svg-sub">set one integer</text>
+                <text x="12" y="154" class="svg-sub">emit a new 40 KB jsonb</text>
+                <text x="12" y="192" class="svg-note">8 bytes of meaning</text>
+
+                <rect x="228" y="36" width="206" height="176" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="240" y="60" class="svg-num">2</text>
+                <text x="256" y="60" class="svg-step">New tuple version</text>
+                <text x="240" y="88" class="svg-sub">MVCC: never in place</text>
+                <text x="240" y="110" class="svg-sub">old tuple gets xmax</text>
+                <text x="240" y="132" class="svg-sub">HOT only if no indexed</text>
+                <text x="240" y="154" class="svg-sub">column changed and</text>
+                <text x="240" y="176" class="svg-sub">the page has room</text>
+
+                <rect x="456" y="36" width="206" height="176" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="468" y="60" class="svg-num">3</text>
+                <text x="484" y="60" class="svg-step">TOAST</text>
+                <text x="468" y="88" class="svg-sub">row &gt; 2 kB threshold</text>
+                <text x="468" y="110" class="svg-sub">compress: pglz or lz4</text>
+                <text x="468" y="132" class="svg-sub">still wide: out of line</text>
+                <text x="468" y="154" class="svg-sub">~2 kB chunks, all new</text>
+                <text x="468" y="192" class="svg-note">≤ 20 chunks uncompressed</text>
+
+                <rect x="684" y="36" width="206" height="176" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="696" y="60" class="svg-num">4</text>
+                <text x="712" y="60" class="svg-step">WAL</text>
+                <text x="696" y="88" class="svg-sub">heap tuple record</text>
+                <text x="696" y="110" class="svg-sub">+ every new chunk</text>
+                <text x="696" y="132" class="svg-sub">+ index entries</text>
+                <text x="696" y="154" class="svg-sub">full-page image on the</text>
+                <text x="696" y="176" class="svg-sub">first touch after ckpt</text>
+
+                <rect x="912" y="36" width="208" height="176" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="924" y="60" class="svg-num">5</text>
+                <text x="940" y="60" class="svg-step">Dead versions</text>
+                <text x="924" y="88" class="svg-sub">old tuple and old</text>
+                <text x="924" y="110" class="svg-sub">chunks stay on disk</text>
+                <text x="924" y="132" class="svg-sub">until autovacuum</text>
+                <text x="924" y="154" class="svg-sub">long transactions</text>
+                <text x="924" y="176" class="svg-sub">delay reclaim</text>
+
+                <g stroke="#252525" stroke-width="2.4" fill="none" marker-end="url(#fig-jsonb-update-arr)">
+                  <path d="M206 124 L226 124"/>
+                  <path d="M434 124 L454 124"/>
+                  <path d="M662 124 L682 124"/>
+                  <path d="M890 124 L910 124"/>
+                </g>
+
+                <text x="0" y="250" class="svg-lane">WHAT ONE EDIT WRITES · SCHEMATIC, NOT TO SCALE</text>
+                <rect x="0" y="262" width="60" height="22" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="72" y="278" class="svg-sub">the change: one bigint</text>
+                <rect x="0" y="294" width="840" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="852" y="310" class="svg-sub">compressed 40 KB value</text>
+                <rect x="0" y="326" width="960" height="22" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="972" y="342" class="svg-sub">+ WAL for it</text>
+
+                <rect x="0" y="366" width="1120" height="58" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="16" y="388" class="svg-lane">THE ALTERNATIVE · PROMOTE THE HOT FIELD</text>
+                <text x="16" y="410" class="svg-sub">UPDATE sessions SET input_tokens = input_tokens + 1: one narrow tuple, TOAST untouched, HOT if the column is not indexed</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="src">from the docs</span> The 2 kB threshold, the HOT conditions and
+              the rule that unchanged TOAST values are not rewritten come from the PostgreSQL
+              manual's Database Physical Storage chapter (the TOAST and Heap-Only Tuples sections). <span class="recon">reconstruction</span>
+              The 40 KB document and the chunk count (40 KB ÷ ~2 kB) are illustrative. The
+              practical point is that bytes written scale with document size, not with the
+              size of the edit.
+            </p>
+          </figure>
+
+          <p>
+            So incrementing one counter in a 1 MB document rewrites the compressed size of
+            that megabyte, plus the WAL to describe it, plus a dead copy for vacuum to clean
+            up. <span class="recon">reconstruction</span> The manual says the same thing about
+            locking: "any update acquires a row-level lock on the whole row. Consider limiting
+            JSON documents to a manageable size". <span class="src">from the docs</span>
+          </p>
+
+          <h3>Indexing a document</h3>
+
+          <p>
+            PostgreSQL offers three tools, from widest to narrowest. A GIN index with the
+            default <code>jsonb_ops</code> class indexes every key and value. It serves
+            <code>?</code>, <code>?|</code>, <code>?&amp;</code>, <code>@&gt;</code>,
+            <code>@?</code> and <code>@@</code>. A GIN index with <code>jsonb_path_ops</code>
+            serves only <code>@&gt;</code>, <code>@?</code> and <code>@@</code>, but "is
+            usually much smaller … and the specificity of searches is better".
+            <span class="src">from the docs</span> For a path you already know you will filter
+            on, a B-tree expression index is smaller still and supports ranges and sorting.
+            Alternatively, promote the path to a generated column. PostgreSQL 18 makes
+            generated columns <code>VIRTUAL</code> by default, and virtual columns cannot be
+            indexed, so declare it <code>STORED</code>. <span class="src">from the docs</span>
+          </p>
+
+          <pre><code>CREATE INDEX sessions_body_gin  ON sessions USING gin (body jsonb_path_ops);
+CREATE INDEX sessions_status    ON sessions ((body-&gt;&gt;'status'));
+ALTER TABLE sessions ADD COLUMN owner text
+  GENERATED ALWAYS AS (body-&gt;&gt;'owner') STORED;
+
+-- PostgreSQL 17+: SQL/JSON, including JSON_TABLE
+SELECT t.* FROM sessions s,
+  JSON_TABLE(s.body, '$.todos[*]'
+    COLUMNS (id int PATH '$.id', done boolean PATH '$.done')) AS t
+WHERE NOT t.done;</code></pre>
+
+          <p>
+            On the query side, jsonpath arrived in PostgreSQL 12. PostgreSQL 17 added the
+            SQL-standard <code>JSON_TABLE</code>, <code>JSON_EXISTS</code>,
+            <code>JSON_QUERY</code> and <code>JSON_VALUE</code>. <code>JSON_TABLE</code>
+            "presents the results as a relational view, which can be accessed as a regular SQL
+            table". <span class="src">from the docs</span>
+          </p>
+
+          <h3>The other engines</h3>
+
+          <p>
+            SQLite has built-in JSON functions and the <code>-&gt;</code> /
+            <code>-&gt;&gt;</code> operators. Since 3.45.0 (January 2024) it also has JSONB, a
+            binary encoding stored in a <code>BLOB</code> that the <code>jsonb_*</code>
+            functions read without reparsing. Expression indexes and generated columns work
+            the same way as in PostgreSQL. <span class="src">from the docs</span> MongoDB stores
+            BSON, a typed binary format with length prefixes, and caps a document at 16 MiB.
+            FerretDB 2 stores BSON inside PostgreSQL through the DocumentDB extension.
+            ClickHouse's <code>JSON</code> type, production-ready since 25.3, infers a type for
+            every path and stores each path as its own subcolumn. Analytics over JSON events
+            then reads only the columns a query names.
+            <span class="src">from the docs</span>
+          </p>
+
+          <figure class="figure" id="fig-formats">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Five on-disk representations of the same JSON</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row">
+                  <div class="stack-cell head">Text JSON</div>
+                  <div class="stack-cell hl-red">The bytes as sent: PostgreSQL <code>json</code>, SQLite <code>TEXT</code>, a <code>.json</code> file. Every read reparses the whole value, and no index can see inside it without an expression.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">PostgreSQL jsonb</div>
+                  <div class="stack-cell hl-blue">Decomposed binary. Keys are deduplicated and stored in an internal order, and there is no whitespace. Values are TOASTed above about 2 kB. GIN, B-tree expression and generated-column indexes all work. Any edit rewrites the whole value.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">SQLite JSONB</div>
+                  <div class="stack-cell hl-blue">A binary encoding of the JSON tree, stored as a <code>BLOB</code> (3.45.0+). It skips reparsing but is internal to SQLite, not an interchange format. Expression indexes work. An edit rewrites the row.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">BSON</div>
+                  <div class="stack-cell hl-purple">MongoDB, and FerretDB on DocumentDB. Typed (dates, int64, decimal128), length-prefixed and traversable. 16 MiB per document. Indexes are per path.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">ClickHouse JSON</div>
+                  <div class="stack-cell hl-green">Each path is a typed subcolumn (25.3+). The format is columnar and compressed per path, and built for append and scan. Changing a stored row is a heavyweight operation, not the hot path.</div>
+                </div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              Red means parsed on every read. Blue is a row-store binary that can be queried by
+              path. Purple is a document-store binary. Green is columnar.
+              <span class="src">from the docs</span> The point is the one-way trade: the more a
+              format is built for querying paths, the less it suits growing one document
+              forever.
+            </p>
+          </figure>
+
+          <h3>The rule</h3>
+
+          <p>
+            Keep documents small and stable in shape. Anything that grows without bound,
+            such as messages, log lines, tool calls or usage ticks, belongs in rows, one per
+            event, keyed to the document. Then each new event is an <code>INSERT</code> of a
+            few hundred bytes, not a rewrite of everything that came before.
+            <span class="recon">reconstruction</span> The <a href="#measured">next section</a>
+            measures what that difference costs.
+          </p>
