@@ -1,0 +1,293 @@
+          <h2 id="yaml-security"><span class="secnum">{{S}}</span>When loading means executing</h2>
+
+          <p class="lede">
+            A YAML tag can name a type, and a loader that honours every name builds whatever the
+            file asks for. That produced a run of code-execution CVEs, published from 2018 to 2022
+            and each fixed by making the default loader refuse more tags. Safe does not mean
+            bounded. Aliases and merge keys let a few hundred bytes describe hundreds of millions
+            of values.
+          </p>
+
+          <h3>A tag names a constructor</h3>
+
+          <p>
+            YAML 1.2.2 says processors for a language "typically provide some form of local tags
+            that map directly to the language’s native data structures" (§10.4).
+            <span class="src">from the spec</span>
+            PyYAML's <code>!!python/</code> tags play that role. NVD on CVE-2017-18342: "In PyYAML
+            before 5.1, the yaml.load() API could execute arbitrary code if used with untrusted
+            data." The maintainers wrote that <code>load</code> "has been unsafe since the first
+            release in May 2006". <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            The repair ran from 5.1 to 6.0 (Figure {{fig-cve-ledger}}). PyYAML 5.1 (13 March 2019)
+            made a bare <code>yaml.load</code> warn and fall back to a new <code>FullLoader</code>.
+            FullLoader was bypassed three times. Version 5.4 "moves arbitrary python tags to
+            UnsafeLoader", and 6.0 (13 October 2021) made the <code>Loader</code> argument
+            mandatory.
+            <span class="src">from the docs</span> In the research probes, a bare
+            <code>yaml.load</code> raises <code>TypeError</code> in 6.0.3. FullLoader still turns
+            <code>!!python/name:os.getcwd</code> into the function object: a reference, not a
+            call. <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            Others broke their APIs too. SnakeYAML 2.0 (26 February 2023) stopped allowing global
+            tags by default, to fix CVE-2022-1471. Psych PR #487, released in 4.0.0 on
+            13 May 2021, "changes the default <code>Psych.load</code> to use
+            <code>safe_load</code>", and Ruby 3.1 shipped it. js-yaml 4.0 moved
+            <code>!!js/function</code> and its other JavaScript tags to a separate package.
+            <span class="src">from the docs</span> RFC 9512 states the rule:
+            "Code execution in deserializers should be disabled by default and only be enabled
+            explicitly." (§4.1) <span class="src">from the spec</span> SnakeYAML's README tells
+            config users: "When you use SnakeYAML to configure your application you are totally
+            safe." <span class="src">from the docs</span> That holds only while nobody untrusted
+            writes the file, and agents now write config too (<a href="#write-back">When the
+            program writes back</a>). <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure wide" id="fig-cve-ledger">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Loader CVEs, 2018–2026: safe loaders stopped every constructor payload and no expansion payload</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead>
+                  <tr><th>CVE</th><th>Library</th><th>Published</th><th>What the payload did</th><th>CVSS 3.1</th><th>Fixed in</th><th>Safe loader hit?</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>CVE-2017-18342</td><td>PyYAML</td><td>2018</td><td><code>yaml.load()</code> ran code via python tags</td><td>9.8 NVD</td><td>5.1 warns; 6.0 requires <code>Loader</code></td><td class="hl-green" style="background: var(--green-soft)">no</td></tr>
+                  <tr><td>CVE-2019-20477</td><td>PyYAML FullLoader</td><td>2020</td><td>class deserialisation, e.g. <code>Popen</code></td><td>9.8 NVD</td><td>5.2</td><td class="hl-green" style="background: var(--green-soft)">no</td></tr>
+                  <tr><td>CVE-2020-1747</td><td>PyYAML FullLoader</td><td>2020</td><td>code execution via <code>python/object/new</code></td><td>9.8 NVD</td><td>5.3.1</td><td class="hl-green" style="background: var(--green-soft)">no</td></tr>
+                  <tr><td>CVE-2020-14343</td><td>PyYAML FullLoader</td><td>2021</td><td>bypass of the CVE-2020-1747 fix</td><td>9.8 NVD</td><td>5.4</td><td class="hl-green" style="background: var(--green-soft)">no</td></tr>
+                  <tr><td>CVE-2022-1471</td><td>SnakeYAML</td><td>2022</td><td><code>Constructor()</code> built any type</td><td>9.8 NVD; 8.3 CNA</td><td>2.0, global tags off</td><td class="hl-green" style="background: var(--green-soft)">no (SafeConstructor)</td></tr>
+                  <tr><td>CVE-2017-18640</td><td>SnakeYAML</td><td>2019</td><td>alias expansion during load</td><td>7.5 NVD</td><td>1.26</td><td class="hl-red" style="background: var(--red-soft)">yes</td></tr>
+                  <tr><td>CVE-2019-11253</td><td>Kubernetes API server</td><td>2019</td><td>9<sup>9</sup> alias bomb, "YAML or JSON"</td><td>7.5 NVD</td><td>1.13.12, 1.14.8, 1.15.5, 1.16.2</td><td class="hl-red" style="background: var(--red-soft)">yes</td></tr>
+                  <tr><td>CVE-2019-11254</td><td>go-yaml v2 in kube-apiserver</td><td>2020</td><td>unbounded aliasing, CPU</td><td>6.5 NVD</td><td>go-yaml v2.2.8</td><td class="hl-red" style="background: var(--red-soft)">yes</td></tr>
+                  <tr><td>CVE-2025-64718</td><td>js-yaml</td><td>2025</td><td>prototype pollution through <code>&lt;&lt;</code></td><td>5.3 GitHub</td><td>4.1.1, 3.14.2</td><td class="hl-red" style="background: var(--red-soft)">yes</td></tr>
+                  <tr><td>CVE-2026-53550</td><td>js-yaml</td><td>2026</td><td>quadratic CPU in merge keys</td><td>5.3 GitHub</td><td>4.2.0, 3.15.0</td><td class="hl-red" style="background: var(--red-soft)">yes</td></tr>
+                  <tr><td>none (issue #897)</td><td>PyYAML</td><td>2025 (issue)</td><td>exponential time on nested merge keys</td><td>none</td><td><code>main</code>, 17 June 2026; no release</td><td class="hl-red" style="background: var(--red-soft)">yes: it is <code>safe_load</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> Every constructor CVE was closed by
+              refusing tags; no alias or merge row was, because a safe loader expands aliases and
+              merge keys itself.
+              <span class="src">from the docs</span> Descriptions and fixes come from NVD, the GitHub
+              Advisory Database and project changelogs. CVSS 3.1 comes from NVD's API, fetched
+              9 October 2026, with NVD's own score where it has one. Published is NVD's year.
+              Green: the library's safe loader was unaffected. Red: the safe loader was hit too;
+              on these rows that column is <span class="recon">reconstruction</span>, inferred
+              from the loader doing the expansion.
+            </p>
+          </figure>
+
+          <h3>One harmless payload, fourteen readers</h3>
+
+          <p>
+            The harness sends <code>_cases/yaml/python_tag.yaml</code>, one 45-byte line that
+            calls <code>str</code>:
+          </p>
+
+          <pre><code>x: !!python/object/apply:builtins.str ["hi"]</code></pre>
+
+          <p>
+            PyYAML's <code>unsafe_load</code> calls it and returns <code>{"x": "hi"}</code>.
+            <code>safe_load</code>, the C loader, <code>full_load</code>, ruamel safe and both
+            js-yaml versions raise errors. The other seven return <code>["hi"]</code>: yaml.v3,
+            sigs.k8s.io/yaml, goccy, serde_yaml, serde-saphyr, eemeli's <code>yaml</code> (with a
+            warning) and ruamel's round-trip loader. <span class="recon">measured here</span>
+            Nothing runs, but a value meant to be a string arrives as a list.
+            <span class="recon">reconstruction</span> <code>!!js/function</code> fails in both js-yaml versions; Go and Rust return its body
+            as a string. <span class="recon">measured here</span>
+          </p>
+
+          <h3>Safe is not bounded</h3>
+
+          <p>
+            The CVE-2019-11253 payload was a Kubernetes ConfigMap of nine anchored lists. List
+            <code>a</code> holds nine strings, and lists <code>b</code> to <code>i</code> each hold
+            nine aliases to the list before, so <code>i</code> names 9<sup>9</sup> = 387,420,489
+            strings. NVD says it let authorised users "send malicious YAML or JSON payloads". The
+            reporter saw the CPU cost client-side, in kubectl. PR #83261 (merged 3 October 2019)
+            limited decode size, and normal API request bodies "are now limited to 3MB".
+            <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            The harness sends that payload (<code>y_bomb9</code>, 446 bytes). Seven loaders accept it
+            in milliseconds and return shared references: 12 containers that a full walk would
+            expand to 435,848,053 leaves (the harness counts them without walking). That is
+            9 + 9<sup>2</sup> + … + 9<sup>9</sup> = 435,848,049 strings, plus the four strings
+            outside <code>data</code>. Five loaders refuse it
+            (Figure {{fig-alias-bomb}}). A six-level cut (<code>y_bomb6</code>, 335 bytes) loads in
+            the same seven, and Python's <code>json.dumps</code> of the result is 4,334,696 bytes,
+            12,939 times the input. <span class="recon">measured here</span> js-yaml's safety guide says
+            the graph "stays cheap until you fully walk it", yet js-yaml 5's
+            <code>maxAliases</code> defaults to −1, unlimited. <span class="src">from the docs</span>
+          </p>
+
+          <figure class="figure wide" id="fig-alias-bomb">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Nine levels in 446 bytes: who refuses the Kubernetes alias bomb, and where</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 604" role="img" aria-label="Bar chart on a logarithmic axis showing how many strings each level of the 446-byte CVE-2019-11253 alias bomb names: level a 9, b 81, c 729, d 6,561, e 59,049, f 531,441, g 4,782,969, h 43,046,721, i 387,420,489. The whole document expands to 435,848,053 leaves. Green callouts mark where loaders refuse it: eemeli's yaml 2.9.1 (maxAliasCount 100), yaml.v3 and sigs.k8s.io/yaml (alias-ratio check) on level d; serde-saphyr (max_nodes 250,000) and serde_yaml (alias jumps above 100 times the event count) on level f. An orange panel lists the loaders that return shared references in under 10 milliseconds each: PyYAML 6.0.3 pure and C, ruamel 0.19.1 safe and round-trip, js-yaml 4.3.2 and 5.4.3, goccy/go-yaml v1.19.2. A red panel shows the six-level, 335-byte version serialised: 4,334,696 bytes from Python json.dumps, 12,939 times the input, and 3,736,811 bytes from JavaScript and Go.">
+                <defs>
+                  <marker id="fig-alias-bomb-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">STRINGS EACH LEVEL NAMES · LOG SCALE · CVE-2019-11253 PAYLOAD, 446 BYTES</text>
+
+                <rect x="0" y="38" width="14" height="14" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="50" class="svg-sub">strings named at that level</text>
+                <rect x="250" y="38" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="272" y="50" class="svg-sub">loaders refuse there (their limit)</text>
+                <rect x="560" y="38" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="582" y="50" class="svg-sub">return shared references</text>
+                <rect x="800" y="38" width="14" height="14" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="822" y="50" class="svg-sub">bytes once serialised</text>
+
+                <rect x="96" y="62" width="250" height="78" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="108" y="86" class="svg-step">Refused on level d</text>
+                <text x="108" y="108" class="svg-sub">yaml 2.9.1 · maxAliasCount 100</text>
+                <text x="108" y="128" class="svg-sub">yaml.v3, sigs · alias ratio</text>
+                <line x1="320" y1="140" x2="320" y2="334" stroke="#367f59" stroke-width="2"/>
+
+                <rect x="372" y="62" width="290" height="78" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="384" y="86" class="svg-step">Refused on level f</text>
+                <text x="384" y="108" class="svg-sub">serde-saphyr · max_nodes 250,000</text>
+                <text x="384" y="128" class="svg-sub">serde_yaml · jumps &gt; 100 × events</text>
+                <line x1="448" y1="140" x2="448" y2="278" stroke="#367f59" stroke-width="2"/>
+
+                <line x1="96" y1="200" x2="96" y2="470" stroke="#b8b8b1"/>
+                <line x1="90" y1="200" x2="96" y2="200" stroke="#b8b8b1"/>
+                <line x1="90" y1="290" x2="96" y2="290" stroke="#b8b8b1"/>
+                <line x1="90" y1="380" x2="96" y2="380" stroke="#b8b8b1"/>
+                <line x1="96" y1="470" x2="668" y2="470" stroke="#b8b8b1"/>
+                <text x="84" y="204" class="svg-sub" text-anchor="end">10⁹</text>
+                <text x="84" y="294" class="svg-sub" text-anchor="end">10⁶</text>
+                <text x="84" y="384" class="svg-sub" text-anchor="end">10³</text>
+                <text x="84" y="474" class="svg-sub" text-anchor="end">1</text>
+
+                <rect x="104" y="441.4" width="48" height="28.6" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="168" y="412.7" width="48" height="57.3" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="232" y="384.1" width="48" height="85.9" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="296" y="355.5" width="48" height="114.5" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="360" y="326.9" width="48" height="143.1" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="424" y="298.2" width="48" height="171.8" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="488" y="269.6" width="48" height="200.4" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="552" y="241.0" width="48" height="229.0" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="616" y="212.4" width="48" height="257.6" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+
+                <text x="128" y="433" class="svg-sub" text-anchor="middle">9</text>
+                <text x="192" y="405" class="svg-sub" text-anchor="middle">81</text>
+                <text x="256" y="376" class="svg-sub" text-anchor="middle">729</text>
+                <text x="320" y="347" class="svg-sub" text-anchor="middle">6,561</text>
+                <text x="384" y="319" class="svg-sub" text-anchor="middle">59,049</text>
+                <text x="448" y="290" class="svg-sub" text-anchor="middle">531,441</text>
+                <text x="512" y="262" class="svg-sub" text-anchor="middle">4.78 M</text>
+                <text x="576" y="233" class="svg-sub" text-anchor="middle">43.0 M</text>
+                <text x="640" y="204" class="svg-sub" text-anchor="middle">387.4 M</text>
+
+                <text x="88" y="492" class="svg-sub" text-anchor="end">level</text>
+                <text x="128" y="492" class="svg-sub" text-anchor="middle">a</text>
+                <text x="192" y="492" class="svg-sub" text-anchor="middle">b</text>
+                <text x="256" y="492" class="svg-sub" text-anchor="middle">c</text>
+                <text x="320" y="492" class="svg-sub" text-anchor="middle">d</text>
+                <text x="384" y="492" class="svg-sub" text-anchor="middle">e</text>
+                <text x="448" y="492" class="svg-sub" text-anchor="middle">f</text>
+                <text x="512" y="492" class="svg-sub" text-anchor="middle">g</text>
+                <text x="576" y="492" class="svg-sub" text-anchor="middle">h</text>
+                <text x="640" y="492" class="svg-sub" text-anchor="middle">i</text>
+
+                <path d="M104 500 L104 508 L472 508 L472 500" fill="none" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="104" y="526" class="svg-sub">y_bomb6 · levels a–f · 335 B · 597,874 leaves</text>
+                <path d="M104 538 L104 546 L664 546 L664 538" fill="none" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="104" y="564" class="svg-sub">y_bomb9 · levels a–i · 446 B · 435,848,053 leaves</text>
+                <text x="104" y="592" class="svg-note">Each level after a is one 37-byte line of nine aliases to the level before, so each adds a factor of 9.</text>
+
+                <rect x="720" y="62" width="400" height="232" rx="8" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="736" y="88" class="svg-step">Loaded as shared references</text>
+                <text x="736" y="114" class="svg-sub">PyYAML 6.0.3 · pure and C</text>
+                <text x="736" y="134" class="svg-sub">ruamel 0.19.1 · safe and rt</text>
+                <text x="736" y="154" class="svg-sub">js-yaml 4.3.2 and 5.4.3</text>
+                <text x="736" y="174" class="svg-sub">goccy/go-yaml v1.19.2</text>
+                <text x="736" y="204" class="svg-note">Under 10 ms each in the final run;</text>
+                <text x="736" y="226" class="svg-note">a graph of 12 containers that a walk</text>
+                <text x="736" y="248" class="svg-note">expands to 435,848,053 leaves.</text>
+                <text x="736" y="274" class="svg-note">No limit fires; the cost moves on.</text>
+
+                <line x1="920" y1="296" x2="920" y2="318" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-alias-bomb-arr)"/>
+
+                <rect x="720" y="322" width="400" height="150" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="736" y="348" class="svg-step">Then serialised (y_bomb6)</text>
+                <text x="736" y="374" class="svg-sub">335 B of YAML in</text>
+                <text x="736" y="394" class="svg-sub">4,334,696 B out · Python json.dumps</text>
+                <text x="736" y="414" class="svg-sub">3,736,811 B out · JS and Go</text>
+                <text x="736" y="442" class="svg-note">Python: 12,939× the input at six levels;</text>
+                <text x="736" y="462" class="svg-note">nine levels would be about 729× more.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> Data from <code>_numbers.json → cases</code>
+              (<code>y_bomb9</code>, <code>y_bomb6</code>). Bars are 9<sup>k</sup> on a log scale;
+              JS and Go put no space after separators. serde-saphyr's level comes from its error
+              (line 8). The other refusal levels, worked out from each library's limit, and the
+              3.2 GB nine-level size (4,334,696 B × 9<sup>3</sup>) are
+              <span class="recon">reconstruction</span>, not run. Without an alias limit, a safe
+              loader is as exposed as any.
+            </p>
+          </figure>
+
+          <h3>Merge keys, the newest vector</h3>
+
+          <p>
+            The research probes chained merge keys, each mapping merging the previous one twice.
+            Lines 1–3 of <code>~/config-ref/bench/yaml/merge20.yaml</code> (it ends at
+            <code>L20</code>, line 21):
+          </p>
+
+          <pre><code>L0: &amp;L0 {k: v}
+L1: &amp;L1 {&lt;&lt;: [*L0, *L0]}
+L2: &amp;L2 {&lt;&lt;: [*L1, *L1]}</code></pre>
+
+          <p>
+            PyYAML 6.0.3's <code>safe_load</code> took two to three seconds at 20 levels
+            (557 bytes) over two runs (about two seconds with <code>CSafeLoader</code>), and about
+            half a minute at 24 (673 bytes): about 4× per two levels. ruamel's pure safe loader took
+            about five seconds at 20.
+            <span class="recon">measured here</span> Wall-clock time here varied by about ±50%, so
+            only orders of magnitude count: seconds at 20 levels, tens of seconds at 24. The fix,
+            PR #937, merged to <code>main</code> on 17 June 2026, notes that "A small document under
+            1 KB can trigger millions of element list extensions". On 9 October 2026 PyPI's latest
+            release is still 6.0.3, from 25 September 2025. <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            js-yaml has had six merge-key advisories since November 2025. They run from prototype
+            pollution to a "Quadratic-complexity DoS in merge key handling via repeated aliases".
+            js-yaml 5 turned merge off by default; two of the six cover 5.x users who turn it
+            back on. <span class="src">from the docs</span>
+          </p>
+
+          <h3>JSON's version, and TOML's</h3>
+
+          <p>
+            JSON has no tags or aliases. <span class="src">from the spec</span> Its analogue is
+            prototype pollution when config layers are merged (<a href="#json">the JSON
+            section</a>). <span class="recon">reconstruction</span> The Kubernetes PR was titled
+            "limit yaml/json decode size". <span class="src">from the docs</span> TOML has no
+            tags, aliases or merge keys. <span class="src">from the spec</span> Its
+            denial-of-service surface is nesting depth. <span class="recon">reconstruction</span>
+            On <code>a = [[[…]]]</code> (<code>t_depth</code>), Rust's toml and toml_edit refuse
+            at 81 levels, tomlkit at 101 and tomli at 402. BurntSushi and @iarna/toml accept
+            100,000, the search cap. <span class="recon">measured here</span> TOML's unreleased
+            <code>main</code> text says: "It's recommended to allow at least 100 levels of nesting."
+            <span class="src">from the spec</span> Rust's limit of 80 sits below that.
+            <span class="recon">reconstruction</span> The rules follow in
+            <a href="#practice">the practice section</a>.
+          </p>

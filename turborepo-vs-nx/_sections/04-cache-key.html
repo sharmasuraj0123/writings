@@ -1,0 +1,138 @@
+          <h2 id="cache-key"><span class="secnum">{{S}}</span>The cache key is the product</h2>
+
+          <p class="lede">
+            Both tools hash a task's inputs, look the hash up, and restore the outputs on a
+            hit. Speed comes from hitting often. Correctness comes from the hash changing
+            whenever the output would have changed. The two tools put different things into
+            that hash by default.
+          </p>
+
+          <h3>What Turborepo hashes</h3>
+
+          <p>
+            Turborepo computes a global hash and then a per-task hash. Its caching page lists
+            what goes into the global one. That covers the resolved root <code>turbo.json</code>
+            and changes to the root lockfile. It also covers "<code>globalDependencies</code>
+            file contents", "Values of variables listed in <code>globalEnv</code>", and
+            pass-through arguments. Each task hash adds the package's config, its slice of the
+            lockfile, its <code>package.json</code>, and the files matched by
+            <code>inputs</code>. With no <code>inputs</code> listed, that is every tracked file
+            in the package. <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            When a task has <code>dependsOn: ["^build"]</code>, Turborepo also folds the hashes
+            of those upstream tasks into the downstream hash. You do not write this down. A
+            change to a leaf package therefore invalidates every package that builds on it.
+            <span class="recon">measured here</span> (§05 confirms it: one leaf edit, six
+            cache misses.)
+          </p>
+
+          <p>
+            Environment variables are strict by default. <code>--env-mode</code> defaults to
+            "Only allow explicitly listed environment variables". A variable that is not
+            listed in <code>env</code> or <code>globalEnv</code> is not visible to the task at
+            all. It cannot change the output without changing the hash.
+            <span class="src">from the docs</span> This default was a 2.0 change, and it is the
+            single most effective guard against poisoned caches in either tool.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>What Nx hashes</h3>
+
+          <p>
+            Nx hashes whatever the target's <code>inputs</code> say. Inputs are built from
+            <code>namedInputs</code>, file globs, <code>{ "env": "VAR" }</code> entries,
+            runtime commands, and external dependency versions. The <code>^</code> prefix on
+            an input means "the same named input, in every project I depend on".
+            <span class="src">from the docs</span> If you leave inputs unset, the default named
+            input covers the whole project root plus <code>^default</code>. The default is
+            safe. The trap is in narrowing it.
+          </p>
+
+          <p>
+            Narrowing it is exactly what a team tuning cache hits does. Write
+            <code>"inputs": ["src"]</code> to stop README edits from busting the cache, forget
+            the matching <code>"^src"</code>, and the downstream hash no longer depends on
+            upstream sources. <code>dependsOn: ["^build"]</code> still orders the tasks, but
+            ordering is not hashing. Nx sees an unchanged downstream hash and restores last
+            week's output. Last week's output was built against last week's dependency.
+            <span class="recon">measured here</span>
+          </p>
+
+          <figure class="figure wide" id="fig-hash">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One edit to leaf package p01: what each config invalidates</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 330" role="img" aria-label="Three copies of the benchmark's dependency chain from p01 through p05 and p08, then p09 and p11, to p12. In Turborepo, all six packages are re-run because upstream hashes are folded in. In Nx with inputs src and caret src, all six re-run. In Nx with inputs src only, only p01 re-runs, and the other five are restored from cache, marked stale.">
+                <text x="0" y="22" class="svg-lane">CHAIN AFFECTED BY EDITING p01 (6 OF 12 PACKAGES)</text>
+                <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+                  <!-- row labels -->
+                  <text x="0" y="78" class="svg-step">turbo</text>
+                  <text x="0" y="98" class="svg-sub">dependsOn ^build</text>
+                  <text x="0" y="168" class="svg-step">nx</text>
+                  <text x="0" y="188" class="svg-sub">inputs src, ^src</text>
+                  <text x="0" y="258" class="svg-step">nx</text>
+                  <text x="0" y="278" class="svg-sub">inputs src only</text>
+                </g>
+                <!-- row 1 -->
+                <g>
+                  <rect x="230" y="62" width="110" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/><text x="268" y="87" class="svg-step">p01</text>
+                  <rect x="380" y="62" width="110" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/><text x="402" y="87" class="svg-step">p05 p08</text>
+                  <rect x="530" y="62" width="110" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/><text x="552" y="87" class="svg-step">p09 p11</text>
+                  <rect x="680" y="62" width="110" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/><text x="718" y="87" class="svg-step">p12</text>
+                  <text x="830" y="80" class="svg-step">6 run · 6 cached</text>
+                  <text x="830" y="100" class="svg-sub">correct</text>
+                </g>
+                <!-- row 2 -->
+                <g>
+                  <rect x="230" y="152" width="110" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/><text x="268" y="177" class="svg-step">p01</text>
+                  <rect x="380" y="152" width="110" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/><text x="402" y="177" class="svg-step">p05 p08</text>
+                  <rect x="530" y="152" width="110" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/><text x="552" y="177" class="svg-step">p09 p11</text>
+                  <rect x="680" y="152" width="110" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/><text x="718" y="177" class="svg-step">p12</text>
+                  <text x="830" y="170" class="svg-step">6 run · 6 cached</text>
+                  <text x="830" y="190" class="svg-sub">correct</text>
+                </g>
+                <!-- row 3 -->
+                <g>
+                  <rect x="230" y="242" width="110" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/><text x="268" y="267" class="svg-step">p01</text>
+                  <rect x="380" y="242" width="110" height="40" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-dasharray="4 3"/><text x="402" y="267" class="svg-step">p05 p08</text>
+                  <rect x="530" y="242" width="110" height="40" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-dasharray="4 3"/><text x="552" y="267" class="svg-step">p09 p11</text>
+                  <rect x="680" y="242" width="110" height="40" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-dasharray="4 3"/><text x="718" y="267" class="svg-step">p12</text>
+                  <text x="830" y="260" class="svg-step">1 run · 11 cached</text>
+                  <text x="830" y="280" class="svg-sub">5 stale outputs restored</text>
+                </g>
+                <rect x="230" y="306" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="252" y="318" class="svg-sub">re-executed</text>
+                <rect x="380" y="306" width="14" height="14" rx="3" fill="#f3dfdc" stroke="#ad4b43" stroke-dasharray="4 3"/>
+                <text x="402" y="318" class="svg-sub">restored from cache, built against old p01</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured on the §05 workspace. All three runs exit 0. The third one prints
+              "Cache: 11/12 hit (92%)" and is wrong. Turborepo cannot be configured into this
+              state through <code>inputs</code>, because upstream hashes are not an input you
+              list.
+            </p>
+          </figure>
+
+          <p>
+            This is not a bug in Nx. The docs say what <code>^</code> means, and the default
+            is correct. It is a sharper tool with one more way to cut yourself. Turborepo's
+            sharper edge is somewhere else. Because the package graph comes only from
+            manifests, an import missing from <code>package.json</code> drops an edge, and the
+            same staleness follows. Boundaries reports that case, but it is still
+            experimental. <span class="recon">reconstruction</span>
+          </p>
+
+          <div class="callout">
+            <span class="k">Rule of thumb</span>
+            <p>
+              In Nx, every narrowed <code>inputs</code> list that names a named input should
+              also name its <code>^</code> twin, unless you can say why the upstream sources
+              do not reach the output. In Turborepo, keep <code>--env-mode=strict</code>, and
+              treat a Boundaries warning as a cache-correctness bug, not a lint nit.
+            </p>
+          </div>

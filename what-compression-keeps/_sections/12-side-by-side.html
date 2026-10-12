@@ -1,0 +1,230 @@
+          <h2 id="side-by-side"><span class="secnum">{{S}}</span>Compression and compaction, side by side</h2>
+
+          <p class="lede">
+            Compression changes how the data is written. Compaction changes which data there is.
+            Lossless compression can be undone; compaction usually cannot. They meet inside storage
+            engines, where their order matters.
+          </p>
+
+          <h3>Two definitions</h3>
+
+          <p>
+            <strong>Compression</strong> changes the encoding: the same data in fewer bits,
+            judged by ratio, by speed and, if lossy, by distortion. Lossless compression is
+            reversible. <strong>Compaction</strong> rewrites the live data densely and drops what
+            no reader can observe any more. It is judged by write, read and space amplification
+            and by pauses, and it cannot be undone. <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            The sources force two refinements. Some compactions drop nothing. Linux memory
+            compaction moves pages "such that free memory is available in contiguous blocks where
+            possible" (<code>Documentation/admin-guide/sysctl/vm.rst</code>, <code>compact_memory</code>), and e4defrag(8) and Windows
+            <code>defrag</code> only consolidate files. <span class="src">from the docs</span> So the defining act is
+            reorganising for the present, and discarding is the common case.
+            LLM context compaction is a third kind: lossy, semantic and irreversible
+            (<a href="#context-compaction">Compacting a conversation</a>).
+            <span class="recon">reconstruction</span> Figure {{fig-grid}} sets every kind side by
+            side; Figure {{fig-quadrant}} asks two questions of it.
+          </p>
+
+          <figure class="figure wide" id="fig-grid">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Compression against every kind of compaction</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead>
+                  <tr><th>Technique</th><th>Unit</th><th>Keeps</th><th>Drops</th><th>Undo?</th><th>Trigger</th><th>Cost</th><th>Also<br>compresses?</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Lossless compression</td><td>byte stream</td><td>every byte</td><td>redundancy</td><td class="hl-green" style="background: var(--green-soft)">yes, decode</td><td>write or send</td><td>CPU</td><td>—</td></tr>
+                  <tr><td>Lossy compression</td><td>samples, pixels</td><td>what a perceptual model keeps</td><td>detail judged unseen</td><td class="hl-red" style="background: var(--red-soft)">no</td><td>encode</td><td>distortion</td><td>—</td></tr>
+                  <tr><td>LSM compaction</td><td>SSTables</td><td>newest version per key</td><td>overwritten values; tombstones after grace</td><td class="hl-red" style="background: var(--red-soft)">no</td><td>file counts, level sizes</td><td>write and space amplification</td><td>yes, per level</td></tr>
+                  <tr><td>Kafka log compaction</td><td>segments</td><td>at least the last value per key; offsets</td><td>older values; tombstones after their retention period (default one day)</td><td class="hl-red" style="background: var(--red-soft)">no</td><td>dirty ratio 0.5</td><td>segment recopy</td><td>separate setting</td></tr>
+                  <tr><td>VACUUM / REPACK</td><td>pages</td><td>"same logical content" (SQLite)</td><td>dead tuples, free pages</td><td class="hl-red" style="background: var(--red-soft)">no</td><td>manual (autovacuum runs plain VACUUM, which marks space reusable)</td><td>lock or up to 2× disk</td><td>—</td></tr>
+                  <tr><td>Data-lake OPTIMIZE</td><td>small files</td><td>"the same results" (Delta)</td><td>superseded files; no rows</td><td class="hl-orange" style="background: var(--orange-soft)">until vacuum or expiry</td><td>manual or auto</td><td>full rewrite</td><td>table codec*</td></tr>
+                  <tr><td>GC compaction</td><td>heap objects</td><td>reachable graph, at new addresses</td><td>unreachable objects</td><td class="hl-red" style="background: var(--red-soft)">no</td><td>fragmentation</td><td>copying survivors</td><td>—</td></tr>
+                  <tr><td>Kernel memory compaction</td><td>physical pages</td><td>all contents</td><td>nothing</td><td class="hl-green" style="background: var(--green-soft)">nothing dropped</td><td>huge-page allocation</td><td>latency spikes</td><td>—</td></tr>
+                  <tr><td>git gc</td><td>objects, packs</td><td>every reachable object</td><td>unreachable, after 2 weeks</td><td class="hl-red" style="background: var(--red-soft)">no, once pruned</td><td>&gt; 6,700 loose objects</td><td>CPU</td><td>yes: zlib, deltas</td></tr>
+                  <tr><td>Raft snapshot</td><td>log prefix</td><td>the state at the snapshot</td><td>earlier entries</td><td class="hl-red" style="background: var(--red-soft)">no</td><td>log size</td><td>snapshot write</td><td>—</td></tr>
+                  <tr><td>LLM context compaction</td><td>turns</td><td>a summary; files re-read</td><td>detail, early instructions, images</td><td class="hl-red" style="background: var(--red-soft)">no</td><td>token threshold</td><td>a model call</td><td>is itself lossy compression</td></tr>
+                  <tr><td>JSON minification</td><td>whitespace</td><td>the JSON value</td><td>formatting</td><td class="hl-orange" style="background: var(--orange-soft)">value yes, bytes no</td><td>serialise</td><td>negligible</td><td>no entropy coding</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> Only lossless compression, and the
+              compactions that move live data without dropping any, lose nothing; every compaction
+              that discards is one-way, and context compaction alone keeps no exact invariant.
+              Each cell condenses a fact sourced in
+              <a href="#compaction">Compaction: keeping only the present</a>,
+              <a href="#context-compaction">Compacting a conversation</a> or the documents they
+              cite; git's trigger is <code>gc.auto</code>, default 6700
+              (<code>config/gc.adoc</code>). <span class="src">from the docs</span> Tint answers one
+              question, can what was dropped come back: green yes, or nothing was dropped; orange
+              for a while, or only in part; red no. *The Iceberg and Delta docs do not say a
+              rewrite re-encodes; it follows from writing new files.
+            </p>
+          </figure>
+
+          <figure class="figure" id="fig-quadrant">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What is kept, against what is rewritten</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 704 432" role="img" aria-label="A grid of two rows and three columns. Columns ask what is kept: every bit; what readers can observe, exactly; or an approximation a model chose. Rows ask what is rewritten: the encoding or the content. Encoding row: lossless compression keeps every bit; JSON minification keeps the JSON value but not its formatting; lossy compression keeps an approximation. Content row: memory compaction, defragmentation and Delta OPTIMIZE keep every bit and change only the layout; LSM compaction, Kafka compaction, VACUUM and REPACK, GC compaction, git gc and Raft snapshots keep the observable present exactly and drop the past; LLM context compaction alone keeps an approximation of the content. Colour answers whether what was dropped can come back: green yes or nothing dropped (lossless compression, memory compaction, defragmentation), orange for a while or in part (JSON minification, Delta OPTIMIZE), red no (all the others).">
+                <text x="0" y="16" class="svg-lane">REWRITES</text>
+                <text x="118" y="16" class="svg-lane">KEEPS EVERY BIT</text>
+                <text x="314" y="16" class="svg-lane">KEEPS WHAT READERS SEE</text>
+                <text x="510" y="16" class="svg-lane">KEEPS AN APPROXIMATION</text>
+                <text x="118" y="34" class="svg-note">nothing is lost</text>
+                <text x="314" y="34" class="svg-note">the present, exactly</text>
+                <text x="510" y="34" class="svg-note">what a model chose</text>
+
+                <text x="0" y="96" class="svg-step">Encoding</text>
+                <text x="0" y="114" class="svg-note">how bits stand</text>
+                <text x="0" y="128" class="svg-note">for the data</text>
+                <rect x="112" y="48" width="188" height="118" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="308" y="48" width="188" height="118" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="504" y="48" width="188" height="118" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+
+                <rect x="124" y="62" width="164" height="24" rx="12" fill="#dfede5" stroke="#367f59"/>
+                <text x="134" y="78" class="svg-sub">lossless compression</text>
+                <text x="124" y="110" class="svg-note">gzip, zstd, brotli, xz, FLAC</text>
+
+                <rect x="320" y="62" width="150" height="24" rx="12" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="330" y="78" class="svg-sub">JSON minification</text>
+                <text x="320" y="110" class="svg-note">the value stays;</text>
+                <text x="320" y="126" class="svg-note">the formatting goes</text>
+
+                <rect x="516" y="62" width="150" height="24" rx="12" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="526" y="78" class="svg-sub">lossy compression</text>
+                <text x="516" y="110" class="svg-note">JPEG, Opus, AV1</text>
+
+                <text x="0" y="262" class="svg-step">Content</text>
+                <text x="0" y="280" class="svg-note">which records</text>
+                <text x="0" y="294" class="svg-note">exist, and where</text>
+                <rect x="112" y="176" width="188" height="214" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="308" y="176" width="188" height="214" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="504" y="176" width="188" height="214" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+
+                <rect x="124" y="190" width="150" height="24" rx="12" fill="#dfede5" stroke="#367f59"/>
+                <text x="134" y="206" class="svg-sub">memory compaction</text>
+                <rect x="124" y="220" width="136" height="24" rx="12" fill="#dfede5" stroke="#367f59"/>
+                <text x="134" y="236" class="svg-sub">defragmentation</text>
+                <rect x="124" y="250" width="128" height="24" rx="12" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="134" y="266" class="svg-sub">Delta OPTIMIZE</text>
+                <text x="124" y="300" class="svg-note">move live data, lose nothing</text>
+
+                <rect x="320" y="190" width="128" height="24" rx="12" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="330" y="206" class="svg-sub">LSM compaction</text>
+                <rect x="320" y="220" width="142" height="24" rx="12" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="330" y="236" class="svg-sub">Kafka compaction</text>
+                <rect x="320" y="250" width="134" height="24" rx="12" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="330" y="266" class="svg-sub">VACUUM / REPACK</text>
+                <rect x="320" y="280" width="120" height="24" rx="12" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="330" y="296" class="svg-sub">GC compaction</text>
+                <rect x="320" y="310" width="66" height="24" rx="12" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="330" y="326" class="svg-sub">git gc</text>
+                <rect x="320" y="340" width="120" height="24" rx="12" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="330" y="356" class="svg-sub">Raft snapshot</text>
+
+                <rect x="516" y="190" width="158" height="24" rx="12" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="526" y="206" class="svg-sub">context compaction</text>
+                <text x="516" y="240" class="svg-note">alone in this corner: lossy,</text>
+                <text x="516" y="256" class="svg-note">semantic, no exact invariant</text>
+
+                <text x="0" y="420" class="svg-lane">CAN IT COME BACK?</text>
+                <rect x="150" y="408" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="172" y="420" class="svg-sub">yes, or nothing dropped</text>
+                <rect x="360" y="408" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="382" y="420" class="svg-sub">for a while, or in part</text>
+                <rect x="570" y="408" width="14" height="14" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="592" y="420" class="svg-sub">no</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> A classification, not a measurement.
+              Storage compactions keep the present exactly; context compaction keeps a model's
+              judgement of it.
+            </p>
+          </figure>
+
+          <h3>Where they meet</h3>
+
+          <p>
+            Several systems compress while they compact. RocksDB skips compaction "trivial
+            moves" that would break per-level codecs and rewrites the file instead
+            (wiki, "Compression"). Cassandra warns that after <code>ALTER TABLE</code> "the
+            compression will not be modified until the table is compacted" ("Compression"). In
+            git, a changed level "will not automatically recompress all existing objects" without
+            <code>git repack -F</code> (<code>config/pack.adoc</code>).
+            <span class="src">from the docs</span> Iceberg and
+            Delta rewrites write new files with the table's current codec.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            Other systems keep them apart. Kafka has <code>cleanup.policy=compact</code>
+            for which records stay and <code>compression.type</code> (default
+            <code>producer</code>) for how batches are encoded (4.3 docs). MongoDB's
+            <code>compact</code> releases obsolete blocks; WiredTiger compresses most
+            collections with snappy by default. <span class="src">from the docs</span> Bigtable (OSDI 2006) treats
+            compactions in §5.4 and compression in §6.
+            <span class="src">from the paper</span> Order matters: compact first, then compress
+            (Figure {{fig-three-treatments}}). <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Five things often said</h3>
+
+          <ul>
+            <li><strong>Compaction is a kind of compression.</strong> Not now: even engines that
+              do both in one pass expose them as separate settings (RocksDB's per-level codec,
+              Cassandra's table compression options). In the 1970s the words overlapped
+              (<a href="#two-words">Fewer bits, or fewer things</a>).
+              <span class="recon">reconstruction</span></li>
+            <li><strong>Kafka compaction keeps only the latest value.</strong> It keeps at least
+              the latest value per key and never cleans the active segment
+              (<a href="#compaction">Compaction</a>, Figure {{fig-kafka-compact}}).
+              <span class="src">from the docs</span></li>
+            <li><strong>Deleting data frees disk space.</strong> etcd: "deleting application data
+              does not reclaim the space on disk" (v3.7, "Maintenance").
+              <span class="src">from the docs</span> SQLite with <code>auto_vacuum</code> off
+              behaves the same (Figure {{fig-maintenance}}).
+              <span class="recon">measured here</span></li>
+            <li><strong>Compaction always shrinks storage.</strong> It often grows it first, and
+              between cleanings a log never holds just the live state (universal compaction and
+              the cleaner model in <a href="#compaction">Compaction</a>,
+              Figure {{fig-maintenance}}). <span class="recon">reconstruction</span></li>
+            <li><strong>VACUUM FULL is the normal fix for bloat.</strong> PostgreSQL: "The usual
+              goal of routine vacuuming is to do standard VACUUMs often enough to avoid needing
+              VACUUM FULL" (18 docs, §24.1.2). <span class="src">from the docs</span></li>
+          </ul>
+
+          <h3>Compact JSON sits between</h3>
+
+          <p>
+            jq calls its <code>-c</code> flag <code>--compact-output</code> (jq 1.8 manual).
+            <span class="src">from the docs</span> Minifying removes bytes like compression,
+            because "Insignificant whitespace is allowed before or after any of the six
+            structural characters" (RFC 8259 §2). <span class="src">from the spec</span> It loses
+            no data, only formatting, and that loss is one-way, like compaction: the value
+            survives, the layout does not. <span class="recon">reconstruction</span> Compression
+            makes most of it moot; What Each File Wants measures how little of the saving
+            survives a codec on three corpora
+            (<a href="../what-each-file-wants/#fig-minify">its minify figure</a>): after
+            brotli 11, 2.88% to 5.34%. <span class="recon">measured here</span>
+          </p>
+
+          <h3>A decision rule</h3>
+
+          <p>
+            Ask whether anyone needs the past. If so, compress, and copy the history out before
+            any compaction. If not, compact. Then ask whether every byte must survive: if so,
+            compress losslessly; if a perceptual model may choose, go lossy. When both apply,
+            compact first and compress what is left. An agent's context has no exact answer, so
+            keep the transcript beside the summary. <span class="recon">reconstruction</span>
+          </p>

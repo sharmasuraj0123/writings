@@ -1,0 +1,327 @@
+          <h2 id="practice"><span class="secnum">{{S}}</span>A practice that holds</h2>
+
+          <p class="lede">
+            Every failure in this guide has a guardrail, usually a flag, a schema or a lint rule.
+            The rules below are mine, and each names the failure it prevents.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Six rules for any format</h3>
+
+          <p>
+            <strong>1. Name the parser and its version.</strong> The format is not the contract;
+            the parser is. The line <code>countries: [GB, IE, FR, DE, NO, SE]</code> gives
+            <code>"NO"</code> in 8 of 12 <a href="#yaml-types">YAML loaders</a> and
+            <code>false</code> in 4. A multi-line <a href="#toml-versions">TOML 1.1</a> inline
+            table is read by 8 of 10 TOML parsers and refused by Python 3.14's
+            <code>tomllib</code> and by @iarna/toml. <span class="recon">measured here</span> Write
+            down which library reads the file, pin it, and run it over the file in CI.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            <strong>2. Validate against a schema, in the editor and in CI.</strong> JSON Schema
+            serves all three formats: on 8 October 2026, SchemaStore's catalog listed 1,513
+            schemas, and by file pattern 762 match YAML files, 624 JSON-family files and 128 TOML
+            files. <span class="recon">measured here</span> JSON Schema's current dialect, 2020-12,
+            is an Internet-Draft that expired on 12 December 2022.
+            <span class="src">from the spec</span>
+            VS Code warns that an in-file <code>"$schema"</code> key "changes the JSON itself,
+            which systems consuming the JSON might not expect". check-jsonschema 0.38.2 validates
+            all three formats in CI. <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            <strong>3. Load into a typed target and reject unknown keys.</strong> Go's
+            <code>encoding/json</code> documentation says "By default, object keys which don't have
+            a corresponding struct field are ignored". <span class="src">from the docs</span>
+            Turning that off guards the silent structure traps.
+            <a href="#toml-rules">TOML's scope trap</a> moves <code>debug</code> into
+            <code>server</code> in all 10 parsers, and three YAML loaders return only the first
+            mapping of the file from <a href="#yaml-structure">Helm issue #9793</a>.
+            <span class="recon">measured here</span> A <code>Server</code> type with no
+            <code>debug</code> field rejects the first, and required fields report the second.
+            Typed targets were not measured here. <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            <strong>4. Reject duplicate keys.</strong> All 10 TOML parsers refuse
+            <code>a = 1</code> followed by <code>a = 2</code>, and so do 9 of 12
+            <a href="#yaml-structure">YAML loaders</a>; PyYAML's two loaders and sigs.k8s.io/yaml
+            keep the last value. In <a href="#json">JSON</a>, 9 of 10 parsers keep the last value
+            silently, and only Go's <code>encoding/json/v2</code> refuses.
+            <span class="recon">measured here</span> A schema cannot catch them: it validates the
+            value the parser returned, after the last duplicate has won.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            <strong>5. Never write human configuration with a non-preserving writer.</strong> Load
+            the agent config, change one value and dump it: each of the 21 writers that dump plain
+            data produced 52 to 144 diff lines, and tomlkit and jsonc-parser's <code>modify</code>
+            changed nothing beyond the edit (<a href="#write-back">the write-back test</a>).
+            <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            <strong>6. Keep secrets out of files that agents read and write.</strong> An agent reads
+            the whole file it edits, and a dumping writer rewrites it, so keep references such as
+            <code>"${GITHUB_TOKEN}"</code> in the file and the values elsewhere.
+            <span class="recon">reconstruction</span> xo-space masks configs sent to the browser
+            only where the value is a string under one of six key names.
+            <span class="src">from the tree</span> In a <a href="#in-the-tree">scratch run</a>, a
+            YAML <code>password: 123456</code> went out as an unmasked integer.
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>Rules per format</h3>
+
+          <p>
+            The flags and tools for each format are in Figure {{fig-checklist}}.
+          </p>
+
+          <p>
+            <strong>JSON.</strong> Keep it strict wherever a program writes it, and use
+            <a href="#json">JSONC</a> only through one named parser that fails on errors:
+            jsonc-parser 3.3.1 reports two errors for a trailing comma and still returns
+            <code>{"a": 1, "b": 2}</code>. <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            <strong>YAML.</strong> Quote every scalar that is not obviously a string. Unquoted,
+            <code>python: 3.10</code> is 3.1 in all 12 loaders here;
+            <a href="#yaml-types">quoted</a>, ten trap values stayed strings in all 16 loader
+            configurations of the research probe. <span class="recon">measured here</span>
+            yamllint's <code>truthy</code> rule allows only <code>true</code> and
+            <code>false</code> by default. <span class="src">from the docs</span> Its default
+            <code>check-keys: true</code> also flags a workflow's bare
+            <a href="#yaml-structure"><code>on:</code></a>. <span class="recon">measured here</span>
+            Quote <code>"on"</code> or set <code>check-keys: false</code> for
+            <code>.github/workflows</code>. <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            Load with a safe loader, never an unsafe or full one, that also limits
+            <a href="#yaml-security">aliases</a>: in Node, eemeli's
+            <code>yaml</code> (<code>maxAliasCount</code> 100); in Go, yaml.v3 (an alias-ratio
+            check); in Rust, serde-saphyr (a node and alias budget) or the archived serde_yaml (a
+            repetition limit). None of the four Python loaders here has one.
+            <span class="recon">measured here</span> A cap on input size does not stop a 446-byte
+            bomb. <span class="recon">reconstruction</span> js-yaml's safety guide says what does:
+            "do a cheap pass first that counts every element and bails out past a limit".
+            <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            <strong>TOML.</strong> Put top-level keys before the first table, or have none, as
+            Alacritty 0.14 did when it moved its root options into a <code>[general]</code> table
+            (<a href="#toml-rules">the scope trap</a>). <span class="src">from the docs</span> Write
+            the 1.0 subset unless every reader is pinned: Python 3.14's <code>tomllib</code> and
+            @iarna/toml refuse all four <a href="#toml-versions">1.1 features</a> measured.
+            <span class="recon">measured here</span>
+          </p>
+
+          <figure class="figure wide" id="fig-checklist">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The guardrails per format: one row per concern, with the flag, rule or library</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row">
+                  <div class="stack-cell head">Parser, pinned</div>
+                  <div class="stack-cell hl-blue"><strong>JSON</strong> one library and version, locked; in Go, <code>encoding/json/v2</code><br><strong>YAML</strong> a safe loader with an alias limit: eemeli <code>yaml</code> in Node, yaml.v3 in Go, serde-saphyr in Rust; in Python none here has one, so count elements before walking the result<br><strong>TOML</strong> the parser by name; <code>tomllib</code> reads 1.1 only from Python 3.15</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Version</div>
+                  <div class="stack-cell hl-blue"><strong>JSON</strong> strict RFC 8259; JSONC only through jsonc-parser, errors fatal<br><strong>YAML</strong> 1.2, so no merge keys; a <code>%YAML 1.2</code> line changes nothing in PyYAML<br><strong>TOML</strong> the 1.0 subset; a 1.1 file says so in a comment</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Schema</div>
+                  <div class="stack-cell hl-purple"><strong>JSON</strong> JSON Schema 2020-12, mapped from outside the file<br><strong>YAML</strong> a yaml-language-server modeline comment<br><strong>TOML</strong> a <code>#:schema</code> comment for Taplo or Tombi<br><strong>All three</strong> check-jsonschema in CI</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Typed target</div>
+                  <div class="stack-cell hl-purple"><strong>All three</strong> <code>deny_unknown_fields</code> (serde), <code>extra='forbid'</code> (pydantic)<br><strong>JSON</strong> <code>DisallowUnknownFields</code> (Go <code>encoding/json</code>)<br><strong>YAML</strong> <code>KnownFields(true)</code> in go-yaml v3, which still reads <code>yes</code> into a <code>bool</code> as true</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Duplicate keys</div>
+                  <div class="stack-cell hl-purple"><strong>JSON</strong> <code>encoding/json/v2</code>; <code>object_pairs_hook</code>; a serde struct, not a <code>Value</code><br><strong>YAML</strong> yamllint <code>key-duplicates</code>; the <code>*Strict</code> functions of sigs.k8s.io/yaml<br><strong>TOML</strong> already invalid; all 10 parsers refuse</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Values</div>
+                  <div class="stack-cell hl-purple"><strong>JSON</strong> ids beyond 2<sup>53</sup> as strings; <code>allow_nan=False</code> in Python; UTF-8 with no BOM, which 7 of 10 report as an error<br><strong>YAML</strong> quote versions, codes, modes, times, a leading <code>0</code> or <code>!</code>; yamllint <code>truthy</code>, plus <code>octal-values</code> (off by default); one document per file<br><strong>TOML</strong> integers in int64, or 2<sup>53</sup> for JavaScript; offsets on date-times; no null, so absence or a documented sentinel</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Writer</div>
+                  <div class="stack-cell hl-green"><strong>JSON</strong> jsonc-parser <code>modify</code>, or own the file outright<br><strong>YAML</strong> ruamel.yaml round-trip, eemeli <code>Document</code>; Go: yaml.v3 <code>Node</code>; never <code>safe_dump</code><br><strong>TOML</strong> tomlkit, or toml_edit, copying the old item's decor; never load and dump</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">Secrets</div>
+                  <div class="stack-cell hl-green"><strong>All three</strong> references such as <code>"${GITHUB_TOKEN}"</code> in the file, values in the environment or a secret store</div>
+                </div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> The concerns are the same in every format;
+              the defaults are not. All 10 TOML parsers refuse a duplicate key unasked; in YAML and
+              JSON that takes a chosen parser. <span class="recon">measured here</span> Blue rows are
+              decided once per project, purple rows are checked on every edit and load, and green
+              rows govern what is written back and who can read it. Each entry appears in this
+              guide, measured or from its own documentation; the selection is mine.
+            </p>
+          </figure>
+
+          <h3>When none of the three fits</h3>
+
+          <p>
+            For computed values, types shared across files, or no implicit typing at all, these
+            are the candidates as of October 2026. <span class="src">from the docs</span>
+          </p>
+
+          <ul>
+            <li><strong>JSON5</strong>: JSON plus some ECMAScript 5.1 syntax; easier editing, no types (spec 1.0.0, 2018).</li>
+            <li><strong>HCL</strong>: HashiCorp's native syntax, with expressions, plus a JSON variant; v2 tagged 2 October 2019.</li>
+            <li><strong>CUE</strong>: unifies data with constraints across JSON, YAML and TOML; pre-1.0, v0.17.1 (16 July 2026).</li>
+            <li><strong>Dhall</strong>: "JSON + functions + types + imports", not Turing-complete; v23.1.0 (16 January 2025).</li>
+            <li><strong>Jsonnet</strong>: templating that emits JSON, v0.22.0 (24 March 2026); by default its imports reach any path the interpreter can read.</li>
+            <li><strong>Nickel</strong>: "in essence JSON with functions", with gradual types; 1.18.0 (19 September 2026).</li>
+            <li><strong>Pkl</strong>: Apple's configuration language, open-sourced on 1 February 2024; 0.32.1 (23 July 2026).</li>
+            <li><strong>KDL</strong>: 2.0.0 (21 December 2024) made bare <code>true</code>, <code>false</code> and <code>null</code> syntax errors.</li>
+            <li><strong>StrictYAML</strong>: a Python-only YAML subset, all strings unless a schema says otherwise; 1.7.3 (10 March 2023).</li>
+            <li><strong>NestedText</strong>: one scalar type, the string; 3.8 (26 December 2025).</li>
+            <li><strong>Starlark</strong>: Bazel's hermetic Python dialect, which needs an embedded interpreter.</li>
+          </ul>
+
+          <p>
+            ESLint took the last exit. Since v9.0.0 (5 April 2024) its default configuration is
+            <code>eslint.config.js</code>, and v10.0.0 (6 February 2026) removed the old formats.
+            One format, its documentation says, lets it "avoid the need for custom parsing of
+            config files". <span class="src">from the docs</span> Most of these languages emit
+            JSON or YAML, so their output is still parsed and still needs the guardrails.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>The decision rule</h3>
+
+          <p>
+            The answer up front, reordered as a flow with a strict-JSON fallback, is four questions
+            asked in order (Figure {{fig-decision}}). TOML gets the hand-edited files because its
+            parsers seldom disagree in silence. <span class="recon">reconstruction</span> In
+            <code>cases[].heard</code>, leaving out errors, the agent config and the depth and
+            bomb runs, the parsers that accept a case return two or more readings in 9 of 15 JSON
+            cases, 12 of 26 YAML cases across the 12 loaders, and 4 of 22 TOML cases; TOML's nine
+            other splits are refusals. <span class="recon">measured here</span> A refusal is loud.
+            The scope trap is the exception: silent, and the same in all 10 parsers, so it needs
+            rule 3, not a better parser. <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure wide" id="fig-decision">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Choosing a configuration format: four questions, asked in order</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 646" role="img" aria-label="A decision flow of four questions asked in order down the left, each with a yes branch to an answer on the right. Question 1: does the ecosystem expect a format? Yes: use that format with the guardrails; YAML for Actions, Compose, Kubernetes and Ansible, TOML for Cargo.toml, pyproject.toml and Codex, JSON for package.json, tsconfig and Claude Code. Question 2: will a program write it? Yes: strict JSON with a JSON Schema if the program owns it; if people edit it too, JSONC through one parser, or a preserving editor such as tomlkit, toml_edit or ruamel's round-trip mode. Question 3: will people edit it by hand? Yes: TOML written as the 1.0 subset, with top-level keys before the first table, absence documented because there is no null, and integers within int64, or within 2 to the 53 if JavaScript reads them. Question 4: does it need logic or types across files? Yes: a configuration language such as CUE, Pkl, Nickel, Dhall or Jsonnet, or configuration as code such as eslint.config.js, whose output still needs guarding. If every answer is no: strict JSON with a schema. Answers are tinted grey when the format is chosen for you, blue when a program writes the file, green when people write it, and purple when it is computed.">
+                <defs>
+                  <marker id="fig-decision-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="18" class="svg-lane">ASK IN THIS ORDER</text>
+                <text x="600" y="18" class="svg-lane">ON THE FIRST YES, USE</text>
+
+                <rect x="0" y="36" width="440" height="96" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="16" y="62" class="svg-num">1</text>
+                <text x="34" y="62" class="svg-step">Does the ecosystem expect a format?</text>
+                <text x="16" y="86" class="svg-sub">a tool documents one format, or a</text>
+                <text x="16" y="104" class="svg-sub">spec defines the file it reads</text>
+
+                <rect x="600" y="36" width="520" height="96" rx="8" fill="#deded9" stroke="#b8b8b1"/>
+                <text x="616" y="62" class="svg-step">Use that format, with the guardrails</text>
+                <text x="616" y="86" class="svg-sub">YAML: Actions, Compose, Kubernetes, Ansible</text>
+                <text x="616" y="104" class="svg-sub">TOML: Cargo.toml, pyproject.toml, Codex</text>
+                <text x="616" y="122" class="svg-sub">JSON: package.json, tsconfig, Claude Code</text>
+
+                <rect x="0" y="160" width="440" height="96" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="16" y="186" class="svg-num">2</text>
+                <text x="34" y="186" class="svg-step">Will a program write it?</text>
+                <text x="16" y="210" class="svg-sub">cargo add, uv add, a settings UI,</text>
+                <text x="16" y="228" class="svg-sub">an agent that edits its own config</text>
+
+                <rect x="600" y="160" width="520" height="96" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="616" y="186" class="svg-step">Strict JSON and a schema, or a preserving editor</text>
+                <text x="616" y="210" class="svg-sub">the program owns it: strict JSON + JSON Schema</text>
+                <text x="616" y="228" class="svg-sub">people edit it too: JSONC via one parser,</text>
+                <text x="616" y="246" class="svg-sub">or tomlkit, toml_edit, ruamel round-trip</text>
+
+                <rect x="0" y="284" width="440" height="96" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="16" y="310" class="svg-num">3</text>
+                <text x="34" y="310" class="svg-step">Will people edit it by hand?</text>
+                <text x="16" y="334" class="svg-sub">the usual case for an application's</text>
+                <text x="16" y="352" class="svg-sub">or a tool's own settings</text>
+
+                <rect x="600" y="284" width="520" height="96" rx="8" fill="#dfede5" stroke="#367f59"/>
+                <text x="616" y="310" class="svg-step">TOML, written as the 1.0 subset</text>
+                <text x="616" y="334" class="svg-sub">top-level keys before the first [table]</text>
+                <text x="616" y="352" class="svg-sub">absence documented, since there is no null</text>
+                <text x="616" y="370" class="svg-sub">integers in int64; within 2⁵³ for JS</text>
+
+                <rect x="0" y="408" width="440" height="96" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="16" y="434" class="svg-num">4</text>
+                <text x="34" y="434" class="svg-step">Does it need logic or types across files?</text>
+                <text x="16" y="458" class="svg-sub">values computed from other values,</text>
+                <text x="16" y="476" class="svg-sub">constraints shared by many files</text>
+
+                <rect x="600" y="408" width="520" height="96" rx="8" fill="#ece6f3" stroke="#765b98"/>
+                <text x="616" y="434" class="svg-step">A configuration language, or code</text>
+                <text x="616" y="458" class="svg-sub">CUE, Pkl, Nickel, Dhall, Jsonnet</text>
+                <text x="616" y="476" class="svg-sub">eslint.config.js: configuration as code</text>
+                <text x="616" y="494" class="svg-sub">its output is parsed: guard that too</text>
+
+                <rect x="0" y="536" width="440" height="60" rx="8" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="16" y="562" class="svg-step">Otherwise: strict JSON, with a schema</text>
+                <text x="16" y="582" class="svg-sub">generated once, read only by programs</text>
+
+                <g stroke="#252525" stroke-width="2.4" fill="none" marker-end="url(#fig-decision-arr)">
+                  <path d="M440 84 L594 84"/>
+                  <path d="M440 208 L594 208"/>
+                  <path d="M440 332 L594 332"/>
+                  <path d="M440 456 L594 456"/>
+                  <path d="M220 132 L220 154"/>
+                  <path d="M220 256 L220 278"/>
+                  <path d="M220 380 L220 402"/>
+                  <path d="M220 504 L220 530"/>
+                </g>
+                <text x="504" y="76" class="svg-sub">yes</text>
+                <text x="504" y="200" class="svg-sub">yes</text>
+                <text x="504" y="324" class="svg-sub">yes</text>
+                <text x="504" y="448" class="svg-sub">yes</text>
+                <text x="232" y="150" class="svg-sub">no</text>
+                <text x="232" y="274" class="svg-sub">no</text>
+                <text x="232" y="398" class="svg-sub">no</text>
+                <text x="232" y="524" class="svg-sub">no</text>
+
+                <rect x="0" y="618" width="14" height="14" rx="3" fill="#deded9" stroke="#b8b8b1"/>
+                <text x="20" y="629" class="svg-sub">chosen for you</text>
+                <rect x="160" y="618" width="14" height="14" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="180" y="629" class="svg-sub">a program writes it</text>
+                <rect x="340" y="618" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="360" y="629" class="svg-sub">people write it</text>
+                <rect x="500" y="618" width="14" height="14" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="520" y="629" class="svg-sub">it is computed</text>
+                <path d="M660 625 L700 625" stroke="#252525" stroke-width="2.4" fill="none" marker-end="url(#fig-decision-arr)"/>
+                <text x="712" y="629" class="svg-sub">control: yes to an answer, no to the next question</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> The flow is my judgement, not a standard.
+              Thick black edges are control: a yes leads to an answer, a no to the next question. The tint says who
+              the file is for. The answers carry the guardrails of Figure {{fig-checklist}}; none of
+              them removes the need to name the parser.
+            </p>
+          </figure>
+
+          <p>
+            Whichever box a file lands in, the six rules stay. The format decides which pitfalls
+            are possible. The guardrails decide whether the two readers of the file hear the same
+            thing. <span class="recon">reconstruction</span>
+          </p>
