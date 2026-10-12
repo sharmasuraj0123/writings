@@ -1,0 +1,300 @@
+          <h2 id="on-the-wire"><span class="secnum">{{S}}</span>Compression on the wire</h2>
+
+          <p class="lede">
+            In HTTP the browser lists the codings it can decode; the server picks one and names it.
+            <span class="src">from the spec</span> One 367,737-byte page from this site travels as
+            68,906 bytes of Brotli 11, and as 61,970 with a sibling post as a shared dictionary.
+            With its previous version as the dictionary, an 822,400-byte page that had grown by 808
+            bytes travels as 198. <span class="recon">measured here</span>
+          </p>
+
+          <h3>Who chooses</h3>
+
+          <p>
+            On the web, compression belongs to the content. RFC 9110 §8.4 calls the codings in
+            Content-Encoding "a characteristic of the representation"; RFC 9112 §6.1 says
+            "Transfer-Encoding is a property of the message, not of the representation."
+            <span class="src">from the spec</span> HTTP/2 forbids Transfer-Encoding (RFC 9113
+            §8.2.2), so web compression is Content-Encoding, negotiated by Accept-Encoding with
+            optional q-values (RFC 9110 §12.5.3). <span class="src">from the spec</span>
+          </p>
+
+          <p>
+            Chromium offers <code>br</code> and <code>zstd</code> only over HTTPS or to localhost; a
+            comment in <code>net/http/http_request_headers.cc</code> says to advertise br "only if
+            transferred data is opaque to proxy". <span class="src">from the docs</span>
+            <code>dcb</code> and <code>dcz</code> are RFC 9842's dictionary-compressed Brotli and
+            zstd codings (§4, §5; A dictionary sent once, below). <span class="src">from the spec</span>
+            The table gives first versions from MDN and caniuse, and what two CDNs do.
+            <span class="src">from the docs</span> Green marks a coding on by default or served,
+            orange one that is partial, flagged or in beta, red one absent or undocumented.
+          </p>
+
+          <table>
+            <thead>
+              <tr><th>Who</th><th>br</th><th>zstd</th><th>dcb, dcz</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Chrome</td><td class="hl-green" style="background: var(--green-soft)">50</td><td class="hl-green" style="background: var(--green-soft)">123, 19 Mar 2024</td><td class="hl-green" style="background: var(--green-soft)">130, 15 Oct 2024</td></tr>
+              <tr><td>Firefox</td><td class="hl-green" style="background: var(--green-soft)">44</td><td class="hl-green" style="background: var(--green-soft)">126, 14 May 2024</td><td class="hl-orange" style="background: var(--orange-soft)">145, behind a pref</td></tr>
+              <tr><td>Safari</td><td class="hl-green" style="background: var(--green-soft)">11</td><td class="hl-orange" style="background: var(--orange-soft)">26.3, needs macOS 26.3; caniuse: partial on desktop</td><td class="hl-red" style="background: var(--red-soft)">none</td></tr>
+              <tr><td>Cloudflare</td><td class="hl-green" style="background: var(--green-soft)">default on Pro, Business</td><td class="hl-green" style="background: var(--green-soft)">default on Free</td><td class="hl-orange" style="background: var(--orange-soft)">passthrough beta, 30 Apr 2026</td></tr>
+              <tr><td>Vercel</td><td class="hl-green" style="background: var(--green-soft)">documented, preferred</td><td class="hl-red" style="background: var(--red-soft)">undocumented; not served to probes</td><td class="hl-red" style="background: var(--red-soft)">undocumented</td></tr>
+            </tbody>
+          </table>
+
+          <p>
+            Cloudflare defaults to gzip on Enterprise, skips gzip under 48 bytes and Brotli or zstd
+            under 50, and always asks the origin for <code>br, gzip</code>.
+            <span class="src">from the docs</span> nginx's gzip module defaults to
+            <code>gzip_min_length 20</code>, level 1 and <code>text/html</code> only.
+            <span class="src">from the docs</span> Vercel's docs name only gzip and Brotli and say
+            to check for "a value of gzip or brotli". <span class="src">from the docs</span> The
+            token is <code>br</code> (RFC 7932 §13). <span class="src">from the spec</span> At the
+            time of writing, probes were made against www.quirq.ai and vercel.com, with curl on
+            9 October 2026 rather than in the harness: both answered <code>zstd, br, gzip</code>
+            with <code>br</code>, and <code>zstd</code> alone with no Content-Encoding.
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>One page, ten encodings</h3>
+
+          <p>
+            Figure {{fig-wire}} encodes <code>what-the-parser-hears/index.html</code>, 367,737
+            bytes, its SHA-256 recorded; every output was decoded and compared with it.
+            <span class="recon">measured here</span> gzip -9 saves 612 bytes over gzip -6. Brotli 11
+            (its encode cost is in Figure {{fig-frontier}}) sends 21.5% less than gzip -6, zstd 19
+            8.3% more than Brotli 11, and zstd 3 0.6% more than gzip -6.
+            <span class="recon">measured here</span> What to leave uncompressed is in
+            <a href="../what-each-file-wants/#already-compressed">Already compressed: leave it</a>
+            and <a href="../what-each-file-wants/#small">Small messages and dictionaries</a>.
+          </p>
+
+          <figure class="figure" id="fig-wire">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One 367,737-byte page in ten encodings: bytes on the wire</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 704 432" role="img" aria-label="Horizontal bar chart of the bytes needed to send what-the-parser-hears/index.html, 367,737 bytes, on a linear axis from 0 to 100,000 bytes; the uncompressed bar is cut. Bytes and percent of the original: identity 367,737 (100%); gzip -6 87,797 (23.9%); gzip -9 87,185 (23.7%); br at brotli 5 79,485 (21.6%); br at brotli 11 68,906 (18.7%); dcb at brotli 5 with a dictionary 70,079 (19.1%); dcb at brotli 11 with a dictionary 61,970 (16.9%); zstd level 3 88,345 (24.0%); zstd level 19 74,639 (20.3%); dcz at zstd 3 with a dictionary 81,205 (22.1%); dcz at zstd 19 with a dictionary 65,060 (17.7%). The dictionary is another post from the same site, where-the-json-lives/index.html, 227,281 bytes. Grey marks no coding, blue a coding without a dictionary, green the same coding with the dictionary.">
+                <text x="0" y="16" class="svg-lane">BYTES ON THE WIRE · ONE 367,737-BYTE PAGE · LINEAR AXIS</text>
+                <rect x="0" y="30" width="14" height="14" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="22" y="41" class="svg-sub">identity, no coding</text>
+                <rect x="180" y="30" width="14" height="14" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="202" y="41" class="svg-sub">one coding, no dictionary</text>
+                <rect x="408" y="30" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="430" y="41" class="svg-sub">with a sibling post as dictionary</text>
+
+                <line x1="212" y1="66" x2="212" y2="358" stroke="#b8b8b1"/>
+                <line x1="212" y1="358" x2="652" y2="358" stroke="#b8b8b1"/>
+                <line x1="307" y1="358" x2="307" y2="364" stroke="#b8b8b1"/>
+                <line x1="402" y1="358" x2="402" y2="364" stroke="#b8b8b1"/>
+                <line x1="497" y1="358" x2="497" y2="364" stroke="#b8b8b1"/>
+                <line x1="592" y1="358" x2="592" y2="364" stroke="#b8b8b1"/>
+                <text x="212" y="376" class="svg-sub" text-anchor="middle">0</text>
+                <text x="307" y="376" class="svg-sub" text-anchor="middle">25,000</text>
+                <text x="402" y="376" class="svg-sub" text-anchor="middle">50,000</text>
+                <text x="497" y="376" class="svg-sub" text-anchor="middle">75,000</text>
+                <text x="592" y="376" class="svg-sub" text-anchor="middle">100,000 B</text>
+
+                <text x="200" y="88" class="svg-sub" text-anchor="end">identity</text>
+                <rect x="212" y="77" width="440" height="14" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <path d="M604 75 L612 93 M612 75 L620 93" stroke="#ffffff" stroke-width="3"/>
+                <text x="222" y="88" class="svg-sub">367,737 B · 100% · bar cut</text>
+                <text x="200" y="114" class="svg-sub" text-anchor="end">gzip -6</text>
+                <rect x="212" y="103" width="333.6" height="14" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="553.6" y="114" class="svg-sub">87,797 B · 23.9%</text>
+                <text x="200" y="140" class="svg-sub" text-anchor="end">gzip -9</text>
+                <rect x="212" y="129" width="331.3" height="14" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="551.3" y="140" class="svg-sub">87,185 B · 23.7%</text>
+                <text x="200" y="166" class="svg-sub" text-anchor="end">br · brotli 5</text>
+                <rect x="212" y="155" width="302.0" height="14" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="522.0" y="166" class="svg-sub">79,485 B · 21.6%</text>
+                <text x="200" y="192" class="svg-sub" text-anchor="end">br · brotli 11</text>
+                <rect x="212" y="181" width="261.8" height="14" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="481.8" y="192" class="svg-sub">68,906 B · 18.7%</text>
+                <text x="200" y="218" class="svg-sub" text-anchor="end">dcb · brotli 5</text>
+                <rect x="212" y="207" width="266.3" height="14" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="486.3" y="218" class="svg-sub">70,079 B · 19.1%</text>
+                <text x="200" y="244" class="svg-sub" text-anchor="end">dcb · brotli 11</text>
+                <rect x="212" y="233" width="235.5" height="14" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="455.5" y="244" class="svg-sub">61,970 B · 16.9%</text>
+                <text x="200" y="270" class="svg-sub" text-anchor="end">zstd · level 3</text>
+                <rect x="212" y="259" width="335.7" height="14" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="555.7" y="270" class="svg-sub">88,345 B · 24.0%</text>
+                <text x="200" y="296" class="svg-sub" text-anchor="end">zstd · level 19</text>
+                <rect x="212" y="285" width="283.6" height="14" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="503.6" y="296" class="svg-sub">74,639 B · 20.3%</text>
+                <text x="200" y="322" class="svg-sub" text-anchor="end">dcz · zstd 3</text>
+                <rect x="212" y="311" width="308.6" height="14" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="528.6" y="322" class="svg-sub">81,205 B · 22.1%</text>
+                <text x="200" y="348" class="svg-sub" text-anchor="end">dcz · zstd 19</text>
+                <rect x="212" y="337" width="247.2" height="14" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="467.2" y="348" class="svg-sub">65,060 B · 17.7%</text>
+
+                <text x="0" y="404" class="svg-note">Brotli 11 is the smallest single coding; the dictionary takes another 10.1% off it.</text>
+                <text x="0" y="422" class="svg-note">dcb and dcz counts include their 36- and 40-byte headers.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> From
+              <code>_numbers.json → wire.rows</code>: Brotli at lgwin 22, dcb through system
+              libbrotli 1.2.0 via ctypes, zstd and dcz through Python's
+              <code>compression.zstd</code>. A dictionary loaded as a prefix, like
+              <code>--patch-from</code>, gives dcz 79,829 and 64,724 bytes. The coding leaves
+              about a fifth of the page; the dictionary takes a further tenth off that.
+            </p>
+          </figure>
+
+          <p>
+            zstd on the wire has a tighter limit than its format. RFC 8878 only recommends 8 MB windows;
+            RFC 9659 (September 2024) says encoders "MUST NOT generate frames requiring a
+            Window_Size larger than 8 MB" for the <code>zstd</code> coding.
+            <span class="src">from the spec</span> At <code>zstd --long</code>'s 128 MiB default
+            (Figure {{fig-window}}), <span class="src">from the docs</span> an input over 8 MB can
+            yield frames no browser need accept. <span class="recon">reconstruction</span> The frames
+            measured here declare a 367,737-byte window, the page's own size.
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>A dictionary sent once</h3>
+
+          <p>
+            Compression Dictionary Transport, RFC 9842 (September 2025, Standards Track), lets one
+            response serve as the dictionary for later ones. <span class="src">from the spec</span>
+            The response opts in with <code>Use-As-Dictionary</code>, whose <code>match</code>
+            pattern names the URLs it covers. A later matching request sends
+            <code>Available-Dictionary</code>, the SHA-256 of the stored bytes, and
+            <code>Dictionary-ID</code> if the server set an id. The server may answer
+            <code>dcb</code>, a 36-byte header (<code>ff 44 43 42</code> and the hash) before a
+            Shared Brotli stream (RFC 9841) with at most a 16 MB window, or <code>dcz</code>, a
+            40-byte zstd skippable frame holding the hash before a zstd frame.
+            <span class="src">from the spec</span> Clients must not offer dcb or dcz without a
+            matching dictionary, and cacheable responses must vary on
+            <code>accept-encoding, available-dictionary</code>.
+            <span class="src">from the spec</span> zstd, unlike Brotli, reaches the dictionary only
+            within its window, so dcz decoders must accept a window of 8 MB or 1.25 times the
+            dictionary, whichever is greater, up to 128 MB.
+            <span class="src">from the spec</span> Matching is same-origin only (RFC 9842 §9.3.1;
+            <a href="#hazards">When compression is the attack</a>).
+            <span class="src">from the spec</span>
+          </p>
+
+          <figure class="figure wide" id="fig-dict-transport">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">A dictionary shipped once, then used by later responses, with measured body sizes</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 790" role="img" aria-label="Sequence diagram between a browser and a server or CDN. 1: the browser requests /where-the-json-lives/ with Accept-Encoding listing br and zstd but not dcb or dcz, since it holds no dictionary. 2: the server answers 200 with Content-Encoding br and Use-As-Dictionary match=/*; the body is 48,049 bytes, the 227,281-byte page at brotli 11. The browser stores the 227,281 decoded bytes under their SHA-256, 8bf4d36b and so on; the server has the same file. 3: the browser requests /what-the-parser-hears/ with Accept-Encoding now including dcb and dcz and Available-Dictionary carrying the hash. 4: the server answers 200 with Content-Encoding dcb and Vary accept-encoding, available-dictionary; the body is 61,970 bytes against 68,906 as br without the dictionary. Below a divider, a later visit after a deploy, with the previous version of the same page as the dictionary. 5: the browser requests /what-is-quirq/ with Available-Dictionary set to the hash of the 821,592-byte copy from its last visit, version a76229b. 6: the server answers with dcb for version 107e64f, 822,400 bytes: 198 bytes as dcb and 272 as dcz, against 125,854 as br. For xo-space-architecture, grown from 232,168 to 242,121 bytes, dcb sends 2,901 bytes against 49,160 as br. Thick black arrows are requests and responses, blue bars body bytes, dashed grey outlines the same page without a dictionary, dashed purple boxes stored state.">
+                <defs>
+                  <marker id="fig-dict-transport-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+
+                <rect x="20" y="24" width="200" height="48" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="120" y="44" class="svg-lane" text-anchor="middle">BROWSER</text>
+                <text x="120" y="62" class="svg-sub" text-anchor="middle">keeps dictionaries</text>
+                <rect x="900" y="24" width="200" height="48" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1000" y="44" class="svg-lane" text-anchor="middle">SERVER OR CDN</text>
+                <text x="1000" y="62" class="svg-sub" text-anchor="middle">has the same files</text>
+                <line x1="120" y1="72" x2="120" y2="740" stroke="#b8b8b1"/>
+                <line x1="1000" y1="72" x2="1000" y2="740" stroke="#b8b8b1"/>
+
+                <text x="244" y="106" class="svg-num">1</text>
+                <text x="262" y="106" class="svg-step">GET /where-the-json-lives/</text>
+                <line x1="120" y1="116" x2="994" y2="116" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-dict-transport-ink)"/>
+                <text x="262" y="136" class="svg-sub">Accept-Encoding: …, br, zstd · no dcb, dcz: no dictionary stored yet</text>
+
+                <text x="244" y="176" class="svg-num">2</text>
+                <text x="262" y="176" class="svg-step">200 · Content-Encoding: br</text>
+                <line x1="1000" y1="186" x2="126" y2="186" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-dict-transport-ink)"/>
+                <text x="262" y="206" class="svg-sub">Use-As-Dictionary: match="/*"</text>
+                <rect x="262" y="216" width="229.1" height="10" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="499.1" y="225" class="svg-sub">48,049 B: 227,281 B of HTML at brotli 11</text>
+
+                <rect x="20" y="250" width="200" height="50" rx="6" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="32" y="270" class="svg-step">stores 227,281 B</text>
+                <text x="32" y="289" class="svg-sub">SHA-256 8bf4d36b…</text>
+                <rect x="900" y="250" width="200" height="50" rx="6" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="912" y="270" class="svg-step">same file on hand</text>
+                <text x="912" y="289" class="svg-sub">found by its hash</text>
+
+                <text x="244" y="336" class="svg-num">3</text>
+                <text x="262" y="336" class="svg-step">GET /what-the-parser-hears/</text>
+                <line x1="120" y1="346" x2="994" y2="346" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-dict-transport-ink)"/>
+                <text x="262" y="366" class="svg-sub">Accept-Encoding: …, br, zstd, dcb, dcz</text>
+                <text x="262" y="384" class="svg-sub">Available-Dictionary: :i/TTa/Zx5GYOoKVWAD9jz3VaUuGIJ9jdVQtB9zCSAzE=:</text>
+
+                <text x="244" y="422" class="svg-num">4</text>
+                <text x="262" y="422" class="svg-step">200 · Content-Encoding: dcb</text>
+                <line x1="1000" y1="432" x2="126" y2="432" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-dict-transport-ink)"/>
+                <text x="262" y="452" class="svg-sub">Vary: accept-encoding, available-dictionary</text>
+                <rect x="262" y="462" width="295.4" height="10" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="565.4" y="471" class="svg-sub">61,970 B as dcb</text>
+                <rect x="262" y="478" width="328.5" height="10" rx="2" fill="none" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+                <text x="598.5" y="487" class="svg-sub">68,906 B as br alone</text>
+                <text x="262" y="510" class="svg-note">a 36-byte header, ff 44 43 42 and the hash, then the page at brotli 11</text>
+
+                <line x1="0" y1="532" x2="1120" y2="532" stroke="#deded9"/>
+                <text x="262" y="556" class="svg-lane">LATER, AFTER A DEPLOY: THE PREVIOUS VERSION IS THE DICTIONARY</text>
+
+                <text x="244" y="588" class="svg-num">5</text>
+                <text x="262" y="588" class="svg-step">GET /what-is-quirq/</text>
+                <line x1="120" y1="598" x2="994" y2="598" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-dict-transport-ink)"/>
+                <text x="262" y="618" class="svg-sub">Available-Dictionary: hash of the copy from the last visit (a76229b, 821,592 B)</text>
+
+                <text x="244" y="654" class="svg-num">6</text>
+                <text x="262" y="654" class="svg-step">200 · Content-Encoding: dcb · version 107e64f, 822,400 B</text>
+                <line x1="1000" y1="664" x2="126" y2="664" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-dict-transport-ink)"/>
+                <rect x="262" y="676" width="2" height="10" fill="#3c6f97"/>
+                <text x="272" y="685" class="svg-sub">198 B as dcb; 272 B as dcz</text>
+                <rect x="262" y="692" width="600" height="10" rx="2" fill="none" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+                <text x="870" y="701" class="svg-sub">125,854 B as br</text>
+                <text x="262" y="728" class="svg-note">xo-space-architecture, 232,168 → 242,121 B: 2,901 B as dcb against 49,160 B as br</text>
+
+                <line x1="0" y1="766" x2="34" y2="766" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-dict-transport-ink)"/>
+                <text x="44" y="770" class="svg-sub">request or response</text>
+                <rect x="220" y="761" width="30" height="10" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="258" y="770" class="svg-sub">body bytes on the wire</text>
+                <rect x="452" y="761" width="30" height="10" rx="2" fill="none" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+                <text x="490" y="770" class="svg-sub">same page, no dictionary</text>
+                <rect x="700" y="759" width="30" height="14" rx="3" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="738" y="770" class="svg-sub">state kept for later</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="src">from the spec</span> Headers follow RFC 9842 §2–§6; the
+              <code>match</code> pattern and the elided Accept-Encoding lists are illustrative, the
+              base64 hash is real. <span class="recon">measured here</span> Body sizes from
+              <code>_numbers.json → wire</code>; bars are linear, at least 2 units wide.
+              <span class="recon">reconstruction</span> The two halves use different dictionaries,
+              so their savings do not add: a sibling post saves a tenth, a previous version nearly
+              everything.
+            </p>
+          </figure>
+
+          <p>
+            A dictionary is worth what it shares. With <code>where-the-json-lives/index.html</code>
+            (227,281 bytes, sharing this site's CSS, chrome and script) as the dictionary, dcb at
+            Brotli 11 sends 10.1% less than br, and dcz at level 19 12.8% less than zstd 19.
+            <span class="recon">measured here</span> Fetched only to be a dictionary, that page
+            would cost 48,049 bytes and take seven pages like this one to repay:
+            48,049 ÷ (68,906 − 61,970) = 6.9. <span class="recon">reconstruction</span> A previous
+            version shares nearly everything (lower half of Figure {{fig-dict-transport}}).
+            <code>what-is-quirq</code> grew by 808 bytes and travels as 198 bytes of dcb against
+            125,854 of br; <code>xo-space-architecture</code> grew by 9,953 and travels as 2,901
+            against 49,160.
+            <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            Chrome and Edge turned dictionary transport on by default in version 130 (Chrome stable
+            15 October 2024); Firefox 145 has it behind <code>network.http.dictionaries.enable</code>; Safari
+            has none. <span class="src">from the docs</span> Reports that Firefox 147 shipped it are
+            unsupported: its release notes (13 January 2026) mention only Brotli in
+            <code>CompressionStream</code>. <span class="src">from the docs</span> Since 30 April
+            2026 Cloudflare passes dcb and dcz through on all plans, in open beta; the origin still
+            builds the deltas. <span class="src">from the docs</span> So in October 2026 a
+            dictionary pays off for Chrome and Edge readers of origins that build their own deltas.
+            <span class="recon">reconstruction</span>
+          </p>

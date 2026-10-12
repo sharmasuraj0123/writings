@@ -1,0 +1,497 @@
+          <h2 id="compaction"><span class="secnum">{{S}}</span>Compaction: keeping only the present</h2>
+
+          <p class="lede">
+            A system that writes out of place leaves old versions behind. Compaction rewrites what
+            is still live and lets the rest go. Each kind keeps an invariant, drops what no reader
+            can see, waits for a trigger, and pays in writes, spare disk or a pause.
+          </p>
+
+          <h3>What each one promises to keep</h3>
+
+          <p>
+            The sources state the invariant themselves. SQLite's <code>VACUUM INTO</code> output
+            "will contain the same logical content as the original database, fully vacuumed"
+            (lang_vacuum.html, §2.1). Delta Lake: "a read before and after an OPTIMIZE has the
+            same results" (Delta 4.4.1). Kafka: "The offset for a message never changes" (4.3
+            docs, Design). Cassandra keeps "the most up-to-date version (by timestamp)" of each
+            column ("Compaction overview"). <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            The promises cover logical content, not physical identity. SQLite's VACUUM "may change
+            the ROWIDs" of tables without an explicit INTEGER PRIMARY KEY (§3).
+            <span class="src">from the docs</span> In one test here on 3.46.1 it changed none of
+            2,000. <span class="recon">measured here</span> A copying collector moves every
+            survivor; in V8's scavenger each copied object "leaves a forwarding-address" ("Trash
+            talk", 3 January 2019). <span class="src">from the docs</span>
+          </p>
+
+          <h3>LSM trees</h3>
+
+          <p>
+            A log-structured merge tree buffers writes in memory and merges them down through
+            ever larger sorted files (Figure {{fig-lsm}}). O'Neil et al. (<em>Acta
+            Informatica</em>, 1996) called this the "rolling merge"; their preprint never says
+            compaction. Its "delete node entry" migrates down and "annihilates the associated
+            entry when it is encountered" (§2.3), the ancestor of the tombstone.
+            <span class="src">from the paper</span> Bigtable (OSDI 2006, §5.4) named the steps: a
+            minor compaction flushes the memtable (the sorted in-memory buffer) to an SSTable (a
+            sorted, immutable file), a merging compaction bounds how many SSTables a read must
+            merge, and a major compaction "produces an SSTable that contains no deletion
+            information or deleted data". <span class="src">from the paper</span>
+          </p>
+
+          <p>
+            RocksDB defines the costs. Write amplification is "the ratio of bytes written to
+            storage versus bytes written to the database"; space amplification is bytes on disk
+            over data size. Leveled compaction keeps space low and rewrites more; universal
+            compaction writes less but "may temporarily increase size amplification by a factor
+            of two" (Tuning Guide). <span class="src">from the docs</span> The RUM conjecture
+            generalises: "An access method that can set an upper bound for two out of the read,
+            update, and memory overheads, also sets a lower bound for the third overhead"
+            (Athanassoulis et al., EDBT 2016, §3). <span class="src">from the paper</span>
+          </p>
+
+          <p>
+            RocksDB compresses as it compacts. Since 11.5.0 (16 June 2026) the default block codec
+            is LZ4 where compiled in; v11.8.1, the latest tagged release, ships it. The wiki
+            recommends ZSTD for the bottommost level, which "contains majority of the data".
+            With dictionary compression on, a dictionary is trained per SST file during
+            compaction. <span class="src">from the docs</span> The codecs themselves are in
+            <a href="#codecs">The codecs that matter in 2026</a>.
+          </p>
+
+          <p>
+            Cassandra 5.0's docs recommend the Unified Compaction Strategy "for most workloads"
+            over the size-tiered, leveled and time-window strategies. 5.0.9 (7 August 2026) is the
+            latest GA release; 6.0 exists only as alphas. A tombstone may be purged only after
+            <code>gc_grace_seconds</code> (default 864000, ten days), by a compaction that
+            includes every SSTable with older data for its partition. Purge sooner, and a replica
+            that missed the delete can spread the row back as a "zombie".
+            <span class="src">from the docs</span>
+          </p>
+
+          <figure class="figure wide" id="fig-lsm">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">How an LSM tree compacts: flush, merge down, drop at the bottom</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 560" role="img" aria-label="Schematic of leveled LSM compaction. Writes (put and delete) go to a sorted in-memory memtable, which is flushed to level 0 as an SSTable; Bigtable calls the flush a minor compaction. Level 0 holds four overlapping SSTables, each covering keys a to z; one holds a tombstone, del K2. Compaction merges each level into the next, ten times larger, dropping overwritten values: level 1 holds four non-overlapping SSTables a–f, g–m, n–s, t–z; level 2 holds more, smaller key ranges; the bottommost level Ln holds most of the data, including an old value K2 = 12. At the bottom, the tombstone and the value it hides are dropped for good, once no deeper level holds K2 (LevelDB) and, in Cassandra, after gc_grace_seconds. RocksDB codec per level: LZ4 by default on every level since 11.5.0; ZSTD recommended for the bottommost level, with a dictionary trained per SST file. Write amplification: a byte is rewritten at each level it passes, up to the fanout per level for leveled compaction. Space amplification: old versions wait in upper levels until merged; universal compaction may need twice the space while it runs.">
+                <defs>
+                  <marker id="fig-lsm-blu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-lsm-pur" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="0" y="16" class="svg-lane">AN LSM TREE · WRITES FLOW DOWN, COMPACTION MERGES THEM</text>
+
+                <text x="0" y="58" class="svg-step">Writes</text>
+                <text x="0" y="78" class="svg-sub">put, delete</text>
+                <line x1="96" y1="64" x2="149" y2="64" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-lsm-blu)"/>
+                <rect x="155" y="34" width="200" height="60" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="167" y="58" class="svg-step">Memtable</text>
+                <text x="167" y="78" class="svg-sub">sorted, in memory</text>
+                <text x="375" y="68" class="svg-note">full → frozen → written out as one SSTable</text>
+                <line x1="255" y1="94" x2="255" y2="129" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-lsm-blu)"/>
+                <text x="265" y="116" class="svg-sub">flush (Bigtable: minor compaction)</text>
+
+                <text x="800" y="120" class="svg-lane">ROCKSDB CODEC</text>
+
+                <text x="0" y="150" class="svg-lane">L0</text>
+                <text x="0" y="166" class="svg-sub">overlapping</text>
+                <rect x="155" y="134" width="100" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="165" y="150" class="svg-sub">a–z</text>
+                <rect x="268" y="134" width="100" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="278" y="150" class="svg-sub">a–z</text>
+                <rect x="276" y="155" width="60" height="14" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="282" y="166" class="svg-sub">del K2</text>
+                <rect x="381" y="134" width="100" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="391" y="150" class="svg-sub">a–z</text>
+                <rect x="494" y="134" width="100" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="504" y="150" class="svg-sub">a–z</text>
+                <rect x="800" y="141" width="60" height="20" rx="10" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="815" y="155" class="svg-sub">LZ4</text>
+                <text x="872" y="155" class="svg-sub">default since 11.5.0</text>
+
+                <path d="M600 153 H615 V223 H602" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-lsm-blu)"/>
+                <text x="625" y="184" class="svg-sub">merge into next level</text>
+                <text x="625" y="200" class="svg-sub">drop overwritten values</text>
+
+                <text x="0" y="220" class="svg-lane">L1</text>
+                <text x="0" y="238" class="svg-sub">no overlap</text>
+                <rect x="155" y="204" width="104" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="165" y="227" class="svg-sub">a–f</text>
+                <rect x="267" y="204" width="104" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="277" y="227" class="svg-sub">g–m</text>
+                <rect x="379" y="204" width="104" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="389" y="227" class="svg-sub">n–s</text>
+                <rect x="491" y="204" width="104" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="501" y="227" class="svg-sub">t–z</text>
+                <rect x="800" y="213" width="60" height="20" rx="10" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="815" y="227" class="svg-sub">LZ4</text>
+                <text x="872" y="227" class="svg-sub">per block, per SST file</text>
+
+                <path d="M600 223 H615 V293 H602" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-lsm-blu)"/>
+                <text x="625" y="254" class="svg-sub">each level ~10× larger</text>
+                <text x="625" y="270" class="svg-sub">drop overwritten values</text>
+
+                <text x="0" y="290" class="svg-lane">L2</text>
+                <text x="0" y="308" class="svg-sub">10× L1</text>
+                <rect x="155" y="274" width="440" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <line x1="210" y1="274" x2="210" y2="312" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="265" y1="274" x2="265" y2="312" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="320" y1="274" x2="320" y2="312" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="375" y1="274" x2="375" y2="312" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="430" y1="274" x2="430" y2="312" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="485" y1="274" x2="485" y2="312" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="540" y1="274" x2="540" y2="312" stroke="#3c6f97" stroke-width="0.8"/>
+                <rect x="800" y="283" width="60" height="20" rx="10" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="815" y="297" class="svg-sub">LZ4</text>
+                <text x="872" y="297" class="svg-sub">same default</text>
+
+                <path d="M600 293 H615 V363 H602" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-lsm-blu)"/>
+                <text x="625" y="324" class="svg-sub">… down to the last level</text>
+                <text x="625" y="340" class="svg-sub">tombstones can go here</text>
+
+                <text x="0" y="360" class="svg-lane">LN</text>
+                <text x="0" y="376" class="svg-sub">bottommost</text>
+                <rect x="155" y="344" width="440" height="38" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <line x1="192" y1="344" x2="192" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="229" y1="344" x2="229" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="266" y1="344" x2="266" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="303" y1="344" x2="303" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="340" y1="344" x2="340" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="414" y1="344" x2="414" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="451" y1="344" x2="451" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="488" y1="344" x2="488" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="525" y1="344" x2="525" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <line x1="562" y1="344" x2="562" y2="382" stroke="#3c6f97" stroke-width="0.8"/>
+                <rect x="344" y="355" width="66" height="16" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="350" y="367" class="svg-sub">K2 = 12</text>
+                <rect x="800" y="353" width="60" height="20" rx="10" fill="#dfede5" stroke="#367f59"/>
+                <text x="812" y="367" class="svg-sub">ZSTD</text>
+                <text x="872" y="360" class="svg-sub">recommended for bottommost</text>
+                <text x="872" y="376" class="svg-sub">dictionary trained per SST file</text>
+
+                <path d="M377 382 V403" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-lsm-pur)"/>
+                <rect x="155" y="408" width="440" height="88" rx="6" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="167" y="430" class="svg-step">Dropped for good</text>
+                <text x="167" y="450" class="svg-sub">del K2 and the K2 = 12 it hides,</text>
+                <text x="167" y="468" class="svg-sub">once no deeper level can hold K2 (LevelDB);</text>
+                <text x="167" y="486" class="svg-sub">in Cassandra, also after gc_grace_seconds</text>
+
+                <text x="640" y="426" class="svg-lane">WRITE AMPLIFICATION</text>
+                <text x="640" y="444" class="svg-note">a byte is rewritten at each level it passes;</text>
+                <text x="640" y="460" class="svg-note">leveled: up to the fanout per level (RocksDB wiki)</text>
+                <text x="640" y="482" class="svg-lane">SPACE AMPLIFICATION</text>
+                <text x="640" y="500" class="svg-note">old versions wait in upper levels until merged;</text>
+                <text x="640" y="516" class="svg-note">universal compaction may need 2× while it runs</text>
+
+                <line x1="0" y1="526" x2="1120" y2="526" stroke="#deded9"/>
+                <rect x="0" y="538" width="14" height="14" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="22" y="549" class="svg-sub">SSTable (sorted, immutable)</text>
+                <rect x="235" y="538" width="14" height="14" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="257" y="549" class="svg-sub">tombstone</text>
+                <rect x="335" y="538" width="14" height="14" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="357" y="549" class="svg-sub">dropped for good</text>
+                <rect x="488" y="538" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="510" y="549" class="svg-sub">fast codec</text>
+                <rect x="596" y="538" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="618" y="549" class="svg-sub">stronger codec</text>
+                <line x1="735" y1="545" x2="765" y2="545" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-lsm-blu)"/>
+                <text x="775" y="549" class="svg-sub">data: flush, merge</text>
+                <path d="M920 545 H950" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-lsm-pur)"/>
+                <text x="960" y="549" class="svg-sub">discarded</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> A schematic of leveled compaction, not a
+              measurement. Overwritten values go at every merge; a tombstone and the value it hides
+              go only at the bottom. Codecs follow RocksDB 11.5.0; the 10× level ratio is Cassandra
+              LCS's default; tombstone rules follow LevelDB and Cassandra.
+            </p>
+          </figure>
+
+          <h3>Kafka: at least the last value</h3>
+
+          <p>
+            A topic with <code>cleanup.policy=compact</code> keeps "at least the last known value
+            for each message key" in a partition (4.3 docs, "Log Compaction"). At least, not only.
+            The cleaner recopies closed segments, never the active one, once the dirty share
+            reaches <code>min.cleanable.dirty.ratio</code> (default 0.5): "at most 50% of the log
+            could be duplicates". A tombstone, a key with a null payload, is itself removed after
+            <code>delete.retention.ms</code> (default one day), so a consumer lagging longer can
+            miss the delete. Batch compression is a separate setting
+            (<a href="../what-each-file-wants/#small">why batches compress</a>).
+            <span class="src">from the docs</span> Figure {{fig-kafka-compact}} shows one
+            cleaning.
+          </p>
+
+          <figure class="figure" id="fig-kafka-compact">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">A compacted partition before and after one cleaning</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 704 320" role="img" aria-label="One Kafka partition with eleven records at offsets 0 to 10. Before cleaning: 0 K1=a, 1 K2=b, 2 K1=c, 3 K3=d, 4 K4=e, 5 K2=f, 6 K3 null (a tombstone), 7 K1=g, 8 K4=h in three closed segments, then 9 K2=i and 10 K1=j in the active segment, which is never cleaned. The log cleaner recopies segments 1 to 3 keeping the latest record per key. After one cleaning, offsets 0 to 4 are gone and nothing is renumbered; offsets 5 K2=f, 6 K3 tombstone, 7 K1=g, 8 K4=h, 9 K2=i and 10 K1=j remain. K1 and K2 still appear twice, because the guarantee is at least the last value per key. The tombstone stays until delete.retention.ms, one day by default, then goes.">
+                <defs>
+                  <marker id="fig-kafka-compact-blu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+
+                <text x="0" y="16" class="svg-lane">ONE PARTITION · BEFORE CLEANING</text>
+                <rect x="0" y="28" width="56" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="8" y="44" class="svg-sub">0</text><text x="8" y="63" class="svg-sub">K1=a</text>
+                <rect x="62" y="28" width="56" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="70" y="44" class="svg-sub">1</text><text x="70" y="63" class="svg-sub">K2=b</text>
+                <rect x="124" y="28" width="56" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="132" y="44" class="svg-sub">2</text><text x="132" y="63" class="svg-sub">K1=c</text>
+                <rect x="186" y="28" width="56" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="194" y="44" class="svg-sub">3</text><text x="194" y="63" class="svg-sub">K3=d</text>
+                <rect x="248" y="28" width="56" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="256" y="44" class="svg-sub">4</text><text x="256" y="63" class="svg-sub">K4=e</text>
+                <rect x="310" y="28" width="56" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="318" y="44" class="svg-sub">5</text><text x="318" y="63" class="svg-sub">K2=f</text>
+                <rect x="372" y="28" width="56" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="376" y="44" class="svg-sub">6</text><text x="376" y="63" class="svg-sub">K3 null</text>
+                <rect x="434" y="28" width="56" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="442" y="44" class="svg-sub">7</text><text x="442" y="63" class="svg-sub">K1=g</text>
+                <rect x="496" y="28" width="56" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="504" y="44" class="svg-sub">8</text><text x="504" y="63" class="svg-sub">K4=h</text>
+                <rect x="558" y="28" width="56" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="566" y="44" class="svg-sub">9</text><text x="566" y="63" class="svg-sub">K2=i</text>
+                <rect x="620" y="28" width="56" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="628" y="44" class="svg-sub">10</text><text x="628" y="63" class="svg-sub">K1=j</text>
+
+                <path d="M0 80 V86 H180 V80" fill="none" stroke="#b8b8b1"/>
+                <text x="90" y="101" class="svg-sub" text-anchor="middle">segment 1</text>
+                <path d="M186 80 V86 H366 V80" fill="none" stroke="#b8b8b1"/>
+                <text x="276" y="101" class="svg-sub" text-anchor="middle">segment 2</text>
+                <path d="M372 80 V86 H552 V80" fill="none" stroke="#b8b8b1"/>
+                <text x="462" y="101" class="svg-sub" text-anchor="middle">segment 3</text>
+                <path d="M558 80 V86 H676 V80" fill="none" stroke="#b8b8b1"/>
+                <text x="617" y="101" class="svg-sub" text-anchor="middle">active, never cleaned</text>
+
+                <line x1="10" y1="112" x2="10" y2="146" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-kafka-compact-blu)"/>
+                <text x="24" y="133" class="svg-sub">log cleaner: recopy segments 1–3, keep the latest record per key</text>
+
+                <text x="0" y="166" class="svg-lane">AFTER ONE CLEANING · OFFSETS UNCHANGED</text>
+                <rect x="0" y="176" width="56" height="44" rx="4" fill="none" stroke="#765b98" stroke-dasharray="4 3"/>
+                <text x="8" y="192" class="svg-sub">0</text>
+                <rect x="62" y="176" width="56" height="44" rx="4" fill="none" stroke="#765b98" stroke-dasharray="4 3"/>
+                <text x="70" y="192" class="svg-sub">1</text>
+                <rect x="124" y="176" width="56" height="44" rx="4" fill="none" stroke="#765b98" stroke-dasharray="4 3"/>
+                <text x="132" y="192" class="svg-sub">2</text>
+                <rect x="186" y="176" width="56" height="44" rx="4" fill="none" stroke="#765b98" stroke-dasharray="4 3"/>
+                <text x="194" y="192" class="svg-sub">3</text>
+                <rect x="248" y="176" width="56" height="44" rx="4" fill="none" stroke="#765b98" stroke-dasharray="4 3"/>
+                <text x="256" y="192" class="svg-sub">4</text>
+                <rect x="310" y="176" width="56" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="318" y="192" class="svg-sub">5</text><text x="318" y="211" class="svg-sub">K2=f</text>
+                <rect x="372" y="176" width="56" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="376" y="192" class="svg-sub">6</text><text x="376" y="211" class="svg-sub">K3 null</text>
+                <rect x="434" y="176" width="56" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="442" y="192" class="svg-sub">7</text><text x="442" y="211" class="svg-sub">K1=g</text>
+                <rect x="496" y="176" width="56" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="504" y="192" class="svg-sub">8</text><text x="504" y="211" class="svg-sub">K4=h</text>
+                <rect x="558" y="176" width="56" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="566" y="192" class="svg-sub">9</text><text x="566" y="211" class="svg-sub">K2=i</text>
+                <rect x="620" y="176" width="56" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="628" y="192" class="svg-sub">10</text><text x="628" y="211" class="svg-sub">K1=j</text>
+
+                <text x="0" y="242" class="svg-note">Offsets 0–4 are gone; nothing is renumbered.</text>
+                <text x="0" y="260" class="svg-note">K1 and K2 still appear twice: the promise is at least the last value per key.</text>
+                <text x="0" y="278" class="svg-note">The K3 tombstone stays until delete.retention.ms (one day by default), then goes.</text>
+
+                <line x1="0" y1="290" x2="704" y2="290" stroke="#deded9"/>
+                <rect x="0" y="300" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="22" y="311" class="svg-sub">kept by the cleaner</text>
+                <rect x="170" y="300" width="14" height="14" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="192" y="311" class="svg-sub">superseded: dropped</text>
+                <rect x="345" y="300" width="14" height="14" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="367" y="311" class="svg-sub">tombstone</text>
+                <rect x="445" y="300" width="14" height="14" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="467" y="311" class="svg-sub">not yet cleaned</text>
+                <line x1="590" y1="307" x2="620" y2="307" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-kafka-compact-blu)"/>
+                <text x="630" y="311" class="svg-sub">data</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">reconstruction</span> A schematic from the Kafka 4.3 design
+              docs, not a broker trace. Compaction removes records; it never renumbers the ones it
+              keeps.
+            </p>
+          </figure>
+
+          <p>
+            <code>_compute.py</code> runs a cleaner modelled on Kafka's (a model, not Kafka) over
+            the 39,366,976-byte update log from <a href="#two-words">the opening section</a>, with
+            1 MiB segments and dirty ratio 0.5. It cleaned 37 times and rewrote 35,691,994 bytes:
+            write amplification (39,366,976 + 35,691,994) ÷ 39,366,976 = 1.91. The log peaked at
+            2,024,373 bytes (2.17× the 933,174 live bytes) and ended at 1,501,846 (1.61×).
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>Databases: deleting is not freeing</h3>
+
+          <p>
+            PostgreSQL keeps old row versions for multiversion concurrency control (MVCC)
+            (<a href="../where-the-json-lives/#relational">Where the JSON Lives</a>). Plain
+            <code>VACUUM</code> marks their space reusable without blocking reads or writes.
+            <code>VACUUM FULL</code> "actively compacts tables by writing a complete new version of
+            the table file with no dead space", under an ACCESS EXCLUSIVE lock, and autovacuum
+            "will never issue VACUUM FULL" (PostgreSQL 18 docs, §24.1.2 and "VACUUM").
+            PostgreSQL 19's <code>REPACK</code>, in beta, takes that lock only to swap files when run with
+            <code>CONCURRENTLY</code>. <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            SQLite's VACUUM "rebuilds the database file, repacking it into a minimal amount of
+            disk space", and may need twice the file size free. With <code>auto_vacuum</code> off,
+            the default, freed pages go on a freelist; <code>auto_vacuum=FULL</code> truncates it
+            at each commit but "can actually make fragmentation worse".
+            <span class="src">from the docs</span> In Figure {{fig-maintenance}}, deleting 90% of
+            100,000 generated JSON documents leaves the 47,034,368-byte file exactly that size, with 10,332
+            of its 11,483 pages free. VACUUM brings it to 4,714,496 bytes and writes 14,154,268 to
+            get there, three times what it leaves (14,154,268 ÷ 4,714,496 = 3.00). After a
+            scattered delete,
+            <code>incremental_vacuum</code> ended 12% larger than VACUUM (5,300,224 against
+            4,722,688 bytes) and left 78 deleted documents readable in unused gaps of live pages;
+            VACUUM left none. <span class="recon">measured here</span> This build compiles in
+            <code>SECURE_DELETE</code>, so the remnant count does not generalise.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure" id="fig-maintenance">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Deleting does not free space until something compacts</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 704 396" role="img" aria-label="Horizontal bar chart on a logarithmic axis from 100 kB to 100 MB, bytes on disk in three measured cases. SQLite 3.46.1 with 100,000 generated JSON documents: 47,034,368 bytes after insert; 47,034,368 bytes after deleting 90 percent, unchanged; 4,714,496 bytes after VACUUM, which wrote 14,154,268 bytes. Key-value update log of 200,000 updates over 5,000 keys: raw log 39,366,976 bytes, 42.19 times the live state; Kafka-style online cleaner peak 2,024,373 bytes, 2.17 times live; cleaner end 1,501,846 bytes, 1.61 times live; one-shot compaction 933,174 bytes, the live state. Git 2.55.0, a synthetic repository of 300 commits plus a deleted five-commit branch: loose objects 7,561,216 bytes on disk and 1,931,211 bytes apparent; after git gc --prune=now 253,952 bytes on disk and 241,355 bytes apparent.">
+                <text x="0" y="16" class="svg-lane">BYTES ON DISK · LOG SCALE</text>
+                <rect x="0" y="28" width="14" height="14" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="22" y="39" class="svg-sub">before compaction</text>
+                <rect x="150" y="28" width="14" height="14" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="172" y="39" class="svg-sub">deleted, still on disk</text>
+                <rect x="350" y="28" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="372" y="39" class="svg-sub">online cleaner</text>
+                <rect x="490" y="28" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="512" y="39" class="svg-sub">after compaction</text>
+
+                <line x1="210" y1="58" x2="210" y2="370" stroke="#deded9"/>
+                <line x1="315" y1="58" x2="315" y2="370" stroke="#deded9"/>
+                <line x1="420" y1="58" x2="420" y2="370" stroke="#deded9"/>
+                <line x1="525" y1="58" x2="525" y2="370" stroke="#deded9"/>
+                <line x1="210" y1="370" x2="525" y2="370" stroke="#b8b8b1"/>
+                <text x="210" y="386" class="svg-sub" text-anchor="middle">100 kB</text>
+                <text x="315" y="386" class="svg-sub" text-anchor="middle">1 MB</text>
+                <text x="420" y="386" class="svg-sub" text-anchor="middle">10 MB</text>
+                <text x="525" y="386" class="svg-sub" text-anchor="middle">100 MB</text>
+
+                <text x="0" y="70" class="svg-lane">SQLITE · 100,000 JSON DOCUMENTS</text>
+                <text x="200" y="91" class="svg-sub" text-anchor="end">after insert</text>
+                <rect x="210" y="78" width="280.6" height="18" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="498.6" y="91" class="svg-sub">47,034,368 B</text>
+                <text x="200" y="117" class="svg-sub" text-anchor="end">after deleting 90%</text>
+                <rect x="210" y="104" width="280.6" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="498.6" y="117" class="svg-sub">47,034,368 B · unchanged</text>
+                <text x="200" y="143" class="svg-sub" text-anchor="end">after VACUUM</text>
+                <rect x="210" y="130" width="175.7" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="393.7" y="143" class="svg-sub">4,714,496 B · wrote 14,154,268 B</text>
+
+                <text x="0" y="176" class="svg-lane">KEY-VALUE LOG · 200,000 UPDATES</text>
+                <text x="200" y="197" class="svg-sub" text-anchor="end">raw update log</text>
+                <rect x="210" y="184" width="272.5" height="18" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="490.5" y="197" class="svg-sub">39,366,976 B · 42.19× live</text>
+                <text x="200" y="223" class="svg-sub" text-anchor="end">online cleaner, peak</text>
+                <rect x="210" y="210" width="137.2" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="355.2" y="223" class="svg-sub">2,024,373 B · 2.17× live</text>
+                <text x="200" y="249" class="svg-sub" text-anchor="end">online cleaner, end</text>
+                <rect x="210" y="236" width="123.5" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="341.5" y="249" class="svg-sub">1,501,846 B · 1.61× live</text>
+                <text x="200" y="275" class="svg-sub" text-anchor="end">one-shot compaction</text>
+                <rect x="210" y="262" width="101.8" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="319.8" y="275" class="svg-sub">933,174 B · the live state</text>
+
+                <text x="0" y="308" class="svg-lane">GIT 2.55.0 · .GIT/OBJECTS ON DISK</text>
+                <text x="200" y="329" class="svg-sub" text-anchor="end">loose objects</text>
+                <rect x="210" y="316" width="197.3" height="18" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="415.3" y="329" class="svg-sub">7,561,216 B · 1,931,211 apparent</text>
+                <text x="200" y="355" class="svg-sub" text-anchor="end">after git gc</text>
+                <rect x="210" y="342" width="42.5" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="260.5" y="355" class="svg-sub">253,952 B · 241,355 apparent</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> Exact bytes from
+              <code>_numbers.json → compaction</code>; all three inputs are generated, and git bars
+              are allocated bytes. In each case
+              space comes back only when a compaction rewrites the live data.
+            </p>
+          </figure>
+
+          <p>
+            MongoDB's <code>compact</code> "Attempts to release unneeded disk space to the
+            operating system", and 8.0 added a background <code>autoCompact</code>. etcd splits
+            the job: compaction drops superseded key versions, and a separate defragmentation,
+            which blocks the member, returns the space (v3.7 docs, "Maintenance").
+            <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            Iceberg's <code>rewrite_data_files</code> bin-packs small files towards 512 MB, and
+            each compaction is a new snapshot: old files stay for time travel until
+            <code>expire_snapshots</code> (Iceberg 1.12.0 docs). Its default Parquet codec is
+            zstd. <span class="src">from the docs</span> Because these rewrites, and Delta's
+            <code>OPTIMIZE</code>, write new files, compaction is when a changed codec reaches old
+            data. <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>Memory, disks, git and logs of record</h3>
+
+          <p>
+            V8's mark–sweep–compact collector compacts only some highly fragmented pages: "You can
+            think of compaction sort of like hard-disk defragmentation on an old PC." G1 compacts as it
+            evacuates live objects (Java 26 tuning guide); ZGC relocates concurrently and has been
+            generational only since JDK 24 (JEP 490). Linux compacts physical memory for huge
+            pages, in per-node <code>kcompactd</code> threads since 4.6, and its docs warn of
+            latency spikes. <span class="src">from the docs</span> These move live data and drop
+            nothing live. <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            The log-structured file system (Rosenblum and Ousterhout, SOSP 1991, §3.4) prices
+            cleaning as write cost: disk time per byte of new data.
+            <span class="src">from the paper</span> Reading N segments at utilisation u, writing
+            back N·u of live data and filling N·(1 − u) with new data moves 2N segments for
+            N·(1 − u) of new data: 2 ÷ (1 − u), or 10 at 80% live.
+            <span class="recon">reconstruction</span> F2FS cleans the same way on flash.
+            <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            <code>git gc</code> does both jobs (its manual is quoted in
+            <a href="#two-words">the opening section</a>); a pack holds objects "individually
+            compressed, with delta compression applied" (git-repack.adoc).
+            <span class="src">from the docs</span> On a synthetic 300-commit repository (24
+            files; a deleted five-commit branch adds five 256 KiB files), git 2.55.0's
+            <code>git gc --prune=now</code> packed 1,646 of 1,661 loose objects, 1,010 as deltas,
+            dropped the 15 unreachable ones, and cut <code>.git/objects</code> from 7,561,216
+            bytes on disk to 253,952 (1,931,211 to 241,355 apparent bytes).
+            <span class="recon">measured here</span> Each loose object occupies whole 4 KiB
+            filesystem blocks, so on-disk bytes overstate the drop.
+            <span class="recon">reconstruction</span> By default, unreachable objects get two
+            weeks' grace (<code>gc.pruneExpire</code>). <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            Raft compacts by snapshot: "the entire current system state is written to a snapshot
+            on stable storage, then the entire log up to that point is discarded" (extended
+            version, 2014, §7). <span class="src">from the paper</span> Event sourcing as Martin
+            Fowler defines it (2005) keeps the events "for the same lifetime as the application
+            state itself"; its snapshots are a cache. <span class="src">from the docs</span> Yjs,
+            a CRDT, discards a deleted item's content but keeps the item as a tombstone, because
+            it fixes the order; <code>doc.gc = false</code> keeps the content too.
+            <span class="src">from the docs</span> An agent's context is the newest sense:
+            <a href="#context-compaction">Compacting a conversation</a>.
+          </p>
