@@ -1,0 +1,388 @@
+          <h2 id="in-the-tree"><span class="secnum">{{S}}</span>What our own tree says</h2>
+
+          <p class="lede">
+            By file count, XO's configuration on this machine is mostly JSON (199 of 230
+            configuration-shaped files), and YAML and TOML are rare (10 files and 1).
+            <span class="recon">measured here</span> xo-space's runtime settings arrive through
+            <code>.env</code> files. <span class="src">from the tree</span> The misreadings with the
+            widest reach in our scratch runs are not the well-known ones. They come from one route
+            that picks a parser by file suffix, and from nine readers of <code>.env</code> files
+            that do not share a grammar.
+          </p>
+
+          <h3>What is on disk</h3>
+
+          <p>
+            A survey on 9 October 2026 found 304 configuration-shaped files: 230 in XO-owned trees
+            and 74 at the top level or in the workflows of upstream clones. JSON is 199 of the 230 XO
+            files (87%), but only
+            55 of those are configuration a person writes. The rest are watcher state under
+            <code>.xo/</code> (66), data and build artifacts (60), JSON Schemas (14) and lockfiles (4).
+            XO trees hold 10 YAML files and one TOML file, fly-lab's <code>pyproject.toml</code>. The
+            upstream clones lean the other way: 36 of their 74 files are YAML and 8 are TOML.
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>Four formats behind one suffix switch</h3>
+
+          <p>
+            xo-space drives five agent backends. Line 7 of each JSON manifest,
+            <code>config/agents/&lt;agent&gt;/manifest.json</code>, names the agent's own config file:
+            <code>~/.claude/settings.json</code>, <code>~/.gemini/antigravity-cli/settings.json</code>,
+            <code>~/.codex/config.toml</code>, <code>~/.hermes/config.yaml</code> and
+            <code>~/.openclaw/openclaw.json</code>. <span class="src">from the tree</span> That makes four
+            formats, because OpenClaw's configuration reference says its "Config format is JSON5
+            (comments + trailing commas allowed)." <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            The Settings → Config route reads all five, choosing the parser by suffix in
+            <code>routers/cowork_agent/config.py</code>, lines 256–261:
+          </p>
+
+          <pre><code>if suffix in (".yaml", ".yml"):
+    import yaml
+    raw = yaml.safe_load(config_path.read_text()) or {}
+else:
+    import json as _json
+    raw = _json.loads(config_path.read_text() or "{}")</code></pre>
+
+          <p>
+            Its docstring (line 232) names only "json for openclaw, yaml for hermes".
+            <span class="src">from the tree</span> In a scratch <code>HOME</code>, a valid Codex
+            <code>config.toml</code> goes to <code>json.loads</code> and the route returns HTTP 500,
+            "Expecting value: line 1 column 1 (char 0)". A five-line JSON5 <code>openclaw.json</code>
+            returns 500 too. <span class="recon">measured here</span> Yet the Codex troubleshooter,
+            <code>config/agents/codex/troubleshoot.py</code> lines 117–118, already warns: "codex's
+            config_file is TOML (~/.codex/config.toml), NOT JSON — never json.load it."
+            <span class="src">from the tree</span>
+          </p>
+
+          <p>
+            The OpenClaw adapter goes further. <code>load_openclaw_config</code>
+            (<code>adapters/openclaw/store.py</code>, lines 27–35) returns <code>{}</code> on any
+            exception, and <code>create_agent</code> (<code>adapters/openclaw/agents.py</code>, lines 156
+            and 182–183) adds the new agent to that dict's <code>agents.list</code> and writes it over
+            the file.
+            <span class="src">from the tree</span> With the same JSON5 file, <code>create_agent</code>
+            returned 200 and left only <code>agents.list</code>; the <code>gateway</code> and
+            <code>channels</code> blocks were gone. <span class="recon">measured here</span>
+            Figure {{fig-xo-config-map}} traces both paths.
+          </p>
+
+          <p>
+            This is a scratch-environment finding. No <code>~/.openclaw</code>, <code>~/.codex</code>
+            or <code>~/.hermes</code> exists on this machine, though the running
+            <code>/opt/xo-space</code> build has the same code. <span class="recon">measured here</span>
+            OpenClaw's own writes produce standard JSON (<a href="#write-back">When the program writes
+            back</a>), its "Minimal config" example opens with a <code>//</code> comment, and its
+            Gateway refuses to start on a config that does not match its schema.
+            <span class="src">from the docs</span> So the exposure is a file written by hand or copied
+            from that example. <span class="recon">reconstruction</span>
+          </p>
+
+          <figure class="figure wide" id="fig-xo-config-map">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Four agent formats, one suffix switch, one write-back</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 560" role="img" aria-label="Diagram of how xo-space reads five agent config files. Five agent manifests, claude_code, antigravity, codex, hermes and openclaw, name config files in four formats: ~/.claude/settings.json (JSON), ~/.gemini/antigravity-cli/settings.json (JSON), ~/.codex/config.toml (TOML), ~/.hermes/config.yaml (YAML) and ~/.openclaw/openclaw.json (JSON5 according to OpenClaw's documentation). All five flow into one suffix switch at routers/cowork_agent/config.py lines 256 to 261, which sends .yaml and .yml files to yaml.safe_load and everything else to json.loads. Results in a scratch home: Claude Code's settings.json goes to the right parser and Antigravity's to json.loads, neither probed, and Antigravity's grammar was not checked; codex returns HTTP 500, Expecting value; hermes returns 200 but password: 123456 comes back unmasked because YAML typed it as an integer; openclaw returns HTTP 500, Expecting property name. A second path below: load_openclaw_config in store.py lines 27 to 35 turns any exception into an empty dict, create_agent in agents.py lines 156 and 182 to 183 appends the new agent to agents.list, and write_openclaw_config in store.py lines 38 to 43 replaces the whole file; a dashed write-back edge returns to openclaw.json, which afterwards holds only agents.list, with gateway and channels gone.">
+                <defs>
+                  <marker id="fig-xo-config-map-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-xo-config-map-black" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#252525"/></marker>
+                  <marker id="fig-xo-config-map-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="0" y="18" class="svg-lane">AGENT</text>
+                <text x="180" y="18" class="svg-lane">MANIFEST LINE 7 · CONFIG_FILE</text>
+                <text x="520" y="18" class="svg-lane">SETTINGS → CONFIG ROUTE</text>
+                <text x="810" y="18" class="svg-lane">RESULT IN A SCRATCH HOME</text>
+
+                <rect x="0" y="36" width="150" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="64" class="svg-step">claude_code</text>
+                <rect x="0" y="96" width="150" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="124" class="svg-step">antigravity</text>
+                <rect x="0" y="156" width="150" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="184" class="svg-step">codex</text>
+                <rect x="0" y="216" width="150" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="244" class="svg-step">hermes</text>
+                <rect x="0" y="276" width="150" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="304" class="svg-step">openclaw</text>
+
+                <line x1="150" y1="59" x2="177" y2="59" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+                <line x1="150" y1="119" x2="177" y2="119" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+                <line x1="150" y1="179" x2="177" y2="179" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+                <line x1="150" y1="239" x2="177" y2="239" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+                <line x1="150" y1="299" x2="177" y2="299" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+
+                <rect x="180" y="36" width="290" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="194" y="55" class="svg-sub">~/.claude/settings.json</text>
+                <text x="194" y="74" class="svg-step">JSON</text>
+                <rect x="180" y="96" width="290" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="194" y="115" class="svg-sub">~/.gemini/antigravity-cli/</text>
+                <text x="194" y="134" class="svg-step">settings.json · JSON</text>
+                <rect x="180" y="156" width="290" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="194" y="175" class="svg-sub">~/.codex/config.toml</text>
+                <text x="194" y="194" class="svg-step">TOML</text>
+                <rect x="180" y="216" width="290" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="194" y="235" class="svg-sub">~/.hermes/config.yaml</text>
+                <text x="194" y="254" class="svg-step">YAML</text>
+                <rect x="180" y="276" width="290" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="194" y="295" class="svg-sub">~/.openclaw/openclaw.json</text>
+                <text x="194" y="314" class="svg-step">JSON5, per OpenClaw's docs</text>
+
+                <line x1="470" y1="59" x2="517" y2="59" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+                <line x1="470" y1="119" x2="517" y2="119" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+                <line x1="470" y1="179" x2="517" y2="179" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+                <line x1="470" y1="239" x2="517" y2="239" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+                <line x1="470" y1="299" x2="517" y2="299" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+
+                <rect x="520" y="36" width="240" height="286" rx="8" fill="#f7f7f5" stroke="#252525" stroke-width="1.5"/>
+                <text x="536" y="64" class="svg-step">Suffix switch</text>
+                <text x="536" y="84" class="svg-sub">routers/cowork_agent/</text>
+                <text x="536" y="100" class="svg-sub">config.py:256–261</text>
+                <text x="536" y="150" class="svg-sub">.yaml or .yml →</text>
+                <text x="536" y="168" class="svg-sub">yaml.safe_load</text>
+                <text x="536" y="214" class="svg-sub">anything else →</text>
+                <text x="536" y="232" class="svg-sub">json.loads</text>
+                <text x="536" y="288" class="svg-note">docstring: "json for openclaw,</text>
+                <text x="536" y="304" class="svg-note">yaml for hermes"</text>
+
+                <line x1="760" y1="59" x2="806" y2="59" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-xo-config-map-black)"/>
+                <line x1="760" y1="119" x2="806" y2="119" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-xo-config-map-black)"/>
+                <line x1="760" y1="179" x2="806" y2="179" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-xo-config-map-black)"/>
+                <line x1="760" y1="239" x2="806" y2="239" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-xo-config-map-black)"/>
+                <line x1="760" y1="299" x2="806" y2="299" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-xo-config-map-black)"/>
+
+                <rect x="810" y="36" width="310" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="824" y="55" class="svg-step">json.loads</text>
+                <text x="824" y="74" class="svg-sub">right parser; not probed here</text>
+                <rect x="810" y="96" width="310" height="46" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="824" y="115" class="svg-step">json.loads</text>
+                <text x="824" y="134" class="svg-sub">not probed; grammar unchecked</text>
+                <rect x="810" y="156" width="310" height="46" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="824" y="175" class="svg-step">HTTP 500</text>
+                <text x="824" y="194" class="svg-sub">json.loads: Expecting value</text>
+                <rect x="810" y="216" width="310" height="46" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="824" y="235" class="svg-step">200 · yaml.safe_load</text>
+                <text x="824" y="254" class="svg-sub">password: 123456 returned unmasked</text>
+                <rect x="810" y="276" width="310" height="46" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="824" y="295" class="svg-step">HTTP 500</text>
+                <text x="824" y="314" class="svg-sub">json.loads: Expecting property name</text>
+
+                <text x="0" y="404" class="svg-lane">OPENCLAW ADAPTER</text>
+                <text x="0" y="422" class="svg-lane">CREATE AGENT</text>
+                <line x1="325" y1="322" x2="325" y2="373" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-xo-config-map-blue)"/>
+
+                <rect x="180" y="376" width="290" height="72" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="194" y="398" class="svg-step">load_openclaw_config</text>
+                <text x="194" y="418" class="svg-sub">store.py:27–35</text>
+                <text x="194" y="436" class="svg-sub">any exception → {}</text>
+                <line x1="470" y1="412" x2="516" y2="412" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-xo-config-map-black)"/>
+                <rect x="520" y="376" width="240" height="72" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="536" y="398" class="svg-step">create_agent</text>
+                <text x="536" y="418" class="svg-sub">agents.py:156, 182–183</text>
+                <text x="536" y="436" class="svg-sub">appends to agents.list</text>
+                <line x1="760" y1="412" x2="806" y2="412" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-xo-config-map-black)"/>
+                <rect x="810" y="376" width="310" height="72" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="824" y="398" class="svg-step">write_openclaw_config</text>
+                <text x="824" y="418" class="svg-sub">store.py:38–43 · json.dumps</text>
+                <text x="824" y="436" class="svg-sub">replaces the whole file</text>
+
+                <path d="M965 448 L965 470 L165 470 L165 340 L205 340 L205 326" fill="none" stroke="#765b98" stroke-width="1.75" stroke-dasharray="6 4" marker-end="url(#fig-xo-config-map-purple)"/>
+                <text x="180" y="490" class="svg-note">write-back: openclaw.json now holds only agents.list; gateway and channels are gone</text>
+
+                <rect x="0" y="514" width="14" height="14" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="22" y="526" class="svg-sub">wrong parser, or error swallowed</text>
+                <rect x="290" y="514" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="312" y="526" class="svg-sub">parsed; YAML type defeats the mask</text>
+                <rect x="600" y="514" width="14" height="14" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="622" y="526" class="svg-sub">no failure shown, or neutral step</text>
+                <line x1="0" y1="547" x2="40" y2="547" stroke="#3c6f97" stroke-width="1.25"/>
+                <text x="48" y="551" class="svg-sub">data: path or file bytes</text>
+                <line x1="290" y1="547" x2="330" y2="547" stroke="#252525" stroke-width="2.5"/>
+                <text x="338" y="551" class="svg-sub">dispatch or call</text>
+                <line x1="600" y1="547" x2="640" y2="547" stroke="#765b98" stroke-width="1.75" stroke-dasharray="6 4"/>
+                <text x="648" y="551" class="svg-sub">effect: file overwritten</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="src">from the tree</span> Paths and line numbers are from the xo-space
+              checkout at <code>aa96ba8</code>. <span class="recon">measured here</span> The three
+              measured results on the right and the write-back ran against scratch files in a scratch
+              <code>HOME</code>, never a real agent config; the Claude Code and Antigravity rows were
+              not probed. The route knows two formats and the manifests name four. Of the loaders
+              shown, the one that swallows its parse error is the one whose output is written back.
+            </p>
+          </figure>
+
+          <h3><code>.env</code> has no single grammar</h3>
+
+          <p>
+            Most of xo-space's configuration arrives as environment variables, loaded from
+            <code>.env</code>-format files by python-dotenv 1.2.3. <span class="src">from the tree</span>
+            The tree holds eight other <code>.env</code> readers: install.sh's bash loop, which matches
+            <code>KEY=</code> prefixes, and seven hand-written Python parsers. The Python ones each strip
+            the line, skip <code>#</code> lines and split at the first <code>=</code>; they differ in how
+            they treat quotes.
+            <span class="src">from the tree</span> Five of these readers, run on one 12-line file,
+            disagree with one another (Figure {{fig-env-readers}}). <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            The disagreement reaches stored values because the Settings → Env Vars writer is not the
+            boot reader. <code>serialize_env_file</code> (<code>registry/agent_env.py</code>, lines 51–54)
+            writes <code>KEY=value</code> unquoted. <span class="src">from the tree</span> In a scratch
+            run through xo-space's own code, a value typed as <code>p@ss #1</code> stays
+            <code>p@ss #1</code> in the live process and becomes <code>p@ss</code> after a restart. <span class="recon">measured here</span> The backup writer's
+            docstring (<code>xo_projects_sync/config.py</code>, lines 94–97) states the assumption: "We don't quote
+            automatically because dotenv treats unquoted values as plain strings and most of our values
+            are simple repo names / hex secrets." <span class="src">from the tree</span> A backup
+            passphrase containing " #" is cut the same way. In another scratch run through xo-space's
+            own code, with a key written twice, the upsert edits the first row while python-dotenv and
+            install.sh take the last, so the edit reverts at the next restart.
+            <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            Precedence has the same split. The comment at <code>server.py</code> lines 29–31 says keys
+            exported by the shell "outrank every file below". <span class="src">from the tree</span> Run
+            against scratch files, they outrank <code>.env</code> and <code>roots.env</code> but not
+            <code>runtime.env</code>, loaded with <code>override=True</code> (line 70).
+            <span class="recon">measured here</span> The secrets file is loaded the same way (lines
+            71–73). <span class="src">from the tree</span> Booleans use two vocabularies:
+            <code>QUIRQ_WATCHER_ENABLED</code> accepts <code>"on"</code> (line 726) and
+            <code>UVICORN_RELOAD</code> does not (line 1159). <span class="src">from the tree</span>
+          </p>
+
+          <figure class="figure wide" id="fig-env-readers">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One <code>.env</code> line, five readers in xo-space</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead>
+                  <tr><th>Line in the file</th><th>python-dotenv<br>1.2.3 (boot)</th><th>install.sh<br>loop</th><th>agent_env.py<br>(Settings UI)</th><th>hermes/<br>profile_env.py</th><th>openclaw/<br>troubleshoot.py</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td><code>STAGE=beta   # beta (default …)</code></td><td><code>beta</code></td><td class="hl-green" style="background: var(--green-soft)"><code>beta</code></td><td class="hl-orange" style="background: var(--orange-soft)">value plus the comment</td><td class="hl-orange" style="background: var(--orange-soft)">value plus the comment</td><td class="hl-orange" style="background: var(--orange-soft)">value plus the comment</td></tr>
+                  <tr><td><code>QUOTED_HASH="a #b"</code></td><td><code>a #b</code></td><td class="hl-orange" style="background: var(--orange-soft)"><code>"a</code></td><td class="hl-orange" style="background: var(--orange-soft)"><code>"a #b"</code></td><td class="hl-green" style="background: var(--green-soft)"><code>a #b</code></td><td class="hl-green" style="background: var(--green-soft)"><code>a #b</code></td></tr>
+                  <tr><td><code>DQ="value"</code></td><td><code>value</code></td><td class="hl-green" style="background: var(--green-soft)"><code>value</code></td><td class="hl-orange" style="background: var(--orange-soft)"><code>"value"</code></td><td class="hl-green" style="background: var(--green-soft)"><code>value</code></td><td class="hl-green" style="background: var(--green-soft)"><code>value</code></td></tr>
+                  <tr><td><code>TRAIL_QUOTE=pa"ss"</code></td><td><code>pa"ss"</code></td><td class="hl-green" style="background: var(--green-soft)"><code>pa"ss"</code></td><td class="hl-green" style="background: var(--green-soft)"><code>pa"ss"</code></td><td class="hl-orange" style="background: var(--orange-soft)"><code>pa"ss</code></td><td class="hl-green" style="background: var(--green-soft)"><code>pa"ss"</code></td></tr>
+                  <tr><td><code>QUOTED_THEN_COMMENT="x" # note</code></td><td><code>x</code></td><td class="hl-green" style="background: var(--green-soft)"><code>x</code></td><td class="hl-orange" style="background: var(--orange-soft)"><code>"x" # note</code></td><td class="hl-orange" style="background: var(--orange-soft)"><code>x" # note</code></td><td class="hl-orange" style="background: var(--orange-soft)"><code>"x" # note</code></td></tr>
+                  <tr><td><code>SPACED = spaced</code></td><td><code>spaced</code></td><td class="hl-orange" style="background: var(--orange-soft)">not found</td><td class="hl-green" style="background: var(--green-soft)"><code>spaced</code></td><td class="hl-green" style="background: var(--green-soft)"><code>spaced</code></td><td class="hl-green" style="background: var(--green-soft)"><code>spaced</code></td></tr>
+                  <tr><td><code>export EXPORTED=v</code></td><td>key <code>EXPORTED</code></td><td class="hl-orange" style="background: var(--orange-soft)">not found</td><td class="hl-orange" style="background: var(--orange-soft)">key <code>export EXPORTED</code></td><td class="hl-orange" style="background: var(--orange-soft)">key <code>export EXPORTED</code></td><td class="hl-orange" style="background: var(--orange-soft)">key <code>export EXPORTED</code></td></tr>
+                  <tr><td><code>ESCAPED="line1\nline2"</code></td><td>two lines</td><td class="hl-orange" style="background: var(--orange-soft)">literal <code>\n</code></td><td class="hl-orange" style="background: var(--orange-soft)">literal <code>\n</code>, quotes kept</td><td class="hl-orange" style="background: var(--orange-soft)">literal <code>\n</code></td><td class="hl-orange" style="background: var(--orange-soft)">literal <code>\n</code></td></tr>
+                  <tr><td>one key on two rows (separate probe)</td><td>last row</td><td class="hl-green" style="background: var(--green-soft)">last row</td><td class="hl-orange" style="background: var(--orange-soft)">lists both; an edit changes the first</td><td>not run</td><td>not run</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> Each reader's code was copied verbatim from
+              the tree and fed the same 12-line file; python-dotenv 1.2.4 gives identical values.
+              The <code>STAGE</code> line's padding and comment are shortened here. Untinted: the
+              boot reader, or not run. Green: hears what the boot reader hears.
+              Orange: hears something else.
+              Only two of the twelve lines, an empty value and <code>$HOME/x</code>, are read the
+              same way by all five. The reader behind the Settings UI disagrees with the boot
+              reader on seven of the nine rows shown.
+            </p>
+          </figure>
+
+          <h3>YAML typing reaches the secret mask</h3>
+
+          <p>
+            Before the Settings route returns a config, <code>_mask_sensitive</code>
+            (<code>services/cowork_agent/helpers.py</code>, lines 214–223) masks six key names, but only
+            string values. <span class="src">from the tree</span> So YAML's typing decides what is hidden.
+            In a scratch Hermes <code>config.yaml</code>, <code>password: 123456</code> came back as the
+            integer 123456, unmasked; the quoted <code>token: "123456"</code> came back as
+            <code>****</code>. <span class="recon">measured here</span> Hermes v0.21.6 reads the file
+            with ruamel.yaml pinned to YAML 1.1 (<code>hermes_yaml.py</code>, lines 22–25),
+            <span class="src">from the docs</span> and on this file
+            agrees with PyYAML on every value. <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            The famous YAML traps are nearly absent. The 46 YAML files in the survey contain no
+            <code>yes</code>, <code>no</code>, <code>NO</code> or <code>off</code> value, no leading-zero
+            number and no unquoted dotted version. The one Norway-style pitfall is a bare
+            <code>on:</code> key, in three XO workflows and 29 upstream ones, and 3 of the 12 loaders
+            measured here rename it (<a href="#yaml-structure">YAML: the structure you did not see</a>).
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>fly-lab: two formats, three readers</h3>
+
+          <p>
+            fly-lab keeps each experiment config twice, as YAML and as a JSON "twin", and reads the
+            YAML when PyYAML is importable (<code>fly_lab/config.py</code>, lines 1–3).
+            <span class="src">from the tree</span> The JSON carries defaults the YAML omits, yet all five
+            pairs load to identical configs. <span class="recon">measured here</span> Command-line
+            overrides go through a third reader, <code>ast.literal_eval</code> with a true/false fallback
+            (lines 113–117). <span class="src">from the tree</span> It hears <code>010</code> as a string, <code>null</code> as the string
+            <code>"null"</code>, and <code>3.10</code> as 3.1. <span class="recon">measured here</span>
+          </p>
+
+          <h3>The quirq outcome spec</h3>
+
+          <p>
+            <code>what-is-quirq/section-2-spec.md</code> defines the unit of work at lines 32–33 as
+            <code>u = (S₀, G, τ, B)</code> with <code>G = {(g₁,w₁),…,(gₙ,wₙ)}</code>, and adds:
+            "All four components committed before execution." Lines 44–45 give the score and the
+            test: <code>V(u) = Σᵢ wᵢ gᵢ(S₁) / Σᵢ wᵢ</code> and <code>done(u) = [ V(u) ≥ τ ]</code>.
+            <span class="src">from the tree</span> No config file represents this yet.
+            quirq-calculator reads no configuration at all, and its <code>PLAN.md</code> lists the
+            V and Q core as next. <span class="src">from the tree</span>
+          </p>
+
+          <p>
+            The format question is easy here; the number question is not. The same spec in JSON, TOML
+            and YAML (τ = 0.8, B = 4.00, weights 0.7, 0.1 and 0.2) parses to equal dicts under
+            <code>json</code>, <code>tomllib</code> and PyYAML. Passing the first two checks gives
+            V = 0.7999999999999999, and <code>done</code> is false in Python and in Node. With
+            <code>Decimal</code>, V is 0.8 and <code>done</code> is true.
+            <span class="recon">measured here</span> Neither 0.7 nor 0.1 has an exact binary form, and
+            <code>json</code>, <code>tomllib</code> and PyYAML all return binary doubles, so changing the
+            format does not fix this.
+            <span class="recon">reconstruction</span> The whitepaper's calculator hides the edge by
+            rounding V to two decimals (<code>whitepaper/index.html</code>, line 1096), a step eq 1 does
+            not contain. <span class="src">from the tree</span>
+          </p>
+
+          <p>
+            A spec that commits τ should commit numbers that compare exactly. Here is a TOML version
+            that keeps top-level keys above the first header
+            (<a href="#toml-rules">TOML: obvious until the second table</a>), uses only TOML 1.0 syntax,
+            and makes every number an integer. <span class="recon">reconstruction</span>
+          </p>
+
+          <pre><code># quirq outcome spec: u = (S0, G, tau, B), section-2-spec.md Definition 1.
+# Top-level keys first. Every number is an integer, so V &gt;= tau is exact.
+spec_version = 1
+start = "refs/tags/quirq/u-0001/start"   # S0, fixed before execution
+settlement = "atomic"                    # divisible | atomic | deadband
+checks = [                               # G: id, predicate, integer weight
+  { id = "a", run = "checks/a.sh", weight = 7 },
+  { id = "b", run = "checks/b.sh", weight = 1 },
+  { id = "c", run = "checks/c.sh", weight = 2 },
+]
+
+[threshold]                              # tau = num / den = 0.8
+num = 8
+den = 10                                 # done iff den*sum(w*g) &gt;= num*sum(w)
+
+[budget]                                 # B = 4.00 USD
+minor_units = 400
+currency = "USD"</code></pre>
+
+          <p>
+            <code>tomllib</code> on Python 3.14.4 loads it, and the same two passing checks give
+            10 × 8 ≥ 8 × 10, so <code>done</code> is true with no rounding.
+            <span class="recon">measured here</span> The budget is in cents for the same reason. One
+            question stays open: "committed before execution" needs a form that can be hashed, and
+            nothing in the tree yet says whether quirq would hash these bytes or a canonical form.
+            <span class="recon">reconstruction</span>
+          </p>

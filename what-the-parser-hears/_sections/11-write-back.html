@@ -1,0 +1,228 @@
+          <h2 id="write-back"><span class="secnum">{{S}}</span>When the program writes back</h2>
+
+          <p class="lede">
+            Configuration is no longer only read. Package managers, agent CLIs and editors write
+            it, and agents edit it. A writer is a reader first: it saves what it heard, through an
+            emitter with habits of its own. Load, change one value and save, and most libraries
+            hand back a different file. Some hand back different data.
+          </p>
+
+          <h3>Who writes, and with what</h3>
+
+          <p>
+            Python's standard library reads TOML and does not write it, on purpose. PEP 680
+            rejected a write API because "Use cases that involve editing an existing TOML file (as
+            opposed to writing a brand new one) are better served by a style preserving library.
+            TOML is intended as a human-readable and -editable configuration format, so it's
+            important to preserve comments, formatting and other markup." It also declined to base
+            <code>tomllib</code> on tomlkit, which "supports style roundtripping. As a result, it
+            has a more complex API and implementation (about 5x as much code as
+            <code>tomli</code>)." PEP 723 dropped an earlier draft that kept a script's TOML
+            metadata in a Python multi-line string, partly because a multi-line double-quoted TOML
+            string would clash with the Python string around it, and many TOML writers do not
+            preserve style, so their output could be malformed. <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            Most agent tools that rewrite their own human-edited files use a style-preserving
+            parser. Codex
+            writes <code>config.toml</code> through what <code>codex-rs/core/src/config/edit.rs</code>
+            calls "the persistence engine", built on toml_edit (lines 21 and 31, commit
+            <code>03b761dca9b0</code>). Gemini CLI reads <code>settings.json</code> through
+            strip-json-comments 3.1.1 and writes it through comment-json 4.2.5
+            (<code>settings.ts</code> line 800, <code>commentJson.ts</code> lines 9 and 49). VS Code
+            applies <code>setProperty</code>, a text edit, to the existing document
+            (<code>configurationEditing.ts</code> lines 9 and 246). Claude Code writes
+            <code>~/.claude/settings.json</code> from <code>/config</code>, keeps it strict JSON
+            (<a href="#json">JSON: a strict grammar, loose readers</a>), and keeps a separate
+            <code>~/.claude.json</code> "that it writes for itself; you don't need to edit it."
+            OpenClaw's own writes "reserialize JSON5 as standard JSON", and with comments present
+            "the writer warns immediately before removing them". <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            Wrangler shows the trade in code. It edits <code>wrangler.jsonc</code> with
+            jsonc-parser's <code>modify</code>, which keeps comments. Its TOML library, smol-toml,
+            does not, so it guards. Lines 23–34 of <code>patch-config.ts</code> in
+            <code>packages/workers-utils/src/config/</code>, commit <code>daae435</code>:
+            <span class="src">from the docs</span>
+          </p>
+
+          <pre><code>if (configPath.endsWith("toml")) {
+  // the TOML parser we use does not preserve comments
+  if (configString.includes("#")) {
+    throw new PatchConfigError(
+      "cannot patch .toml config if comments are present"
+    );
+  } else {
+    // for simplicity, use the JSONC editor to make all edits
+    // toml -&gt; js object -&gt; json string -&gt; edits -&gt; js object -&gt; toml
+    configString = JSON.stringify(parseTOML(configString));
+  }
+}</code></pre>
+
+          <p>
+            The guard is a substring test. A comment-free file containing
+            <code>THEME_COLOR = "#ff6600"</code> is refused too: the guard expression returns true
+            on it, measured on a reproduction of the code path, not on Wrangler itself.
+            <span class="recon">measured here</span> A file that passes is edited as JSON and
+            written back with <code>TOML.stringify(parseJSONC(configString))</code> (line 49).
+            <span class="src">from the docs</span> That is the smol-toml writer in
+            Figure {{fig-roundtrip}}. <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            A preserving editor keeps the text and can still move the meaning. cargo 1.97.1, adding
+            <code>itoa</code> to a commented <code>Cargo.toml</code>, kept every comment and put
+            <code>itoa = "1"</code> first, in sorted order. The comment "# keep serde first; the
+            derive feature is required by api.rs" stayed attached to <code>serde</code>, which is
+            no longer first. <code>uv add --frozen "idna&gt;=3"</code> (uv 0.12.5) kept a
+            commented-out dependency inside the array and also inserted in sorted order.
+            <span class="recon">measured here</span> cargo and uv build on toml_edit; Poetry on
+            tomlkit. <span class="src">from the docs</span>
+          </p>
+
+          <h3>Load, change one value, save</h3>
+
+          <p>
+            The harness loads the agent config from <a href="#three-ways">One configuration,
+            three ways</a> (69 lines of JSON, 66 of YAML, 67 of TOML), changes
+            <code>model.max_tokens</code> from 8192 to 4096, and dumps it. It diffs the output
+            against the original edited by hand on that line and re-reads it with a JSON, a TOML
+            and three YAML readers. Twenty-eight writer configurations ran.
+            <span class="recon">measured here</span> Figure {{fig-roundtrip}} shows eighteen of
+            them in thirteen rows, and adds tomli_w from an earlier probe.
+          </p>
+
+          <figure class="figure wide" id="fig-roundtrip">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Load, change one value, save: what fourteen writers did to the rest of the file</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead>
+                  <tr><th>Writer</th><th>Format</th><th>Comments kept</th><th>Key order</th><th>Diff lines beyond the edit</th><th>Values it changed</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>tomlkit 0.15.1</td><td>TOML</td><td class="hl-green" style="background: var(--green-soft)">6 of 6</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>0</td><td class="hl-green" style="background: var(--green-soft)">none</td></tr>
+                  <tr><td>toml_edit 0.25.16, <code>value()</code></td><td>TOML</td><td class="hl-orange" style="background: var(--orange-soft)">5 of 6</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>2</td><td class="hl-green" style="background: var(--green-soft)">none; the edited line's comment dropped</td></tr>
+                  <tr><td>tomli_w 1.2.0 †</td><td>TOML</td><td class="hl-red" style="background: var(--red-soft)">0 of 6</td><td class="hl-orange" style="background: var(--orange-soft)"><code>[[jobs]]</code> moved to the top as an inline array</td><td>not measured</td><td class="hl-orange" style="background: var(--orange-soft)"><code>0o5432</code> → <code>2842</code></td></tr>
+                  <tr><td>smol-toml 1.9.0</td><td>TOML</td><td class="hl-red" style="background: var(--red-soft)">0 of 6</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>52</td><td class="hl-red" style="background: var(--red-soft)"><code>120.0</code> → <code>120</code>, <code>250.0</code> → <code>250</code>; <code>.000</code> added to the datetime</td></tr>
+                  <tr><td>@iarna/toml 2.2.5</td><td>TOML</td><td class="hl-red" style="background: var(--red-soft)">0 of 6</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>52</td><td class="hl-red" style="background: var(--red-soft)">as smol-toml</td></tr>
+                  <tr><td>ruamel.yaml 0.19.1, round-trip</td><td>YAML</td><td class="hl-green" style="background: var(--green-soft)">6 of 6</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>38; 4 with indent and width set</td><td class="hl-green" style="background: var(--green-soft)">none; <code>"</code> → <code>'</code> in two flow lists</td></tr>
+                  <tr><td>PyYAML 6.0.3, <code>safe_dump</code></td><td>YAML</td><td class="hl-red" style="background: var(--red-soft)">0 of 6</td><td class="hl-orange" style="background: var(--orange-soft)">sorted</td><td>125; 100 with <code>sort_keys=False</code></td><td class="hl-red" style="background: var(--red-soft)"><code>NO</code> → <code>false</code>; datetime respelled; em dash escaped</td></tr>
+                  <tr><td>js-yaml 4.3.2 and 5.4.3, <code>dump</code></td><td>YAML</td><td class="hl-red" style="background: var(--red-soft)">0 of 6</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>67</td><td class="hl-red" style="background: var(--red-soft)"><code>120.0</code> → <code>120</code>, <code>250.0</code> → <code>250</code>; datetime gains <code>.000</code> (4) or quotes (5)</td></tr>
+                  <tr><td>yaml (eemeli) 2.9.1, <code>Document</code></td><td>YAML</td><td class="hl-green" style="background: var(--green-soft)">6 of 6</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>24; 65 via <code>stringify</code></td><td class="hl-green" style="background: var(--green-soft)">none; <code>stringify</code> writes <code>120</code></td></tr>
+                  <tr><td>yaml.v3 v3.0.1, <code>Node</code></td><td>YAML</td><td class="hl-green" style="background: var(--green-soft)">6 of 6</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>14; 139 via <code>Marshal</code>, sorted</td><td class="hl-green" style="background: var(--green-soft)">none; <code>Marshal</code> writes <code>120</code></td></tr>
+                  <tr><td>jsonc-parser 3.3.1, <code>modify</code></td><td>JSON</td><td>—</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>0</td><td class="hl-green" style="background: var(--green-soft)">none</td></tr>
+                  <tr><td><code>JSON.stringify</code>, Node 24.21.0</td><td>JSON</td><td>—</td><td class="hl-green" style="background: var(--green-soft)">kept</td><td>56</td><td class="hl-orange" style="background: var(--orange-soft)"><code>120.0</code> → <code>120</code>, <code>250.0</code> → <code>250</code></td></tr>
+                  <tr><td>serde_json 1.0.151</td><td>JSON</td><td>—</td><td class="hl-orange" style="background: var(--orange-soft)">sorted</td><td>144</td><td class="hl-green" style="background: var(--green-soft)">none</td></tr>
+                  <tr><td>Go 1.27.2 <code>encoding/json</code></td><td>JSON</td><td>—</td><td class="hl-orange" style="background: var(--orange-soft)">sorted</td><td>144</td><td class="hl-orange" style="background: var(--orange-soft)"><code>120.0</code> → <code>120</code>, <code>250.0</code> → <code>250</code></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Only writers that edit the text come close to a hand edit; the rest rebuild the file.
+              <span class="recon">measured here</span> Values come from
+              <code>_numbers.json → roundtrip.results</code>. The exception is tomli_w (†), from the
+              TOML research probe on a different 18-line sample with six comments. Diff lines count
+              the + and − lines of a unified diff against the hand edit. The JSON file has no
+              comments (—). Green means kept or unchanged. Orange means a partial loss with every
+              value intact: one comment, the key order, the layout or a number's spelling. Red
+              means every comment lost, or a value's type changed: a
+              boolean where the author wrote a string, or an integer where TOML and the YAML 1.2
+              Core schema read <code>120.0</code> as a float. The harness compares numbers by
+              value and passes <code>120</code>, so that red tint is
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            Two writers reproduce the hand edit byte for byte: tomlkit and jsonc-parser's
+            <code>modify</code>. toml_edit's idiomatic <code>value(4096)</code> assignment replaces
+            the item's decor and drops <code># hard cap per response</code>; copying the old decor
+            back keeps it. <span class="recon">measured here</span> Codex's <code>edit.rs</code>
+            imports the same <code>value</code> (line 24), and its <code>insert</code> copies the
+            old item's decor onto the new one before assigning it (lines 602–605).
+            <span class="src">from the docs</span> ruamel's round-trip mode keeps all six
+            comments but re-indents the <code>mcp_servers</code> list by default, 38 lines; with
+            <code>indent(mapping=2, sequence=4, offset=2)</code> and <code>width=4096</code> it
+            is 4, all quote style. yaml.v3's <code>Node</code> costs 14 lines, in blank lines and
+            comment spacing; eemeli's <code>Document</code> 24, all spacing.
+            <span class="recon">measured here</span> A preserving editor
+            also preserves mistakes: each YAML one leaves <code>NO</code> bare, and PyYAML hears
+            <code>false</code> after the edit as before. <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            The other 21 configurations rebuild the file from data, and data has no comments. They
+            produced 52 to 144 diff lines for a one-line edit. <span class="recon">measured here</span>
+            PyYAML's <code>safe_dump</code> sorts keys by default (<code>dump_all</code> declares
+            <code>sort_keys=True</code>, <code>yaml/__init__.py</code> line 220).
+            <span class="src">from the docs</span> It drops all six comments and writes
+            <code>false</code> for <code>NO</code>, so none of the three YAML readers hears the
+            author's intent again: the write-back row of Figure {{fig-two-readers}}. serde-saphyr
+            does the same. serde_json, Go and yaml.v3's <code>Marshal</code> sort too. JavaScript
+            parsers hand back <code>120.0</code> and <code>120</code> as the same number, so every
+            JavaScript writer that rebuilds the file writes <code>120</code>; in the TOML probe,
+            <code>timeout = 1.0</code>, commented "written as a float on purpose", came back as
+            <code>timeout = 1</code>. <span class="recon">measured here</span> In TOML that turns a
+            float into an integer. <span class="src">from the spec</span>
+          </p>
+
+          <h3>Written by one library, read by another</h3>
+
+          <p>
+            A second test gave eleven YAML emitters 28 strings that look like something else,
+            dumped each with default options, and read each back with PyYAML (1.1), ruamel.yaml's
+            safe loader (1.2, plus timestamps and <code>1_000</code>) and eemeli's
+            <code>yaml</code> (strict 1.2 Core). <span class="recon">measured here</span> The bare
+            <code>NO</code> and <code>22:22</code> of three 1.2 writers, which PyYAML hears as
+            <code>false</code> and 1342 (base 60), are one direction. PyYAML has the mirror
+            fault: it writes the string <code>1e3</code> bare, and both 1.2 readers hear the number 1000. Red cells list
+            strings a reader heard as something else; green means none.
+            <span class="recon">measured here</span>
+          </p>
+
+          <table>
+            <thead>
+              <tr><th>Emitter</th><th>Writes <code>NO</code> as</th><th>PyYAML 6.0.3<br>retypes</th><th>ruamel safe<br>retypes</th><th>eemeli Core<br>retypes</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>yaml.v3, sigs.k8s.io/yaml, serde-saphyr, js-yaml 5.4.3</td><td><code>"NO"</code> or <code>'NO'</code></td><td class="hl-green" style="background: var(--green-soft)">none</td><td class="hl-green" style="background: var(--green-soft)">none</td><td class="hl-green" style="background: var(--green-soft)">none</td></tr>
+              <tr><td>js-yaml 4.3.2</td><td><code>'NO'</code></td><td class="hl-red" style="background: var(--red-soft)">1_000</td><td class="hl-red" style="background: var(--red-soft)">1_000</td><td class="hl-green" style="background: var(--green-soft)">none</td></tr>
+              <tr><td>PyYAML 6.0.3</td><td><code>'NO'</code></td><td class="hl-green" style="background: var(--green-soft)">none</td><td class="hl-red" style="background: var(--red-soft)">1e3</td><td class="hl-red" style="background: var(--red-soft)">1e3</td></tr>
+              <tr><td>goccy/go-yaml v1.19.2</td><td><code>"NO"</code></td><td class="hl-red" style="background: var(--red-soft)">.inf, 1:30:00</td><td class="hl-red" style="background: var(--red-soft)">.inf, 1e3</td><td class="hl-red" style="background: var(--red-soft)">.inf, 1e3</td></tr>
+              <tr><td>ruamel.yaml 0.19.1, round-trip and safe</td><td><code>NO</code></td><td class="hl-red" style="background: var(--red-soft)">NO, no, yes, on, off, 22:22, 1:30:00</td><td class="hl-green" style="background: var(--green-soft)">none</td><td class="hl-green" style="background: var(--green-soft)">none</td></tr>
+              <tr><td>yaml (eemeli) 2.9.1, serde_yaml 0.9.34</td><td><code>NO</code></td><td class="hl-red" style="background: var(--red-soft)">the same seven, plus 1_000 and 2001-12-14</td><td class="hl-red" style="background: var(--red-soft)">1_000, 2001-12-14</td><td class="hl-green" style="background: var(--green-soft)">none</td></tr>
+            </tbody>
+          </table>
+
+          <p>
+            The four in the first row survive every reader, because each quotes every ambiguous
+            scalar. Both TOML writers given the same strings, smol-toml and Rust's <code>toml</code>,
+            return all 28 as strings. <span class="recon">measured here</span> TOML has no
+            unquoted string values. <span class="src">from the spec</span>
+          </p>
+
+          <h3>Edit, refuse, or own</h3>
+
+          <p>
+            A tool that writes configuration a person also edits has three honest options. It can
+            edit the text with a format-preserving editor, as Codex, Gemini CLI, VS Code, cargo, uv
+            and Poetry do. It can refuse, as Wrangler does for TOML with a <code>#</code> in it. Or
+            it can own the file outright and say so, as Claude Code does with
+            <code>~/.claude.json</code>. Load, change and dump is not a fourth option: on this
+            config it cost 52 to 144 diff lines for one edit, and at worst it changed what every
+            later reader hears. Preserving editors still need a test, as toml_edit's lost comment
+            and cargo's stranded one show. An agent that edits the file as text preserves comments
+            by construction, but not meaning: appending a line is how a top-level key ends up in
+            the last TOML table (<a href="#toml-rules">TOML: obvious until the second table</a>),
+            and a line two spaces too far left is how a YAML key lands under the wrong parent
+            (<a href="#yaml-structure">YAML: the structure you did not see</a>). An agent that
+            scripts a load and dump inherits whatever its library does in Figure {{fig-roundtrip}}.
+            <span class="recon">reconstruction</span> xo-space's own write-back is in
+            <a href="#in-the-tree">What our own tree says</a>, and the rule returns in
+            <a href="#practice">A practice that holds</a>.
+          </p>

@@ -1,0 +1,301 @@
+          <h2 id="yaml-types"><span class="secnum">{{S}}</span>YAML: the type you did not write</h2>
+
+          <p class="lede">
+            YAML gives every unquoted scalar a type by testing it against a list of regular
+            expressions. The file does not choose the list; the loader does. Loaders in use today
+            carry YAML 1.1's list, YAML 1.2's list, or a private mixture of the two. So the same
+            unquoted word is a string in one program and a boolean in the next, and neither
+            program says so.
+          </p>
+
+          <h3>Two lists of patterns</h3>
+
+          <p>
+            YAML 1.2.2 says plain scalars "are matched with an extended list of regular
+            expressions", and that anything matching none of them is a string (§10.3.2). Its Core
+            schema is "the recommended default schema that YAML processor should use
+            unless instructed otherwise" (§10.3). <span class="src">from the spec</span> This is
+            the whole Core list, from the §10.3.2 table:
+          </p>
+
+          <pre><code>Regular expression                           Resolved to tag
+null | Null | NULL | ~                       tag:yaml.org,2002:null
+/* Empty */                                  tag:yaml.org,2002:null
+true | True | TRUE | false | False | FALSE   tag:yaml.org,2002:bool
+[-+]? [0-9]+                                 tag:yaml.org,2002:int (Base 10)
+0o [0-7]+                                    tag:yaml.org,2002:int (Base 8)
+0x [0-9a-fA-F]+                              tag:yaml.org,2002:int (Base 16)
+[-+]? ( \. [0-9]+ | [0-9]+ ( \. [0-9]* )? ) ( [eE] [-+]? [0-9]+ )?
+                                             tag:yaml.org,2002:float (Number)
+[-+]? ( \.inf | \.Inf | \.INF )              tag:yaml.org,2002:float (Infinity)
+\.nan | \.NaN | \.NAN                        tag:yaml.org,2002:float (Not a number)
+*                                            tag:yaml.org,2002:str (Default)</code></pre>
+
+          <p>
+            YAML 1.1 kept its types outside the spec, in the 2005 type repository
+            (<a href="#data-models">What each format can say</a>). The boolean page,
+            yaml.org/type/bool.html, gives this regexp:
+          </p>
+
+          <pre><code> y|Y|yes|Yes|YES|n|N|no|No|NO
+|true|True|TRUE|false|False|FALSE
+|on|On|ON|off|Off|OFF</code></pre>
+
+          <p>
+            The integer page adds leading-zero octal, <code>_</code> separators and a base-60
+            form, "convenient for time and angle values". The float page requires a dot, and a
+            sign on any exponent. <span class="src">from the spec</span> Side by side, the two lists
+            predict every trap in this section. <code>NO</code> is on the 1.1
+            boolean list and matches nothing in Core. <code>0755</code> is octal under 1.1 and
+            matches Core's <code>[-+]? [0-9]+</code> as decimal 755. <code>22:22</code> is base 60
+            under 1.1 and a string under Core. <code>1e3</code> has no dot, so it is a string
+            under 1.1 and 1000 under Core. <code>3.10</code> is a float under both.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h3>The Norway problem, told second-hand</h3>
+
+          <p>
+            The best-known case is "The Norway Problem", a name from Colm O'Connor's StrictYAML
+            documentation. The section was added in commit <code>a4d99c6</code> on
+            3 November 2018, the earliest use found. <span class="src">from the docs</span> The
+            story is second-hand. It opens "A while back I met an old coworker and he started
+            telling me about this interesting bug he faced", and names no company, date or
+            postmortem. <span class="src">from the docs</span>
+          </p>
+
+          <p>
+            The page goes on: "The most tragic aspect of this bug, however, is that it is
+            intended behavior according to the YAML 1.2 specification."
+            <span class="src">from the docs</span> That is wrong. In the Core table above,
+            <code>NO</code> matches no row and is a string; the behaviour is YAML 1.1's.
+            <span class="src">from the spec</span> It is still common. Given
+            <code>countries: [GB, IE, FR, DE, NO, SE]</code>, 4 of the 12 loaders measured here
+            hear <code>false</code> for Norway: PyYAML 6.0.3 through both its pure and its C
+            loader, sigs.k8s.io/yaml v1.6.0, and serde-saphyr 1.3.0.
+            <span class="recon">measured here</span> serde-saphyr 1.3.0 is a Rust crate published
+            on 16 September 2026. Its <code>strict_booleans</code> option is documented as "Default:
+            false (accept YAML 1.1 boolean forms)", and it compares those forms
+            case-insensitively. <span class="src">from the docs</span>
+          </p>
+
+          <h3>Twelve scalars, twelve loaders</h3>
+
+          <p>
+            Figure {{fig-scalar-matrix}} sends twelve plain scalars through every YAML loader in
+            the harness, each called with default options into an untyped target. Ten of the
+            twelve rows get two or three readings. The two that do not are <code>~</code>, null
+            everywhere, and <code>3.10</code>, which every loader turns into 3.1.
+            <span class="recon">measured here</span>
+          </p>
+
+          <figure class="figure wide" id="fig-scalar-matrix">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Twelve plain scalars, twelve YAML loaders: what each one heard</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead>
+                  <tr><th>Written</th><th>PyYAML<br>pure/C</th><th>ruamel<br>safe/rt</th><th>js-yaml<br>4.3.2</th><th>js-yaml<br>5.4.3</th><th>yaml<br>2.9.1</th><th>yaml.v3<br>v3.0.1</th><th>sigs.k8s<br>.io/yaml</th><th>goccy<br>v1.19.2</th><th>serde_<br>yaml</th><th>serde-<br>saphyr</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td><code>NO</code></td><td class="hl-purple" style="background: var(--purple-soft)">false</td><td>"NO"</td><td>"NO"</td><td>"NO"</td><td>"NO"</td><td>"NO"</td><td class="hl-purple" style="background: var(--purple-soft)">false</td><td>"NO"</td><td>"NO"</td><td class="hl-purple" style="background: var(--purple-soft)">false</td></tr>
+                  <tr><td><code>yes</code></td><td class="hl-purple" style="background: var(--purple-soft)">true</td><td>"yes"</td><td>"yes"</td><td>"yes"</td><td>"yes"</td><td>"yes"</td><td class="hl-purple" style="background: var(--purple-soft)">true</td><td>"yes"</td><td>"yes"</td><td class="hl-purple" style="background: var(--purple-soft)">true</td></tr>
+                  <tr><td><code>on</code></td><td class="hl-purple" style="background: var(--purple-soft)">true</td><td>"on"</td><td>"on"</td><td>"on"</td><td>"on"</td><td>"on"</td><td class="hl-purple" style="background: var(--purple-soft)">true</td><td>"on"</td><td>"on"</td><td class="hl-purple" style="background: var(--purple-soft)">true</td></tr>
+                  <tr><td><code>y</code></td><td>"y"</td><td>"y"</td><td>"y"</td><td>"y"</td><td>"y"</td><td>"y"</td><td class="hl-purple" style="background: var(--purple-soft)">true</td><td>"y"</td><td>"y"</td><td class="hl-purple" style="background: var(--purple-soft)">true</td></tr>
+                  <tr><td><code>0755</code></td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">755</td><td class="hl-blue" style="background: var(--blue-soft)">755</td><td class="hl-blue" style="background: var(--blue-soft)">755</td><td class="hl-blue" style="background: var(--blue-soft)">755</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td>"0755"</td><td class="hl-blue" style="background: var(--blue-soft)">755</td></tr>
+                  <tr><td><code>0o755</code></td><td>"0o755"</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td><td class="hl-blue" style="background: var(--blue-soft)">493</td></tr>
+                  <tr><td><code>22:22</code></td><td class="hl-blue" style="background: var(--blue-soft)">1342</td><td>"22:22"</td><td>"22:22"</td><td>"22:22"</td><td>"22:22"</td><td>"22:22"</td><td>"22:22"</td><td>"22:22"</td><td>"22:22"</td><td>"22:22"</td></tr>
+                  <tr><td><code>3.10</code></td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td><td class="hl-blue" style="background: var(--blue-soft)">3.1</td></tr>
+                  <tr><td><code>1e3</code></td><td>"1e3"</td><td class="hl-blue" style="background: var(--blue-soft)">1000</td><td class="hl-blue" style="background: var(--blue-soft)">1000</td><td class="hl-blue" style="background: var(--blue-soft)">1000</td><td class="hl-blue" style="background: var(--blue-soft)">1000</td><td class="hl-blue" style="background: var(--blue-soft)">1000</td><td class="hl-blue" style="background: var(--blue-soft)">1000</td><td>"1e3"</td><td class="hl-blue" style="background: var(--blue-soft)">1000</td><td class="hl-blue" style="background: var(--blue-soft)">1000</td></tr>
+                  <tr><td><code>01234</code></td><td class="hl-blue" style="background: var(--blue-soft)">668</td><td class="hl-blue" style="background: var(--blue-soft)">1234</td><td class="hl-blue" style="background: var(--blue-soft)">1234</td><td class="hl-blue" style="background: var(--blue-soft)">1234</td><td class="hl-blue" style="background: var(--blue-soft)">1234</td><td class="hl-blue" style="background: var(--blue-soft)">668</td><td class="hl-blue" style="background: var(--blue-soft)">668</td><td class="hl-blue" style="background: var(--blue-soft)">668</td><td>"01234"</td><td class="hl-blue" style="background: var(--blue-soft)">1234</td></tr>
+                  <tr><td><code>2001-12-14</code></td><td class="hl-orange" style="background: var(--orange-soft)">date</td><td class="hl-orange" style="background: var(--orange-soft)">date</td><td class="hl-orange" style="background: var(--orange-soft)">Date</td><td>"2001-12-14"</td><td>"2001-12-14"</td><td class="hl-orange" style="background: var(--orange-soft)">time.Time</td><td>"2001-12-14"</td><td>"2001-12-14"</td><td>"2001-12-14"</td><td>"2001-12-14"</td></tr>
+                  <tr><td><code>~</code></td><td class="hl-green" style="background: var(--green-soft)">null</td><td class="hl-green" style="background: var(--green-soft)">null</td><td class="hl-green" style="background: var(--green-soft)">null</td><td class="hl-green" style="background: var(--green-soft)">null</td><td class="hl-green" style="background: var(--green-soft)">null</td><td class="hl-green" style="background: var(--green-soft)">null</td><td class="hl-green" style="background: var(--green-soft)">null</td><td class="hl-green" style="background: var(--green-soft)">null</td><td class="hl-green" style="background: var(--green-soft)">null</td><td class="hl-green" style="background: var(--green-soft)">null</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> Values from <code>_numbers.json</code>,
+              cases <code>y_norway</code>, <code>y_bools</code>, <code>y_octal</code>,
+              <code>y_sexagesimal</code>, <code>y_versions</code>, <code>y_exponent</code>,
+              <code>y_zip</code>, <code>y_timestamps</code> and <code>y_nulls</code>. PyYAML's pure
+              and C loaders agree on every row, as do ruamel's safe and round-trip modes, so each
+              pair shares a column. Tint encodes the type heard, not right or wrong: untinted and
+              in quotes is a string, purple a boolean, blue a number, orange a native date object,
+              green null. Only js-yaml 5.4.3 and eemeli's yaml 2.9.1 match the Core table on all
+              twelve rows.
+            </p>
+          </figure>
+
+          <p>
+            <strong>Booleans.</strong> Ten spellings from the 1.1 boolean list (case
+            <code>y_bools</code>) split three ways. Eight loaders treat only <code>True</code> and <code>TRUE</code> as
+            booleans. PyYAML adds the yes, no, on and off family but not <code>y</code> or
+            <code>n</code>. sigs.k8s.io/yaml and serde-saphyr make all ten booleans.
+            <span class="recon">measured here</span> PyYAML's gap is deliberate. On 20 January
+            2020 a maintainer wrote in issue #376 that "PyYAML implements YAML 1.1 (with the
+            exception that <code>y/Y</code> and <code>n/N</code> are not recognized as
+            booleans)". On 22 August 2023 another answered #744, a report of <code>on</code>
+            loading as <code>True</code>: "by design until PyYAML properly supports YAML 1.2
+            behavior." <span class="src">from the docs</span> What that does to keys is in
+            <a href="#yaml-structure">the structure you did not see</a>.
+          </p>
+
+          <p>
+            <strong>Leading zeros.</strong> A file mode written <code>0755</code> has three
+            readings. PyYAML, yaml.v3, sigs.k8s.io/yaml and goccy hear octal 493. ruamel, both
+            js-yamls, eemeli's yaml and serde-saphyr hear decimal 755. serde_yaml returns the
+            string <code>"0755"</code>. <span class="recon">measured here</span> serde_yaml's
+            source (<code>src/de.rs</code>, lines 1093–1094) cites the 1.2 spec for that rule, but
+            Core's <code>[-+]? [0-9]+</code> matches <code>0755</code>, so the rule is serde_yaml's
+            own. <span class="src">from the docs</span> ZIP codes fare worse. <code>zip: 01234</code>
+            and <code>zip_nj: 08540</code> get four readings between them: 1234 and 8540 in the six
+            loaders that read 755; 668 and the string <code>"08540"</code> in PyYAML and goccy,
+            because 8 is not an octal digit; 668 and 8540 in yaml.v3 and sigs.k8s.io/yaml; two
+            strings in serde_yaml. <span class="recon">measured here</span> A New Jersey ZIP code
+            survives PyYAML only because it contains an 8.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            <strong>Times, versions, exponents.</strong> <code>22:22</code> is 1342 (22 × 60 + 22)
+            and <code>1:30:00</code> is 5400 (3,600 + 1,800) in PyYAML, and strings in the other
+            ten. <span class="recon">measured here</span> <code>python: 3.10</code> is the float
+            3.1 in all twelve loaders, and <code>go: 1.20</code> is 1.2.
+            <span class="recon">measured here</span> Both float patterns match
+            <code>3.10</code>, so YAML 1.2 changed nothing here. <span class="src">from the spec</span> In
+            setup-python, issue #482, opened on 14 August 2022, is titled
+            <em>Python version 3.10 is parsed as "3.1"</em>. <span class="src">from the docs</span>
+            The exponent runs the other way. <code>1e3</code> is the string <code>"1e3"</code> in
+            PyYAML and goccy, which apply the 1.1 float rule, and 1000 in the other nine.
+            <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            <strong>Dates.</strong> <code>2001-12-14</code> is a native date object in six
+            loaders and a string in the other six. <span class="recon">measured here</span> Core
+            has no timestamp type, so the six are keeping YAML 1.1's.
+            <span class="src">from the spec</span> js-yaml 4 also turns <code>2001-12-14T21:59:43.10-05:00</code>
+            into a JavaScript <code>Date</code> that prints as
+            <code>2001-12-15T02:59:43.100Z</code>. The instant survives; the offset does not.
+            <span class="recon">measured here</span>
+          </p>
+
+          <h3>Which YAML each loader implements</h3>
+
+          <p>
+            A library's description does not predict its row in Figure {{fig-scalar-matrix}}.
+            ruamel.yaml 0.19.1 says "If no explicit version is set version 1.2 is assumed",
+            <span class="src">from the docs</span> yet it still turns
+            <code>1_000</code> into 1000 and <code>2001-12-14</code> into a date.
+            <span class="recon">measured here</span> The README of go-yaml v3 says "The yaml
+            package supports most of YAML 1.2, but preserves some behavior from 1.1 for backwards
+            compatibility", and names typed booleans and <code>0777</code> octal as what it keeps.
+            <span class="src">from the docs</span> yaml.v3 keeps <code>1_000</code> and dates as
+            well. <span class="recon">measured here</span> sigs.k8s.io/yaml, the library Kubernetes
+            uses, says in a doc comment (<code>yaml.go</code>, line 52): "As per the YAML 1.1
+            specification, which yaml.v2 used underneath implements, literal 'yes' and 'no'
+            strings without quotation marks will be converted to true/false implicitly."
+            <span class="src">from the docs</span> It turns <code>y</code> into <code>true</code>
+            too, yet leaves <code>22:22</code> a string. <span class="recon">measured here</span>
+            Figure {{fig-yaml-loaders}} gives each library's row.
+          </p>
+
+          <figure class="figure wide" id="fig-yaml-loaders">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Which YAML each loader actually implements, as of 8 October 2026</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row">
+                  <div class="stack-cell head">PyYAML 6.0.3</div>
+                  <div class="stack-cell hl-red">25 September 2025 · YAML 1.1, minus <code>y/n</code>. Keeps yes/no/on/off, <code>0755</code> octal, base 60, dates, <code>1_000</code>; <code>1e3</code> stays text; <code>0o755</code> is text. The C loader types identically. Duplicate keys: last wins. Alias limit: none found.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">ruamel.yaml 0.19.1</div>
+                  <div class="stack-cell hl-orange">2 January 2026 · 1.2 by default. Still resolves <code>1_000</code> and dates. Duplicate keys: error. Alias limit: none found.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">js-yaml 4.3.2</div>
+                  <div class="stack-cell hl-orange">26 August 2026, npm tag <code>v4-legacy</code> · Core booleans and numbers, plus 1.1 timestamps and <code>&lt;&lt;</code> merge. Duplicate keys: error. Alias limit: none found.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">js-yaml 5.4.3</div>
+                  <div class="stack-cell hl-green">5 October 2026 (5.0.0: 20 June 2026) · <code>CORE_SCHEMA</code>, merge off; 1.1 types opt-in through <code>YAML11_SCHEMA</code>. Duplicate keys: error. Alias limit: <code>maxAliases</code> is -1, unlimited.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">yaml (eemeli) 2.9.1</div>
+                  <div class="stack-cell hl-green">11 September 2026 · 1.2 Core; <code>version: '1.1'</code> switches schema and turns merge on. Duplicate keys: error. Alias limit: <code>maxAliasCount</code> 100.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">yaml.v3 v3.0.1</div>
+                  <div class="stack-cell hl-orange">27 May 2022; frozen, upstream archived, continued as <code>go.yaml.in/yaml</code> v4, which Docker Compose requires ·"most of YAML 1.2". Keeps <code>0755</code> octal, <code>1_000</code>, dates as <code>time.Time</code>, 1.1 booleans into typed <code>bool</code> fields. Duplicate keys: error. Alias limit: ratio heuristic.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">sigs.k8s.io/yaml v1.6.0</div>
+                  <div class="stack-cell hl-red">24 July 2025 · go-yaml v2 (YAML 1.1) then <code>encoding/json</code>. All 1.1 booleans including <code>y</code> and <code>n</code>; <code>0755</code> octal; no base 60; <code>.inf</code> is an error. Duplicate keys: last wins. Alias limit: ratio heuristic.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">goccy/go-yaml v1.19.2</div>
+                  <div class="stack-cell hl-orange">8 January 2026 · 1.2 booleans; 1.1 octal, so <code>0755</code> is 493; <code>1_000</code> is 1000; 1.1 float rule, so <code>1e3</code> stays text; dates as strings. Duplicate keys: error. Alias limit: none found.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">serde_yaml 0.9.34</div>
+                  <div class="stack-cell hl-orange">25 March 2024; archived · 1.2 booleans and <code>0o</code> octal; leading-zero digits kept as strings, its own rule. Duplicate keys: error. Alias limit: repetition limit.</div>
+                </div>
+                <div class="stack-row">
+                  <div class="stack-cell head">serde-saphyr 1.3.0</div>
+                  <div class="stack-cell hl-orange">16 September 2026 · 1.2 octal, so <code>0755</code> is 755, but <code>1_000</code> is 1000 and 1.1 booleans are on by default, case-insensitive; rejects <code>.inf</code> in untyped values. Duplicate keys: error. Alias limit: 50,000 aliases, 250,000 nodes.</div>
+                </div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              <span class="src">from the docs</span> Release dates from PyPI, npm, the Go module
+              proxy and crates.io; schema claims from each project's README, changelog or source.
+              <span class="recon">measured here</span> The kept 1.1 rules and the duplicate-key
+              policy are the readings in <code>_numbers.json</code> (case <code>y_dup_keys</code>
+              for duplicates); alias limits are the ones <code>_numbers.json → limits</code>
+              records from each installed package's source. Red: YAML 1.1 typing by default.
+              Orange: a 1.2 base that keeps a 1.1 rule or adds its own. Green: the 1.2.2 Core
+              schema on every scalar measured here. Two of ten are green.
+            </p>
+          </figure>
+
+          <h3>What works everywhere</h3>
+
+          <p>
+            Quoting. YAML 1.2.2 resolves a quoted scalar to a string without consulting the table,
+            and says why: "This tag resolution convention allows the author of a YAML character
+            stream to effectively “disable” the tag resolution process." (§3.3.2)
+            <span class="src">from the spec</span> The YAML research probe behind this guide, run
+            separately from <code>_compute.py</code>, quoted ten trap values: <code>'NO'</code>,
+            <code>"NO"</code>, <code>"3.10"</code>, <code>"22:22"</code>, <code>"0755"</code>,
+            <code>"on"</code> as a key, <code>'yes'</code>, <code>'2001-12-14'</code>,
+            <code>'null'</code> and <code>'~'</code>. Each came back as the quoted text, a string,
+            in all 16 loader configurations it ran, among them PyYAML, ruamel in its 1.1 and 1.2
+            modes, js-yaml 4 and 5, eemeli's yaml, go-yaml v2 to v4 and sigs.k8s.io/yaml.
+            <span class="recon">measured here</span> goccy, serde_yaml and serde-saphyr were not in
+            that probe.
+          </p>
+
+          <p>
+            The other two candidate fixes do not travel. The spec offers an explicit
+            <code>!</code> tag for the same purpose. <span class="src">from the spec</span> Yet in
+            the same probe <code>v: ! 123</code> is still the integer 123 in PyYAML's
+            <code>safe_load</code>, all three ruamel modes and go-yaml v3.0.1. A
+            <code>%YAML 1.2</code> directive changes nothing in PyYAML, which ignores it
+            (<a href="#data-models">What each format can say</a>).
+            <span class="recon">measured here</span> yamllint does honour it: under <code>%YAML 1.2</code> its
+            <code>truthy</code> rule passes <code>yes</code> and <code>on</code>.
+            <span class="src">from the docs</span> Adding the header to a file that PyYAML loads
+            therefore silences the linter's warning and leaves the boolean in place.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <p>
+            Quoting is also the writer's job, and three writers built for 1.2 skip it;
+            <a href="#write-back">When the program writes back</a> measures what a 1.2 emitter's
+            bare <code>NO</code> becomes in a 1.1 reader. <span class="recon">measured here</span>
+          </p>

@@ -1,0 +1,326 @@
+          <h2 id="two-readers"><span class="secnum">{{S}}</span>Two readers, one file</h2>
+
+          <p class="lede">
+            A configuration file has two readers. One is the person who writes it. The other is
+            the program that loads it. Most of the time they agree on what the file says. Every
+            pitfall in this guide is a place where they do not, and the program's reading is the
+            one that runs.
+          </p>
+
+          <p>
+            The disagreements come in three kinds. The first is <strong>syntax</strong> the author
+            did not expect to matter. A UTF-8 byte-order mark before <code>{"a": 1}</code> is
+            reported as an error by 7 of the 10 JSON parsers measured here, including
+            <code>JSON.parse</code>, Python's <code>json</code> and both Go APIs (jsonc-parser
+            flags it but still returns the object); jq and the two json5 parsers skip it
+            silently. A tab in YAML indentation is an error in all 12 YAML loaders, and a trailing
+            comma in JSON is accepted silently only by the two json5 parsers; jsonc-parser flags
+            it and returns the object anyway. <span class="recon">measured here</span>
+            jsonc-parser is Microsoft's fault-tolerant parser for JSON with comments, built to
+            return a result even from invalid input. <span class="src">from the docs</span>
+            RFC 8259 §8.1 lets a parser ignore a BOM, and YAML 1.2.2 §6.1 forbids the tab.
+            <span class="src">from the spec</span> Syntax disagreements are mostly loud: the
+            program refuses to start, and someone fixes the file.
+            <span class="recon">reconstruction</span> The JSON cases return in
+            <a href="#json">JSON: a strict grammar, loose readers</a>.
+          </p>
+
+          <p>
+            The second kind is <strong>typing</strong> the author did not intend, and it is
+            silent. In YAML the country code <code>NO</code> becomes <code>false</code> in 4 of 12
+            loaders. The version <code>3.10</code> becomes the float 3.1 in all 12. A file mode
+            written <code>0755</code> has three readings: 493 in five loaders, 755 in six, and the
+            string <code>"0755"</code> in one. None of these raises an error.
+            <span class="recon">measured here</span> Each one is taken apart in
+            <a href="#yaml-types">YAML: the type you did not write</a>.
+          </p>
+
+          <p>
+            The third kind is <strong>structure</strong> the author did not see. In TOML, the
+            lines after a table header, "until the next header or EOF, are the key/values of that
+            table" (TOML 1.0.0 and 1.1.0, section Table). <span class="src">from the spec</span>
+            A <code>debug = true</code> appended at the end of a file, under a comment calling
+            it a top-level setting, lands at <code>server.debug</code> in all 10 TOML parsers,
+            with no error.
+            <span class="recon">measured here</span> Helm issue #9793 (10 June 2021, Helm
+            v3.6.0) reported that the unindented lines after an indented first line of
+            <code>values.yaml</code> were ignored. <span class="src">from the docs</span> The
+            reported file still loses them: yaml.v3 v3.0.1, sigs.k8s.io/yaml v1.6.0 and
+            serde-saphyr 1.3.0 return only the first mapping, and nine other loaders refuse the
+            file. <span class="recon">measured here</span> sigs.k8s.io/yaml is the library
+            Kubernetes uses, and serde-saphyr is a Rust crate.
+            <span class="src">from the docs</span> The two traps have their own sections,
+            <a href="#toml-rules">TOML: obvious until the second table</a> and
+            <a href="#yaml-structure">YAML: the structure you did not see</a>.
+          </p>
+
+          <p>
+            A fourth kind arrives when programs write configuration back, as <code>cargo add</code>
+            has done to <code>Cargo.toml</code> since Rust 1.62 and Claude Code does to
+            <code>~/.claude/settings.json</code> from its <code>/config</code> menu.
+            <span class="src">from the docs</span> Every such writer is a reader first, and it
+            writes down what it heard. <span class="recon">reconstruction</span> Load the 66-line
+            YAML agent config this guide returns to with PyYAML's <code>safe_load</code>, change
+            one value, save it with <code>safe_dump</code>, and <code>NO</code> comes back as
+            <code>false</code>, with the keys sorted and none of the six comments. Re-read by
+            PyYAML, ruamel.yaml and eemeli's <code>yaml</code> (the npm package named
+            <code>yaml</code>), it is <code>false</code> all three times, though the last two heard
+            <code>NO</code> in the original.
+            <span class="recon">measured here</span> The writer has changed what every later
+            reader hears. Figure {{fig-two-readers}} lays the four kinds side by side, and
+            <a href="#write-back">When the program writes back</a> follows the fourth.
+          </p>
+
+          <figure class="figure wide" id="fig-two-readers">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What the author meant, the bytes on disk, and what the parsers heard</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 640" role="img" aria-label="Four kinds of disagreement between a config file's author and its parsers, one per row, each read left to right from what the author meant, through the bytes on disk, to what the measured parsers heard. 1, syntax: the author meant the JSON object {&quot;a&quot;: 1} but the editor saved a UTF-8 byte-order mark first; 3 of 10 JSON parsers (jq and both json5 parsers) skip it silently and hear {&quot;a&quot;: 1}; 7 of 10 report an error or flag it, and one of those, jsonc-parser, flags it but still returns {&quot;a&quot;: 1}. 2, typing, three rows: the YAML line countries: [GB, IE, FR, DE, NO, SE], where NO means Norway, is heard as the string NO by 8 of 12 YAML loaders and as false by 4 (PyYAML twice, sigs.k8s.io/yaml, serde-saphyr); python: 3.10 is heard as the float 3.1 by all 12; a file mode written a: 0755 is heard as 493 by 5 loaders (PyYAML twice and the three Go loaders), as 755 by 6 and as the string 0755 by 1. 3, structure: a TOML file with a [server] table and debug = true appended at the end under a comment saying it is meant as a top-level setting; all 10 TOML parsers put debug inside server, with no error. 4, write-back: PyYAML 6.0.3 loads the agent config, changes max_tokens to 4096 and dumps it; the rewritten file says - false where it said NO, and all 3 re-readers (PyYAML, ruamel.yaml, eemeli yaml) hear false; keys are sorted and 0 of 6 comments survive. Thick black arrows mark the author writing, thin blue arrows parsers reading, a dashed purple arrow the program writing back. Green marks a reading that matches the author's intent, red a different reading with no error, grey an error reported or flagged.">
+                <defs>
+                  <marker id="fig-two-readers-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-two-readers-blu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-two-readers-pur" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="0" y="16" class="svg-lane">KIND</text>
+                <text x="112" y="16" class="svg-lane">WHAT THE AUTHOR MEANT</text>
+                <text x="396" y="16" class="svg-lane">THE BYTES ON DISK</text>
+                <text x="756" y="16" class="svg-lane">WHAT THE PARSERS HEARD</text>
+
+                <text x="0" y="52" class="svg-num">1</text>
+                <text x="16" y="52" class="svg-step">Syntax</text>
+                <text x="0" y="70" class="svg-note">mostly loud</text>
+                <rect x="112" y="30" width="244" height="56" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="124" y="53" class="svg-sub">{"a": 1}</text>
+                <text x="124" y="73" class="svg-note">an object; the editor saved a BOM</text>
+                <line x1="356" y1="58" x2="391" y2="58" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-two-readers-ink)"/>
+                <rect x="396" y="30" width="316" height="56" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="408" y="53" class="svg-sub">EF BB BF {"a": 1}</text>
+                <text x="408" y="73" class="svg-note">_cases/json/bom.json · first 3 bytes in hex</text>
+                <line x1="712" y1="58" x2="751" y2="58" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-two-readers-blu)"/>
+                <rect x="756" y="36" width="128" height="22" rx="11" fill="#dfede5" stroke="#367f59"/>
+                <text x="768" y="51" class="svg-sub">{"a": 1} · 3/10</text>
+                <rect x="892" y="36" width="174" height="22" rx="11" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="904" y="51" class="svg-sub">error or flag · 7/10</text>
+                <text x="756" y="78" class="svg-note">jq and json5 ×2 skip it; jsonc-parser flags it but returns it</text>
+
+                <path d="M94 102 H100 V286 H94" fill="none" stroke="#b8b8b1"/>
+                <text x="0" y="124" class="svg-num">2</text>
+                <text x="16" y="124" class="svg-step">Typing</text>
+                <text x="0" y="142" class="svg-note">silent</text>
+                <rect x="112" y="102" width="244" height="56" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="124" y="125" class="svg-sub">"NO"</text>
+                <text x="124" y="145" class="svg-note">Norway, one of six country codes</text>
+                <line x1="356" y1="130" x2="391" y2="130" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-two-readers-ink)"/>
+                <rect x="396" y="102" width="316" height="56" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="408" y="125" class="svg-sub">countries: [GB, IE, FR, DE, NO, SE]</text>
+                <text x="408" y="145" class="svg-note">_cases/yaml/norway.yaml</text>
+                <line x1="712" y1="130" x2="751" y2="130" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-two-readers-blu)"/>
+                <rect x="756" y="108" width="104" height="22" rx="11" fill="#dfede5" stroke="#367f59"/>
+                <text x="768" y="123" class="svg-sub">"NO" · 8/12</text>
+                <rect x="868" y="108" width="110" height="22" rx="11" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="880" y="123" class="svg-sub">false · 4/12</text>
+                <text x="756" y="150" class="svg-note">false: PyYAML ×2, sigs.k8s.io/yaml, serde-saphyr</text>
+
+                <rect x="112" y="166" width="244" height="56" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="124" y="189" class="svg-sub">"3.10"</text>
+                <text x="124" y="209" class="svg-note">a Python version, as text</text>
+                <line x1="356" y1="194" x2="391" y2="194" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-two-readers-ink)"/>
+                <rect x="396" y="166" width="316" height="56" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="408" y="189" class="svg-sub">python: 3.10</text>
+                <text x="408" y="209" class="svg-note">_cases/yaml/versions.yaml, line 1</text>
+                <line x1="712" y1="194" x2="751" y2="194" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-two-readers-blu)"/>
+                <rect x="756" y="172" width="104" height="22" rx="11" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="768" y="187" class="svg-sub">3.1 · 12/12</text>
+                <text x="756" y="214" class="svg-note">a float in every loader measured</text>
+
+                <rect x="112" y="230" width="244" height="56" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="124" y="253" class="svg-sub">rwxr-xr-x</text>
+                <text x="124" y="273" class="svg-note">a file mode: octal 755, i.e. 493</text>
+                <line x1="356" y1="258" x2="391" y2="258" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-two-readers-ink)"/>
+                <rect x="396" y="230" width="316" height="56" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="408" y="253" class="svg-sub">a: 0755</text>
+                <text x="408" y="273" class="svg-note">_cases/yaml/octal.yaml, line 1</text>
+                <line x1="712" y1="258" x2="751" y2="258" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-two-readers-blu)"/>
+                <rect x="756" y="236" width="96" height="22" rx="11" fill="#dfede5" stroke="#367f59"/>
+                <text x="768" y="251" class="svg-sub">493 · 5/12</text>
+                <rect x="860" y="236" width="96" height="22" rx="11" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="872" y="251" class="svg-sub">755 · 6/12</text>
+                <rect x="964" y="236" width="118" height="22" rx="11" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="976" y="251" class="svg-sub">"0755" · 1/12</text>
+                <text x="756" y="278" class="svg-note">493: PyYAML ×2 and the three Go loaders</text>
+
+                <text x="0" y="324" class="svg-num">3</text>
+                <text x="16" y="324" class="svg-step">Structure</text>
+                <text x="0" y="342" class="svg-note">often silent</text>
+                <rect x="112" y="302" width="244" height="142" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="124" y="325" class="svg-sub">debug = true</text>
+                <text x="124" y="345" class="svg-note">a top-level setting, appended</text>
+                <text x="124" y="363" class="svg-note">at the end of the file</text>
+                <text x="124" y="395" class="svg-sub">{"debug": true, "server": …}</text>
+                <line x1="356" y1="373" x2="391" y2="373" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-two-readers-ink)"/>
+                <rect x="396" y="302" width="316" height="142" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="404" y="406" width="100" height="17" rx="3" fill="#f3dfdc"/>
+                <text x="408" y="322" class="svg-sub">title = "app"</text>
+                <text x="408" y="338" class="svg-sub">[server]</text>
+                <text x="408" y="354" class="svg-sub">host = "0.0.0.0"</text>
+                <text x="408" y="370" class="svg-sub">port = 8080</text>
+                <text x="408" y="402" class="svg-sub"># meant as a top-level setting</text>
+                <text x="408" y="418" class="svg-sub">debug = true</text>
+                <text x="408" y="437" class="svg-note">_cases/toml/scope_trap.toml</text>
+                <line x1="712" y1="373" x2="751" y2="373" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-two-readers-blu)"/>
+                <rect x="756" y="316" width="172" height="22" rx="11" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="768" y="331" class="svg-sub">server.debug · 10/10</text>
+                <text x="756" y="362" class="svg-sub">{"server": {"debug": true, …}, "title": "app"}</text>
+                <text x="756" y="386" class="svg-note">all ten move it into server; none errs</text>
+
+                <text x="0" y="484" class="svg-num">4</text>
+                <text x="16" y="484" class="svg-step">Write-back</text>
+                <text x="0" y="502" class="svg-note">silent, lasting</text>
+                <rect x="112" y="462" width="244" height="100" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="124" y="485" class="svg-sub">max_tokens: 4096</text>
+                <text x="124" y="505" class="svg-note">change one value, nothing else;</text>
+                <text x="124" y="523" class="svg-note">done by PyYAML 6.0.3:</text>
+                <text x="124" y="543" class="svg-sub">safe_load → edit → safe_dump</text>
+                <path d="M356 512 H391" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-two-readers-pur)"/>
+                <rect x="396" y="462" width="316" height="100" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="408" y="481" class="svg-note">agent.yaml after the dump, lines 68–71 of 77</text>
+                <rect x="404" y="521" width="64" height="17" rx="3" fill="#f3dfdc"/>
+                <text x="408" y="501" class="svg-sub">- FR</text>
+                <text x="408" y="517" class="svg-sub">- DE</text>
+                <text x="408" y="533" class="svg-sub">- false</text>
+                <text x="408" y="549" class="svg-sub">- SE</text>
+                <line x1="712" y1="512" x2="751" y2="512" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-two-readers-blu)"/>
+                <rect x="756" y="470" width="182" height="22" rx="11" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="768" y="485" class="svg-sub">false · 3/3 re-readers</text>
+                <text x="756" y="512" class="svg-note">PyYAML, ruamel.yaml and yaml (eemeli);</text>
+                <text x="756" y="530" class="svg-note">the last two heard NO before the dump</text>
+                <text x="756" y="548" class="svg-note">keys sorted, 0 of 6 comments kept</text>
+
+                <line x1="0" y1="574" x2="1120" y2="574" stroke="#deded9"/>
+                <rect x="0" y="586" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="22" y="597" class="svg-sub">heard what the author meant</text>
+                <rect x="248" y="586" width="14" height="14" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="270" y="597" class="svg-sub">heard something else, no error</text>
+                <rect x="520" y="586" width="14" height="14" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="542" y="597" class="svg-sub">reported an error</text>
+                <text x="740" y="597" class="svg-sub">n/N: parsers hearing it / measured</text>
+                <line x1="0" y1="621" x2="30" y2="621" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-two-readers-ink)"/>
+                <text x="40" y="625" class="svg-sub">author writes</text>
+                <line x1="170" y1="621" x2="200" y2="621" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-two-readers-blu)"/>
+                <text x="210" y="625" class="svg-sub">parser reads</text>
+                <path d="M330 621 H360" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-two-readers-pur)"/>
+                <text x="370" y="625" class="svg-sub">program writes back</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <span class="recon">measured here</span> Readings are from
+              <code>_numbers.json</code> (cases <code>j_bom</code>, <code>y_norway</code>,
+              <code>y_versions</code>, <code>y_octal</code>, <code>t_scope_trap</code>) and
+              its <code>roundtrip</code> record, on the exact bytes in <code>_cases/</code>.
+              <span class="recon">reconstruction</span> The left column, and so the tints, is my
+              reading of what an author meant. Only syntax tends to stop the program; the other
+              three hand it a different value and let it run.
+            </p>
+          </figure>
+
+          <h3>How this guide listens</h3>
+
+          <p>
+            Most results badged <em>measured here</em> come from one harness,
+            <code>_compute.py</code>, beside this page. The rest come from research probes run on
+            the same machine (unpublished, in <code>~/config-ref/bench</code>), and the text names
+            the probe wherever one is used. The harness sends 71 cases (30 YAML, 17 JSON, 24 TOML)
+            to the parsers for their format, 34 configurations in Python, Node, Rust, Go and jq,
+            and records what each heard, with its native type, or its exact error. The main
+            matrix is 32 of them: 12 YAML, 10 JSON, 10 TOML. PyYAML's <code>full_load</code> and
+            <code>unsafe_load</code> run only on the tag case. Parsers are called as a loader
+            without a schema calls them: default options, untyped target. Typed targets were not
+            measured. What a parser heard is exact and repeatable: repeated full runs gave the
+            same readings, and only timings, alias-bomb load times and two stack-bound depth
+            limits moved. <span class="recon">measured here</span>
+          </p>
+
+          <p>
+            The roster below gives each configuration with the version the harness recorded.
+            Python's <code>tomllib</code> runs twice, on 3.14.4 and on the 3.15.0 release
+            candidate. <span class="recon">measured here</span>
+          </p>
+
+          <table>
+            <thead>
+              <tr><th>Runtime</th><th>JSON (10)</th><th>YAML (12)</th><th>TOML (10)</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Python 3.14.4</td><td><code>json</code> (stdlib); json5 0.15.0</td><td>PyYAML 6.0.3: <code>safe_load</code> (pure Python) and <code>CSafeLoader</code> (libyaml 0.2.5); ruamel.yaml 0.19.1: safe and round-trip</td><td><code>tomllib</code> (stdlib; also on 3.15.0rc1); tomli 2.5.0; tomlkit 0.15.1</td></tr>
+              <tr><td>Node 24.21.0</td><td><code>JSON.parse</code>; json5 2.2.3; jsonc-parser 3.3.1</td><td>js-yaml 4.3.2 and 5.4.3; yaml 2.9.1 (eemeli)</td><td>@iarna/toml 2.2.5; smol-toml 1.9.0</td></tr>
+              <tr><td>Rust 1.97.1</td><td>serde_json 1.0.151, default and with <code>arbitrary_precision</code></td><td>serde_yaml 0.9.34+deprecated; serde-saphyr 1.3.0</td><td>toml 1.1.7 and toml_edit 0.25.16, both spec 1.1.0</td></tr>
+              <tr><td>Go 1.27.2</td><td><code>encoding/json</code> and <code>encoding/json/v2</code> (stdlib)</td><td>yaml.v3 v3.0.1; goccy/go-yaml v1.19.2; sigs.k8s.io/yaml v1.6.0</td><td>BurntSushi/toml v1.6.0; go-toml/v2 v2.4.3</td></tr>
+              <tr><td>jq 1.8.1</td><td>jq</td><td>none</td><td>none</td></tr>
+              <tr><td>Tag case only</td><td>none</td><td>PyYAML 6.0.3: <code>full_load</code> and <code>unsafe_load</code></td><td>none</td></tr>
+            </tbody>
+          </table>
+
+          <p>
+            The same agent configuration, written as 69 lines of JSON, 66 of YAML and 67 of TOML,
+            gives the JSON file's data in 28 of the 32 parsers of the main matrix, with date-times
+            compared as instants; <a href="#three-ways">One configuration, three ways</a> names
+            the other four. <span class="recon">measured here</span>
+          </p>
+
+          <h3>The answer, up front</h3>
+
+          <p>
+            You can stop reading after this list. Each item is my judgement.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <ol>
+            <li>
+              <strong>For configuration people edit, in a tool you control: TOML.</strong> Write
+              to the 1.0 subset unless you pin the parser, and put top-level keys before the first
+              table header. Python 3.14.4's <code>tomllib</code> rejects all four TOML 1.1 features
+              measured here. <span class="recon">measured here</span>
+            </li>
+            <li>
+              <strong>For configuration a program writes, or that crosses language boundaries:
+              strict JSON, validated by JSON Schema.</strong> If people also edit it, use JSONC
+              through one named parser that fails on errors, or keep the file's format and write
+              it with a format-preserving editor (tomlkit, toml_edit, ruamel.yaml round-trip).
+              JSONC here means JSON with comments as VS Code reads it.
+              <span class="src">from the docs</span> Failing on errors is not automatic:
+              jsonc-parser flags a trailing comma and still returns <code>{"a": 1, "b": 2}</code>.
+              <span class="recon">measured here</span>
+            </li>
+            <li>
+              <strong>YAML only where the ecosystem expects it.</strong> GitHub Actions documents
+              only YAML for workflows, the Compose specification defines its file as YAML, Ansible
+              chose it, and Kubernetes says "By convention, manifests are YAML".
+              <span class="src">from the docs</span> There, quote every scalar that is not
+              obviously a string and lint with yamllint 1.38.0, whose <code>truthy</code> rule
+              allows only <code>true</code> and <code>false</code> by default.
+              <span class="src">from the docs</span> Validate against a schema, and load with a
+              YAML 1.2 safe loader that limits aliases.
+            </li>
+            <li>
+              <strong>For all three: name and pin the parser, validate against a schema, use a
+              loader that rejects duplicate and unknown keys and a typed target, check in CI, and
+              never run load-and-dump on a file people edit.</strong>
+            </li>
+            <li>
+              <strong>If a file needs computed values or types shared across files, use a
+              configuration language (CUE, Pkl, Nickel) or configuration as code, and guard its
+              output the same way.</strong>
+            </li>
+          </ol>
+
+          <p>
+            The rest of the guide earns that answer, one format at a time and then
+            <a href="#three-ways">side by side</a>, and <a href="#practice">A practice that
+            holds</a> turns it into rules. A companion post,
+            <a href="../where-the-json-lives/">Where the JSON Lives</a>, treats JSON as stored data.
+            This one treats JSON, YAML and TOML as written configuration: files a person edits and
+            a program trusts.
+          </p>
