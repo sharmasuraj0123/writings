@@ -1,0 +1,552 @@
+          <h2 id="request-path"><span class="secnum">{{S}}</span>The request path in next start</h2>
+          <p class="lede">
+            §04's files are all the server needs.
+            <code>next start</code> is one Node process. At boot it turns the
+            manifests into Sets and a sorted regex list, and never reads
+            <code>app/</code> again. Matching a URL costs microseconds. The costs
+            sit elsewhere: the first request after boot, each prerendered path's
+            first request, and Proxy.
+          </p>
+
+          <h3>Boot</h3>
+          <p>
+            The router <code>require</code>s the render server
+            (<code>server/lib/router-server.ts</code>:356-357) and calls its handler
+            directly (:531-535), with no IPC. <code>setupFsCheck</code> reads seven manifests
+            and nothing under <code>app/</code>
+            (<code>server/lib/router-utils/filesystem.ts</code>:348-396). It lists
+            <code>public/</code>, legacy <code>static/</code> and
+            <code>.next/static/</code> into Sets (:309-346) and compiles regex
+            matchers for the dynamic routes, ordered by <code>getSortedRoutes</code>
+            (:102-135, 509-526). An App route gets two: one built from
+            <code>app-paths-manifest.json</code> (:397-406, 466), one from
+            <code>routes-manifest.json</code> (:513-524), with no de-duplication
+            <span class="src">from the code</span>. Page bodies
+            still come from the file-system IncrementalCache, behind a 50 MB memory
+            LRU by default (<code>server/config-shared.ts</code>:2304)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>Resolution</h3>
+          <p>
+            <code>resolveRoutes</code> walks one list, built once in production
+            (:148-153). <code>server/lib/router-utils/resolve-routes.ts</code>:85-117, comments
+            and blank lines trimmed <span class="src">from the code</span>:
+          </p>
+<pre><code>const calculateRoutes = () =&gt; {
+  return [
+    { match: () =&gt; ({}), name: 'middleware_next_data' },
+    ...(opts.minimalMode ? [] : fsChecker.headers),
+    ...(opts.minimalMode ? [] : fsChecker.redirects),
+    { match: () =&gt; ({}), name: 'middleware' },
+    ...(opts.minimalMode ? [] : fsChecker.rewrites.beforeFiles),
+    { match: () =&gt; ({}), name: 'before_files_end' },
+    { match: () =&gt; ({}), name: 'check_fs' },
+    ...(opts.minimalMode ? [] : fsChecker.rewrites.afterFiles),
+    {
+      check: true,
+      match: () =&gt; ({}),
+      name: 'after files check: true',
+    },
+    ...(opts.minimalMode ? [] : fsChecker.rewrites.fallback),
+  ]
+}</code></pre>
+          <p>
+            <code>check_fs</code> is exact matching: it probes six Sets in a fixed
+            order, behind an 8 MiB LRU that caches misses too
+            (<code>filesystem.ts</code>:175-213, 757-764). The first hit wins, so in
+            production a <code>public/</code> file shadows an app page
+            <span class="src">from the code</span>. <code>/sec0/a/1</code> misses all
+            six, because <code>appFiles</code> holds patterns (:439-441).
+          </p>
+          <p>
+            Dynamic routes are tried only in <code>checkTrue</code>: the exact
+            lookup again, then a <code>for…of</code> over the sorted matchers, first
+            match wins (<code>resolve-routes.ts</code>:281-349)
+            <span class="src">from the code</span>. The example's pattern is the
+            3rd of 119 in the lab build's <code>routes-manifest.json</code>
+            <span class="recon">measured here</span>. Each App pattern sits in the
+            list twice, so it matches on the 5th of 238 regexes, and a miss tries
+            all 238 <span class="src">from the code</span>. Figure {{fig-resolve-routes}}
+            follows it down the list.
+          </p>
+          <p>
+            The scan is linear, and cheap. <code>e6-match.mjs</code> rebuilt the
+            loop around next/dist's own sorter and matchers. At 100 dynamic routes a
+            hit cost 5.8 µs and a miss, which tries every regex, 8.0 µs; at 1,000,
+            85 and 168 µs. Hits tried 51.8, then 504.4 matchers: 9.7× the matchers,
+            14.6× the time. <code>Set.has</code> stayed under 0.1 µs
+            <span class="recon">measured here</span>. The script compiles one regex per
+            pattern; <code>next start</code> holds two per App pattern, so its scan
+            runs up to twice as long. A miss at 1,000 App patterns would cost about
+            2 × 168 = 336 µs, 14% of a 2.37 ms static request (below)
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure" id="fig-resolve-routes">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title"><code>/sec0/a/1</code> down the phase list: six Sets miss, the 3rd pattern matches</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 604" role="img" aria-label="Left: the ten entries of resolveRoutes in order, five blue sentinels and five grey config lists: middleware_next_data, headers, redirects, middleware (Proxy), beforeFiles rewrites, before_files_end, check_fs, afterFiles rewrites, after files check: true, and fallback rewrites. A thick arrow shows /sec0/a/1 walking rows one to nine: the Proxy matcher does not match, check_fs misses, and check: true matches the 3rd of 119 patterns. Right, top: check_fs expanded as an 8 MiB LRU over six Sets probed in order: dev virtual files, _next/static, legacy static, public, appFiles, pageFiles; public beats app pages, and appFiles holds patterns, so the example misses. Right, middle: checkTrue as a left-to-right scan of 238 regexes, each of the 119 patterns listed twice: /gallery/(.)photo/[id] twice, no match; /gallery/photo/[id] twice, no match; /sec0/a/[id] matches on the 5th regex with id 1; 233 more not tried. Bottom: a bar chart of microseconds per lookup: Set.has under 0.1; 100 routes hit 5.8 and miss 8.0; 1,000 routes hit 85 and miss 168.">
+                <defs>
+                  <marker id="fig-resolve-routes-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+
+                <text x="20" y="20" class="svg-lane">RESOLVEROUTES · TEN ENTRIES, BUILT ONCE IN PRODUCTION</text>
+
+                <line x1="27" y1="40" x2="27" y2="300" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-resolve-routes-arr-ink)"/>
+
+                <rect x="40" y="34" width="250" height="26" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="50" y="51" class="svg-num">1</text>
+                <text x="66" y="51" class="svg-sub" style="fill:#252525">middleware_next_data</text>
+
+                <rect x="40" y="66" width="250" height="26" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50" y="83" class="svg-num">2</text>
+                <text x="66" y="83" class="svg-sub" style="fill:#252525">headers</text>
+
+                <rect x="40" y="98" width="250" height="26" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50" y="115" class="svg-num">3</text>
+                <text x="66" y="115" class="svg-sub" style="fill:#252525">redirects</text>
+
+                <rect x="40" y="130" width="250" height="26" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="50" y="147" class="svg-num">4</text>
+                <text x="66" y="147" class="svg-sub" style="fill:#252525">middleware · Proxy</text>
+                <text x="282" y="147" text-anchor="end" class="svg-sub">no match</text>
+
+                <rect x="40" y="162" width="250" height="26" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50" y="179" class="svg-num">5</text>
+                <text x="66" y="179" class="svg-sub" style="fill:#252525">beforeFiles rewrites</text>
+
+                <rect x="40" y="194" width="250" height="26" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="50" y="211" class="svg-num">6</text>
+                <text x="66" y="211" class="svg-sub" style="fill:#252525">before_files_end</text>
+
+                <rect x="40" y="226" width="250" height="26" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="50" y="243" class="svg-num">7</text>
+                <text x="66" y="243" class="svg-sub" style="fill:#252525">check_fs</text>
+                <text x="282" y="243" text-anchor="end" class="svg-sub">miss</text>
+
+                <rect x="40" y="258" width="250" height="26" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50" y="275" class="svg-num">8</text>
+                <text x="66" y="275" class="svg-sub" style="fill:#252525">afterFiles rewrites</text>
+
+                <rect x="40" y="290" width="250" height="26" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="2"/>
+                <text x="50" y="307" class="svg-num">9</text>
+                <text x="66" y="307" class="svg-sub" style="fill:#252525">after files check: true</text>
+                <text x="282" y="307" text-anchor="end" class="svg-sub" style="fill:#367f59">3rd of 119</text>
+
+                <rect x="40" y="322" width="250" height="26" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50" y="339" class="svg-num">10</text>
+                <text x="66" y="339" class="svg-sub" style="fill:#252525">fallback rewrites</text>
+
+                <path d="M290 239 H340 V110 H360" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M290 303 H346 V274 H360" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+
+                <rect x="360" y="34" width="620" height="152" rx="8" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="374" y="54" class="svg-step">check_fs → getItem(): exact match, six Sets in order</text>
+                <rect x="374" y="64" width="592" height="24" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="384" y="80" class="svg-sub" style="fill:#252525">8 MiB LRU, production only · misses cached as notFound</text>
+
+                <rect x="374" y="98" width="90" height="46" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="382" y="111" class="svg-num">1</text>
+                <text x="419" y="125" text-anchor="middle" class="svg-sub" style="fill:#252525">devVirtual</text>
+                <text x="419" y="138" text-anchor="middle" class="svg-sub">dev only</text>
+
+                <rect x="474" y="98" width="90" height="46" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="482" y="111" class="svg-num">2</text>
+                <text x="519" y="125" text-anchor="middle" class="svg-sub" style="fill:#252525">_next/static</text>
+                <text x="519" y="138" text-anchor="middle" class="svg-sub">Set.has</text>
+
+                <rect x="575" y="98" width="90" height="46" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="583" y="111" class="svg-num">3</text>
+                <text x="620" y="125" text-anchor="middle" class="svg-sub" style="fill:#252525">static/</text>
+                <text x="620" y="138" text-anchor="middle" class="svg-sub">legacy</text>
+
+                <rect x="675" y="98" width="90" height="46" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="683" y="111" class="svg-num">4</text>
+                <text x="720" y="125" text-anchor="middle" class="svg-sub" style="fill:#252525">public/</text>
+                <text x="720" y="138" text-anchor="middle" class="svg-sub">beats app</text>
+
+                <rect x="776" y="98" width="90" height="46" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="784" y="111" class="svg-num">5</text>
+                <text x="821" y="125" text-anchor="middle" class="svg-sub" style="fill:#252525">appFiles</text>
+                <text x="821" y="138" text-anchor="middle" class="svg-sub">patterns</text>
+
+                <rect x="876" y="98" width="90" height="46" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="884" y="111" class="svg-num">6</text>
+                <text x="921" y="125" text-anchor="middle" class="svg-sub" style="fill:#252525">pageFiles</text>
+                <text x="921" y="138" text-anchor="middle" class="svg-sub">Set.has</text>
+
+                <text x="374" y="163" class="svg-note">First hit wins: a public/ file shadows an app page with the same path.</text>
+                <text x="374" y="178" class="svg-note">appFiles holds /sec0/a/[id], not /sec0/a/1, so the example misses all six.</text>
+
+                <rect x="360" y="200" width="620" height="148" rx="8" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="374" y="220" class="svg-step">check: true → checkTrue(): linear first-match scan</text>
+                <text x="374" y="237" class="svg-sub">getItem() once more, then for…of over 238 regexes: 119 patterns, each twice</text>
+
+                <rect x="374" y="248" width="170" height="42" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="459" y="265" text-anchor="middle" class="svg-sub" style="fill:#252525">/gallery/(.)photo/[id]</text>
+                <text x="459" y="281" text-anchor="middle" class="svg-sub">×2, no match</text>
+
+                <rect x="554" y="248" width="150" height="42" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="629" y="265" text-anchor="middle" class="svg-sub" style="fill:#252525">/gallery/photo/[id]</text>
+                <text x="629" y="281" text-anchor="middle" class="svg-sub">×2, no match</text>
+
+                <rect x="714" y="248" width="120" height="42" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="2"/>
+                <text x="774" y="265" text-anchor="middle" class="svg-sub" style="fill:#252525">/sec0/a/[id]</text>
+                <text x="774" y="281" text-anchor="middle" class="svg-sub" style="fill:#367f59">{ id: '1' }</text>
+
+                <rect x="844" y="248" width="122" height="42" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+                <text x="905" y="265" text-anchor="middle" class="svg-sub" style="fill:#252525">233 more</text>
+                <text x="905" y="281" text-anchor="middle" class="svg-sub">not tried</text>
+
+                <text x="374" y="313" class="svg-note">Tried left to right; the first regex that matches returns, so /sec0/a/[id] wins on the 5th.</text>
+                <text x="374" y="329" class="svg-note">A URL that matches nothing tries all 238, which is why a miss costs more below.</text>
+
+                <line x1="20" y1="364" x2="980" y2="364" stroke="#deded9"/>
+                <text x="20" y="386" class="svg-lane">INSET · MICROSECONDS PER LOOKUP, MEDIAN OF 7 × 10,000 (E6-MATCH.MJS)</text>
+
+                <text x="230" y="410" text-anchor="end" class="svg-sub" style="fill:#252525">Set.has · static path</text>
+                <line x1="240" y1="398" x2="240" y2="414" stroke="#252525" stroke-width="2"/>
+                <text x="248" y="410" class="svg-sub" style="fill:#252525">&lt; 0.1</text>
+
+                <text x="230" y="436" text-anchor="end" class="svg-sub" style="fill:#252525">100 routes · hit</text>
+                <rect x="240" y="424" width="20.7" height="16" fill="#dfede5" stroke="#367f59"/>
+                <text x="267" y="436" class="svg-sub" style="fill:#252525">5.8</text>
+
+                <text x="230" y="462" text-anchor="end" class="svg-sub" style="fill:#252525">100 routes · miss</text>
+                <rect x="240" y="450" width="28.6" height="16" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="275" y="462" class="svg-sub" style="fill:#252525">8.0</text>
+
+                <text x="230" y="488" text-anchor="end" class="svg-sub" style="fill:#252525">1,000 routes · hit</text>
+                <rect x="240" y="476" width="303.6" height="16" fill="#dfede5" stroke="#367f59"/>
+                <text x="550" y="488" class="svg-sub" style="fill:#252525">85</text>
+
+                <text x="230" y="514" text-anchor="end" class="svg-sub" style="fill:#252525">1,000 routes · miss</text>
+                <rect x="240" y="502" width="600" height="16" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="847" y="514" class="svg-sub" style="fill:#252525">168</text>
+
+                <line x1="240" y1="528" x2="840" y2="528" stroke="#b8b8b1"/>
+                <line x1="240" y1="528" x2="240" y2="533" stroke="#b8b8b1"/>
+                <line x1="418.6" y1="528" x2="418.6" y2="533" stroke="#b8b8b1"/>
+                <line x1="597.1" y1="528" x2="597.1" y2="533" stroke="#b8b8b1"/>
+                <line x1="775.7" y1="528" x2="775.7" y2="533" stroke="#b8b8b1"/>
+                <text x="240" y="545" text-anchor="middle" class="svg-sub">0</text>
+                <text x="418.6" y="545" text-anchor="middle" class="svg-sub">50</text>
+                <text x="597.1" y="545" text-anchor="middle" class="svg-sub">100</text>
+                <text x="775.7" y="545" text-anchor="middle" class="svg-sub">150 µs</text>
+
+                <text x="560" y="412" class="svg-note">Matchers tried per hit, mean: 51.8 at 100 routes, 504.4 at 1,000.</text>
+                <text x="560" y="428" class="svg-note">9.7× the matchers took 14.6× the time.</text>
+                <text x="560" y="444" class="svg-note">A miss tries them all: 168 ÷ 8.0 ≈ 21×.</text>
+
+                <text x="20" y="572" class="svg-note">Rows: blue = sentinel, grey = compiled config; thick black = the order /sec0/a/1 walks. Bars: green = hit, red = miss, black = Set.has.</text>
+                <text x="20" y="590" class="svg-note">For scale, a whole static request took 2,370 µs to first byte at p50 (e4-latency.mjs).</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Structure, and the doubled list, as cited above <span class="src">from the code</span>.
+              Outcomes and pattern order: the 401-route build, whose Proxy matches only
+              <code>/mw/…</code> (<code>e8-golden-trace.mjs</code>). The inset times
+              <code>e6-match.mjs</code>'s copy of the loop, one regex per pattern, on a
+              shared 2-vCPU container; a rerun moved absolute times by up to 30%, so read the
+              ratios <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>Hand-off and the cache decision</h3>
+          <p>
+            The match is not repeated: <code>invokeRender</code> passes the route
+            and params to <code>BaseServer</code> as request meta
+            (<code>router-server.ts</code>:813-833)
+            <span class="src">from the code</span>. PR #94157, merged 2026-08-15,
+            deleted the server's own matcher stack because "The filesystem checker
+            already owns the normalized route lookup path in production"
+            <span class="src">from the docs</span>.
+          </p>
+          <p>
+            <code>Vary</code> is the four router headers, plus
+            <code>next-url</code> only where a path could be intercepted
+            (<code>server/base-server.ts</code>:2359-2386). <code>_rsc</code> is the
+            first 96 bits of SHA-256 over four request headers, not the URL
+            (<code>cache-busting-search-param.ts</code>:24-77); by default a mismatch
+            gets a 307 (<code>base-server.ts</code>:2446-2490)
+            <span class="src">from the code</span>. So all twelve <code>/_tree</code>
+            prefetches from <code>/sec0/a/1</code> carried
+            <code>nVRY9RLVAUtqyrUj</code> <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Only a request for an SSG (statically generated) page that needs no
+            dynamic response gets a cache key
+            (<code>build/templates/app-page-runtime.ts</code>:677-698). Others get
+            <code>null</code>, and <code>ResponseCache.get</code> just runs the
+            renderer (<code>server/response-cache/index.ts</code>:246-253)
+            <span class="src">from the code</span>. Dynamic pages are neither cached
+            nor coalesced: concurrent <code>/dyn</code> requests each render
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>Seeds and the first request</h3>
+          <p>
+            New in 16.4, build output is a seed. The cache key is
+            <code>/route-cache/&lt;kind&gt;/&lt;sha256(sourceRoute)&gt;/$&lt;path&gt;</code>,
+            where <code>sourceRoute</code> is the App module name with its groups and
+            slots (<code>server/lib/route-cache-key.ts</code>:14-18, 87-113). The first request for
+            a path copies the build's <code>.rsc</code>, segments and <code>.meta</code>
+            under it and writes <code>.html</code> last, "the publication marker"
+            (<code>file-system-cache.ts</code>:477-606)
+            <span class="src">from the code</span>. That costs about 12 ms, once per
+            path: medians of 15.7–17.2 ms against 3.95–4.24 ms for repeats
+            <span class="recon">measured here</span>
+            (<code>e8-seed-promotion.mjs</code>). The handler sets
+            <code>x-nextjs-prerender: 1</code>, then appends the copy in
+            <code>.meta</code>, so it arrives twice
+            (<code>app-page-runtime.ts</code>:1995-2008, 2134-2155)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The first request after boot pays most.
+            <code>experimental.preloadEntriesOnStart</code>, default
+            <code>true</code> (<code>config-shared.ts</code>:2415), loads all 405
+            App entries in the background (<code>server/next-server.ts</code>:264-273,
+            331-375)
+            <span class="src">from the code</span>, on the thread the first request
+            needs. That request took a median 1.24 s after a fresh start; 394 ms
+            with preloading off; 146 ms after 4 s idle. 0.89–1.05 s of CPU ran under
+            <code>unstable_preloadEntries</code>
+            <span class="recon">measured here</span> (<code>e8-cold-prof.mjs</code>).
+            Preloading paid off only for a server left idle first: a second
+            script idled both configurations 4 s and measured medians of 103 ms
+            with preloading against 205 ms without, about 100 ms saved
+            <span class="recon">measured here</span>
+            (<code>e8-preload-tradeoff.mjs</code>).
+          </p>
+          <p>
+            Warm time to first byte over localhost, 1,000 keep-alive requests
+            per endpoint, 101-route build <span class="recon">measured here</span>
+            (<code>e4-latency.mjs</code>):
+          </p>
+          <table>
+            <thead><tr><th>Endpoint</th><th>p50 ms</th><th>p95 ms</th></tr></thead>
+            <tbody>
+              <tr><td>static page</td><td>2.37</td><td>3.67</td></tr>
+              <tr><td>SSG param</td><td>2.63</td><td>4.16</td></tr>
+              <tr><td>route handler</td><td>2.26</td><td>3.76</td></tr>
+              <tr><td><code>cookies()</code> page</td><td>5.55</td><td>9.84</td></tr>
+              <tr><td>static, through a no-op Proxy</td><td>3.30</td><td>5.35</td></tr>
+            </tbody>
+          </table>
+
+          <h3>Proxy</h3>
+          <p>
+            Matchers are widened at build time to <code>/_next/data/</code>,
+            <code>.json</code>, <code>.rsc</code> and <code>.segments/</code> forms
+            (<code>build/analysis/get-page-static-info.ts</code>:486-534)
+            <span class="src">from the code</span>, and end-anchored:
+            <code>'/about'</code> does not match <code>/about/team</code>, though the
+            docs say it does (<code>proxy.mdx</code>, § Matcher)
+            <span class="src">from the docs</span>. The code wins. The runtime
+            builds a fresh <code>RegExp</code> per try
+            (<code>middleware-route-matcher.ts</code>:17-39), under 1 µs in three
+            micro-benchmarks <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The cost is elsewhere: +0.93 ms at p50 in the table, +39%; under the
+            lab's CPU lock, +0.909 ms to first byte and 888 µs of CPU per matched
+            request <span class="recon">measured here</span>
+            (<code>e8-proxy-prof.mjs</code>, <code>e8-proxy-attrib.mjs</code>). Figure {{fig-proxy-cost}} follows the
+            detour. A matched request re-enters the whole
+            <code>handleRequest</code> with <code>middlewareInvoke</code>
+            (<code>resolve-routes.ts</code>:589-613), and Proxy's result returns as
+            an exception, <code>server/next-server.ts</code>:2006-2010
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>if ('response' in result) {
+  if (isMiddlewareInvoke) {
+    bubblingResult = true
+    throw new BubbledError(true, result)
+  }</code></pre>
+          <p>
+            <code>BubbledError</code> extends <code>Error</code>
+            (<code>server/lib/trace/tracer.ts</code>:56-63); constructing one cost
+            69 µs, the largest extra self time of any function on the path
+            <span class="recon">measured here</span> (<code>e8-proxy-attrib.mjs</code>).
+            <code>resolveRoutes</code>
+            catches it, decodes the <code>x-middleware-*</code> headers, and
+            resolution resumes.
+          </p>
+          <p>
+            Excluded requests pay too. The App-only build's
+            <code>.next/server/pages/</code> holds <code>404.html</code> and
+            <code>500.html</code>, which enables Pages
+            (<code>next-server.ts</code>:559-566), so every request that reaches
+            <code>BaseServer</code> runs <code>handleNextDataRequest</code>
+            (<code>base-server.ts</code>:2012-2024), which calls
+            <code>getMiddleware()</code> before checking for a data URL
+            (<code>base-server.ts</code>:740-748)
+            <span class="src">from the code</span>: 40–45 µs per request
+            <span class="recon">measured here</span> (<code>e8-proxy-attrib.mjs</code>).
+          </p>
+
+          <figure class="figure wide" id="fig-proxy-cost">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Where a no-op Proxy's 0.9 ms goes: a re-entry and an exception</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 548" role="img" aria-label="Left: a nine-step sequence across three columns, router layer, BaseServer and next-server, and the Proxy bundle. 1, the router tests the user matcher on the raw path, then the decoded path. 2, it re-enters BaseServer handleRequest with request meta middlewareInvoke. 3, handleNextDataRequest calls getMiddleware. 4, handleCatchallMiddlewareRequest re-checks a dot-star matcher. 5, the Proxy bundle's adapter builds NextRequest, runs proxy and NextResponse. 6, next-server throws new BubbledError carrying the result, 69 microseconds. 7, the router catches it and decodes the x-middleware headers. 8, normal resolution: beforeFiles, check_fs, check true, match. 9, invokeRender runs the normal pass to a cache hit. Steps are coloured by the CPU bucket they charge. Right: horizontal bars of median extra CPU per matched request in microseconds: Proxy bundle 437, Next plumbing 242 containing BubbledError 69 and require, path and fs 69, unattributed about 102, router layer 85, BaseServer re-entry 72, GC 25. Notes say the bucket medians sum to about 963, not the 888 total. Inset: the compiled matcher for '/about' and a truth table: /about, /about.rsc and /_next/data/BUILD/about.json match; /about/team does not, though the docs say it does.">
+                <defs>
+                  <marker id="fig-proxy-cost-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+
+                <text x="110" y="22" text-anchor="middle" class="svg-lane">ROUTER LAYER</text>
+                <text x="110" y="38" text-anchor="middle" class="svg-sub">resolve-routes.ts</text>
+                <text x="310" y="22" text-anchor="middle" class="svg-lane">BASESERVER</text>
+                <text x="310" y="38" text-anchor="middle" class="svg-sub">base-server.ts, next-server.ts</text>
+                <text x="510" y="22" text-anchor="middle" class="svg-lane">PROXY BUNDLE</text>
+                <text x="510" y="38" text-anchor="middle" class="svg-sub">adapter() + proxy.ts</text>
+
+                <line x1="110" y1="46" x2="110" y2="496" stroke="#deded9" stroke-dasharray="3 4"/>
+                <line x1="310" y1="46" x2="310" y2="496" stroke="#deded9" stroke-dasharray="3 4"/>
+                <line x1="510" y1="46" x2="510" y2="496" stroke="#deded9" stroke-dasharray="3 4"/>
+
+                <rect x="25" y="56" width="170" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="31" y="70" class="svg-num">1</text>
+                <text x="43" y="70" class="svg-sub" style="fill:#252525">match(raw path)</text>
+                <text x="43" y="84" class="svg-sub">else match(decoded)</text>
+
+                <rect x="220" y="106" width="180" height="34" rx="5" fill="#dfede5" stroke="#367f59"/>
+                <text x="226" y="120" class="svg-num">2</text>
+                <text x="238" y="120" class="svg-sub" style="fill:#252525">handleRequest again</text>
+                <text x="238" y="134" class="svg-sub">meta middlewareInvoke</text>
+
+                <rect x="220" y="156" width="180" height="34" rx="5" fill="#ece6f3" stroke="#765b98"/>
+                <text x="226" y="170" class="svg-num">3</text>
+                <text x="238" y="170" class="svg-sub" style="fill:#252525">handleNextDataRequest</text>
+                <text x="238" y="184" class="svg-sub">→ getMiddleware()</text>
+
+                <rect x="220" y="206" width="180" height="34" rx="5" fill="#ece6f3" stroke="#765b98"/>
+                <text x="226" y="220" class="svg-num">4</text>
+                <text x="238" y="220" class="svg-sub" style="fill:#252525">handleCatchallMiddleware</text>
+                <text x="238" y="234" class="svg-sub">Request: '.*' re-check</text>
+
+                <rect x="425" y="256" width="172" height="34" rx="5" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="431" y="270" class="svg-num">5</text>
+                <text x="443" y="270" class="svg-sub" style="fill:#252525">adapter(): NextRequest,</text>
+                <text x="443" y="284" class="svg-sub">proxy(), NextResponse</text>
+
+                <rect x="220" y="306" width="180" height="34" rx="5" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.5"/>
+                <text x="226" y="320" class="svg-num">6</text>
+                <text x="238" y="320" class="svg-sub" style="fill:#252525">throw new BubbledError</text>
+                <text x="238" y="334" class="svg-sub">(true, result) · 69 µs</text>
+
+                <rect x="25" y="356" width="170" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="31" y="370" class="svg-num">7</text>
+                <text x="43" y="370" class="svg-sub" style="fill:#252525">catch err.result</text>
+                <text x="43" y="384" class="svg-sub">decode x-middleware-*</text>
+
+                <rect x="25" y="406" width="170" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="31" y="420" class="svg-num">8</text>
+                <text x="43" y="420" class="svg-sub" style="fill:#252525">beforeFiles, check_fs,</text>
+                <text x="43" y="434" class="svg-sub">check: true → match</text>
+
+                <rect x="220" y="456" width="180" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="226" y="470" class="svg-num">9</text>
+                <text x="238" y="470" class="svg-sub" style="fill:#252525">invokeRender: normal</text>
+                <text x="238" y="484" class="svg-sub">pass, cache HIT</text>
+
+                <path d="M110 90 V98 H310 V105" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-proxy-cost-arr-ink)"/>
+                <path d="M310 140 V155" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-proxy-cost-arr-ink)"/>
+                <path d="M310 190 V205" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-proxy-cost-arr-ink)"/>
+                <path d="M310 240 V248 H510 V255" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-proxy-cost-arr-ink)"/>
+                <path d="M510 290 V298 H310 V305" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-proxy-cost-arr-ink)"/>
+                <path d="M310 340 V348 H110 V355" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-proxy-cost-arr-ink)"/>
+                <text x="180" y="344" text-anchor="middle" class="svg-sub" style="fill:#ad4b43">throw</text>
+                <path d="M110 390 V405" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-proxy-cost-arr-ink)"/>
+                <path d="M110 440 V448 H310 V455" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-proxy-cost-arr-ink)"/>
+
+                <text x="650" y="22" class="svg-lane">EXTRA CPU PER MATCHED REQUEST (MICROSECONDS)</text>
+                <text x="650" y="38" class="svg-sub">bucket medians of 3 rounds · e8-proxy-attrib.mjs</text>
+
+                <text x="650" y="69" class="svg-sub" style="fill:#252525">Proxy bundle</text>
+                <rect x="800" y="56" width="250" height="18" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="1056" y="69" class="svg-sub" style="fill:#252525">437</text>
+
+                <text x="650" y="97" class="svg-sub" style="fill:#252525">Next plumbing</text>
+                <rect x="800" y="84" width="138.4" height="18" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="800" y="84" width="39.5" height="18" fill="#f3dfdc" stroke="#ad4b43"/>
+                <rect x="839.5" y="84" width="39.5" height="18" fill="#ffffff" stroke="#765b98"/>
+                <text x="944" y="97" class="svg-sub" style="fill:#252525">242</text>
+                <text x="650" y="118" class="svg-sub">↳ inside it: BubbledError 69 (red), require()/path/fs 69 (white)</text>
+
+                <text x="650" y="141" class="svg-sub" style="fill:#252525">unattributed</text>
+                <rect x="800" y="128" width="58.4" height="18" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="864" y="141" class="svg-sub" style="fill:#252525">~102</text>
+
+                <text x="650" y="169" class="svg-sub" style="fill:#252525">router layer</text>
+                <rect x="800" y="156" width="48.6" height="18" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="855" y="169" class="svg-sub" style="fill:#252525">85</text>
+
+                <text x="650" y="197" class="svg-sub" style="fill:#252525">BaseServer re-entry</text>
+                <rect x="800" y="184" width="41.2" height="18" fill="#dfede5" stroke="#367f59"/>
+                <text x="848" y="197" class="svg-sub" style="fill:#252525">72</text>
+
+                <text x="650" y="225" class="svg-sub" style="fill:#252525">GC</text>
+                <rect x="800" y="212" width="14.3" height="18" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="820" y="225" class="svg-sub" style="fill:#252525">25</text>
+
+                <line x1="800" y1="242" x2="1050" y2="242" stroke="#b8b8b1"/>
+                <line x1="800" y1="242" x2="800" y2="247" stroke="#b8b8b1"/>
+                <line x1="857.2" y1="242" x2="857.2" y2="247" stroke="#b8b8b1"/>
+                <line x1="914.4" y1="242" x2="914.4" y2="247" stroke="#b8b8b1"/>
+                <line x1="971.6" y1="242" x2="971.6" y2="247" stroke="#b8b8b1"/>
+                <line x1="1028.8" y1="242" x2="1028.8" y2="247" stroke="#b8b8b1"/>
+                <text x="800" y="259" text-anchor="middle" class="svg-sub">0</text>
+                <text x="857.2" y="259" text-anchor="middle" class="svg-sub">100</text>
+                <text x="914.4" y="259" text-anchor="middle" class="svg-sub">200</text>
+                <text x="971.6" y="259" text-anchor="middle" class="svg-sub">300</text>
+                <text x="1028.8" y="259" text-anchor="middle" class="svg-sub">400 µs</text>
+
+                <text x="650" y="282" class="svg-note">Each bucket's median is taken on its own: they sum to about 963 µs,</text>
+                <text x="650" y="297" class="svg-note">not the 888 µs median total. TTFB: +0.909 ms at p50, 3 paired rounds × 2,000.</text>
+
+                <line x1="650" y1="314" x2="1100" y2="314" stroke="#deded9"/>
+                <text x="650" y="334" class="svg-lane">INSET · MATCHER '/ABOUT' AFTER WIDENING</text>
+                <text x="650" y="352" class="svg-sub" style="fill:#252525">^(?:\/(_next\/data\/[^/]{1,}))?\/about</text>
+                <text x="650" y="367" class="svg-sub" style="fill:#252525">(\.json|\.rsc|\.segments\/.+\.segment\.rsc)?[\/#\?]?$</text>
+
+                <rect x="650" y="378" width="450" height="20" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="660" y="392" class="svg-sub" style="fill:#252525">/about</text>
+                <text x="1090" y="392" text-anchor="end" class="svg-sub" style="fill:#252525">matches</text>
+                <rect x="650" y="402" width="450" height="20" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="660" y="416" class="svg-sub" style="fill:#252525">/about.rsc</text>
+                <text x="1090" y="416" text-anchor="end" class="svg-sub" style="fill:#252525">matches</text>
+                <rect x="650" y="426" width="450" height="20" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="660" y="440" class="svg-sub" style="fill:#252525">/_next/data/BUILD/about.json</text>
+                <text x="1090" y="440" text-anchor="end" class="svg-sub" style="fill:#252525">matches</text>
+                <rect x="650" y="450" width="450" height="20" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="660" y="464" class="svg-sub" style="fill:#252525">/about/team</text>
+                <text x="1090" y="464" text-anchor="end" class="svg-sub" style="fill:#ad4b43">no match (docs: matches)</text>
+
+                <text x="20" y="522" class="svg-note">Fill = the bucket a step charges: orange Proxy bundle, purple Next plumbing, blue router layer, green BaseServer re-entry, red BubbledError,</text>
+                <text x="20" y="538" class="svg-note">grey work a request without Proxy also does. Thick black = order of execution. Inset rows: green matches, red does not.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Steps: <code>resolve-routes.ts</code>:566-631 and 668-808,
+              <code>base-server.ts</code>:1657-1678,
+              <code>next-server.ts</code>:2006-2010
+              <span class="src">from the code</span>; for a Node Proxy, step 4 tests
+              <code>'.*'</code>, not the user's matchers. Bars: the 401-route build's
+              no-op <code>proxy.ts</code> under the CPU lock on a shared 2-vCPU
+              container, each sample bucketed by its synchronous stack, so named
+              buckets are lower bounds <span class="recon">measured here</span>
+              (<code>e8-proxy-attrib.mjs</code>). Step colours follow its bucket
+              rules as I read them <span class="recon">reconstruction</span>.
+              Inset: <code>'/about'</code> compiled with the bundled
+              <code>path-to-regexp</code> as the build does, then tested
+              <span class="recon">measured here</span>.
+            </p>
+          </figure>

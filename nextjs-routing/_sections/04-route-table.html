@@ -1,0 +1,379 @@
+          <h2 id="route-table"><span class="secnum">{{S}}</span>The route table, the LoaderTree and the manifests</h2>
+          <p class="lede">
+            The build hands the server data structures, not a folder tree: a
+            specificity-sorted table of anchored regexes, one LoaderTree literal
+            per route, a prerender manifest that classifies every URL, six files per
+            prerendered URL and a per-segment hint tree. This section opens each
+            for <code>/sec0/a/[id]</code>.
+          </p>
+
+          <h3>The table</h3>
+          <p>
+            <code>generateRoutesManifest</code> sorts every page key once with
+            <code>sortPages</code>, then splits it into
+            <code>dynamicRoutes</code> and <code>staticRoutes</code>
+            (<code>build/generate-routes-manifest.ts</code>:69-95). A segment scores
+            0 if static, 1 for <code>[x]</code>, 2 for <code>[...x]</code>, 3 for
+            <code>[[...x]]</code>. Paths compare left to right: at the first
+            difference the lower score wins, a path that ends first wins, and equal
+            scores fall to <code>localeCompare</code>
+            (<code>shared/lib/router/utils/sortable-routes.ts</code>:20-58, 75-114)
+            <span class="src">from the code</span>. The older trie sorter is
+            <code>@deprecated</code> (<code>sorted-routes.ts</code>:204-227) yet
+            still orders <code>next start</code>'s
+            matchers (<code>server/lib/router-utils/filesystem.ts</code>:118-135,
+            526). Sorting 1,000 routes with both sorters took 14–26 ms
+            <span class="recon">measured here</span> (<code>bench.mts</code>).
+          </p>
+          <p>
+            Rows come from <code>pageToRoute</code>
+            (<code>build/utils.ts</code>:1855-1869). A <code>[x]</code> segment
+            becomes <code>/([^/]+?)</code>, every route gets an optional trailing
+            slash and <code>^…$</code> anchors (<code>route-regex.ts</code>:120,
+            163-171, beside the sorter), and group names take the
+            <code>nxtP</code> prefix (<code>lib/constants.ts</code>:6)
+            <span class="src">from the code</span>. The example's row in the lab
+            build's <code>routes-manifest.json</code>
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>{ "page": "/sec0/a/[id]",
+  "regex": "^/sec0/a/([^/]+?)(?:/)?$",
+  "routeKeys": { "nxtPid": "nxtPid" },
+  "namedRegex": "^/sec0/a/(?&lt;nxtPid&gt;[^/]+?)(?:/)?$" }</code></pre>
+          <p>
+            It is the 3rd of 119 dynamic rows, beside 285 static rows. The split is by URL shape, not render mode:
+            <code>/dyn</code>, which reads <code>cookies()</code> per request, is a
+            static row. §05 scans this list.
+          </p>
+          <p>
+            The <code>rsc</code> block fixes the wire contract
+            (<code>generate-routes-manifest.ts</code>:121-136)
+            <span class="src">from the code</span>: the <code>.rsc</code> suffix,
+            <code>.segments/</code> directories of <code>.segment.rsc</code> files,
+            and this <code>Vary</code> value, plus <code>next-url</code> on
+            interceptable paths (§05):
+          </p>
+<pre><code>rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch</code></pre>
+
+          <h3>The LoaderTree</h3>
+          <p>
+            Each route compiles to one LoaderTree, the structure the renderer walks;
+            <code>/sec0/a/1</code> to <code>/sec0/a/5</code> share one.
+            At 16.4 it has four elements. <code>server/lib/app-dir-module.ts</code>:7-29,
+            verbatim <span class="src">from the code</span>:
+          </p>
+<pre><code>export type LoaderTree = [
+  segment: string,
+  parallelRoutes: { [parallelRouterKey: string]: LoaderTree },
+  modules: AppDirModules,
+  /**
+   * At build time, for each dynamic segment, we compute the list of static
+   * sibling segments that exist at the same URL path level. This is used by
+   * the client router to determine if a prefetch can be reused.
+   *
+   * For example, given the following file structure:
+   *   /app/(group1)/products/sale/page.tsx -&gt; /products/sale
+   *   /app/(group2)/products/[id]/page.tsx -&gt; /products/[id]
+   *
+   * The [id] segment would have staticSiblings: ['sale']
+   *
+   * This accounts for route groups, which may place sibling routes in
+   * different parts of the file system tree but at the same URL level.
+   *
+   * A value of `null` means the static siblings are unknown (e.g., in webpack
+   * dev mode where routes are compiled on-demand).
+   */
+  staticSiblings: readonly string[] | null,
+]</code></pre>
+          <p>
+            Figure {{fig-loader-tree}} draws the literal Turbopack compiled for the
+            example <span class="recon">measured here</span>. Five nodes nest through
+            <code>children</code>: <code>""</code>, <code>sec0</code>,
+            <code>a</code>, <code>[id]</code>, <code>__PAGE__</code>. Only the root
+            and <code>sec0</code> carry a layout. Every module is
+            a lazy getter, such as
+            <code>instrumentModuleGetter(() =&gt; a.r(79741))</code> for the page.
+            It defers evaluation, not loading: the server entry pulls in all 12
+            chunks first.
+          </p>
+          <p>
+            Every node ends in <code>[]</code>, and that is a claim. Turbopack's
+            <code>walk_tree</code> writes it on every node, dev included: “An empty
+            array means "known to have no siblings" which is distinct from not
+            outputting the field (unknown)”
+            (<code>crates/next-core/src/app_page_loader_tree.rs</code>:328-442).
+            Only dynamic segments get a non-empty list
+            (<code>app_structure.rs</code>:1818-1842, same directory), and <code>app/sec0/a/</code> has no other child.
+            The webpack loader writes <code>null</code> in dev
+            (<code>next-app-loader/index.ts</code>:701-711). The server forwards the
+            list only under <code>experimental.optimisticRouting</code>
+            (<code>server/app-render/app-render.tsx</code>:535-551), on by default in
+            16.4 (<code>server/config-shared.ts</code>:2411)
+            <span class="src">from the code</span>. §08 uses it.
+          </p>
+          <p>
+            Slots add tree levels, not URL levels: a named slot is a virtual
+            <code>(__SLOT__)</code> segment, and a slot with nothing for the URL
+            gets a synthesized <code>__DEFAULT__</code> leaf
+            (<code>app_structure.rs</code>:1844-1848, 2043-2079, 2082-2138)
+            <span class="src">from the code</span>. The inset applies this to §02's
+            <code>/dashboard/settings</code> <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure" id="fig-loader-tree">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The compiled LoaderTree of <code>/sec0/a/[id]</code>, and a tree with slots</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 806" role="img" aria-label="Nested boxes showing the compiled LoaderTree for /sec0/a/[id]. A key row names the four tuple elements: segment, parallelRoutes (slots), modules and staticSiblings. Five nodes nest through their children slot: the root with an empty segment string, sec0, a, [id] and __PAGE__. The root's modules are its layout plus Next's built-in not-found, forbidden, unauthorized and global-error; sec0 has a layout; a and [id] hold only metadata; __PAGE__ has empty slots and a lazy page getter, instrumentModuleGetter of a.r(79741). Every node ends in an empty array. Notes explain that an empty array means known to have no static siblings, null means unknown in webpack dev, and the doc comment's example is ['sale']. An inset shows the /dashboard/settings tree from section 02: the dashboard node has three slots, children as a __DEFAULT__ leaf from dashboard/default.tsx, team as a (__SLOT__) level containing settings and then __PAGE__, and analytics as a __DEFAULT__ leaf from its default.tsx.">
+                <text x="20" y="20" class="svg-lane">MAIN · THE COMPILED LOADERTREE OF /sec0/a/[id]</text>
+
+                <rect x="20" y="32" width="118" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="79" y="47" text-anchor="middle" class="svg-sub" style="fill:#252525">[0] segment</text>
+                <rect x="146" y="32" width="196" height="22" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="244" y="47" text-anchor="middle" class="svg-sub" style="fill:#252525">[1] parallelRoutes: slots</text>
+                <rect x="350" y="32" width="118" height="22" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="409" y="47" text-anchor="middle" class="svg-sub" style="fill:#252525">[2] modules</text>
+                <rect x="476" y="32" width="150" height="22" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="551" y="47" text-anchor="middle" class="svg-sub" style="fill:#252525">[3] staticSiblings</text>
+                <text x="640" y="47" class="svg-note">one tuple per node; a child sits in its parent's [1]</text>
+
+                <rect x="20" y="70" width="620" height="372" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="30" y="78" width="78" height="52" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="69" y="108" text-anchor="middle" class="svg-sub" style="fill:#252525">""</text>
+                <rect x="116" y="78" width="462" height="52" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="126" y="94" class="svg-sub" style="fill:#252525">layout: [e, "app/layout.tsx"]</text>
+                <text x="126" y="108" class="svg-sub" style="fill:#252525">"not-found": [f, built-in]  forbidden: [g, built-in]</text>
+                <text x="126" y="122" class="svg-sub" style="fill:#252525">unauthorized: [h, built-in]  "global-error": [i, built-in]</text>
+                <rect x="586" y="78" width="44" height="52" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="608" y="108" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <text x="42" y="150" class="svg-sub" style="fill:#765b98">children:</text>
+
+                <rect x="42" y="158" width="576" height="276" rx="8" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="52" y="166" width="78" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="91" y="182" text-anchor="middle" class="svg-sub" style="fill:#252525">"sec0"</text>
+                <rect x="138" y="166" width="418" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="148" y="182" class="svg-sub" style="fill:#252525">metadata: {}  layout: [j, "app/sec0/layout.tsx"]</text>
+                <rect x="564" y="166" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="586" y="182" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <text x="64" y="208" class="svg-sub" style="fill:#765b98">children:</text>
+
+                <rect x="64" y="216" width="532" height="210" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="74" y="224" width="78" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="113" y="240" text-anchor="middle" class="svg-sub" style="fill:#252525">"a"</text>
+                <rect x="160" y="224" width="374" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="170" y="240" class="svg-sub" style="fill:#252525">metadata: {}</text>
+                <rect x="542" y="224" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="564" y="240" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <text x="86" y="266" class="svg-sub" style="fill:#765b98">children:</text>
+
+                <rect x="86" y="274" width="488" height="144" rx="8" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="96" y="282" width="78" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="135" y="298" text-anchor="middle" class="svg-sub" style="fill:#252525">"[id]"</text>
+                <rect x="182" y="282" width="330" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="192" y="298" class="svg-sub" style="fill:#252525">metadata: {}</text>
+                <rect x="520" y="282" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="2.5"/>
+                <text x="542" y="298" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <text x="108" y="324" class="svg-sub" style="fill:#765b98">children:</text>
+
+                <rect x="108" y="332" width="444" height="78" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="118" y="340" width="78" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="157" y="356" text-anchor="middle" class="svg-sub" style="fill:#252525">"__PAGE__"</text>
+                <rect x="204" y="340" width="32" height="24" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="220" y="356" text-anchor="middle" class="svg-sub" style="fill:#252525">{}</text>
+                <rect x="244" y="340" width="246" height="62" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="252" y="354" class="svg-sub" style="fill:#252525">metadata: {},</text>
+                <text x="252" y="367" class="svg-sub" style="fill:#252525">page: [instrumentModuleGetter(</text>
+                <text x="264" y="380" class="svg-sub" style="fill:#252525">() =&gt; a.r(79741)),</text>
+                <text x="264" y="393" class="svg-sub" style="fill:#252525">"app/sec0/a/[id]/page.tsx"]</text>
+                <rect x="498" y="340" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="520" y="356" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+
+                <line x1="642" y1="104" x2="652" y2="104" stroke="#b8b8b1"/>
+                <text x="656" y="92" class="svg-note">Here only the root holds not-found, forbidden,</text>
+                <text x="656" y="105" class="svg-note">unauthorized and global-error. This app has</text>
+                <text x="656" y="118" class="svg-note">none of its own, so all four are Next's built-ins.</text>
+
+                <line x1="610" y1="178" x2="652" y2="178" stroke="#b8b8b1"/>
+                <text x="656" y="176" class="svg-note">Two layout getters on the whole chain:</text>
+                <text x="656" y="189" class="svg-note">app/layout.tsx (e) and app/sec0/layout.tsx (j).</text>
+
+                <line x1="588" y1="236" x2="652" y2="236" stroke="#b8b8b1"/>
+                <text x="656" y="234" class="svg-note">a and [id] have no files of their own, so [2]</text>
+                <text x="656" y="247" class="svg-note">holds only metadata: no layout, no getter.</text>
+
+                <line x1="566" y1="294" x2="652" y2="294" stroke="#b8b8b1"/>
+                <rect x="656" y="280" width="58" height="18" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="2.5"/>
+                <text x="685" y="293" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <text x="722" y="293" class="svg-note">known: no static siblings (Turbopack, dev too)</text>
+                <rect x="656" y="302" width="58" height="18" rx="4" fill="#ffffff" stroke="#d98226" stroke-dasharray="4 3"/>
+                <text x="685" y="315" text-anchor="middle" class="svg-sub" style="fill:#252525">null</text>
+                <text x="722" y="315" class="svg-note">unknown: the webpack loader in next dev</text>
+                <rect x="656" y="324" width="58" height="18" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="685" y="337" text-anchor="middle" class="svg-sub" style="fill:#252525">['sale']</text>
+                <text x="722" y="337" class="svg-note">the doc comment's products/sale beside [id]</text>
+
+                <line x1="544" y1="361" x2="652" y2="361" stroke="#b8b8b1"/>
+                <text x="656" y="365" class="svg-note">Every module is a lazy getter. page.js loads</text>
+                <text x="656" y="378" class="svg-note">its 12 chunks up front; the getter defers</text>
+                <text x="656" y="391" class="svg-note">evaluation until the segment renders.</text>
+
+                <text x="20" y="474" class="svg-lane">INSET · THE /dashboard/settings TREE FROM §02: SLOTS ADD TREE LEVELS, NOT URL LEVELS</text>
+
+                <rect x="20" y="486" width="960" height="272" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="30" y="494" width="96" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="78" y="510" text-anchor="middle" class="svg-sub" style="fill:#252525">"dashboard"</text>
+                <rect x="134" y="494" width="784" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="144" y="510" class="svg-sub" style="fill:#252525">metadata: {}  layout: app/dashboard/layout.tsx</text>
+                <rect x="926" y="494" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="948" y="510" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+
+                <text x="36" y="540" class="svg-sub" style="fill:#765b98">children:</text>
+                <rect x="36" y="548" width="294" height="70" rx="8" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="46" y="556" width="96" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="94" y="572" text-anchor="middle" class="svg-sub" style="fill:#252525">"__DEFAULT__"</text>
+                <rect x="150" y="556" width="28" height="24" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="164" y="572" text-anchor="middle" class="svg-sub" style="fill:#252525">{}</text>
+                <rect x="276" y="556" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="298" y="572" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <rect x="46" y="586" width="274" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="56" y="602" class="svg-sub" style="fill:#252525">defaultPage: app/dashboard/default.tsx</text>
+                <text x="36" y="642" class="svg-note">No ordinary settings/ folder under dashboard/,</text>
+                <text x="36" y="655" class="svg-note">so children falls back to its default.tsx.</text>
+                <text x="36" y="690" class="svg-note">(__SLOT__) is the @team folder itself: a tree</text>
+                <text x="36" y="703" class="svg-note">level that adds no URL segment.</text>
+
+                <text x="346" y="540" class="svg-sub" style="fill:#765b98">team:</text>
+                <rect x="346" y="548" width="304" height="198" rx="8" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="356" y="556" width="96" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="404" y="572" text-anchor="middle" class="svg-sub" style="fill:#252525">"(__SLOT__)"</text>
+                <rect x="460" y="556" width="128" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="470" y="572" class="svg-sub" style="fill:#252525">metadata: {}</text>
+                <rect x="596" y="556" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="618" y="572" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <text x="358" y="596" class="svg-sub" style="fill:#765b98">children:</text>
+                <rect x="358" y="604" width="280" height="134" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="368" y="612" width="96" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="416" y="628" text-anchor="middle" class="svg-sub" style="fill:#252525">"settings"</text>
+                <rect x="472" y="612" width="104" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="482" y="628" class="svg-sub" style="fill:#252525">metadata: {}</text>
+                <rect x="584" y="612" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="606" y="628" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <text x="370" y="652" class="svg-sub" style="fill:#765b98">children:</text>
+                <rect x="370" y="660" width="256" height="70" rx="8" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="380" y="668" width="96" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="428" y="684" text-anchor="middle" class="svg-sub" style="fill:#252525">"__PAGE__"</text>
+                <rect x="484" y="668" width="28" height="24" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="498" y="684" text-anchor="middle" class="svg-sub" style="fill:#252525">{}</text>
+                <rect x="572" y="668" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="594" y="684" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <rect x="380" y="698" width="236" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="390" y="714" class="svg-sub" style="fill:#252525">page: …/@team/settings/page.tsx</text>
+
+                <text x="660" y="540" class="svg-sub" style="fill:#765b98">analytics:</text>
+                <rect x="660" y="548" width="304" height="70" rx="8" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="670" y="556" width="96" height="24" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="718" y="572" text-anchor="middle" class="svg-sub" style="fill:#252525">"__DEFAULT__"</text>
+                <rect x="774" y="556" width="28" height="24" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="788" y="572" text-anchor="middle" class="svg-sub" style="fill:#252525">{}</text>
+                <rect x="910" y="556" width="44" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="932" y="572" text-anchor="middle" class="svg-sub" style="fill:#252525">[]</text>
+                <rect x="670" y="586" width="284" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="680" y="602" class="svg-sub" style="fill:#252525">defaultPage: …/@analytics/default.tsx</text>
+                <text x="660" y="642" class="svg-note">@analytics has nothing for /settings, so its</text>
+                <text x="660" y="655" class="svg-note">default.tsx becomes a __DEFAULT__ leaf.</text>
+
+                <text x="20" y="782" class="svg-note">Main tree: the lab build's literal, reformatted; paths cut to app-relative, Next's own files marked built-in.</text>
+                <text x="20" y="797" class="svg-note">Inset: reconstructed from the Rust tree builder for §02's tree; getters shown as file paths; the root node is omitted.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The main tree is the literal in the app-page template chunk (module
+              98110) of the lab's <code>apps/scale-N400</code> build, made by
+              <code>build-bench.mjs</code>, reformatted
+              <span class="recon">measured here</span>. The inset is worked out from the Rust tree builder
+              <span class="recon">reconstruction</span>. The lab's <code>/dash</code>
+              route, with an <code>@stats</code> slot, compiled both shapes:
+              <code>(__SLOT__)</code> over a <code>__PAGE__</code> for
+              <code>/dash</code>, a <code>__DEFAULT__</code> leaf for
+              <code>/dash/settings</code> <span class="recon">measured here</span>.
+              Nothing in either tree is decided per request.
+            </p>
+          </figure>
+
+          <h3>The manifests</h3>
+          <p>
+            <code>server/app-paths-manifest.json</code> maps 405 keys to server
+            files, <code>/sec0/a/[id]/page</code> to
+            <code>app/sec0/a/[id]/page.js</code>, merged from one Turbopack fragment
+            per page (<code>shared/lib/turbopack/manifest-loader.ts</code>:330-347).
+            <code>app-path-routes-manifest.json</code> maps the same keys to URLs,
+            built from what the compiler emitted rather than what discovery found
+            (<code>build/index.ts</code>:2286-2336)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            <code>prerender-manifest.json</code>, version 4, classifies URLs: 754 rows
+            and 118 patterns here. <code>/sec0/a/1</code> is <code>"complete"</code>
+            and <code>"static"</code>, <code>initialRevalidateSeconds: false</code>.
+            The pattern row covers ids outside <code>generateStaticParams</code>:
+            <code>fallback: null</code>, classified <code>"empty"</code> and
+            <code>"blocking"</code>, rendered on first request
+            (<code>build/index.ts</code>:515-536, 4052-4058)
+            <span class="src">from the code</span>. <code>/dyn</code> is in neither
+            map. The file is 647,564 B at 401 routes, about 859 B per
+            prerendered row (647,564 / 754)
+            <span class="recon">measured here</span> (<code>measure-dist.mjs</code>).
+          </p>
+          <p>
+            A grep of the tag finds no <code>app-build-manifest.json</code>
+            <span class="src">from the code</span>. Version 16 dropped the First
+            Load JS column as "inaccurate in server-driven architectures using React
+            Server Components" (<code>version-16.mdx</code>, § Performance
+            Improvements) <span class="src">from the docs</span>;
+            <code>diagnostics/route-bundle-stats.json</code> carries it now (§10).
+            <code>server/prefetch-hints.json</code> is §09's.
+          </p>
+
+          <h3>Six files per URL</h3>
+          <p>
+            <code>exportAppPage</code> writes each id's <code>.rsc</code>, segment files, HTML and
+            <code>.meta</code> record (<code>export/routes/app-page.ts</code>:181-254)
+            <span class="src">from the code</span>. For <code>/sec0/a/1</code>,
+            <code>.segment.rsc</code> suffixes dropped
+            <span class="recon">measured here</span> (<code>e8-golden-trace.mjs</code>):
+          </p>
+          <table>
+            <thead><tr><th>File</th><th>Bytes</th><th>Holds</th></tr></thead>
+            <tbody>
+              <tr><td><code>1.html</code></td><td>9,954</td><td>hard-load document</td></tr>
+              <tr><td><code>1.rsc</code></td><td>5,866</td><td>full Flight payload</td></tr>
+              <tr><td><code>1.meta</code></td><td>1,036</td><td>replay headers, segment list, hints</td></tr>
+              <tr><td><code>1.segments/_tree</code></td><td>275</td><td>segment names and hints, no data</td></tr>
+              <tr><td><code>1.segments/_full</code></td><td>5,866</td><td><code>1.rsc</code>, byte for byte</td></tr>
+              <tr><td><code>1.segments/sec0/a/$d$id/__PAGE__</code></td><td>4,942</td><td>page, layouts inlined</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Segment files are not a second render: <code>collectSegmentData</code>
+            decodes the page's RSC buffer once, then writes <code>/_tree</code>,
+            the <code>/_full</code> copy and one buffer per segment
+            (<code>server/app-render/collect-segment-data.tsx</code>:157-175, 319-337)
+            <span class="src">from the code</span>.
+            <code>1.meta</code> is what <code>next start</code> replays:
+            <code>x-nextjs-stale-time: 300</code>, <code>x-nextjs-prerender: 1</code>,
+            six implicit cache tags from <code>_N_T_/layout</code> to
+            <code>_N_T_/sec0/a/1</code> (§07), and a route-cache key (§05).
+          </p>
+          <p>
+            <code>1.rsc</code> and
+            <code>2.rsc</code> differ in 3 of 25 lines, so the root and
+            <code>sec0</code> layout rows are stored once per id, and again inside
+            each <code>__PAGE__</code> segment. At 401 routes the build wrote 756 HTML
+            files (754 plus the Pages 404 and 500), 754 <code>.rsc</code> files
+            and 2,268 segment files, none of them a layout's: every layout was
+            inlined into its child (§09) <span class="recon">measured here</span>
+            (<code>measure-dist.mjs</code>). Bytes are from one Turbopack build on
+            the shared 2-vCPU container, deterministic for it.
+          </p>

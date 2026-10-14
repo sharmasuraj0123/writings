@@ -1,0 +1,284 @@
+          <h2 id="efficiency-and-price"><span class="secnum">{{S}}</span>Why it is efficient, and what it costs</h2>
+          <p class="lede">
+            The file tree turns runtime questions into build-time facts. Which
+            URLs exist, which code each needs, which layouts two URLs share
+            and what a link will fetch are settled before the first request.
+            That pays off in seven places. Each has a measured price, and some
+            prices land on people who did not choose the feature.
+          </p>
+
+          <div class="measured">
+            <div><div class="n">0</div><div class="k">requests for a click on a prefetched static link</div></div>
+            <div><div class="n">85 µs</div><div class="k">for a dynamic-route hit among 1,000 dynamic routes</div></div>
+            <div><div class="n">22–24 s</div><div class="k">of static generation at 401 routes, on every build</div></div>
+            <div><div class="n">0.9 ms</div><div class="k">of CPU a no-op Proxy adds per matched request</div></div>
+          </div>
+
+          <p>
+            The first two tiles are what the precomputation buys, the last two
+            what it charges <span class="recon">measured here</span>
+            (<code>e3-nav.mjs</code>, <code>e6-match.mjs</code>,
+            <code>build-bench.mjs</code>, <code>e8-proxy-attrib.mjs</code>).
+            Figure {{fig-price-ledger}} pairs every saving with its price.
+          </p>
+
+          <h3>Seven precomputations</h3>
+          <p>
+            All seven follow one pattern. A question a framework would
+            otherwise answer per request or per navigation (does this URL
+            exist, what code does it need, what does the client already hold)
+            has an answer fixed by the folder tree. So the build answers it
+            once and writes the answer into a file that the server or the
+            browser reads by lookup <span class="recon">reconstruction</span>.
+          </p>
+          <ol>
+            <li>
+              <strong>Discovery happens once.</strong> <code>next build</code>
+              walks <code>app/</code> and skips a <code>_</code> folder before
+              reading it (<code>lib/recursive-readdir.ts</code>:81-86).
+              <code>next start</code> reads seven manifests at boot and nothing
+              under <code>app/</code>
+              (<code>server/lib/router-utils/filesystem.ts</code>:348-396)
+              <span class="src">from the code</span>. Pruning made a walk of
+              1,001 route files beside 10,000 helper files 2.5–5× faster
+              <span class="recon">measured here</span>. §02, §03, §05.
+            </li>
+            <li>
+              <strong>Routing is a lookup.</strong> The build sorts every route
+              by specificity, static before <code>[x]</code> before
+              <code>[...x]</code> before <code>[[...x]]</code>, and writes an
+              anchored regex for each dynamic one
+              (<code>sortable-routes.ts</code>:20-58; <code>route-regex.ts</code>:120,
+              163-171); <code>next start</code> compiles and orders its matchers
+              once, at boot (§04). At request time a static URL costs a few
+              <code>Set.has</code> probes behind an LRU. A dynamic URL costs a
+              first-match scan that needs no tie-breaking, because the sort
+              already put the specific pattern first
+              (<code>filesystem.ts</code>:757-764; <code>resolve-routes.ts</code>:281-349)
+              <span class="src">from the code</span>. Static lookups took under
+              0.1 µs. A dynamic hit took 5.8 µs at 100 routes and 85 µs at 1,000,
+              3.6% of a 2.37 ms static request
+              <span class="recon">measured here</span>. The renderer receives
+              the match as request meta and does not repeat it. §04, §05.
+            </li>
+            <li>
+              <strong>Rendering starts below what the client holds.</strong>
+              Every route compiles to a LoaderTree of fixed shape. The client can
+              therefore name what it holds, segment by segment, in
+              <code>Next-Router-State-Tree</code>, and
+              <code>walkTreeWithFlightRouterState</code> sends a skipped node for
+              each level that matches
+              (<code>walk-tree-with-flight-router-state.tsx</code>:143-154)
+              <span class="src">from the code</span>. A dynamic navigation came
+              back 41% smaller with only the root layout shared, and 52% smaller
+              with three layouts shared. For every target type the client kept
+              the shared layouts' <code>CacheNode</code>s and DOM nodes
+              <span class="recon">measured here</span>. §06, §08.
+            </li>
+            <li>
+              <strong>Each route ships its own segments' client code.</strong>
+              The server compile follows each segment file's imports and stops at
+              every <code>"use client"</code> module, which becomes a client entry
+              for that segment (<code>flight-client-entry-plugin.ts</code>:814-825
+              under webpack; Turbopack chains the same groups,
+              <code>app_client_references_chunks.rs</code>:258-294). A route's
+              first load is the union of its segments' chunks plus the shared
+              runtime (<code>build/route-bundle-stats.ts</code>:155-175)
+              <span class="src">from the code</span>. A 113 KB dependency imported
+              by one leaf page was in 1 of 53 first loads. Imported by a section
+              layout, it was in that section's 19
+              <span class="recon">measured here</span>. §10.
+            </li>
+            <li>
+              <strong>Prefetches are file reads, and dynamic data is a hole.</strong>
+              For each prerendered URL the build re-encodes the page's RSC buffer
+              into per-segment files, without a second render. It also records, per
+              segment, whether the segment rides inside its child's response, in
+              <code>prefetch-hints.json</code>
+              (<code>collect-segment-data.tsx</code>:157-175;
+              <code>build/index.ts</code>:4620-4623). A segment prefetch is then
+              answered from that buffer or with a 404. The handler's comment says
+              such requests "should never reach the application layer"
+              (<code>app-page-runtime.ts</code>:2066-2121)
+              <span class="src">from the code</span>. A click on a prefetched
+              static link made 0 requests <span class="recon">measured here</span>.
+              With Cache Components the build also emits a shell for every
+              dynamic pattern (<code>build/static-paths/app.ts</code>:1297-1370),
+              and each <code>loading.tsx</code> is a Suspense edge where a hole
+              can stop (<code>layout-router.tsx</code>:479-494)
+              <span class="src">from the code</span>. So <code>cookies()</code>
+              costs one hole instead of the route: first byte at 3.63 ms against
+              6.45 ms <span class="recon">measured here</span>. §04, §07, §09.
+            </li>
+            <li>
+              <strong>The client needs no route map.</strong> It learns route
+              shapes from <code>/_tree</code> responses. Optimistic routing then
+              predicts an unseen URL's tree from a learned pattern, and the
+              build's <code>staticSiblings</code> mark where a pattern does not
+              apply (<code>segment-cache/optimistic-routes.ts</code>:1-44)
+              <span class="src">from the code</span>. With
+              <code>/sec0/a/1</code>'s tree known, prefetching
+              <code>/sec0/a/2</code> sent one 4,942-B request and no
+              <code>/_tree</code>. From 101 to 1,001 routes App first-load JS
+              moved by under 0.15%, while the Pages twin, which ships its route
+              map to every page, grew 45%
+              <span class="recon">measured here</span>. §08, §10.
+            </li>
+            <li>
+              <strong>Invalidation follows the folders.</strong> Every render is
+              tagged once per folder level. <code>/sec0/a/1</code> carries
+              <code>_N_T_/layout</code>, <code>_N_T_/sec0/layout</code> and four
+              more, down to <code>_N_T_/sec0/a/1</code>
+              <span class="recon">measured here</span>.
+              <code>revalidatePath('/sec0', 'layout')</code> becomes a
+              revalidation of the one tag <code>_N_T_/sec0/layout</code>
+              (<code>server/lib/implicit-tags.ts</code>:26-57;
+              <code>server/web/spec-extension/revalidate.ts</code>:110-136)
+              <span class="src">from the code</span>. One call therefore reaches
+              every page under <code>app/sec0/</code> without a list of URLs.
+              Not timed. §07.
+            </li>
+          </ol>
+
+          <h3>The prices</h3>
+          <p>
+            The savings arrive per request and per navigation. The prices
+            arrive per build, per hard load and per visible link
+            <span class="recon">reconstruction</span>. Static generation took
+            21.7 to 23.5 s at 401 routes cold, warm or after a one-file edit,
+            58% of a 38.4 s warm build, while compile fell from 25.2 s to
+            1.86 s (§12). Twelve visible links cost 24 prefetches, 20,143 B on
+            the wire, 8.7× the page's own 2,319-B document (§09). HTML ran
+            1.47–1.73× its decoded RSC payload, because a hard load ships the
+            output twice (§06) <span class="recon">measured here</span>
+            (<code>build-bench.mjs</code>, <code>e3-nav.mjs</code>). The scan in
+            item 2 is linear: <code>next start</code> holds two regexes per App
+            pattern, so a miss at 1,000 patterns would cost about 336 µs (§05)
+            <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            Three defaults suit a bigger machine
+            (<code>server/config-shared.ts</code>:2422-2426, 2415, 2495)
+            <span class="src">from the code</span>. The worker pool counts the
+            host's 8 CPUs, not the container's 2, and pinning
+            <code>experimental.cpus: 2</code> cut a cold 401-route build 21%,
+            from 70.4 to 55.9 s (§03, §12). The build cache cost 19% more CPU
+            with nothing to restore it (§12). Preloading 405 entries made the
+            first request after a start take 1.24 s, against 394 ms with it off
+            (§05) <span class="recon">measured here</span>
+            (<code>run-e1bc.sh</code>, <code>e8-cold-prof.mjs</code>).
+          </p>
+
+          <figure class="figure wide" id="fig-price-ledger">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Seven precomputations and one contrast: what each saves, what it costs, who pays</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack" style="min-width: 940px">
+                <div class="stack-row" style="grid-template-columns: 160px 1fr 1fr 1fr 0.75fr">
+                  <div class="stack-cell head">Precomputation</div>
+                  <div class="stack-cell head">Build computes</div>
+                  <div class="stack-cell head">It saves</div>
+                  <div class="stack-cell head">It costs</div>
+                  <div class="stack-cell head">Who pays</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 160px 1fr 1fr 1fr 0.75fr">
+                  <div class="stack-cell head">1. Discovery up front<br>§02, §03, §12</div>
+                  <div class="stack-cell hl-blue">A build-time walk; <code>_</code> folders skipped before <code>readdir</code>.</div>
+                  <div class="stack-cell hl-green">Walk 2.5–5× faster with pruning.</div>
+                  <div class="stack-cell hl-red"><code>/[a]/x</code> + <code>/[b]/y</code>: build exits 0, start exits 1.</div>
+                  <div class="stack-cell">The deployer, at start.</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 160px 1fr 1fr 1fr 0.75fr">
+                  <div class="stack-cell head">2. Table lookups<br>§04, §05</div>
+                  <div class="stack-cell hl-blue">Sorted table: <code>Set</code>s for static URLs, regexes for dynamic.</div>
+                  <div class="stack-cell hl-green">Static under 0.1 µs; dynamic 85 µs at 1,000 routes.</div>
+                  <div class="stack-cell hl-red">Proxy: +0.93 ms p50 (+39%), 888 µs CPU. Preloading: first request 1.24 s.</div>
+                  <div class="stack-cell">Matched requests; first visitors after a start.</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 160px 1fr 1fr 1fr 0.75fr">
+                  <div class="stack-cell head">3. Below shared layouts<br>§06, §08, §13</div>
+                  <div class="stack-cell hl-blue">A fixed-shape segment tree; the client sends its own.</div>
+                  <div class="stack-cell hl-green">Dynamic navigations 41–52% smaller; layout DOM nodes kept.</div>
+                  <div class="stack-cell hl-red">Output twice per hard load: HTML 1.47–1.73× RSC. Leaf <code>"use client"</code>: RSC 5.6× a layout-top boundary's.</div>
+                  <div class="stack-cell">Every hard load.</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 160px 1fr 1fr 1fr 0.75fr">
+                  <div class="stack-cell head">4. Per-route client code<br>§10</div>
+                  <div class="stack-cell hl-blue">Client entries per segment; first load unions their chunks.</div>
+                  <div class="stack-cell hl-green">A 113 KB dependency in 1 of 53 first loads.</div>
+                  <div class="stack-cell hl-red">Prefetch downloads it, 55,806 B gzip, on pages that only link there.</div>
+                  <div class="stack-cell">Visitors of linking pages.</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 160px 1fr 1fr 1fr 0.75fr">
+                  <div class="stack-cell head">5. Per-URL prerender<br>§04, §09, §12</div>
+                  <div class="stack-cell hl-blue"><code>.html</code>, <code>.rsc</code>, <code>.meta</code>, <code>.segments/</code> per URL; prefetch hints.</div>
+                  <div class="stack-cell hl-green">Prefetches served from stored buffers; prefetched click: 0 requests.</div>
+                  <div class="stack-cell hl-red">Static generation 22–24 s every build, 58% of warm; 7 workers on 2 CPUs; cache write +19% CPU.</div>
+                  <div class="stack-cell">Every build; small CI containers.</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 160px 1fr 1fr 1fr 0.75fr">
+                  <div class="stack-cell head">6. No upfront route map<br>§08, §09, §10</div>
+                  <div class="stack-cell hl-blue">No map shipped; the client learns routes from <code>/_tree</code>.</div>
+                  <div class="stack-cell hl-green">App first load within 0.15% from 101 to 1,001 routes; Pages +45%.</div>
+                  <div class="stack-cell hl-red">24 requests, 20,143 B for 12 visible links. Intercepted: extra <code>Vary</code>; no segment prefetch without Cache Components.</div>
+                  <div class="stack-cell">Visitors, for links never clicked.</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 160px 1fr 1fr 1fr 0.75fr">
+                  <div class="stack-cell head">7. Tree-keyed invalidation<br>§07</div>
+                  <div class="stack-cell hl-blue">One soft tag per folder level: six on <code>/sec0/a/1</code>.</div>
+                  <div class="stack-cell hl-green"><code>revalidatePath</code> reaches a subtree. Not timed.</div>
+                  <div class="stack-cell hl-red">A partially prerendered page under <code>next start</code>: <code>private, no-store</code>, 1.9× the bytes.</div>
+                  <div class="stack-cell">CDNs, which may not store it.</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 160px 1fr 1fr 1fr 0.75fr">
+                  <div class="stack-cell head">App vs Pages<br>§10</div>
+                  <div class="stack-cell hl-blue">App: Flight per URL. Pages: HTML plus a full route map.</div>
+                  <div class="stack-cell hl-green">Pages' map +183 B per route; Pages ships more JS above ≈490 routes.</div>
+                  <div class="stack-cell hl-red">App HTML 2.9× Pages'; App build CPU 1.53–1.74×.</div>
+                  <div class="stack-cell">Small apps.</div>
+                </div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              Blue cells are read at the tag <span class="src">from the code</span>.
+              Green and red cells are lab numbers from each row's sections
+              <span class="recon">measured here</span>, by the <code>e2</code> to
+              <code>e9</code> scripts, <code>build-bench.mjs</code> and
+              <code>run-e1bc.sh</code>; row 1 times a verbatim copy of
+              <code>recursive-readdir.ts</code>. The pairings and the last column
+              are mine <span class="recon">reconstruction</span>. One shared
+              2-vCPU container, localhost, synthetic pages: ratios carry,
+              milliseconds do not.
+            </p>
+          </figure>
+
+          <h3>Who pays</h3>
+          <p>
+            Some prices land on bystanders. A page that only links to a route
+            with a 113 KB dependency downloads its chunk through prefetch while the page loads, and
+            in a mixed app Pages pages carried 3,505 B of Bloom filters for 90
+            App routes (§10) <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Built both ways, one app shows where the design pays (§10). App
+            HTML for <code>/sec0/a/1</code> was 9,954 B against 3,472 B, 2.9×,
+            because 6,848 B of it is inline Flight. App builds took 1.53–1.74×
+            the CPU: 44.6 against 29.1 CPU-s at 101 routes, 88.8 against 51.1 at
+            401, both built with <code>experimental.cpus: 2</code>, so below
+            §03's default-pool figures. Against that, item 6: by interpolation
+            Pages ships less JavaScript per page only below about 490 routes
+            <span class="recon">measured here</span>
+            (<code>e9-measure.mjs</code>, <code>e9-run-b-builds.sh</code>).
+          </p>
+          <p>
+            So the design wins where the tree is large and shared: many routes,
+            layouts over many pages, densely linked static pages. It did not
+            pay here for a small app, which pays App's fixed costs before a
+            route map would hurt; for a tight build budget,
+            since prerendering is paid per page; or for CDN caching of dynamic
+            pages, which <code>private, no-store</code> forbids
+            <span class="recon">reconstruction</span>. §12 and §13 price the
+            remedies.
+          </p>

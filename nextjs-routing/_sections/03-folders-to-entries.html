@@ -1,0 +1,417 @@
+          <h2 id="folders-to-entries"><span class="secnum">{{S}}</span>From folders to entries</h2>
+          <p class="lede">
+            <code>next build</code> turns the folder tree into lists before it
+            compiles anything: page keys, a validated path set, route types and a
+            routes manifest, each but the validation in its own traced span. Then one entry per page
+            goes to a compiler, and Turbopack reads the tree again. Validation
+            misses one kind of slug conflict, which crashes
+            <code>next start</code> instead. The prerender pool is sized from the
+            host's CPUs, not the container's.
+          </p>
+
+          <h3>Which compiler</h3>
+          <p>
+            With no flag, <code>next build</code> picks Turbopack and marks the
+            choice as a default, <code>process.env.TURBOPACK = 'auto'</code>
+            (<code>lib/bundler.ts</code>:99-103); <code>--webpack</code> opts out.
+            A defaulted build that finds a <code>webpack</code> function and no
+            <code>turbopack</code> key exits rather than ignore the config
+            (<code>lib/turbopack-warning.ts</code>:146-166). The webpack
+            loader's own comment calls Turbopack "the canonical implementation going
+            forward" (<code>next-app-loader/index.ts</code>:1047-1054, under
+            <code>build/webpack/loaders/</code>) <span class="src">from the code</span>.
+          </p>
+
+          <h3>The spans, in order</h3>
+          <p>
+            <code>build()</code> in <code>build/index.ts</code> is a chain of
+            <code>traceChild</code> spans. Those that touch routes open in order:
+            <code>discover-routes</code> (:1555),
+            <code>generate-route-types</code> (:1650),
+            <code>generate-routes-manifest</code> (:1786), the compile branch
+            (:1889, whose own span, <code>run-turbopack</code> or
+            <code>run-webpack</code>, opens in the bundler's module),
+            <code>static-check</code> (:2349),
+            <code>static-generation</code> (:3214) and, for Turbopack only,
+            <code>write-route-bundle-stats</code> (:4839)
+            <span class="src">from the code</span>. Figure {{fig-build-pipeline}}
+            adds what each one writes.
+          </p>
+          <p>
+            <code>clean</code> deletes <code>.next/</code> but keeps <code>cache</code>, <code>dev</code>,
+            <code>diagnostics</code>, <code>lock</code> and <code>trace</code>
+            (:1379-1388), so a second build can start warm (§12). The routes
+            manifest is computed from discovery's page keys before compilation
+            (:1785-1800), so its route list comes from the tree, not from compiler
+            output <span class="src">from the code</span>. And after JS
+            <code>discoverRoutes</code> (:1554-1567), Turbopack's Rust side reads
+            <code>app/</code> again through <code>get_directory_tree</code>, a
+            <code>#[turbo_tasks::function]</code> that calls itself per
+            subdirectory, one memoised task each
+            (<code>crates/next-core/src/app_structure.rs</code>:331-343, 443-450)
+            <span class="src">from the code</span>. The repetition is inferred from
+            both call sites, not traced <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>What validation misses</h3>
+          <p>
+            Between discovery and the type step, without a span,
+            <code>validateAppPaths(appPaths)</code> runs (:1635). It rejects syntax
+            errors (<code>…</code> for <code>...</code>), semantic ones (a repeated
+            slug) and ambiguity, found by rewriting every <code>[name]</code> to
+            <code>[*]</code> and grouping
+            (<code>build/validate-app-paths.ts</code>:16-139, 155-186, 211-278)
+            <span class="src">from the code</span>: <code>/blog/[id]</code> and
+            <code>/blog/[slug]</code> collide, <code>/[category]/posts</code> and
+            <code>/posts/[slug]</code> pass. The comment above the call says it
+            duplicates the older <code>sorted-routes.ts</code> (:1631-1635).
+          </p>
+          <p>
+            It duplicates less than that. Whole paths hide two names at one level
+            once the paths diverge: <code>/[*]/x</code> is not <code>/[*]/y</code>. The lab built <code>app/[a]/x</code> beside
+            <code>app/[b]/y</code>. <code>next build</code> exited 0;
+            <code>next start</code> printed "✓ Ready" and exited with code 1 after
+            509–843 ms, before serving a request (<code>e8-sortconflict.mjs</code>)
+            <span class="recon">measured here</span>. The thrower is
+            <code>getSortedRoutes</code>, a trie sorter marked
+            <code>@deprecated</code> that <code>next start</code> still uses to
+            order dynamic routes (<code>server/lib/router-utils/filesystem.ts</code>:134)
+            <span class="src">from the code</span>. Its check, in
+            <code>shared/lib/router/utils/sorted-routes.ts</code>:121-134, with five
+            comment lines trimmed:
+          </p>
+<pre><code>function handleSlug(previousSlug: string | null, nextSlug: string) {
+  if (previousSlug !== null) {
+    // Because currently multiple dynamic params on the same segment level are not supported
+    if (previousSlug !== nextSlug) {
+      throw new Error(
+        `You cannot use different slug names for the same dynamic path ('${previousSlug}' !== '${nextSlug}').`
+      )
+    }
+  }</code></pre>
+          <p>
+            Each trie node holds one <code>slugName</code>, so every dynamic folder
+            under one parent must share a name <span class="src">from the code</span>.
+            A pipeline that gates on
+            <code>next build</code> alone can ship an app that dies at boot
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>One entry per page</h3>
+          <p>
+            Under webpack, <code>createEntrypoints</code> names each page's server
+            entry <code>app/&lt;key&gt;</code>, here
+            <code>app/sec0/a/[id]/page</code> (<code>build/entries.ts</code>:561-568),
+            and gives App pages no client entry, to "let the server compiler inject
+            them instead" (:629-639). So the <code>server</code> compile runs before
+            <code>edge-server</code> and <code>client</code>
+            (<code>build/webpack-build/index.ts</code>:14-18), and its
+            <code>injectedClientEntries</code> become the client compile's entries
+            (<code>impl.ts</code>:267-285, same directory)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Turbopack writes one server file per page,
+            <code>server/app{original_name}.js</code>
+            (<code>crates/next-api/src/app.rs</code>:2066-2083)
+            <span class="src">from the code</span>. In the lab's 401-route build
+            that is <code>server/app/sec0/a/[id]/page.js</code>, beside a one-entry
+            <code>app-paths-manifest.json</code> merged into a file of 405 keys
+            (<code>build-bench.mjs</code> output) <span class="recon">measured here</span>.
+            Each layout and page sits behind a lazy getter. Under webpack its
+            <code>import</code> is <code>webpackMode: "eager"</code>, so the getter
+            defers evaluation, not bundling
+            (<code>next-app-loader/index.ts</code>:1316-1327)
+            <span class="src">from the code</span>. §04 reads that tree.
+          </p>
+
+          <h3>What the build reads without running</h3>
+          <p>
+            Segment config is read from source. A regex,
+            <code>PARSE_PATTERN</code>, skips files that mention none of twelve
+            words such as <code>runtime</code> or <code>export const</code>
+            (<code>build/analysis/get-page-static-info.ts</code>:50-51, 654-664).
+            The rest are parsed by SWC through a 500-entry LRU keyed by the
+            content's SHA-1 (<code>parse-module.ts</code>:6-15), and only an
+            <code>export const</code> with a literal value counts
+            (<code>extract-const-value.ts</code>:229-275)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            <code>generateStaticParams</code> does run, top-down: one awaited call
+            per parent param combination, inside a <code>for</code> loop
+            (<code>build/static-paths/app.ts</code>:724-823)
+            <span class="src">from the code</span>. Calls multiply with the
+            parents' fan-out and run in sequence. The running example's one call
+            returns ids 1 to 5.
+          </p>
+
+          <h3>The worker pool</h3>
+          <p>
+            Static checks and prerendering share a pool of
+            <code>experimental.cpus</code> workers, by default
+            <code>max(1, os.cpus().length - 1)</code>, with
+            <code>CIRCLE_NODE_TOTAL</code> in place of the CPU count when set
+            (<code>server/config-shared.ts</code>:2422-2426). The pool is capped at
+            tasks + 1 (<code>build/index.ts</code>:979-1004), with at most 8
+            concurrent renders per worker and at least 25 pages per worker (:2476-2477 of the
+            config file) <span class="src">from the code</span>.
+            <code>os.cpus()</code> counts the host. This container's 2-CPU quota
+            sits on a host with 8, so the default is 8 − 1 = 7: "Generating static
+            pages using 7 workers (756/756) in 21.7s" (<code>build-bench.mjs</code>)
+            <span class="recon">measured here</span>. §12 prices the fix.
+          </p>
+
+          <h3>Cost at a glance</h3>
+          <p>
+            Medians of three cold builds (two for webpack's quiet rerun),
+            from <code>build-bench.mjs</code> <span class="recon">measured here</span>:
+          </p>
+          <table>
+            <thead>
+              <tr><th>Routes</th><th>Turbopack wall</th><th>webpack wall</th><th>Turbopack CPU-s</th><th>webpack CPU-s</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>21</td><td>27.6 s</td><td>52.2 s</td><td>43.4</td><td>69.5</td></tr>
+              <tr><td>101</td><td>38.6 s</td><td>69.3 s</td><td>59.4</td><td>96.9</td></tr>
+              <tr><td>401</td><td>70.4 s (quiet)</td><td>134.3 s (quiet)</td><td>118.7 (117.8 quiet)</td><td>189.8 (194.9 quiet)</td></tr>
+            </tbody>
+          </table>
+          <p>
+            CPU-seconds survive a noisy box; wall time does not. The first N=400
+            Turbopack runs took 97.5 s under foreign load, the quiet rerun 70.4 s,
+            at 118.7 and 117.8 CPU-s. webpack used 1.60–1.63× Turbopack's CPU at
+            every size in the first runs, 1.65× in the quiet pair. From 101 to 401 routes Turbopack added
+            (118.7 − 59.4) / 300 = 0.20 CPU-s per route, webpack 0.31–0.33
+            <span class="recon">measured here</span> (<code>build-bench.mjs</code>).
+          </p>
+
+          <figure class="figure wide" id="fig-build-pipeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title"><code>next build</code> lane by lane: the JS spans, one of two compilers, then the boot that can still fail</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 662" role="img" aria-label="A swimlane of next build at v16.4.0. Top lane, the JS orchestrator in build/index.ts, shows nine boxes in source order with the line where each opens: clean at 1381, which wipes .next but keeps cache, dev, diagnostics, lock and trace; discover-routes at 1555, which reads app/ in JS; a red marker for validateAppPaths at 1635, which has no span; generate-route-types at 1650, writing .next/types; generate-routes-manifest at 1786, computed before compile and written at 3076; compile at 1889, the branch; TypeScript, serial after compile; static-check at 2349; static-generation at 3214, writing HTML, RSC and segment files and then the prerender manifest; and write-route-bundle-stats at 4839, Turbopack only. Orange measured labels give compile 25.2 s, TypeScript 13.8 s, static generation 21.7 s with 7 workers, and a whole-build wall of 70.4 s, for the 401-route app. Below, app/ on disk feeds both discover-routes and Turbopack's get_directory_tree, so the tree is read twice. A purple note says cache/ survives clean so the next build starts warm. A red note says validateAppPaths erases parameter names, rejecting /blog/[id] with /blog/[slug] but passing /[a]/x with /[b]/y. Inside compile, exactly one lane runs. Turbopack: get_directory_tree as one memoised task per directory, walk_tree emitting each LoaderTree as JS text, one server file per page such as server/app/sec0/a/[id]/page.js, and per-page app-paths manifests merged into 405 keys. Webpack: createEntrypoints with server entry app/sec0/a/[id]/page and no client entry for App pages, then server, edge-server and client compiles, with a dashed purple arc showing the server compile's injectedClientEntries feeding the client compile. Bottom lane, next start at boot: setupFsCheck sorts dynamic routes with the deprecated getSortedRoutes, and for /[a]/x plus /[b]/y the server prints Ready and exits with code 1 after 509 to 843 ms.">
+                <defs>
+                  <marker id="fig-build-pipeline-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-build-pipeline-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-build-pipeline-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="8" y="14" class="svg-lane">JS ORCHESTRATOR · build() IN build/index.ts · SPANS IN SOURCE ORDER</text>
+
+                <rect x="8" y="24" width="114" height="122" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="1.5"/>
+                <text x="65" y="40" text-anchor="middle" class="svg-sub">:1381</text>
+                <text x="65" y="58" text-anchor="middle" class="svg-step">clean</text>
+                <text x="65" y="76" text-anchor="middle" class="svg-sub">wipes .next/</text>
+                <text x="65" y="90" text-anchor="middle" class="svg-sub">keeps cache/</text>
+                <text x="65" y="104" text-anchor="middle" class="svg-sub">dev/ lock trace</text>
+                <text x="65" y="118" text-anchor="middle" class="svg-sub">diagnostics/</text>
+
+                <rect x="134" y="24" width="114" height="122" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="191" y="40" text-anchor="middle" class="svg-sub">:1555</text>
+                <text x="191" y="58" text-anchor="middle" class="svg-step">discover-routes</text>
+                <text x="191" y="76" text-anchor="middle" class="svg-sub">JS reads app/</text>
+                <text x="191" y="90" text-anchor="middle" class="svg-sub">collectAppFiles</text>
+                <text x="191" y="104" text-anchor="middle" class="svg-sub">→ page keys</text>
+                <text x="191" y="118" text-anchor="middle" class="svg-sub">(in memory)</text>
+
+                <rect x="250" y="34" width="8" height="102" rx="2" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.5"/>
+
+                <rect x="260" y="24" width="114" height="122" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="317" y="40" text-anchor="middle" class="svg-sub">:1650</text>
+                <text x="317" y="58" text-anchor="middle" class="svg-step">generate-</text>
+                <text x="317" y="73" text-anchor="middle" class="svg-step">route-types</text>
+                <text x="317" y="91" text-anchor="middle" class="svg-sub">.next/types/</text>
+                <text x="317" y="105" text-anchor="middle" class="svg-sub">routes.d.ts,</text>
+                <text x="317" y="119" text-anchor="middle" class="svg-sub">validator.ts …</text>
+
+                <rect x="386" y="24" width="114" height="122" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="443" y="40" text-anchor="middle" class="svg-sub">:1786</text>
+                <text x="443" y="58" text-anchor="middle" class="svg-step">generate-routes-</text>
+                <text x="443" y="73" text-anchor="middle" class="svg-step">manifest</text>
+                <text x="443" y="91" text-anchor="middle" class="svg-sub">from page keys,</text>
+                <text x="443" y="105" text-anchor="middle" class="svg-sub">before compile;</text>
+                <text x="443" y="119" text-anchor="middle" class="svg-sub">written at :3076</text>
+
+                <rect x="512" y="24" width="114" height="122" rx="6" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="569" y="40" text-anchor="middle" class="svg-sub">:1889</text>
+                <text x="569" y="58" text-anchor="middle" class="svg-step">compile</text>
+                <text x="569" y="76" text-anchor="middle" class="svg-sub">one branch:</text>
+                <text x="569" y="90" text-anchor="middle" class="svg-sub">Turbopack, or</text>
+                <text x="569" y="104" text-anchor="middle" class="svg-sub">--webpack</text>
+                <text x="569" y="118" text-anchor="middle" class="svg-sub">(lanes below)</text>
+                <rect x="539" y="127" width="60" height="15" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="569" y="138" text-anchor="middle" class="svg-num">25.2 s</text>
+
+                <rect x="638" y="24" width="96" height="122" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="686" y="40" text-anchor="middle" class="svg-sub">:2049</text>
+                <text x="686" y="58" text-anchor="middle" class="svg-step">TypeScript</text>
+                <text x="686" y="76" text-anchor="middle" class="svg-sub">span run-</text>
+                <text x="686" y="90" text-anchor="middle" class="svg-sub">typescript,</text>
+                <text x="686" y="104" text-anchor="middle" class="svg-sub">serial, after</text>
+                <text x="686" y="118" text-anchor="middle" class="svg-sub">compile</text>
+                <rect x="656" y="127" width="60" height="15" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="686" y="138" text-anchor="middle" class="svg-num">13.8 s</text>
+
+                <rect x="746" y="24" width="114" height="122" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="803" y="40" text-anchor="middle" class="svg-sub">:2349</text>
+                <text x="803" y="58" text-anchor="middle" class="svg-step">static-check</text>
+                <text x="803" y="76" text-anchor="middle" class="svg-sub">isPageStatic</text>
+                <text x="803" y="90" text-anchor="middle" class="svg-sub">for each page,</text>
+                <text x="803" y="104" text-anchor="middle" class="svg-sub">in the worker</text>
+                <text x="803" y="118" text-anchor="middle" class="svg-sub">pool</text>
+
+                <rect x="872" y="24" width="114" height="122" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="929" y="40" text-anchor="middle" class="svg-sub">:3214</text>
+                <text x="929" y="58" text-anchor="middle" class="svg-step">static-</text>
+                <text x="929" y="73" text-anchor="middle" class="svg-step">generation</text>
+                <text x="929" y="91" text-anchor="middle" class="svg-sub">.html, .rsc and</text>
+                <text x="929" y="105" text-anchor="middle" class="svg-sub">segment files,</text>
+                <text x="929" y="119" text-anchor="middle" class="svg-sub">then manifests</text>
+                <rect x="875" y="127" width="108" height="15" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="929" y="138" text-anchor="middle" class="svg-num">21.7 s, 7 workers</text>
+
+                <rect x="998" y="24" width="114" height="122" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="1055" y="40" text-anchor="middle" class="svg-sub">:4839</text>
+                <text x="1055" y="58" text-anchor="middle" class="svg-step">write-route-</text>
+                <text x="1055" y="73" text-anchor="middle" class="svg-step">bundle-stats</text>
+                <text x="1055" y="91" text-anchor="middle" class="svg-sub">route-bundle-</text>
+                <text x="1055" y="105" text-anchor="middle" class="svg-sub">stats.json;</text>
+                <text x="1055" y="119" text-anchor="middle" class="svg-sub">Turbopack only</text>
+
+                <line x1="8" y1="158" x2="1106" y2="158" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-build-pipeline-arr-ink)"/>
+                <text x="600" y="178" class="svg-note">left to right is source order; widths are not durations</text>
+                <rect x="944" y="166" width="164" height="16" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="1026" y="178" text-anchor="middle" class="svg-num">whole build: 70.4 s wall</text>
+
+                <path d="M65 146 L65 186" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-build-pipeline-arr-purple)"/>
+                <rect x="8" y="188" width="114" height="70" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="65" y="205" text-anchor="middle" class="svg-sub">cache/ survives,</text>
+                <text x="65" y="219" text-anchor="middle" class="svg-sub">so the next</text>
+                <text x="65" y="233" text-anchor="middle" class="svg-sub">build starts</text>
+                <text x="65" y="247" text-anchor="middle" class="svg-sub">warm (§12)</text>
+
+                <path d="M191 188 L191 148" fill="none" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-build-pipeline-arr-blue)"/>
+                <path d="M191 258 L191 298" fill="none" stroke="#3c6f97" stroke-width="1.25" marker-end="url(#fig-build-pipeline-arr-blue)"/>
+                <rect x="134" y="188" width="114" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="191" y="206" text-anchor="middle" class="svg-step">app/ on disk</text>
+                <text x="191" y="223" text-anchor="middle" class="svg-sub">read twice:</text>
+                <text x="191" y="237" text-anchor="middle" class="svg-sub">JS ↑, then</text>
+                <text x="191" y="251" text-anchor="middle" class="svg-sub">Rust ↓</text>
+
+                <path d="M254 136 L254 212 L262 212" fill="none" stroke="#b8b8b1"/>
+                <rect x="262" y="188" width="258" height="70" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="272" y="205" class="svg-sub">validateAppPaths(appPaths) :1635</text>
+                <text x="272" y="219" class="svg-sub">no span; erases names: [id] → [*]</text>
+                <text x="272" y="233" class="svg-sub">/blog/[id] + /blog/[slug] → error</text>
+                <text x="272" y="247" class="svg-sub">/[a]/x + /[b]/y → passes: the gap</text>
+
+                <line x1="569" y1="146" x2="569" y2="268" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-build-pipeline-arr-ink)"/>
+
+                <rect x="4" y="270" width="1112" height="262" rx="10" fill="none" stroke="#b8b8b1"/>
+                <text x="580" y="290" class="svg-lane">INSIDE compile (:1889-2022) · EXACTLY ONE LANE RUNS</text>
+
+                <text x="8" y="334" class="svg-lane">TURBOPACK</text>
+                <text x="8" y="349" class="svg-lane">(DEFAULT)</text>
+
+                <rect x="134" y="300" width="231" height="80" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="249.5" y="316" text-anchor="middle" class="svg-sub">app_structure.rs:331-343</text>
+                <text x="249.5" y="334" text-anchor="middle" class="svg-step">get_directory_tree</text>
+                <text x="249.5" y="352" text-anchor="middle" class="svg-sub">#[turbo_tasks::function], one</text>
+                <text x="249.5" y="366" text-anchor="middle" class="svg-sub">memoised task per directory</text>
+
+                <line x1="365" y1="340" x2="380" y2="340" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-build-pipeline-arr-ink)"/>
+
+                <rect x="381" y="300" width="231" height="80" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="496.5" y="316" text-anchor="middle" class="svg-sub">app_page_loader_tree.rs:328-442</text>
+                <text x="496.5" y="334" text-anchor="middle" class="svg-step">walk_tree</text>
+                <text x="496.5" y="352" text-anchor="middle" class="svg-sub">writes each page's LoaderTree</text>
+                <text x="496.5" y="366" text-anchor="middle" class="svg-sub">as JS source text (§04)</text>
+
+                <line x1="612" y1="340" x2="627" y2="340" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-build-pipeline-arr-ink)"/>
+
+                <rect x="628" y="300" width="231" height="80" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="743.5" y="316" text-anchor="middle" class="svg-sub">next-api/src/app.rs:2066-2083</text>
+                <text x="743.5" y="334" text-anchor="middle" class="svg-step">one server file per page</text>
+                <text x="743.5" y="352" text-anchor="middle" class="svg-sub">server/app/sec0/a/[id]/page.js</text>
+                <text x="743.5" y="366" text-anchor="middle" class="svg-sub">plus page.js.nft.json</text>
+
+                <line x1="859" y1="340" x2="874" y2="340" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-build-pipeline-arr-ink)"/>
+
+                <rect x="875" y="300" width="231" height="80" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="990.5" y="316" text-anchor="middle" class="svg-sub">manifest-loader.ts:330-347</text>
+                <text x="990.5" y="334" text-anchor="middle" class="svg-step">per-page manifests merged</text>
+                <text x="990.5" y="352" text-anchor="middle" class="svg-sub">a 1-entry app-paths-manifest</text>
+                <text x="990.5" y="366" text-anchor="middle" class="svg-sub">per page → 405 keys at N=400</text>
+
+                <line x1="8" y1="392" x2="1110" y2="392" stroke="#deded9"/>
+
+                <text x="8" y="438" class="svg-lane">WEBPACK</text>
+                <text x="8" y="453" class="svg-lane">(--webpack)</text>
+
+                <rect x="134" y="404" width="231" height="80" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="249.5" y="420" text-anchor="middle" class="svg-sub">build/entries.ts:561-568, 629-639</text>
+                <text x="249.5" y="438" text-anchor="middle" class="svg-step">createEntrypoints</text>
+                <text x="249.5" y="456" text-anchor="middle" class="svg-sub">server entry app/sec0/a/[id]/page</text>
+                <text x="249.5" y="470" text-anchor="middle" class="svg-sub">no initial client entry (App)</text>
+
+                <line x1="365" y1="444" x2="380" y2="444" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-build-pipeline-arr-ink)"/>
+
+                <rect x="381" y="404" width="231" height="80" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="496.5" y="420" text-anchor="middle" class="svg-sub">webpack-build/index.ts:14-18</text>
+                <text x="496.5" y="438" text-anchor="middle" class="svg-step">1 · server compile</text>
+                <text x="496.5" y="456" text-anchor="middle" class="svg-sub">finds client components and</text>
+                <text x="496.5" y="470" text-anchor="middle" class="svg-sub">records injectedClientEntries</text>
+
+                <line x1="612" y1="444" x2="627" y2="444" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-build-pipeline-arr-ink)"/>
+
+                <rect x="628" y="404" width="231" height="80" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="743.5" y="420" text-anchor="middle" class="svg-sub">ORDERED_COMPILER_NAMES</text>
+                <text x="743.5" y="438" text-anchor="middle" class="svg-step">2 · edge-server compile</text>
+                <text x="743.5" y="456" text-anchor="middle" class="svg-sub">entries for edge-runtime pages</text>
+
+                <line x1="859" y1="444" x2="874" y2="444" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-build-pipeline-arr-ink)"/>
+
+                <rect x="875" y="404" width="231" height="80" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="990.5" y="420" text-anchor="middle" class="svg-sub">webpack-build/impl.ts:267-285</text>
+                <text x="990.5" y="438" text-anchor="middle" class="svg-step">3 · client compile</text>
+                <text x="990.5" y="456" text-anchor="middle" class="svg-sub">builds the injected entries,</text>
+                <text x="990.5" y="470" text-anchor="middle" class="svg-sub">page entries dependOn main-app</text>
+
+                <path d="M496.5 484 C496.5 512 990.5 512 990.5 488" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-build-pipeline-arr-purple)"/>
+                <text x="743.5" y="524" text-anchor="middle" class="svg-note">injectedClientEntries: the server compile decides which client entries exist</text>
+
+                <text x="8" y="576" class="svg-lane">NEXT START</text>
+                <text x="8" y="591" class="svg-lane">(AT BOOT)</text>
+
+                <rect x="134" y="548" width="306" height="64" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="287" y="564" text-anchor="middle" class="svg-sub">server/lib/router-utils/filesystem.ts:134</text>
+                <text x="287" y="582" text-anchor="middle" class="svg-step">setupFsCheck → getSortedRoutes</text>
+                <text x="287" y="600" text-anchor="middle" class="svg-sub">@deprecated trie orders dynamic routes</text>
+
+                <line x1="440" y1="580" x2="469" y2="580" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-build-pipeline-arr-ink)"/>
+
+                <rect x="470" y="548" width="636" height="64" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.5"/>
+                <text x="788" y="564" text-anchor="middle" class="svg-sub">measured here: e8-sortconflict.mjs</text>
+                <text x="788" y="582" text-anchor="middle" class="svg-step">app/[a]/x + app/[b]/y: next build exits 0; next start throws in handleSlug</text>
+                <text x="788" y="600" text-anchor="middle" class="svg-sub">"✓ Ready", then 'a' !== 'b' and exit code 1 after 509–843 ms, before any request</text>
+
+                <text x="8" y="636" class="svg-note">Fill: blue reads app/ · green writes into .next/ · grey stays in memory or checks · white is the compiler branch · purple survives clean · red marks the slug-conflict gap.</text>
+                <text x="8" y="652" class="svg-note">Edges: thin blue = data · thick black = sequence · dashed purple = state carried forward. Orange = measured, 401-route Turbopack cold build, QUIET medians (n=3).</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Span names, order and opening lines are read from
+              <code>build/index.ts</code> at v16.4.0, the lower lanes from the files
+              named in each box <span class="src">from the code</span>; "read twice"
+              is inferred from two call sites <span class="recon">reconstruction</span>.
+              Orange: medians of three cold QUIET Turbopack builds of the 401-route
+              app, from the build log via <code>build-bench.mjs</code>
+              <span class="recon">measured here</span>. Spans, not slices: compile,
+              TypeScript and static generation sum to 60.7 of 70.4 s. One shared
+              2-vCPU container, localhost, synthetic pages: ratios carry over,
+              seconds do not.
+            </p>
+          </figure>

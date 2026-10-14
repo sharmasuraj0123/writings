@@ -1,0 +1,1108 @@
+          <h2 id="what-ships"><span class="secnum">{{S}}</span>What each route ships</h2>
+          <p class="lede">
+            Per-route splitting means per-route chunk lists, not files. First
+            load is the union of a route's segment chunks, so a heavy dependency
+            stays in the routes that import it; prefetch then spreads its
+            download to every page that links there. The Pages Router ships a
+            route map to every page instead, which stays cheaper below a few
+            hundred routes.
+          </p>
+
+          <h3>How a route gets its code</h3>
+          <p>
+            Under webpack, the server compile creates one client entry per user
+            segment file, listing only the client modules reachable from it
+            (<code>flight-client-entry-plugin.ts</code>:341-436, 893-948, in
+            <code>build/webpack/plugins/</code>). Turbopack chains client chunk
+            groups down the server-component walk, and each layout's group
+            becomes the availability baseline for the segments after it
+            (<code>app_client_references_chunks.rs</code>:258-294, in
+            <code>crates/next-core/src/next_app/</code>). First load is the
+            union of every segment's <code>entryJSFiles</code> plus
+            <code>rootMainFiles</code>
+            (<code>build/route-bundle-stats.ts</code>:155-175)
+            <span class="src">from the code</span>. For Turbopack App routes it
+            equalled the HTML's script tags minus the <code>noModule</code>
+            polyfill, to the byte (<code>e9-measure.mjs</code>)
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Files follow chunker thresholds (for Turbopack,
+            <code>minChunkSize</code> 50,000 B and <code>maxMergeChunkSize</code>
+            200,000 B; <code>turbopackChunking.mdx</code> § Size Thresholds)
+            <span class="src">from the docs</span>. With the lab's tiny pages,
+            Turbopack emitted the same 10 client chunks, 591 KB, at 21, 101 and
+            401 routes, while webpack's grew from 47 to 503. The 422-B
+            <code>SectionNav</code> chunk is all that separates
+            <code>/sec0/a/[id]</code> (464,045 B) from <code>/dyn</code>
+            (463,623 B) (<code>measure-dist.mjs</code>)
+            <span class="recon">measured here</span>.
+          </p>
+
+          <h3>One heavy dependency, six placements</h3>
+          <p>
+            The lab then generated a <code>node_modules</code> package,
+            imported by a client component <code>HeavyWidget</code>, into a
+            31-route app with two sections and 53 prerendered pages. Minified,
+            it is a 112,993-B chunk, 55,806 B gzipped; synthetic, it gzips
+            only 2.0× (<code>e9-gen-split.mjs</code>, <code>e9-measure.mjs</code>). Figure {{fig-what-ships}} maps six
+            placements, built under both bundlers, onto the 53 pages
+            (<code>e9-measure.mjs</code>) <span class="recon">measured here</span>:
+          </p>
+          <ul>
+            <li>Installed, never imported (v0): the baseline, with the same
+              first-load bytes as the plain lab app, from 10 Turbopack chunk
+              files.</li>
+            <li>One leaf page imports it: that page only. <code>/sec0/p1</code>
+              grew by exactly the chunk, 464,045 → 577,038 B under
+              Turbopack.</li>
+            <li>The <code>sec0</code> layout imports it: all 19
+              <code>sec0</code> pages, nowhere else.</li>
+            <li>Two leaves in different sections: one shared file.</li>
+            <li><code>next/dynamic</code> called from the Server Component page:
+              not split, and 3,260 B more than a plain import under Turbopack;
+              the docs call
+              splitting there "currently <strong>not</strong> supported"
+              (<code>docs/01-app/02-guides/lazy-loading.mdx</code>:60)
+              <span class="src">from the docs</span>.</li>
+            <li><code>next/dynamic</code> in a client component, rendered on
+              click: in no first load; the toggle and lazy wrapper cost the host
+              page 5,051 B under Turbopack.</li>
+          </ul>
+
+          <h3>Prefetch carries code</h3>
+          <p>
+            A prefetched page segment names its client chunks.
+            <code>/sec0/p1</code>'s carries this import row
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>10:"/_next/static/chunks/2id7man46-w8-.js"
+11:I[88762,["$2","$9","$10"],"HeavyWidget"]</code></pre>
+          <p>
+            React's vendored Flight client resolves every import row with
+            <code>preloadModule</code> (line 1447), prefetch or not.
+            Lines 86-95 of
+            <code>react-server-dom-turbopack-client.browser.production.js</code>,
+            in <code>compiled/react-server-dom-turbopack/cjs/</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>function preloadModule(metadata) {
+  for (var chunks = metadata[1], promises = [], i = 0; i &lt; chunks.length; i++) {
+    var thenable = __turbopack_load_by_url__(chunks[i]);
+    loadedChunks.has(thenable) || promises.push(thenable);
+    if (!instrumentedChunks.has(thenable)) {
+      var resolve = loadedChunks.add.bind(loadedChunks, thenable);
+      thenable.then(resolve, ignoreReject);
+      instrumentedChunks.add(thenable);
+    }
+  }</code></pre>
+          <p>
+            So under Turbopack <code>/sec0/p0</code>, whose <code>SectionNav</code> links to
+            <code>/sec0/p1</code>, fetched the 55,806-B chunk before any click,
+            and the click made no requests. With prefetch requests aborted, the
+            click paid a waterfall instead: 1,604 B of RSC, then the chunk it
+            named. With the import in the layout, <code>/sec1/p0</code>
+            downloaded it too: its header links to <code>/sec0/p0</code>, whose
+            prefetched segment inlines the <code>sec0</code> layout's script
+            reference. The plain N=100 app did the same with a 302-B
+            <code>Counter</code> chunk (<code>e9-nav.mjs</code>)
+            <span class="recon">measured here</span>. The linking page pays so
+            that the click costs no request
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-what-ships">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One 113 KB dependency, six placements: who ships it, who downloads it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 588" role="img" aria-label="A heatmap and two timelines. The heatmap has twelve rows, six placements of one 113 KB client dependency times two bundlers, and 53 columns, the prerendered pages grouped into 15 pages outside the sections, 19 sec0 pages and 19 sec1 pages. Solid cells mark pages whose first-load JS contains the dependency: none for v0 and v3; only /sec0/p1 for v1 and v4; all 19 sec0 pages for v2; /sec0/p1 and /sec1/p1 for v5; identical for Turbopack and webpack. Dark hatched cells mark measured prefetch downloads: /sec0/p0 for v1, v4 and v5, and /sec1/p0 for v2 and v5. Pale hatched cells mark pages that, by the same links, would prefetch it: the other sec0 pages for v1 and v4, every non-error page outside sec0 for v2, and the other pages of both sections for v5. In v3 the target page fetches it only when the toggle is clicked. Below, two timelines for a click from /sec0/p0 to /sec0/p1 in v1 under Turbopack. With prefetch on, the page load fetches the route tree and page segment, whose import row makes preloadModule download the 55,806-byte chunk, and the click costs 0 requests. With prefetch blocked, the load costs 9 requests and 141,148 bytes, and the click fetches 1,604 bytes of RSC and then the 55,806-byte chunk.">
+                <defs>
+                  <pattern id="fig-what-ships-hatch" patternUnits="userSpaceOnUse" width="4" height="4" patternTransform="rotate(45)"><rect width="4" height="4" fill="#f7e3c8"/><line x1="0" y1="0" x2="0" y2="4" stroke="#d98226" stroke-width="2.2"/></pattern>
+                  <pattern id="fig-what-ships-hatch-recon" patternUnits="userSpaceOnUse" width="4" height="4" patternTransform="rotate(45)"><rect width="4" height="4" fill="#ffffff"/><line x1="0" y1="0" x2="0" y2="4" stroke="#d98226" stroke-width="1" stroke-opacity="0.55"/></pattern>
+                  <marker id="fig-what-ships-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-what-ships-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="10" y="18" class="svg-lane">WHERE ONE 113 KB CLIENT DEPENDENCY LANDS · 53 PRERENDERED PAGES · 12 BUILDS</text>
+                <text x="367.5" y="44" text-anchor="middle" class="svg-sub" style="fill:#252525">15 pages outside the sections</text>
+                <path d="M256 56 V51 H479 V56" fill="none" stroke="#b8b8b1"/>
+                <text x="636.5" y="44" text-anchor="middle" class="svg-sub" style="fill:#252525">sec0 · 19 pages · target /sec0/p1</text>
+                <path d="M495 56 V51 H778 V56" fill="none" stroke="#b8b8b1"/>
+                <text x="935.5" y="44" text-anchor="middle" class="svg-sub" style="fill:#252525">sec1 · 19 pages</text>
+                <path d="M794 56 V51 H1077 V56" fill="none" stroke="#b8b8b1"/>
+                <text x="501.5" y="80" text-anchor="middle" class="svg-sub" style="fill:#252525">p0</text>
+                <text x="516.5" y="80" text-anchor="middle" class="svg-sub" style="fill:#252525">p1</text>
+                <text x="800.5" y="80" text-anchor="middle" class="svg-sub" style="fill:#252525">p0</text>
+                <text x="815.5" y="80" text-anchor="middle" class="svg-sub" style="fill:#252525">p1</text>
+                <text x="450.0" y="80" text-anchor="middle" class="svg-sub">errors</text>
+                <text x="1098" y="80" text-anchor="middle" class="svg-sub">n/53</text>
+                <text x="10" y="102" class="svg-sub" style="fill:#252525">v0 installed, not imported</text>
+                <text x="10" y="118" class="svg-sub">baseline</text>
+                <text x="250" y="102" text-anchor="end" class="svg-sub">Turbopack</text>
+                <rect x="256" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="510" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="525" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="540" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="555" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="570" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="585" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="600" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="615" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="630" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="645" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="660" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="675" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="690" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="705" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="720" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="735" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="750" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="765" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="794" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="809" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="824" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="839" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="854" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="869" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="884" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="899" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="914" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="929" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="944" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="959" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="974" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="989" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1004" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1019" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1034" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1049" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1064" y="92" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="1098" y="102" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="250" y="118" text-anchor="end" class="svg-sub">webpack</text>
+                <rect x="256" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="510" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="525" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="540" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="555" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="570" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="585" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="600" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="615" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="630" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="645" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="660" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="675" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="690" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="705" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="720" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="735" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="750" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="765" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="794" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="809" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="824" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="839" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="854" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="869" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="884" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="899" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="914" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="929" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="944" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="959" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="974" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="989" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1004" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1019" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1034" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1049" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1064" y="108" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="1098" y="118" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <line x1="10" y1="125" x2="1110" y2="125" stroke="#deded9"/>
+                <text x="10" y="140" class="svg-sub" style="fill:#252525">v1 one leaf page imports it</text>
+                <text x="10" y="156" class="svg-sub">/sec0/p1</text>
+                <text x="250" y="140" text-anchor="end" class="svg-sub">Turbopack</text>
+                <rect x="256" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="510" y="130" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="525" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="540" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="555" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="570" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="585" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="600" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="615" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="630" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="645" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="660" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="675" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="690" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="705" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="720" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="735" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="750" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="765" y="130" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="794" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="809" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="824" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="839" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="854" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="869" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="884" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="899" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="914" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="929" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="944" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="959" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="974" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="989" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1004" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1019" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1034" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1049" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1064" y="130" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="1098" y="140" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="250" y="156" text-anchor="end" class="svg-sub">webpack</text>
+                <rect x="256" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="510" y="146" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="525" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="540" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="555" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="570" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="585" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="600" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="615" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="630" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="645" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="660" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="675" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="690" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="705" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="720" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="735" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="750" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="765" y="146" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="794" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="809" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="824" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="839" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="854" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="869" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="884" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="899" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="914" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="929" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="944" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="959" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="974" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="989" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1004" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1019" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1034" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1049" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1064" y="146" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="1098" y="156" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <line x1="10" y1="163" x2="1110" y2="163" stroke="#deded9"/>
+                <text x="10" y="178" class="svg-sub" style="fill:#252525">v2 sec0 layout imports it</text>
+                <text x="10" y="194" class="svg-sub">app/sec0/layout.tsx</text>
+                <text x="250" y="178" text-anchor="end" class="svg-sub">Turbopack</text>
+                <rect x="256" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="271" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="286" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="301" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="316" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="331" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="346" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="361" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="376" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="391" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="406" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="421" y="168" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="168" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="168" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="168" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="510" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="525" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="540" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="555" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="570" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="585" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="600" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="615" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="630" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="645" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="660" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="675" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="690" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="705" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="720" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="735" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="750" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="765" y="168" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="794" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="809" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="824" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="839" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="854" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="869" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="884" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="899" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="914" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="929" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="944" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="959" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="974" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="989" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1004" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1019" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1034" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1049" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1064" y="168" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <text x="1098" y="178" text-anchor="middle" class="svg-sub" style="fill:#252525">19</text>
+                <text x="250" y="194" text-anchor="end" class="svg-sub">webpack</text>
+                <rect x="256" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="271" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="286" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="301" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="316" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="331" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="346" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="361" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="376" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="391" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="406" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="421" y="184" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="184" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="184" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="184" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="510" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="525" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="540" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="555" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="570" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="585" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="600" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="615" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="630" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="645" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="660" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="675" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="690" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="705" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="720" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="735" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="750" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="765" y="184" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="794" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="809" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="824" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="839" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="854" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="869" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="884" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="899" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="914" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="929" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="944" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="959" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="974" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="989" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1004" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1019" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1034" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1049" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1064" y="184" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <text x="1098" y="194" text-anchor="middle" class="svg-sub" style="fill:#252525">19</text>
+                <line x1="10" y1="201" x2="1110" y2="201" stroke="#deded9"/>
+                <text x="10" y="216" class="svg-sub" style="fill:#252525">v3 client next/dynamic</text>
+                <text x="10" y="232" class="svg-sub">rendered on click</text>
+                <text x="250" y="216" text-anchor="end" class="svg-sub">Turbopack</text>
+                <rect x="256" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="510" y="206" width="13" height="13" rx="2" fill="#ffffff" stroke="#d98226" stroke-width="1.5"/>
+                <rect x="525" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="540" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="555" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="570" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="585" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="600" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="615" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="630" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="645" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="660" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="675" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="690" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="705" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="720" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="735" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="750" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="765" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="794" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="809" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="824" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="839" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="854" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="869" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="884" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="899" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="914" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="929" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="944" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="959" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="974" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="989" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1004" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1019" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1034" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1049" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1064" y="206" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="1098" y="216" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="250" y="232" text-anchor="end" class="svg-sub">webpack</text>
+                <rect x="256" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="510" y="222" width="13" height="13" rx="2" fill="#ffffff" stroke="#d98226" stroke-width="1.5"/>
+                <rect x="525" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="540" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="555" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="570" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="585" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="600" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="615" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="630" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="645" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="660" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="675" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="690" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="705" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="720" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="735" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="750" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="765" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="794" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="809" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="824" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="839" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="854" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="869" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="884" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="899" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="914" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="929" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="944" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="959" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="974" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="989" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1004" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1019" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1034" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1049" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1064" y="222" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="1098" y="232" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <line x1="10" y1="239" x2="1110" y2="239" stroke="#deded9"/>
+                <text x="10" y="254" class="svg-sub" style="fill:#252525">v4 next/dynamic called</text>
+                <text x="10" y="270" class="svg-sub">from the Server Component</text>
+                <text x="250" y="254" text-anchor="end" class="svg-sub">Turbopack</text>
+                <rect x="256" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="510" y="244" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="525" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="540" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="555" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="570" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="585" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="600" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="615" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="630" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="645" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="660" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="675" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="690" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="705" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="720" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="735" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="750" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="765" y="244" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="794" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="809" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="824" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="839" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="854" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="869" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="884" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="899" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="914" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="929" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="944" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="959" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="974" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="989" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1004" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1019" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1034" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1049" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1064" y="244" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="1098" y="254" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="250" y="270" text-anchor="end" class="svg-sub">webpack</text>
+                <rect x="256" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="510" y="260" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="525" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="540" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="555" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="570" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="585" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="600" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="615" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="630" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="645" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="660" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="675" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="690" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="705" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="720" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="735" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="750" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="765" y="260" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="794" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="809" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="824" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="839" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="854" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="869" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="884" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="899" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="914" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="929" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="944" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="959" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="974" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="989" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1004" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1019" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1034" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1049" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="1064" y="260" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="1098" y="270" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <line x1="10" y1="277" x2="1110" y2="277" stroke="#deded9"/>
+                <text x="10" y="292" class="svg-sub" style="fill:#252525">v5 two leaf pages</text>
+                <text x="10" y="308" class="svg-sub">/sec0/p1 and /sec1/p1</text>
+                <text x="250" y="292" text-anchor="end" class="svg-sub">Turbopack</text>
+                <rect x="256" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="282" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="510" y="282" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="525" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="540" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="555" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="570" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="585" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="600" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="615" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="630" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="645" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="660" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="675" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="690" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="705" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="720" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="735" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="750" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="765" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="794" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="809" y="282" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="824" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="839" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="854" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="869" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="884" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="899" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="914" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="929" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="944" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="959" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="974" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="989" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1004" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1019" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1034" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1049" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1064" y="282" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <text x="1098" y="292" text-anchor="middle" class="svg-sub" style="fill:#252525">2</text>
+                <text x="250" y="308" text-anchor="end" class="svg-sub">webpack</text>
+                <rect x="256" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="271" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="286" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="301" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="316" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="331" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="346" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="361" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="376" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="391" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="406" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="421" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="436" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="451" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="466" y="298" width="13" height="13" rx="2" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="495" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="510" y="298" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="525" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="540" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="555" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="570" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="585" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="600" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="615" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="630" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="645" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="660" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="675" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="690" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="705" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="720" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="735" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="750" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="765" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="794" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <rect x="809" y="298" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <rect x="824" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="839" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="854" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="869" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="884" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="899" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="914" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="929" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="944" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="959" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="974" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="989" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1004" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1019" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1034" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1049" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <rect x="1064" y="298" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <text x="1098" y="308" text-anchor="middle" class="svg-sub" style="fill:#252525">2</text>
+                <text x="10" y="338" class="svg-lane">KEY</text>
+                <rect x="256" y="327" width="13" height="13" rx="2" fill="#d98226" stroke="#d98226"/>
+                <text x="276" y="338" class="svg-sub" style="fill:#252525">in the page's first-load JS (built HTML, measured)</text>
+                <rect x="660" y="327" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch)" stroke="#d98226"/>
+                <text x="680" y="338" class="svg-sub" style="fill:#252525">downloaded by prefetch (Chromium, measured)</text>
+                <rect x="256" y="347" width="13" height="13" rx="2" fill="url(#fig-what-ships-hatch-recon)" stroke="#e5b98a"/>
+                <text x="276" y="358" class="svg-sub" style="fill:#252525">links to a page that ships it (reconstruction)</text>
+                <rect x="660" y="347" width="13" height="13" rx="2" fill="#ffffff" stroke="#d98226" stroke-width="1.5"/>
+                <text x="680" y="358" class="svg-sub" style="fill:#252525">fetched only when the toggle is clicked</text>
+                <line x1="10" y1="376" x2="1110" y2="376" stroke="#deded9"/>
+                <text x="10" y="398" class="svg-lane">ONE CLICK, /sec0/p0 → /sec0/p1 · v1, TURBOPACK · GZIP WIRE BYTES</text>
+                <text x="10" y="429" class="svg-sub" style="fill:#252525">(a) prefetch on</text>
+                <text x="10" y="444" class="svg-sub">34 req · 216,685 B</text>
+                <rect x="130" y="412" width="150" height="40" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1"/>
+                <text x="205.0" y="429" text-anchor="middle" class="svg-step">load /sec0/p0</text>
+                <text x="205.0" y="444" text-anchor="middle" class="svg-sub">document + 8 scripts</text>
+                <line x1="280" y1="432" x2="298" y2="432" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-what-ships-arr-ink)"/>
+                <rect x="300" y="412" width="280" height="40" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="440.0" y="429" text-anchor="middle" class="svg-step">24 prefetches, 19,731 B</text>
+                <text x="440.0" y="444" text-anchor="middle" class="svg-sub">/sec0/p1: /_tree 147 + __PAGE__ 1,531</text>
+                <line x1="582" y1="432" x2="688" y2="432" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-what-ships-arr-purple)"/>
+                <text x="635.0" y="425" text-anchor="middle" class="svg-sub" style="fill:#765b98">preloadModule()</text>
+                <rect x="690" y="412" width="160" height="40" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+                <text x="770.0" y="429" text-anchor="middle" class="svg-step">chunk, 55,806 B</text>
+                <text x="770.0" y="444" text-anchor="middle" class="svg-sub">2id7man46-w8-.js</text>
+                <line x1="850" y1="432" x2="868" y2="432" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-what-ships-arr-ink)"/>
+                <rect x="870" y="420" width="50" height="24" rx="12" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="895" y="436" text-anchor="middle" class="svg-num" style="fill:#252525">click</text>
+                <line x1="920" y1="432" x2="938" y2="432" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-what-ships-arr-ink)"/>
+                <rect x="940" y="412" width="170" height="40" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="1025.0" y="429" text-anchor="middle" class="svg-step">0 requests</text>
+                <text x="1025.0" y="444" text-anchor="middle" class="svg-sub">both already cached</text>
+                <text x="10" y="499" class="svg-sub" style="fill:#252525">(b) prefetch blocked</text>
+                <text x="10" y="514" class="svg-sub">9 req · 141,148 B</text>
+                <rect x="150" y="482" width="250" height="40" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1"/>
+                <text x="275.0" y="499" text-anchor="middle" class="svg-step">load /sec0/p0</text>
+                <text x="275.0" y="514" text-anchor="middle" class="svg-sub">document + 8 scripts · no chunk</text>
+                <line x1="400" y1="502" x2="418" y2="502" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-what-ships-arr-ink)"/>
+                <rect x="420" y="490" width="50" height="24" rx="12" fill="#ffffff" stroke="#252525" stroke-width="1.5"/>
+                <text x="445" y="506" text-anchor="middle" class="svg-num" style="fill:#252525">click</text>
+                <line x1="470" y1="502" x2="488" y2="502" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-what-ships-arr-ink)"/>
+                <rect x="490" y="482" width="140" height="40" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="560.0" y="499" text-anchor="middle" class="svg-step">RSC /sec0/p1</text>
+                <text x="560.0" y="514" text-anchor="middle" class="svg-sub">1,604 B</text>
+                <line x1="632" y1="502" x2="738" y2="502" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-what-ships-arr-purple)"/>
+                <text x="685.0" y="495" text-anchor="middle" class="svg-sub" style="fill:#765b98">names the chunk</text>
+                <rect x="740" y="482" width="160" height="40" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+                <text x="820.0" y="499" text-anchor="middle" class="svg-step">chunk, 55,806 B</text>
+                <text x="820.0" y="514" text-anchor="middle" class="svg-sub">2id7man46-w8-.js</text>
+                <line x1="900" y1="502" x2="918" y2="502" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-what-ships-arr-ink)"/>
+                <rect x="920" y="482" width="190" height="40" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1"/>
+                <text x="1015.0" y="499" text-anchor="middle" class="svg-step">render /sec0/p1</text>
+                <text x="1015.0" y="514" text-anchor="middle" class="svg-sub">after two sequential fetches</text>
+                <text x="10" y="552" class="svg-note">Blue = RSC payload · orange = the dependency chunk · green = nothing to fetch · thick black = sequence · dashed purple = the import row triggering a chunk load.</text>
+                <text x="10" y="570" class="svg-note">Box widths encode order, not duration. Localhost: the bytes are exact, the timing is not measured here.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Solid cells: built HTML, 53 pages × 12 builds
+              (<code>e9-measure.mjs</code>). Dark hatching: Chromium sessions on
+              the two linking pages the lab loaded, <code>/sec0/p0</code> and
+              <code>/sec1/p0</code>. Timelines: the v1 Turbopack sessions
+              (<code>e9-nav.mjs</code>, one rep each)
+              <span class="recon">measured here</span>. Pale hatching extends
+              that along the generator's links; at the lab's 1280×4000 viewport
+              nearly every link is visible
+              <span class="recon">reconstruction</span>; error pages are left
+              unmarked. Localhost, shared 2-vCPU container: bytes are exact; no
+              timing is claimed.
+            </p>
+          </figure>
+
+          <h3>The route map the App Router does not ship</h3>
+          <p>
+            The Pages Router resolves routes in the browser, so every Pages page
+            loads <code>_buildManifest.js</code> and <code>_ssgManifest.js</code>
+            as <code>defer</code> scripts (<code>build-manifest-plugin.ts</code>:203-214;
+            <code>pages/_document.tsx</code>:163-199). Under Turbopack the first
+            holds <code>sortedPages</code>, built from Pages entries only, each
+            page's chunks and per-page bootstrap params; when collecting those
+            params the writer skips App entries "to keep
+            <code>_buildManifest.js</code> (loaded on every page) small"
+            (<code>shared/lib/turbopack/manifest-loader.ts</code>:558-566, 592-627)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            On the lab's <code>pages/</code> twin it grew from 18,590 B
+            (3,988 gzip) at 101 routes to 183,519 B (34,623) at 1,001:
+            (183,519 − 18,590) / 900 ≈ 183 B per route, 54% of it bootstrap
+            params. The App app's 488-B file was loaded by 0 pages. Pages first
+            load for <code>/sec0/a/1</code> rose from 389,116 to 563,131 B, the
+            route map from 5.1% to 34.4% of it; App stayed at 464,039–464,709 B.
+            Interpolated, Pages costs more above roughly 490 routes raw, 600 gzip
+            (<code>e9-measure.mjs</code>) <span class="recon">measured here</span>.
+            <code>next build</code>'s route stats leave the map out for Pages
+            (<code>build/route-bundle-stats.ts</code>:102-129)
+            <span class="src">from the code</span>: 369,400 B reported for
+            <code>/sec0/p0</code> at 101 routes, where the HTML loaded
+            389,296 B <span class="recon">measured here</span>.
+          </p>
+          <p>
+            On a miss in <code>sortedPages</code>, the client's
+            <code>resolveDynamicRoute</code> compiles a fresh regex per dynamic
+            page until one matches, once per prefetched link
+            (<code>shared/lib/router/router.ts</code>:204-221, 2571;
+            <code>utils/route-regex.ts</code>:168-171)
+            <span class="src">from the code</span>. For a URL in the last
+            section that cost 128 µs at 28 dynamic pages and 1,781 µs at 298
+            (<code>e9-resolve.mjs</code>),
+            against 5.8 and 85 µs for the server's precompiled scan at 100 and
+            1,000 (<code>e6-match.mjs</code>, §05)
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Pages wins at build time: the twin used 0.58–0.65× the App app's
+            CPU-seconds at 101 and 401 routes (<code>build-bench.mjs</code>),
+            and the cross-router Bloom filters cost only the Pages pages of a
+            mixed app, +3,505 B raw (<code>e9-measure.mjs</code>)
+            <span class="recon">measured here</span>. The Layouts RFC of 23 May
+            2022 named the problem: client-side routing "scales
+            poorly when the number of potential routes is large because the
+            client has to download a route map"
+            (nextjs.org/blog/layouts-rfc § Server-Centric Routing)
+            <span class="src">from the docs</span>. Figure {{fig-route-map-scale}}
+            prices it.
+          </p>
+
+          <figure class="figure" id="fig-route-map-scale">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The Pages route map at scale; the App Router ships none</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 692" role="img" aria-label="Three panels. Top left, a line chart of the Pages Router _buildManifest.js against routes in the app: raw 18,590, 73,527 and 183,519 bytes at 101, 401 and 1,001 routes; gzip 3,988, 14,424 and 34,623 bytes; the App Router app's file is a flat 488 bytes that no page loads. Top right, first-load JS of /sec0/a/1: Pages rises from 389,116 to 447,069 to 563,131 bytes, the route map being 5.1, 17.4 and 34.4 percent of it, while App stays at 464,039 to 464,709 bytes; a shaded band between about 490 and 600 routes marks the interpolated raw and gzip crossovers. Middle, a stacked bar of the 183,519-byte manifest at 1,001 routes: bootstrap params 99,833 bytes, 54.4 percent; page to chunk lists 50,699, 27.6 percent; sortedPages 15,684, 8.5 percent; the rest 17,303, 9.4 percent, nearly all indentation. Bottom, horizontal bars of microseconds per route lookup: the server scan costs 5.8 at 100 dynamic routes and 85 at 1,000; the Pages client costs 128 at 28 dynamic pages, 616 at 118, 1,781 at 298 and 5,148 at 1,198.">
+                <defs>
+                </defs>
+                <text x="20" y="18" class="svg-lane">ROUTE MAP: _BUILDMANIFEST.JS PER PAGE LOAD</text>
+                <line x1="20" y1="37" x2="38" y2="37" stroke="#ad4b43" stroke-width="2.5"/>
+                <text x="43" y="41" class="svg-sub" style="fill:#252525">Pages raw</text>
+                <line x1="118" y1="37" x2="136" y2="37" stroke="#ad4b43" stroke-width="1.5" stroke-dasharray="4 3"/>
+                <text x="141" y="41" class="svg-sub" style="fill:#252525">Pages gzip</text>
+                <line x1="222" y1="37" x2="240" y2="37" stroke="#3c6f97" stroke-width="2.5"/>
+                <text x="245" y="41" class="svg-sub" style="fill:#252525">App: 488 B, 0 pages load it</text>
+                <line x1="80" y1="280.0" x2="440" y2="280.0" stroke="#deded9"/>
+                <text x="74" y="284.0" text-anchor="end" class="svg-sub">0</text>
+                <line x1="80" y1="225.0" x2="440" y2="225.0" stroke="#deded9"/>
+                <text x="74" y="229.0" text-anchor="end" class="svg-sub">50 KB</text>
+                <line x1="80" y1="170.0" x2="440" y2="170.0" stroke="#deded9"/>
+                <text x="74" y="174.0" text-anchor="end" class="svg-sub">100 KB</text>
+                <line x1="80" y1="115.0" x2="440" y2="115.0" stroke="#deded9"/>
+                <text x="74" y="119.0" text-anchor="end" class="svg-sub">150 KB</text>
+                <line x1="80" y1="60.0" x2="440" y2="60.0" stroke="#deded9"/>
+                <text x="74" y="64.0" text-anchor="end" class="svg-sub">200 KB</text>
+                <line x1="80" y1="60" x2="80" y2="280" stroke="#b8b8b1"/>
+                <line x1="80" y1="280" x2="440" y2="280" stroke="#b8b8b1"/>
+                <line x1="114.6" y1="280" x2="114.6" y2="285" stroke="#b8b8b1"/>
+                <text x="114.6" y="297" text-anchor="middle" class="svg-sub">101</text>
+                <line x1="217.5" y1="280" x2="217.5" y2="285" stroke="#b8b8b1"/>
+                <text x="217.5" y="297" text-anchor="middle" class="svg-sub">401</text>
+                <line x1="423.2" y1="280" x2="423.2" y2="285" stroke="#b8b8b1"/>
+                <text x="423.2" y="297" text-anchor="middle" class="svg-sub">1,001</text>
+                <text x="260" y="314" text-anchor="middle" class="svg-sub">routes in the app</text>
+                <polyline points="114.6,259.6 217.5,199.1 423.2,78.1" fill="none" stroke="#ad4b43" stroke-width="2.5"/>
+                <polyline points="114.6,275.6 217.5,264.1 423.2,241.9" fill="none" stroke="#ad4b43" stroke-width="1.5" stroke-dasharray="4 3"/>
+                <line x1="90.6" y1="279.5" x2="423.2" y2="279.5" stroke="#3c6f97" stroke-width="2.5"/>
+                <circle cx="114.6" cy="259.6" r="3.5" fill="#ad4b43"/>
+                <circle cx="217.5" cy="199.1" r="3.5" fill="#ad4b43"/>
+                <circle cx="423.2" cy="78.1" r="3.5" fill="#ad4b43"/>
+                <circle cx="114.6" cy="275.6" r="3" fill="#ffffff" stroke="#ad4b43" stroke-width="1.5"/>
+                <circle cx="217.5" cy="264.1" r="3" fill="#ffffff" stroke="#ad4b43" stroke-width="1.5"/>
+                <circle cx="423.2" cy="241.9" r="3" fill="#ffffff" stroke="#ad4b43" stroke-width="1.5"/>
+                <text x="114.6" y="250.6" text-anchor="middle" class="svg-sub" style="fill:#252525">18,590</text>
+                <text x="211.5" y="190.1" text-anchor="end" class="svg-sub" style="fill:#252525">73,527</text>
+                <text x="415.2" y="82.1" text-anchor="end" class="svg-sub" style="fill:#252525">183,519 B</text>
+                <text x="217.5" y="256.1" text-anchor="middle" class="svg-sub" style="fill:#252525">14,424</text>
+                <text x="415.2" y="233.9" text-anchor="end" class="svg-sub" style="fill:#252525">34,623 B</text>
+                <text x="190" y="100" text-anchor="middle" class="svg-note">≈183 B raw, 34 B gzip</text>
+                <text x="190" y="114" text-anchor="middle" class="svg-note">per added route</text>
+                <text x="520" y="18" class="svg-lane">FIRST-LOAD JS OF /SEC0/A/1, RAW BYTES</text>
+                <line x1="520" y1="37" x2="538" y2="37" stroke="#ad4b43" stroke-width="2.5"/>
+                <text x="543" y="41" class="svg-sub" style="fill:#252525">Pages</text>
+                <line x1="590" y1="37" x2="608" y2="37" stroke="#3c6f97" stroke-width="2.5"/>
+                <text x="613" y="41" class="svg-sub" style="fill:#252525">App</text>
+                <rect x="650" y="30" width="18" height="12" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="673" y="41" class="svg-sub" style="fill:#252525">crossover, interpolated</text>
+                <rect x="752.3" y="60" width="40.5" height="220" fill="#f7e3c8" stroke="none"/>
+                <line x1="580" y1="280.0" x2="950" y2="280.0" stroke="#deded9"/>
+                <text x="574" y="284.0" text-anchor="end" class="svg-sub">350 KB</text>
+                <line x1="580" y1="236.0" x2="950" y2="236.0" stroke="#deded9"/>
+                <text x="574" y="240.0" text-anchor="end" class="svg-sub">400 KB</text>
+                <line x1="580" y1="192.0" x2="950" y2="192.0" stroke="#deded9"/>
+                <text x="574" y="196.0" text-anchor="end" class="svg-sub">450 KB</text>
+                <line x1="580" y1="148.0" x2="950" y2="148.0" stroke="#deded9"/>
+                <text x="574" y="152.0" text-anchor="end" class="svg-sub">500 KB</text>
+                <line x1="580" y1="104.0" x2="950" y2="104.0" stroke="#deded9"/>
+                <text x="574" y="108.0" text-anchor="end" class="svg-sub">550 KB</text>
+                <line x1="580" y1="60.0" x2="950" y2="60.0" stroke="#deded9"/>
+                <text x="574" y="64.0" text-anchor="end" class="svg-sub">600 KB</text>
+                <line x1="580" y1="60" x2="580" y2="280" stroke="#b8b8b1"/>
+                <line x1="580" y1="280" x2="950" y2="280" stroke="#b8b8b1"/>
+                <text x="944" y="266" text-anchor="end" class="svg-note">axis starts at 350 KB</text>
+                <line x1="615.6" y1="280" x2="615.6" y2="285" stroke="#b8b8b1"/>
+                <text x="615.6" y="297" text-anchor="middle" class="svg-sub">101</text>
+                <line x1="721.3" y1="280" x2="721.3" y2="285" stroke="#b8b8b1"/>
+                <text x="721.3" y="297" text-anchor="middle" class="svg-sub">401</text>
+                <line x1="932.7" y1="280" x2="932.7" y2="285" stroke="#b8b8b1"/>
+                <text x="932.7" y="297" text-anchor="middle" class="svg-sub">1,001</text>
+                <text x="765" y="314" text-anchor="middle" class="svg-sub">routes in the app</text>
+                <text x="748.3" y="74" text-anchor="end" class="svg-sub" style="fill:#252525">raw ≈490</text>
+                <text x="796.8" y="74" class="svg-sub" style="fill:#252525">gzip ≈600</text>
+                <polyline points="615.6,245.6 721.3,194.6 932.7,92.4" fill="none" stroke="#ad4b43" stroke-width="2.5"/>
+                <polyline points="615.6,179.6 721.3,179.6 932.7,179.1" fill="none" stroke="#3c6f97" stroke-width="2.5"/>
+                <circle cx="615.6" cy="245.6" r="3.5" fill="#ad4b43"/>
+                <circle cx="721.3" cy="194.6" r="3.5" fill="#ad4b43"/>
+                <circle cx="932.7" cy="92.4" r="3.5" fill="#ad4b43"/>
+                <circle cx="615.6" cy="179.6" r="3.5" fill="#3c6f97"/>
+                <circle cx="721.3" cy="179.6" r="3.5" fill="#3c6f97"/>
+                <circle cx="932.7" cy="179.1" r="3.5" fill="#3c6f97"/>
+                <text x="615.6" y="261.6" text-anchor="middle" class="svg-sub" style="fill:#252525">389,116</text>
+                <text x="615.6" y="273.6" text-anchor="middle" class="svg-sub">map 5.1%</text>
+                <text x="729.3" y="210.6" class="svg-sub" style="fill:#252525">447,069</text>
+                <text x="729.3" y="222.6" class="svg-sub">map 17.4%</text>
+                <text x="937.7" y="108.4" class="svg-sub" style="fill:#252525">563,131</text>
+                <text x="937.7" y="120.4" class="svg-sub">map 34.4%</text>
+                <text x="932.7" y="196.1" text-anchor="end" class="svg-sub" style="fill:#3c6f97">App 464,039 → 464,709</text>
+                <line x1="20" y1="330" x2="980" y2="330" stroke="#deded9"/>
+                <text x="20" y="352" class="svg-lane">WHAT THE 183,519-B _BUILDMANIFEST.JS HOLDS AT 1,001 ROUTES</text>
+                <rect x="60.0" y="364" width="478.7" height="30" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="299.4" y="383" text-anchor="middle" class="svg-sub" style="fill:#252525">bootstrap params · 99,833 B · 54.4%</text>
+                <rect x="538.7" y="364" width="243.1" height="30" fill="#ffffff" stroke="#ad4b43"/>
+                <text x="660.3" y="383" text-anchor="middle" class="svg-sub" style="fill:#252525">page → chunks · 50,699 B · 27.6%</text>
+                <rect x="781.8" y="364" width="75.2" height="30" fill="#f3dfdc" stroke="#ad4b43"/>
+                <rect x="857.0" y="364" width="83.0" height="30" fill="#f7f7f5" stroke="#ad4b43"/>
+                <path d="M819.4 394 V404" stroke="#b8b8b1" fill="none"/>
+                <text x="823.4" y="414" text-anchor="end" class="svg-sub" style="fill:#252525">sortedPages · 15,684 B · 8.5%</text>
+                <path d="M898.5 394 V420" stroke="#b8b8b1" fill="none"/>
+                <text x="940.0" y="432" text-anchor="end" class="svg-sub" style="fill:#252525">rest · 17,303 B · 9.4%, nearly all indentation</text>
+                <text x="60" y="414" class="svg-note">JSON.stringify(…, null, 2): the indentation is 17,060 B raw, 740 B after gzip.</text>
+                <line x1="20" y1="450" x2="980" y2="450" stroke="#deded9"/>
+                <text x="20" y="472" class="svg-lane">RESOLVING ONE DYNAMIC URL: MICROSECONDS PER LOOKUP</text>
+                <text x="20" y="488" class="svg-sub">client: Pages resolveDynamicRoute, URL in the last section · server: precompiled scan (§05)</text>
+                <text x="20" y="512" class="svg-sub" style="fill:#252525">server hit · 100 dynamic routes</text>
+                <rect x="340" y="500" width="1.5" height="16" fill="#dfede5" stroke="#367f59"/>
+                <text x="347.5" y="512" class="svg-sub" style="fill:#252525">5.8</text>
+                <text x="20" y="536" class="svg-sub" style="fill:#252525">server hit · 1,000 dynamic routes</text>
+                <rect x="340" y="524" width="9.3" height="16" fill="#dfede5" stroke="#367f59"/>
+                <text x="355.3" y="536" class="svg-sub" style="fill:#252525">85</text>
+                <text x="20" y="560" class="svg-sub" style="fill:#252525">client · 28 dynamic pages (101 routes)</text>
+                <rect x="340" y="548" width="14.0" height="16" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="360.0" y="560" class="svg-sub" style="fill:#252525">128</text>
+                <text x="20" y="584" class="svg-sub" style="fill:#252525">client · 118 dynamic pages (401 routes)</text>
+                <rect x="340" y="572" width="67.1" height="16" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="413.1" y="584" class="svg-sub" style="fill:#252525">616</text>
+                <text x="20" y="608" class="svg-sub" style="fill:#252525">client · 298 dynamic pages (1,001 routes)</text>
+                <rect x="340" y="596" width="194.3" height="16" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="540.3" y="608" class="svg-sub" style="fill:#252525">1,781</text>
+                <text x="20" y="632" class="svg-sub" style="fill:#252525">client · 1,198 dynamic pages (synthetic)</text>
+                <rect x="340" y="620" width="561.6" height="16" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="907.6" y="632" class="svg-sub" style="fill:#252525">5,148</text>
+                <line x1="340" y1="648" x2="940" y2="648" stroke="#b8b8b1"/>
+                <line x1="340.0" y1="648" x2="340.0" y2="653" stroke="#b8b8b1"/>
+                <text x="340.0" y="665" text-anchor="middle" class="svg-sub">0</text>
+                <line x1="449.1" y1="648" x2="449.1" y2="653" stroke="#b8b8b1"/>
+                <text x="449.1" y="665" text-anchor="middle" class="svg-sub">1,000</text>
+                <line x1="558.2" y1="648" x2="558.2" y2="653" stroke="#b8b8b1"/>
+                <text x="558.2" y="665" text-anchor="middle" class="svg-sub">2,000</text>
+                <line x1="667.3" y1="648" x2="667.3" y2="653" stroke="#b8b8b1"/>
+                <text x="667.3" y="665" text-anchor="middle" class="svg-sub">3,000</text>
+                <line x1="776.4" y1="648" x2="776.4" y2="653" stroke="#b8b8b1"/>
+                <text x="776.4" y="665" text-anchor="middle" class="svg-sub">4,000</text>
+                <line x1="885.5" y1="648" x2="885.5" y2="653" stroke="#b8b8b1"/>
+                <text x="885.5" y="665" text-anchor="middle" class="svg-sub">5,000</text>
+                <text x="940.0" y="665" text-anchor="end" class="svg-sub">µs</text>
+                <text x="20" y="688" class="svg-note">The client compiles a new RegExp for each dynamic page it tries: 4.3–6.0 µs per page scanned, linear in the table it downloaded.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Bytes: built files and HTML, Turbopack with
+              <code>experimental.cpus: 2</code>
+              (<code>e9-measure.mjs</code>) <span class="recon">measured here</span>;
+              the crossover band is interpolated. The manifest's parts follow
+              its writer, <code>manifest-loader.ts</code>:592-627
+              <span class="src">from the code</span>. Client resolution: medians of
+              7 × 2,000 lookups in Node 24, not a phone
+              (<code>e9-resolve.mjs</code>). The server's hits tried 51.8 and
+              504.4 regexes on average, 0.11–0.17 µs each, against the client's
+              4.3–6.0 µs per dynamic page (<code>e6-match.mjs</code>)
+              <span class="recon">measured here</span>. Red is Pages, blue App,
+              green the server. With real page code, the crossover moves.
+            </p>
+          </figure>
