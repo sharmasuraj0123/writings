@@ -1,0 +1,421 @@
+          <h2 id="one-rule"><span class="secnum">{{S}}</span>One rule, many precomputations</h2>
+          <p class="lede">
+            The App Router's grammar is one rule. Folders name URL segments, a
+            closed set of file stems gives each segment its behaviour, and
+            everything else in <code>app/</code> except metadata files is
+            invisible to routing.
+            Because the structure is declared in files, <code>next build</code>
+            knows the whole tree before any request arrives. It enumerates the
+            routes, compiles one entry per route, sorts a route table, prerenders
+            the static parts, splits client code per segment and records
+            per-segment prefetch hints. The server and the browser then read
+            those artifacts instead of rediscovering structure. Every
+            efficiency follows from that, and so does every cost.
+          </p>
+          <p>
+            Turbopack, the Rust bundler <code>next build</code> uses unless
+            told otherwise (§03), classifies a file by the stem before its
+            first dot, against a closed list of twelve: <code>page</code>,
+            <code>layout</code>, <code>error</code>, <code>global-error</code>,
+            <code>global-not-found</code>, <code>loading</code>,
+            <code>template</code>, <code>forbidden</code>,
+            <code>unauthorized</code>, <code>not-found</code>,
+            <code>default</code> and <code>route</code>
+            (<code>crates/next-core/src/app_structure.rs</code>:377-395)
+            <span class="src">from the code</span>. A segment, in this vocabulary,
+            is one folder level of a route: static (<code>blog</code>), dynamic
+            (<code>[slug]</code>), catch-all, group or slot. It is the unit of
+            everything that follows. Layouts, loading states, error boundaries,
+            client caching, prefetching and partial rendering are all per
+            segment. Any other stem gives a
+            segment nothing; metadata files such as <code>icon.png</code> are
+            matched separately (§02). The docs add the other half: "a route is
+            <strong>not publicly accessible</strong> until a
+            <code>page.js</code> or <code>route.js</code> file is added to a
+            route segment" (<code>docs/01-app/01-getting-started/02-project-structure.mdx</code>,
+            § Colocation) <span class="src">from the docs</span>.
+          </p>
+          <p>
+            The running example is the lab's <code>app/sec0/a/[id]/page.tsx</code>.
+            Its <code>generateStaticParams</code> returns ids 1 to 5, and it sits
+            under <code>app/layout.tsx</code> and <code>app/sec0/layout.tsx</code>,
+            whose client component <code>SectionNav</code> renders ten
+            <code>&lt;Link&gt;</code>s, in the 401-route Turbopack build
+            <code>apps/scale-N400</code> (build ID
+            <code>wFd3hpqcsr6vknDk6t3wj</code>). The second example is
+            <code>/dyn</code>, a page that awaits <code>cookies()</code> and so
+            renders on every request. Figure {{fig-golden-trace}} follows the
+            first from file to click, and ends on a navigation to the second.
+          </p>
+          <p>
+            The subject is next@16.4.0, released 6 October 2026: tag v16.4.0,
+            commit e273d5b2<wbr/>e869d0be<wbr/>06c0e86f<wbr/>788e1594<wbr/>f9dd40cf. Paths are relative to
+            <code>packages/next/src/</code> unless they start with
+            <code>crates/</code> or <code>docs/</code>. Numbers marked measured
+            here come from a lab on one shared 2-vCPU container, where
+            <code>nproc</code> reports 2 and <code>os.cpus()</code> reports 8
+            (cgroup <code>cpu.max</code> 200000 100000). Requests go over
+            localhost, with no RTT, TLS, HTTP/2 or CDN; the pages are synthetic,
+            with filler that gzips 8 to 10×; one <code>next start</code> process
+            serves them; the browser is Chromium. Ratios carry to other machines.
+            Milliseconds do not.
+          </p>
+
+          <figure class="figure wide" id="fig-golden-trace">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One route, file to click: fifteen artifacts across build, server and browser</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1120 792" role="img" aria-label="A wide diagram in three lanes that follows the lab route app/sec0/a/[id]/page.tsx from file to click in fifteen numbered boxes. Build lane: 01 the source files; 02 the discovery key /sec0/a/[id]/page; 03 the routes-manifest row whose named regex is ^/sec0/a/(?&lt;nxtPid&gt;[^/]+?)(?:/)?$, third of 119 dynamic routes; 04 the LoaderTree literal, a nest of 4-tuples each ending in an empty array; 05 the prefetch hints 64, 96, 96, 96, 160; 06 the six files written per URL, 1.html 9,954 bytes, 1.rsc 5,866, 1.meta 1,036, _tree 275, _full 5,866 and the page segment 4,942; 07 the prerender-manifest rows, five complete static rows and a pattern row with fallback null that computes blocking. Server lane: 08 the boot tables built once by setupFsCheck; 09 the hard GET that misses check_fs, matches third, is served from the route-cache copy that the first hit promoted from the build seed, and returns x-nextjs-cache HIT with x-nextjs-prerender twice; 10 the document with two self.__next_f pushes carrying the 5,866-byte payload again. Browser lane: 11 the viewport prefetch, a _tree request with _rsc nVRY9RLVAUtqyrUj then the page segment, 24 requests for 12 links; 12 a predicted router.prefetch that sends only the 4,942-byte page segment; 13 a warm soft navigation with 0 requests in 50 ms; 14 an unprefetched navigation that receives the whole 5,866-byte payload, 1,619 bytes on the wire; 15 a navigation to /dyn whose root comes back as a skipped node, 2,602 bytes against 4,433 without the state tree. Arrows are labelled with the functions that produce each next box or read a build file at runtime.">
+                <defs>
+                  <marker id="fig-golden-trace-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-golden-trace-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="6" y="12" class="svg-lane">BUILD · NEXT BUILD (TURBOPACK) · APPS/SCALE-N400</text>
+                <text x="154.0" y="27" text-anchor="middle" class="svg-sub">collectAppFiles</text>
+                <text x="154.0" y="40" text-anchor="middle" class="svg-sub">→ createPagesMapping</text>
+                <line x1="147" y1="60" x2="161" y2="60" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <text x="310.0" y="40" text-anchor="middle" class="svg-sub">pageToRoute</text>
+                <line x1="303" y1="60" x2="317" y2="60" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <text x="476.0" y="27" text-anchor="middle" class="svg-sub">get_directory_tree</text>
+                <text x="476.0" y="40" text-anchor="middle" class="svg-sub">→ walk_tree</text>
+                <line x1="469" y1="60" x2="483" y2="60" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <text x="650.0" y="40" text-anchor="middle" class="svg-sub">collectPrefetchHints</text>
+                <line x1="643" y1="60" x2="657" y2="60" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <text x="802.0" y="27" text-anchor="middle" class="svg-sub">collectSegmentData</text>
+                <text x="802.0" y="40" text-anchor="middle" class="svg-sub">→ exportAppPage</text>
+                <line x1="795" y1="60" x2="809" y2="60" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <text x="970.0" y="40" text-anchor="middle" class="svg-sub">writePrerenderManifest</text>
+                <line x1="963" y1="60" x2="977" y2="60" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <rect x="6" y="48" width="140" height="186" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="14" y="64" class="svg-num">01</text>
+                <text x="138" y="64" text-anchor="end" class="svg-num">§02</text>
+                <text x="14" y="82" class="svg-step">Source files</text>
+                <text x="14.0" y="100" class="svg-sub">app/layout.tsx</text>
+                <text x="14.0" y="113" class="svg-sub">app/sec0/layout.tsx</text>
+                <text x="20.3" y="126" class="svg-sub">client SectionNav</text>
+                <text x="20.3" y="139" class="svg-sub">with 10 &lt;Link&gt;s</text>
+                <text x="14.0" y="152" class="svg-sub">app/sec0/a/[id]/</text>
+                <text x="20.3" y="165" class="svg-sub">page.tsx</text>
+                <text x="14.0" y="178" class="svg-sub">generateStaticParams</text>
+                <text x="20.3" y="191" class="svg-sub">→ ids 1–5</text>
+                <text x="14.0" y="204" class="svg-sub">app/dyn/page.tsx</text>
+                <text x="20.3" y="217" class="svg-sub">awaits cookies()</text>
+                <rect x="162" y="48" width="140" height="186" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="1.5"/>
+                <text x="170" y="64" class="svg-num">02</text>
+                <text x="294" y="64" text-anchor="end" class="svg-num">§03</text>
+                <text x="170" y="82" class="svg-step">Discovery key</text>
+                <text x="170.0" y="100" class="svg-sub">/sec0/a/[id]/page</text>
+                <text x="170.0" y="113" class="svg-sub">→ private-next-</text>
+                <text x="176.3" y="126" class="svg-sub">app-dir/sec0/a/</text>
+                <text x="176.3" y="139" class="svg-sub">[id]/page.tsx</text>
+                <text x="170.0" y="152" class="svg-sub">normalizeAppPath</text>
+                <text x="170.0" y="165" class="svg-sub">→ /sec0/a/[id]</text>
+                <text x="170.0" y="178" class="svg-sub">validateAppPaths:</text>
+                <text x="176.3" y="191" class="svg-sub">no ambiguity</text>
+                <rect x="318" y="48" width="150" height="186" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="326" y="64" class="svg-num">03</text>
+                <text x="460" y="64" text-anchor="end" class="svg-num">§04</text>
+                <text x="326" y="82" class="svg-step">routes-manifest.json</text>
+                <text x="326.0" y="100" class="svg-sub">dynamicRoutes[2]:</text>
+                <text x="326.0" y="113" class="svg-sub">"namedRegex":</text>
+                <text x="332.3" y="126" class="svg-sub">"^/sec0/a/(?&lt;nxtPid&gt;</text>
+                <text x="338.6" y="139" class="svg-sub">[^/]+?)(?:/)?$"</text>
+                <text x="326.0" y="152" class="svg-sub">"routeKeys":</text>
+                <text x="332.3" y="165" class="svg-sub">{"nxtPid":"nxtPid"}</text>
+                <text x="326.0" y="178" class="svg-sub">3rd of 119 dynamic;</text>
+                <text x="326.0" y="191" class="svg-sub">285 static rows,</text>
+                <text x="332.3" y="204" class="svg-sub">/dyn among them</text>
+                <rect x="484" y="48" width="158" height="186" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="492" y="64" class="svg-num">04</text>
+                <text x="634" y="64" text-anchor="end" class="svg-num">§04</text>
+                <text x="492" y="82" class="svg-step">LoaderTree literal</text>
+                <text x="492.0" y="100" class="svg-sub">["",{children:</text>
+                <text x="498.3" y="113" class="svg-sub">["sec0",{children:</text>
+                <text x="504.6" y="126" class="svg-sub">["a",{children:</text>
+                <text x="510.9" y="139" class="svg-sub">["[id]",{children:</text>
+                <text x="517.2" y="152" class="svg-sub">["__PAGE__",{},</text>
+                <text x="523.5" y="165" class="svg-sub">{page:…},[]]</text>
+                <text x="510.9" y="178" class="svg-sub">},{…},[]]},{…},[]]</text>
+                <text x="498.3" y="191" class="svg-sub">},{layout:…},[]]</text>
+                <text x="492.0" y="204" class="svg-sub">},{layout:…},[]]</text>
+                <text x="492.0" y="217" class="svg-sub">4th = []: no siblings</text>
+                <rect x="658" y="48" width="136" height="186" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="666" y="64" class="svg-num">05</text>
+                <text x="786" y="64" text-anchor="end" class="svg-num">§04 §09</text>
+                <text x="666" y="82" class="svg-step">Prefetch hints</text>
+                <text x="666.0" y="100" class="svg-sub">prefetch-hints.json</text>
+                <text x="666.0" y="113" class="svg-sub">"/sec0/a/[id]":</text>
+                <text x="666.0" y="126" class="svg-sub">(root)</text>
+                <text x="786" y="126" text-anchor="end" class="svg-sub">64</text>
+                <text x="666.0" y="139" class="svg-sub">sec0</text>
+                <text x="786" y="139" text-anchor="end" class="svg-sub">96</text>
+                <text x="666.0" y="152" class="svg-sub">a</text>
+                <text x="786" y="152" text-anchor="end" class="svg-sub">96</text>
+                <text x="666.0" y="165" class="svg-sub">[id]</text>
+                <text x="786" y="165" text-anchor="end" class="svg-sub">96</text>
+                <text x="666.0" y="178" class="svg-sub">__PAGE__</text>
+                <text x="786" y="178" text-anchor="end" class="svg-sub">160</text>
+                <text x="666.0" y="191" class="svg-sub">64 inlined→child</text>
+                <text x="666.0" y="204" class="svg-sub">32 parent→self</text>
+                <text x="666.0" y="217" class="svg-sub">128 head→self</text>
+                <rect x="810" y="48" width="152" height="186" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="818" y="64" class="svg-num">06</text>
+                <text x="954" y="64" text-anchor="end" class="svg-num">§04</text>
+                <text x="818" y="82" class="svg-step">Six files per URL</text>
+                <text x="818.0" y="100" class="svg-sub">server/app/sec0/a/</text>
+                <text x="818.0" y="113" class="svg-sub">1.html</text>
+                <text x="954" y="113" text-anchor="end" class="svg-sub">9,954</text>
+                <text x="818.0" y="126" class="svg-sub">1.rsc</text>
+                <text x="954" y="126" text-anchor="end" class="svg-sub">5,866</text>
+                <text x="818.0" y="139" class="svg-sub">1.meta</text>
+                <text x="954" y="139" text-anchor="end" class="svg-sub">1,036</text>
+                <text x="818.0" y="152" class="svg-sub">1.segments/</text>
+                <text x="824.3" y="165" class="svg-sub">_tree</text>
+                <text x="954" y="165" text-anchor="end" class="svg-sub">275</text>
+                <text x="824.3" y="178" class="svg-sub">_full</text>
+                <text x="954" y="178" text-anchor="end" class="svg-sub">5,866</text>
+                <text x="824.3" y="191" class="svg-sub">sec0/a/$d$id/</text>
+                <text x="830.6" y="204" class="svg-sub">__PAGE__</text>
+                <text x="954" y="204" text-anchor="end" class="svg-sub">4,942</text>
+                <text x="818.0" y="217" class="svg-sub">bytes; _full = 1.rsc</text>
+                <rect x="978" y="48" width="136" height="186" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="986" y="64" class="svg-num">07</text>
+                <text x="1106" y="64" text-anchor="end" class="svg-num">§04</text>
+                <text x="986" y="82" class="svg-step">prerender-manifest</text>
+                <text x="986.0" y="100" class="svg-sub">"/sec0/a/1"…"/5":</text>
+                <text x="992.3" y="113" class="svg-sub">response: complete</text>
+                <text x="992.3" y="126" class="svg-sub">compute: static</text>
+                <text x="986.0" y="139" class="svg-sub">"/sec0/a/[id]":</text>
+                <text x="992.3" y="152" class="svg-sub">fallback: null</text>
+                <text x="992.3" y="165" class="svg-sub">response: empty</text>
+                <text x="992.3" y="178" class="svg-sub">compute: blocking</text>
+                <text x="986.0" y="191" class="svg-sub">754 routes, v4</text>
+                <text x="986.0" y="204" class="svg-sub">/dyn: in neither</text>
+                <text x="992.3" y="217" class="svg-sub">map</text>
+                <line x1="393" y1="234" x2="393" y2="297" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-golden-trace-arr-blue)"/>
+                <text x="400" y="256" text-anchor="start" class="svg-sub">setupFsCheck</text>
+                <text x="400" y="268" text-anchor="start" class="svg-sub">(boot, once)</text>
+                <line x1="822" y1="234" x2="822" y2="297" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-golden-trace-arr-blue)"/>
+                <text x="815" y="256" text-anchor="end" class="svg-sub">FileSystemCache.get</text>
+                <text x="815" y="268" text-anchor="end" class="svg-sub">→ promoteSeed</text>
+                <text x="6" y="280" class="svg-lane">SERVER · NEXT START, ONE NODE PROCESS</text>
+                <text x="530.0" y="290" text-anchor="middle" class="svg-sub">resolveRoutes</text>
+                <line x1="471" y1="310" x2="589" y2="310" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <text x="884.0" y="290" text-anchor="middle" class="svg-sub">sendRenderResult</text>
+                <line x1="851" y1="310" x2="909" y2="310" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <rect x="270" y="298" width="200" height="196" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="1.5"/>
+                <text x="278" y="314" class="svg-num">08</text>
+                <text x="462" y="314" text-anchor="end" class="svg-num">§05</text>
+                <text x="278" y="332" class="svg-step">Boot tables</text>
+                <text x="278.0" y="350" class="svg-sub">setupFsCheck, once at boot:</text>
+                <text x="278.0" y="363" class="svg-sub">appFiles = Set {</text>
+                <text x="284.3" y="376" class="svg-sub">"/sec0/a/[id]", …}</text>
+                <text x="284.3" y="389" class="svg-sub">patterns, not /sec0/a/1</text>
+                <text x="278.0" y="402" class="svg-sub">dynamicRoutes: 119 regexes</text>
+                <text x="284.3" y="415" class="svg-sub">sorted by getSortedRoutes</text>
+                <text x="278.0" y="428" class="svg-sub">public/, .next/static/ →</text>
+                <text x="284.3" y="441" class="svg-sub">in-memory Sets</text>
+                <text x="278.0" y="454" class="svg-sub">app/ is not read at runtime</text>
+                <rect x="590" y="298" width="260" height="196" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="598" y="314" class="svg-num">09</text>
+                <text x="842" y="314" text-anchor="end" class="svg-num">§05</text>
+                <text x="598" y="332" class="svg-step">Hard GET /sec0/a/1</text>
+                <text x="598.0" y="350" class="svg-sub">check_fs: miss (Set lookups)</text>
+                <text x="598.0" y="363" class="svg-sub">checkTrue: /sec0/a/[id], 3rd of 119</text>
+                <text x="604.3" y="376" class="svg-sub">params {id: "1"}</text>
+                <text x="598.0" y="389" class="svg-sub">1st hit promotes seed to .next/server/</text>
+                <text x="604.3" y="402" class="svg-sub">route-cache/APP_PAGE/22872ffb…/</text>
+                <text x="604.3" y="415" class="svg-sub">$/sec0/a/1.*  (.html written last)</text>
+                <text x="598.0" y="428" class="svg-sub">200, 9,954 B, same bytes as 1.html</text>
+                <text x="598.0" y="441" class="svg-sub">x-nextjs-cache: HIT</text>
+                <text x="598.0" y="454" class="svg-sub">x-nextjs-prerender: 1</text>
+                <text x="598.0" y="467" class="svg-sub">x-nextjs-prerender: 1</text>
+                <text x="598.0" y="480" class="svg-sub">Cache-Control: s-maxage=31536000</text>
+                <rect x="910" y="298" width="204" height="196" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="918" y="314" class="svg-num">10</text>
+                <text x="1106" y="314" text-anchor="end" class="svg-num">§06</text>
+                <text x="918" y="332" class="svg-step">Document: two pushes</text>
+                <text x="918.0" y="350" class="svg-sub">(self.__next_f=</text>
+                <text x="924.3" y="363" class="svg-sub">self.__next_f||[])</text>
+                <text x="924.3" y="376" class="svg-sub">.push([0])</text>
+                <text x="918.0" y="389" class="svg-sub">self.__next_f.push([1,</text>
+                <text x="924.3" y="402" class="svg-sub">"1:\"$Sreact.fragment\"</text>
+                <text x="924.3" y="415" class="svg-sub">\n2:…"])</text>
+                <text x="918.0" y="428" class="svg-sub">push 2 = all 5,866 B of</text>
+                <text x="924.3" y="441" class="svg-sub">1.rsc: the payload, again</text>
+                <rect x="6" y="309" width="22" height="11" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="36" y="318" class="svg-note">source the author wrote</text>
+                <rect x="6" y="335" width="22" height="11" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="36" y="344" class="svg-note">file next build wrote under .next/</text>
+                <rect x="6" y="361" width="22" height="11" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="36" y="370" class="svg-note">in-memory state</text>
+                <rect x="6" y="387" width="22" height="11" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="36" y="396" class="svg-note">bytes on the wire</text>
+                <line x1="6" y1="418" x2="28" y2="418" stroke="#252525" stroke-width="2.5"/>
+                <text x="36" y="422" class="svg-note">next step; label: what produces it</text>
+                <line x1="6" y1="444" x2="28" y2="444" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="36" y="448" class="svg-note">runtime read of a build file</text>
+                <text x="6" y="474" class="svg-num">§04</text>
+                <text x="36" y="474" class="svg-note">box number · section that explains it</text>
+                <path d="M1012 494 L1012 510 L104 510 L104 575" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <text x="558.0" y="527" text-anchor="middle" class="svg-note">hydration drains self.__next_f (app-index.tsx); then every visible &lt;Link&gt; is prefetched</text>
+                <text x="6" y="550" class="svg-lane">BROWSER</text>
+                <text x="118" y="550" class="svg-lane">SESSION A · PREFETCH ON</text>
+                <text x="684" y="550" class="svg-lane">SESSION B · EVERY PREFETCH BLOCKED</text>
+                <line x1="673.0" y1="540" x2="673.0" y2="762" stroke="#deded9" stroke-width="1.5"/>
+                <text x="221.0" y="568" text-anchor="middle" class="svg-sub">router.prefetch</text>
+                <line x1="211" y1="588" x2="231" y2="588" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <text x="447.0" y="568" text-anchor="middle" class="svg-sub">router.push</text>
+                <line x1="437" y1="588" x2="457" y2="588" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <text x="899.0" y="568" text-anchor="middle" class="svg-sub">router.push('/dyn')</text>
+                <line x1="889" y1="588" x2="909" y2="588" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-golden-trace-arr-ink)"/>
+                <rect x="6" y="576" width="204" height="186" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="14" y="592" class="svg-num">11</text>
+                <text x="202" y="592" text-anchor="end" class="svg-num">§09</text>
+                <text x="14" y="610" class="svg-step">Viewport prefetch</text>
+                <text x="14.0" y="628" class="svg-sub">GET /sec0/a/1?_rsc=</text>
+                <text x="32.9" y="641" class="svg-sub">nVRY9RLVAUtqyrUj</text>
+                <text x="14.0" y="654" class="svg-sub">rsc: 1</text>
+                <text x="14.0" y="667" class="svg-sub">next-router-prefetch: 1</text>
+                <text x="14.0" y="680" class="svg-sub">next-router-segment-prefetch:</text>
+                <text x="20.3" y="693" class="svg-sub">/_tree  → 275 B</text>
+                <text x="14.0" y="706" class="svg-sub">then …/$d$id/__PAGE__ alone:</text>
+                <text x="20.3" y="719" class="svg-sub">the layouts ride inside it</text>
+                <text x="14.0" y="732" class="svg-sub">12 links → 24 requests,</text>
+                <text x="20.3" y="745" class="svg-sub">all x-nextjs-postponed: 2</text>
+                <rect x="232" y="576" width="204" height="186" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="240" y="592" class="svg-num">12</text>
+                <text x="428" y="592" text-anchor="end" class="svg-num">§08</text>
+                <text x="240" y="610" class="svg-step">Predicted prefetch</text>
+                <text x="240.0" y="628" class="svg-sub">router.prefetch('/sec0/a/2')</text>
+                <text x="240.0" y="641" class="svg-sub">pattern /sec0/a/[id] learned</text>
+                <text x="246.3" y="654" class="svg-sub">from one _tree; siblings []</text>
+                <text x="240.0" y="667" class="svg-sub">→ no /_tree request</text>
+                <text x="240.0" y="680" class="svg-sub">GET /sec0/a/2?_rsc=</text>
+                <text x="258.9" y="693" class="svg-sub">kOGHNaC9L4yO-hEQ</text>
+                <text x="240.0" y="706" class="svg-sub">segment-prefetch:</text>
+                <text x="246.3" y="719" class="svg-sub">/sec0/a/$d$id/__PAGE__</text>
+                <text x="240.0" y="732" class="svg-sub">1 request · 4,942 B</text>
+                <rect x="458" y="576" width="204" height="186" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="1.5"/>
+                <text x="466" y="592" class="svg-num">13</text>
+                <text x="654" y="592" text-anchor="end" class="svg-num">§08</text>
+                <text x="466" y="610" class="svg-step">Warm soft navigation</text>
+                <text x="466.0" y="628" class="svg-sub">router.push('/sec0/a/2')</text>
+                <text x="466.0" y="641" class="svg-sub">0 requests · 50 ms</text>
+                <text x="466.0" y="654" class="svg-sub">every segment already cached</text>
+                <text x="466.0" y="667" class="svg-sub">&lt;html&gt;: same DOM node</text>
+                <text x="466.0" y="680" class="svg-sub">&lt;section data-layout="sec0"&gt;:</text>
+                <text x="472.3" y="693" class="svg-sub">same DOM node</text>
+                <text x="466.0" y="706" class="svg-sub">only the page subtree changes</text>
+                <rect x="684" y="576" width="204" height="186" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="692" y="592" class="svg-num">14</text>
+                <text x="880" y="592" text-anchor="end" class="svg-num">§06</text>
+                <text x="692" y="610" class="svg-step">Unprefetched SSG navigation</text>
+                <text x="692.0" y="628" class="svg-sub">router.push('/sec0/a/2')</text>
+                <text x="692.0" y="641" class="svg-sub">GET /sec0/a/2?_rsc=…</text>
+                <text x="698.3" y="654" class="svg-sub">+ next-router-state-tree</text>
+                <text x="692.0" y="667" class="svg-sub">SSG: Flight headers stripped,</text>
+                <text x="698.3" y="680" class="svg-sub">state tree ignored</text>
+                <text x="692.0" y="693" class="svg-sub">→ the stored 2.rsc, whole</text>
+                <text x="692.0" y="706" class="svg-sub">5,866 B · 1,619 B on the wire</text>
+                <text x="692.0" y="719" class="svg-sub">layouts re-sent; DOM kept</text>
+                <rect x="910" y="576" width="204" height="186" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="918" y="592" class="svg-num">15</text>
+                <text x="1106" y="592" text-anchor="end" class="svg-num">§06</text>
+                <text x="918" y="610" class="svg-step">Dynamic navigation to /dyn</text>
+                <text x="918.0" y="628" class="svg-sub">walkTreeWithFlightRouterState</text>
+                <text x="918.0" y="641" class="svg-sub">root "" unchanged → skipped:</text>
+                <text x="918.0" y="654" class="svg-sub">{"s":"","h":16,"d":</text>
+                <text x="924.3" y="667" class="svg-sub">{"r":null,"p":true,</text>
+                <text x="930.6" y="680" class="svg-sub">"v":null}}</text>
+                <text x="918.0" y="693" class="svg-sub">dyn ≠ sec0 → render from dyn</text>
+                <text x="918.0" y="706" class="svg-sub">2,602 B; 4,433 B without the</text>
+                <text x="924.3" y="719" class="svg-sub">state tree (−41%)</text>
+                <text x="918.0" y="732" class="svg-sub">Cache-Control: private,</text>
+                <text x="924.3" y="745" class="svg-sub">no-cache, no-store, …</text>
+                <text x="6" y="782" class="svg-note">Within a lane, boxes run in the order the code runs them. Sizes are bytes, decoded unless marked wire. Only box 13 is timed.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Bytes from one Turbopack build of the lab's 401-route app, captured
+              by <code>e8-golden-trace.mjs</code>
+              <span class="recon">measured here</span>; they are deterministic for
+              that build. Only box 13 is timed, and its 50 ms includes Playwright
+              polling. Function names are read
+              at the tag <span class="src">from the code</span>; boxes 05 to 07
+              follow <code>server/app-render/app-render.tsx</code>, which computes
+              hints (:11121) before segment data (:11198), and
+              <code>build/index.ts</code>:4619-4623, which writes both manifests
+              after <code>exportApp</code> returns. Long literals are cut with …;
+              segment files drop their <code>.segment.rsc</code> suffix. Green is a
+              file <code>next build</code> wrote, purple in-memory state, blue bytes
+              on the wire, grey the author's source.
+            </p>
+          </figure>
+
+          <h3>The price, stated first</h3>
+          <p>
+            Precomputation has a price. Four lab numbers give its shape, and
+            the sections cited give the mechanism.
+          </p>
+          <ul>
+            <li>
+              <strong>Rendered output ships twice on a hard load</strong>, a
+              full document request: as HTML, and as inline Flight data (the
+              React Server Components wire format, the RSC payload) in
+              <code>self.__next_f</code> pushes (box 10). In the lab's boundary app, moving <code>"use client"</code>
+              from the top of a layout down to the leaves cut 38,489 B of
+              JavaScript from every route, and made the RSC payload 5.6× larger
+              (119,482 B against 21,174 B) and the HTML 2.3× larger (200,807 B
+              against 87,754 B), all uncompressed <span class="recon">measured here</span>
+              (<code>e2-boundary.mjs</code>). §06, §13.
+            </li>
+            <li>
+              <strong>Every visible link costs two requests</strong>: a
+              <code>/_tree</code> and a page segment that carries its layouts
+              (box 11). A page with 12 visible links made 24 prefetch requests,
+              60,768 B decoded and 20,143 B on the wire
+              <span class="recon">measured here</span>
+              (<code>e3-nav.mjs</code>). §09.
+            </li>
+            <li>
+              <strong>The build cache does not skip prerendering.</strong> At 401
+              routes, static generation took 22–24 s cold, warm and after a
+              one-file edit, 58% of a 38.4 s warm build
+              <span class="recon">measured here</span>
+              (<code>build-bench.mjs</code>). §12.
+            </li>
+            <li>
+              <strong>A no-op <code>proxy.ts</code> adds 0.93 ms at p50 to each
+              request it matches</strong>. Proxy is 16.x's successor to
+              middleware: user code that runs before a request is matched to
+              a route (§02, §05). A static page went from 2.37 to 3.30 ms
+              to first byte, +39% <span class="recon">measured here</span>
+              (<code>e4-latency.mjs</code>). §05.
+            </li>
+          </ul>
+          <p>
+            After the walk you should be able to open a <code>.next/</code>
+            directory and name the function that wrote each file; predict what a
+            visible link, a click, a <code>cookies()</code> call, a
+            <code>"use client"</code> placement or a <code>proxy.ts</code> costs;
+            and set <code>experimental.cpus</code>, the build cache,
+            <code>experimental.prefetchInlining</code>,
+            <code>cacheComponents</code> with <code>partialPrefetching</code>, and
+            a Proxy <code>matcher</code> knowing what each did here.
+          </p>
+          <p>
+            The sections follow the boxes. §02 is box 01; §03 is box 02; §04 is
+            boxes 03 to 07, the build's tables and files, among them the
+            LoaderTree, the nested tuple each route compiles to. §05 is boxes 08 and 09, the request path in
+            <code>next start</code>. §06 is boxes 10, 14 and 15, rendering and
+            partial rendering. §07 is what Cache Components change in boxes 06, 07
+            and 15. §08 is boxes 12 and 13, the client router; §09 is boxes 05 and
+            11, prefetching. §10 is the client code the strip leaves out. Then
+            the argument turns: §11 weighs what each precomputation saves
+            against what it costs, §12 and §13 are the practices that moved
+            those numbers, and §14 tests common beliefs against the strip and
+            closes the account.
+          </p>

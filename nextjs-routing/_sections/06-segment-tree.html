@@ -1,0 +1,499 @@
+          <h2 id="segment-tree"><span class="secnum">{{S}}</span>Rendering a segment tree</h2>
+          <p class="lede">
+            A route renders as a fixed stack of boundaries per segment, filled from
+            the folder's files. An HTML request renders the whole tree and ships its
+            output twice. A soft navigation, a client-side transition that
+            fetches RSC data instead of a document, can start at the first
+            segment that differs, but only for a dynamic target: there are
+            three cases, not one.
+          </p>
+
+          <h3>The render</h3>
+          <p>
+            For an HTML request, <code>getRSCPayload</code> builds the full tree from
+            the root (<code>server/app-render/app-render.tsx</code>:2064-2222).
+            <code>createComponentTree</code> takes one LoaderTree node at a time: it
+            resolves the segment's <code>template</code>, <code>error</code> and
+            <code>loading</code> modules, then loads the layout or page through its lazy
+            getter (<code>create-component-tree.tsx</code>:191-260). Child slots are
+            built with one <code>Promise.all</code> (:527-528), so siblings never wait
+            for each other <span class="src">from the code</span>.
+          </p>
+
+          <h3>The stack</h3>
+          <p>
+            Each slot of a layout becomes one <code>LayoutRouter</code> client element,
+            built by the segment that owns the slot with that segment's error component
+            and template. Only the <code>children</code> slot also gets its not-found,
+            forbidden and unauthorized elements
+            (<code>create-component-tree.tsx</code>:532-546, 698-724). The client turns
+            these into a fixed stack, outermost first:
+            <code>TemplateContext.Provider</code> keyed by the child's state key, the
+            template (a <code>Fragment</code> if none, :218-226),
+            <code>ScrollHandler</code>, <code>ErrorBoundary</code>,
+            <code>LoadingBoundary</code>, <code>HTTPAccessFallbackBoundary</code>,
+            <code>RedirectBoundary</code>, then <code>InnerLayoutRouter</code> with the
+            child (<code>client/components/layout-router.tsx</code>:666-729)
+            <span class="src">from the code</span>. Figure {{fig-segment-stack}} draws it.
+          </p>
+          <p>
+            Since Layout X renders the <code>LayoutRouter</code>, X's boundaries sit
+            below Layout X. A throw in Layout X escapes <code>X/error.js</code>, and
+            <code>X/loading.js</code> cannot cover data Layout X awaits.
+            <code>error.mdx</code> and <code>loading.mdx</code> both say their file
+            "does <strong>not</strong> wrap the <code>layout.js</code>" of the same
+            segment <span class="src">from the docs</span>.
+          </p>
+          <p>
+            The server emits no <code>&lt;Suspense&gt;</code> for
+            <code>loading.tsx</code>. It wraps the segment's output in
+            <code>LoadingBoundaryProvider</code>, which only puts the loading element
+            into context (<code>create-component-tree.tsx</code>:1300-1311); the client
+            <code>LayoutRouter</code> wraps each child slot in
+            <code>&lt;Suspense fallback={loading}&gt;</code>
+            (<code>layout-router.tsx</code>:416-500). So loading lives on the parent
+            and applies to all its slots, which the comment at :675-684 says "sort of
+            smells like an implementation accident" <span class="src">from the code</span>.
+          </p>
+          <p>
+            The Provider's key is the segment's state key. In the browser that is
+            the router cache key, and a dynamic segment's key is
+            <code>name|value|type</code>, so <code>/sec0/a/1</code> →
+            <code>/sec0/a/2</code> turns <code>id|1|d</code> into <code>id|2|d</code>
+            and remounts everything below. Search params are not in it, so
+            <code>?q=</code> never remounts (<code>create-router-cache-key.ts</code>:3-11;
+            <code>create-segment-key.browser.ts</code>:5;
+            <code>layout-router.tsx</code>:558-567). The server's key leaves the value
+            out, <code>name|type</code> (<code>create-segment-key.ts</code>:10-16)
+            <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure" id="fig-segment-stack">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One segment's boundary stack, outermost first, with the child segment nested inside</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 652" role="img" aria-label="Nested boxes for one segment X. Outermost is a dashed LoadingBoundaryProvider, which the server emits when X/loading.js exists and which only sets context. Inside it: Layout X, a server component; a LayoutRouter client element for the children slot; TemplateContext.Provider keyed by the state key, wrapping the template or a Fragment; ScrollHandler; ErrorBoundary fed by X/error.js; LoadingBoundary, a Suspense whose fallback is X/loading.js read from context; HTTPAccessFallbackBoundary fed by X/not-found.js, children slot only; RedirectBoundary; and InnerLayoutRouter, which holds an abbreviated copy of the same stack for child segment Y ending at Y/page.js. On the right, convention files feed their boundaries, and three notes say what X's boundaries cover: Layout Y, the page and everything below; not Layout X or X/template.js, which render above them; and that the Provider key for a dynamic child is name|value|type, so a new param value remounts while search params do not.">
+                <defs>
+                  <marker id="fig-segment-stack-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-segment-stack-arr-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <text x="20" y="20" class="svg-lane">ONE SEGMENT X, ITS children SLOT, CHILD Y INSIDE</text>
+                <text x="660" y="20" class="svg-lane">WHAT FEEDS EACH BOUNDARY</text>
+
+                <rect x="20" y="34" width="620" height="568" rx="8" fill="#ffffff" stroke="#765b98" stroke-width="1.5" stroke-dasharray="6 4"/>
+                <text x="34" y="52" class="svg-step">LoadingBoundaryProvider</text>
+                <text x="202" y="52" class="svg-sub">server emits it if X/loading.js exists · context only</text>
+
+                <rect x="36" y="62" width="588" height="532" rx="7" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="50" y="80" class="svg-step">Layout X</text>
+                <text x="120" y="80" class="svg-sub">X/layout.js · Server Component · renders {children}</text>
+
+                <rect x="52" y="90" width="556" height="496" rx="7" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="66" y="108" class="svg-step">LayoutRouter</text>
+                <text x="160" y="108" class="svg-sub">client · one per slot · props set by the server</text>
+
+                <rect x="68" y="118" width="524" height="460" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="82" y="136" class="svg-step">TemplateContext.Provider key={stateKey}</text>
+                <text x="364" y="136" class="svg-sub">› template or Fragment</text>
+
+                <rect x="84" y="146" width="492" height="424" rx="6" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="98" y="164" class="svg-step">ScrollHandler</text>
+
+                <rect x="100" y="174" width="460" height="388" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="114" y="192" class="svg-step">ErrorBoundary</text>
+                <text x="216" y="192" class="svg-sub">errorComponent = X/error.js</text>
+
+                <rect x="116" y="202" width="428" height="352" rx="6" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="130" y="220" class="svg-step">LoadingBoundary</text>
+                <text x="246" y="220" class="svg-sub">&lt;Suspense fallback={X/loading}&gt;</text>
+
+                <rect x="132" y="230" width="396" height="316" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="146" y="248" class="svg-step">HTTPAccessFallbackBoundary</text>
+                <text x="334" y="248" class="svg-sub">children slot only</text>
+
+                <rect x="148" y="258" width="364" height="280" rx="6" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="162" y="276" class="svg-step">RedirectBoundary</text>
+
+                <rect x="164" y="286" width="332" height="244" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="178" y="304" class="svg-step">InnerLayoutRouter</text>
+                <text x="306" y="304" class="svg-sub">→ child segment Y</text>
+
+                <rect x="180" y="314" width="300" height="206" rx="5" fill="#ffffff" stroke="#765b98" stroke-dasharray="5 3"/>
+                <text x="190" y="329" class="svg-sub">LoadingBoundaryProvider (Y/loading.js)</text>
+                <rect x="190" y="336" width="280" height="176" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="200" y="351" class="svg-sub" style="fill:#252525">Layout Y (Y/layout.js)</text>
+                <rect x="200" y="358" width="260" height="146" rx="5" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="210" y="373" class="svg-sub">LayoutRouter › Provider › Scroll</text>
+                <rect x="210" y="380" width="240" height="116" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="220" y="395" class="svg-sub">ErrorBoundary ← Y/error.js</text>
+                <rect x="220" y="402" width="220" height="86" rx="5" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="230" y="417" class="svg-sub">Suspense ← Y/loading.js</text>
+                <rect x="230" y="424" width="200" height="56" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="240" y="439" class="svg-sub">fallbacks › Redirect › Inner</text>
+                <rect x="240" y="448" width="180" height="24" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="330" y="464" text-anchor="middle" class="svg-sub" style="fill:#252525">Y/page.js</text>
+
+                <rect x="676" y="36" width="124" height="24" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="738" y="52" text-anchor="middle" class="svg-sub" style="fill:#252525">X/loading.js</text>
+                <text x="810" y="52" class="svg-sub">server → context</text>
+                <line x1="676" y1="48" x2="644" y2="48" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#fig-segment-stack-arr-blue)"/>
+                <path d="M632 60 L632 212 L548 212" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-segment-stack-arr-purple)"/>
+
+                <rect x="676" y="116" width="124" height="24" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="738" y="132" text-anchor="middle" class="svg-sub" style="fill:#252525">X/template.js</text>
+                <text x="810" y="132" class="svg-sub">or a Fragment</text>
+                <line x1="676" y1="128" x2="596" y2="128" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#fig-segment-stack-arr-blue)"/>
+
+                <rect x="676" y="172" width="124" height="24" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="738" y="188" text-anchor="middle" class="svg-sub" style="fill:#252525">X/error.js</text>
+                <line x1="676" y1="184" x2="564" y2="184" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#fig-segment-stack-arr-blue)"/>
+
+                <rect x="676" y="228" width="124" height="24" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="738" y="244" text-anchor="middle" class="svg-sub" style="fill:#252525">X/not-found.js</text>
+                <text x="810" y="244" class="svg-sub">+ forbidden, unauthorized</text>
+                <line x1="676" y1="240" x2="532" y2="240" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#fig-segment-stack-arr-blue)"/>
+
+                <rect x="660" y="290" width="330" height="80" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="674" y="310" class="svg-step">Covered by X's boundaries</text>
+                <text x="674" y="328" class="svg-sub">Layout Y, Y/page.js and all below;</text>
+                <text x="674" y="344" class="svg-sub">error.js also wraps the loading and</text>
+                <text x="674" y="360" class="svg-sub">not-found UI (docs, error.mdx)</text>
+
+                <rect x="660" y="382" width="330" height="96" rx="6" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="674" y="402" class="svg-step">Not covered: Layout X, X/template.js</text>
+                <text x="674" y="420" class="svg-sub">Both render above X's ErrorBoundary</text>
+                <text x="674" y="436" class="svg-sub">and Suspense. A throw in Layout X goes</text>
+                <text x="674" y="452" class="svg-sub">to a boundary above X; so does an</text>
+                <text x="674" y="468" class="svg-sub">await that suspends in Layout X.</text>
+
+                <rect x="660" y="490" width="330" height="80" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="674" y="510" class="svg-step">Provider key = Y's segment key</text>
+                <text x="674" y="528" class="svg-sub">browser: name|value|type, e.g. id|1|d,</text>
+                <text x="674" y="544" class="svg-sub">so /a/1 → /a/2 remounts all below it;</text>
+                <text x="674" y="560" class="svg-sub">search params are never in the key</text>
+
+                <text x="20" y="626" class="svg-note">Blue fill: emitted by the server (create-component-tree.tsx). Grey and white: built by the client LayoutRouter (layout-router.tsx:666-729).</text>
+                <text x="20" y="644" class="svg-note">Dashed purple: context, not a boundary. Thin blue: a convention file's module, passed as data. Y repeats X's stack, abbreviated.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Order and props are read from <code>layout-router.tsx</code>:666-729 and
+              <code>create-component-tree.tsx</code>:527-724 <span class="src">from the code</span>;
+              coverage matches <code>error.mdx</code> and <code>loading.mdx</code>
+              <span class="src">from the docs</span>. X and Y are placeholder folders with
+              every convention file. Not drawn: the <code>&lt;Activity&gt;</code> per
+              state key under Cache Components and the dev-only
+              <code>SegmentStateProvider</code> (:731-753). Nothing here is measured.
+            </p>
+          </figure>
+
+          <h3>The payload, twice</h3>
+          <p>
+            An HTML render produces one Flight stream and uses it twice:
+            <code>tee()</code> feeds the SSR <code>App</code> that Fizz, React's
+            server HTML renderer, renders to HTML,
+            and <code>consume()</code> is inlined into the same document as
+            <code>self.__next_f.push(…)</code> scripts
+            (<code>app-render.tsx</code>:4070-4083, 4207-4266)
+            <span class="src">from the code</span>. The hard GET of
+            <code>/sec0/a/1</code> returned 9,954 B of HTML with exactly two pushes, the
+            second holding all 5,866 B of <code>1.rsc</code>, byte-identical to the file
+            on disk (<code>e8-golden-trace.mjs</code>). Across four E3 targets, HTML was
+            1.47–1.73× its decoded payload (<code>e3-nav.mjs</code>)
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The payload is a tree of transport nodes
+            <code>{s, h, d: {r, p, v}, c}</code>: segment, hint bitmask, data (rendered
+            node, partial flag, params read) and children, a <code>Map</code> keyed by
+            slot name so keyed access does not go megamorphic
+            (<code>shared/lib/rsc-transport.ts</code>:122-146)
+            <span class="src">from the code</span>. The format is new in 16.4, from PR
+            #96439, merged 2026-08-07 <span class="src">from the docs</span>.
+          </p>
+
+          <h3>Partial rendering</h3>
+          <p>
+            A request for a dynamic target need not render from the root.
+            <code>walkTreeWithFlightRouterState</code> walks the LoaderTree beside the
+            client's <code>Next-Router-State-Tree</code>, a request header
+            carrying the client's serialized state tree (§08), and decides per
+            level,
+            <code>server/app-render/walk-tree-with-flight-router-state.tsx</code>:143-154
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>const renderComponentsOnThisLevel =
+  // No further router state available
+  !flightRouterState ||
+  // Route structure or path param changed
+  didRouteOrPathParamChange(actualSegment, flightRouterState[0]) ||
+  // Normal requests leave out the page's search params, so treat a missing
+  // value as empty. HMR requests include them.
+  (actualSegment === PAGE_SEGMENT_KEY &amp;&amp;
+    getRenderedSearch(query) !==
+      (flightRouterState[5] === undefined ? '' : flightRouterState[5])) ||
+  // Explicit refresh
+  flightRouterState[3] === 'refetch'</code></pre>
+          <p>
+            Above the first level that renders, nodes come back skipped,
+            <code>{r: null, p: true, v: null}</code> (<code>rsc-transport.ts</code>:213-215).
+            The layout is not rendered, but its module is still imported to compute
+            prefetch hints (<code>create-transport-tree-from-loader-tree.ts</code>:72-80),
+            and its <code>generateMetadata</code> still runs, because the head resolves
+            metadata over the whole tree
+            (<code>lib/metadata/resolve-metadata.ts</code>:85-86, 135-136)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>Three cases, not one</h3>
+          <p>
+            The docs say that between siblings Next.js "reuses the parent layout and only
+            fetches the updated leaf page" (<code>prefetching.mdx</code> § Client cache)
+            <span class="src">from the docs</span>. That holds for one target type of
+            three. Figure {{fig-soft-nav-cases}} draws all three on the lab build
+            with Cache Components off; that flag, <code>cacheComponents</code>,
+            changes the rendering model and is §07's subject.
+          </p>
+          <p>
+            <strong>(a) Prefetched static target.</strong> The client holds every
+            segment, so the click sends nothing: <code>/sec0/a/1</code> →
+            <code>/sec0/a/2</code> made zero requests and took 50 ms of wall time
+            (<code>e8-golden-trace.mjs</code>; zero requests also for the prefetched
+            static targets in <code>e3-nav.mjs</code>) <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <strong>(b) Unprefetched prerendered target.</strong> For a non-dynamic RSC
+            request to an SSG page, the handler deletes the Flight headers
+            (<code>build/templates/app-page-runtime.ts</code>:521-532, 724-732). Without
+            PPR (partial prerendering, §07) every RSC request is non-dynamic:
+            <code>isDynamicRSCRequest</code> starts
+            with <code>isRoutePPREnabled</code> <span class="src">from the code</span>.
+            The state tree is ignored and the cached <code>2.rsc</code> comes back whole:
+            5,866 B decoded, 1,619 B on the wire, every layout re-sent though not
+            re-executed. Without a state tree the bytes were the same, 5,866 B
+            (<code>e8-golden-trace.mjs</code>); for
+            <code>/sec0/guide/g1</code>, 5,948 B both ways, both cache HITs
+            (<code>e3b-replay.mjs</code>) <span class="recon">measured here</span>. The
+            file-system cache reads a page as one entry, with a TODO for "separate cache
+            entries for each segment"
+            (<code>server/lib/incremental-cache/file-system-cache.ts</code>:291-330)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            <strong>(c) Dynamic target.</strong> The server diffs.
+            <code>/sec0/a/2</code> → <code>/dyn</code> returned 2,602 B (978 B wire) with
+            the root skipped; without a state tree, 4,433 B. The skip saved 1,831 B, 41%.
+            A dynamic sibling under the root, <code>sec0</code> and <code>guide</code>
+            layouts fell from 5,894 B to 2,857 B, 52% (<code>e3b-replay.mjs</code>)
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            In all three the client keeps the shared <code>CacheNode</code>s, its
+            per-segment render state (§08), because
+            reuse is decided per segment on the client
+            (<code>client/components/render-tree.ts</code>:513-522)
+            <span class="src">from the code</span>. The <code>&lt;html&gt;</code> and
+            <code>sec0</code> <code>&lt;section&gt;</code> DOM nodes, tagged before the
+            click, survived even case (b) <span class="recon">measured here</span>. That
+            shows "not refetched and not remounted". "Not re-rendered" is not guaranteed
+            (§08 quotes the TODO) and was not measured.
+          </p>
+
+          <figure class="figure wide" id="fig-soft-nav-cases">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Three soft navigations: what crosses the wire, what the server renders, what the client keeps</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 494" role="img" aria-label="Three panels side by side. Panel a, a prefetched static target, /sec0/a/1 to /sec0/a/2: the click makes zero requests, the server is not contacted, the root, sec0 and a CacheNodes are reused and the [id] and page nodes are new from the client cache; html and section DOM nodes are kept; 0 bytes, 50 ms wall. Panel b, an unprefetched prerendered target, the same pair with prefetch aborted: one GET with rsc, state tree and next-url headers; the handler strips the Flight headers and serves the cached 2.rsc whole; every node is sent in full, yet the client reuses the root, sec0 and a nodes and keeps the html and section nodes; 5,866 bytes decoded, 1,619 on the wire, the same with or without a state tree. Panel c, a dynamic target, /sec0/a/2 to /dyn: walkTreeWithFlightRouterState finds the root unchanged and sends it as a skipped node with r null, then renders dyn and its page; the client reuses the root, adds dyn and the page, and removes the sec0 subtree and its section DOM node; 2,602 bytes against 4,433 without a state tree, a 41 percent saving.">
+                <defs>
+                  <marker id="fig-soft-nav-cases-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-soft-nav-cases-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+
+                <!-- panel frames -->
+                <rect x="10" y="8" width="360" height="440" rx="8" fill="#ffffff" stroke="#deded9"/>
+                <rect x="380" y="8" width="360" height="440" rx="8" fill="#ffffff" stroke="#deded9"/>
+                <rect x="750" y="8" width="360" height="440" rx="8" fill="#ffffff" stroke="#deded9"/>
+
+                <!-- ===== panel a ===== -->
+                <text x="22" y="28" class="svg-lane">(A) PREFETCHED STATIC TARGET</text>
+                <text x="22" y="46" class="svg-sub">/sec0/a/1 → /sec0/a/2 · prefetched</text>
+                <rect x="22" y="58" width="336" height="44" rx="6" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 4"/>
+                <text x="190" y="77" text-anchor="middle" class="svg-step">click: 0 requests</text>
+                <text x="190" y="94" text-anchor="middle" class="svg-sub">every segment already in the client cache</text>
+                <rect x="22" y="120" width="336" height="62" rx="6" fill="#ffffff" stroke="#deded9"/>
+                <text x="190" y="146" text-anchor="middle" class="svg-sub">server not contacted</text>
+                <text x="190" y="162" text-anchor="middle" class="svg-sub">(page segment fetched earlier by prefetch)</text>
+
+                <text x="22" y="214" class="svg-lane">SEGMENT</text>
+                <text x="130" y="214" class="svg-lane">RESPONSE</text>
+                <text x="258" y="214" class="svg-lane">CLIENT</text>
+
+                <rect x="22" y="222" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="30" y="237" class="svg-sub" style="fill:#252525">"" (root)</text>
+                <rect x="130" y="222" width="120" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="190" y="237" text-anchor="middle" class="svg-sub">not sent</text>
+                <rect x="258" y="222" width="100" height="22" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="308" y="237" text-anchor="middle" class="svg-sub">reused</text>
+
+                <rect x="22" y="250" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="30" y="265" class="svg-sub" style="fill:#252525">sec0</text>
+                <rect x="130" y="250" width="120" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="190" y="265" text-anchor="middle" class="svg-sub">not sent</text>
+                <rect x="258" y="250" width="100" height="22" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="308" y="265" text-anchor="middle" class="svg-sub">reused</text>
+
+                <rect x="22" y="278" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="30" y="293" class="svg-sub" style="fill:#252525">a</text>
+                <rect x="130" y="278" width="120" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="190" y="293" text-anchor="middle" class="svg-sub">not sent</text>
+                <rect x="258" y="278" width="100" height="22" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="308" y="293" text-anchor="middle" class="svg-sub">reused</text>
+
+                <rect x="22" y="306" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="30" y="321" class="svg-sub" style="fill:#252525">[id] = 2</text>
+                <rect x="130" y="306" width="120" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="190" y="321" text-anchor="middle" class="svg-sub">not sent</text>
+                <rect x="258" y="306" width="100" height="22" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="308" y="321" text-anchor="middle" class="svg-sub" style="fill:#252525">new · cache</text>
+
+                <rect x="22" y="334" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="30" y="349" class="svg-sub" style="fill:#252525">__PAGE__</text>
+                <rect x="130" y="334" width="120" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="190" y="349" text-anchor="middle" class="svg-sub">not sent</text>
+                <rect x="258" y="334" width="100" height="22" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="308" y="349" text-anchor="middle" class="svg-sub" style="fill:#252525">new · cache</text>
+
+                <text x="22" y="378" class="svg-sub">DOM: &lt;html&gt; kept · &lt;section&gt; kept</text>
+                <rect x="22" y="390" width="336" height="46" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="190" y="409" text-anchor="middle" class="svg-step">0 requests · 0 B · 50 ms wall</text>
+                <text x="190" y="426" text-anchor="middle" class="svg-sub">n = 1, Playwright polling included</text>
+
+                <!-- ===== panel b ===== -->
+                <text x="392" y="28" class="svg-lane">(B) UNPREFETCHED PRERENDERED TARGET</text>
+                <text x="392" y="46" class="svg-sub">/sec0/a/1 → /sec0/a/2 · prefetch aborted</text>
+                <rect x="392" y="58" width="336" height="44" rx="6" fill="#f7f7f5" stroke="#252525"/>
+                <text x="560" y="77" text-anchor="middle" class="svg-step">GET /sec0/a/2?_rsc=…</text>
+                <text x="560" y="94" text-anchor="middle" class="svg-sub">rsc: 1 · state tree · next-url: /sec0/a/1</text>
+                <line x1="560" y1="102" x2="560" y2="118" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-soft-nav-cases-arr-ink)"/>
+                <rect x="392" y="120" width="336" height="62" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="404" y="138" class="svg-sub" style="fill:#252525">isSSG &amp;&amp; isRSCRequest &amp;&amp; !isDynamicRSCRequest</text>
+                <text x="404" y="155" class="svg-sub" style="fill:#252525">→ stripFlightHeaders: state tree gone</text>
+                <text x="404" y="172" class="svg-sub" style="fill:#252525">→ cached 2.rsc, whole · x-nextjs-cache HIT</text>
+                <line x1="560" y1="182" x2="560" y2="198" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#fig-soft-nav-cases-arr-blue)"/>
+
+                <text x="392" y="214" class="svg-lane">SEGMENT</text>
+                <text x="500" y="214" class="svg-lane">RESPONSE</text>
+                <text x="628" y="214" class="svg-lane">CLIENT</text>
+
+                <rect x="392" y="222" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="400" y="237" class="svg-sub" style="fill:#252525">"" (root)</text>
+                <rect x="500" y="222" width="120" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="560" y="237" text-anchor="middle" class="svg-sub" style="fill:#252525">sent in full</text>
+                <rect x="628" y="222" width="100" height="22" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="678" y="237" text-anchor="middle" class="svg-sub">reused</text>
+
+                <rect x="392" y="250" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="400" y="265" class="svg-sub" style="fill:#252525">sec0</text>
+                <rect x="500" y="250" width="120" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="560" y="265" text-anchor="middle" class="svg-sub" style="fill:#252525">sent in full</text>
+                <rect x="628" y="250" width="100" height="22" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="678" y="265" text-anchor="middle" class="svg-sub">reused</text>
+
+                <rect x="392" y="278" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="400" y="293" class="svg-sub" style="fill:#252525">a</text>
+                <rect x="500" y="278" width="120" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="560" y="293" text-anchor="middle" class="svg-sub" style="fill:#252525">sent in full</text>
+                <rect x="628" y="278" width="100" height="22" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="678" y="293" text-anchor="middle" class="svg-sub">reused</text>
+
+                <rect x="392" y="306" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="400" y="321" class="svg-sub" style="fill:#252525">[id] = 2</text>
+                <rect x="500" y="306" width="120" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="560" y="321" text-anchor="middle" class="svg-sub" style="fill:#252525">sent in full</text>
+                <rect x="628" y="306" width="100" height="22" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="678" y="321" text-anchor="middle" class="svg-sub" style="fill:#252525">new</text>
+
+                <rect x="392" y="334" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="400" y="349" class="svg-sub" style="fill:#252525">__PAGE__</text>
+                <rect x="500" y="334" width="120" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="560" y="349" text-anchor="middle" class="svg-sub" style="fill:#252525">sent in full</text>
+                <rect x="628" y="334" width="100" height="22" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="678" y="349" text-anchor="middle" class="svg-sub" style="fill:#252525">new</text>
+
+                <text x="392" y="378" class="svg-sub">DOM: &lt;html&gt; kept · &lt;section&gt; kept</text>
+                <rect x="392" y="390" width="336" height="46" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="560" y="409" text-anchor="middle" class="svg-step">5,866 B decoded · 1,619 B wire</text>
+                <text x="560" y="426" text-anchor="middle" class="svg-sub">same bytes with or without state tree</text>
+
+                <!-- ===== panel c ===== -->
+                <text x="762" y="28" class="svg-lane">(C) DYNAMIC TARGET</text>
+                <text x="762" y="46" class="svg-sub">/sec0/a/2 → /dyn · reads cookies()</text>
+                <rect x="762" y="58" width="336" height="44" rx="6" fill="#f7f7f5" stroke="#252525"/>
+                <text x="930" y="77" text-anchor="middle" class="svg-step">GET /dyn?_rsc=…</text>
+                <text x="930" y="94" text-anchor="middle" class="svg-sub">rsc: 1 · state tree · next-url: /sec0/a/2</text>
+                <line x1="930" y1="102" x2="930" y2="118" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-soft-nav-cases-arr-ink)"/>
+                <rect x="762" y="120" width="336" height="62" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="774" y="138" class="svg-sub" style="fill:#252525">walkTreeWithFlightRouterState</text>
+                <text x="774" y="155" class="svg-sub" style="fill:#252525">"" matches the state tree → skipped</text>
+                <text x="774" y="172" class="svg-sub" style="fill:#252525">dyn ≠ sec0 → rendering starts here</text>
+                <line x1="930" y1="182" x2="930" y2="198" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#fig-soft-nav-cases-arr-blue)"/>
+
+                <text x="762" y="214" class="svg-lane">SEGMENT</text>
+                <text x="870" y="214" class="svg-lane">RESPONSE</text>
+                <text x="998" y="214" class="svg-lane">CLIENT</text>
+
+                <rect x="762" y="222" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="770" y="237" class="svg-sub" style="fill:#252525">"" (root)</text>
+                <rect x="870" y="222" width="120" height="22" rx="4" fill="#ffffff" stroke="#3c6f97" stroke-dasharray="4 3"/>
+                <text x="930" y="237" text-anchor="middle" class="svg-sub" style="fill:#252525">skipped, r: null</text>
+                <rect x="998" y="222" width="100" height="22" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1048" y="237" text-anchor="middle" class="svg-sub">reused</text>
+
+                <rect x="762" y="250" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="770" y="265" class="svg-sub" style="fill:#252525">dyn</text>
+                <rect x="870" y="250" width="120" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="930" y="265" text-anchor="middle" class="svg-sub" style="fill:#252525">rendered</text>
+                <rect x="998" y="250" width="100" height="22" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="1048" y="265" text-anchor="middle" class="svg-sub" style="fill:#252525">new</text>
+
+                <rect x="762" y="278" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="770" y="293" class="svg-sub" style="fill:#252525">__PAGE__</text>
+                <rect x="870" y="278" width="120" height="22" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="930" y="293" text-anchor="middle" class="svg-sub" style="fill:#252525">rendered</text>
+                <rect x="998" y="278" width="100" height="22" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="1048" y="293" text-anchor="middle" class="svg-sub" style="fill:#252525">new</text>
+
+                <rect x="762" y="306" width="100" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="770" y="321" class="svg-sub">old sec0 tree</text>
+                <rect x="870" y="306" width="120" height="22" rx="4" fill="#ffffff" stroke="#deded9"/>
+                <text x="930" y="321" text-anchor="middle" class="svg-sub">not sent</text>
+                <rect x="998" y="306" width="100" height="22" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="1048" y="321" text-anchor="middle" class="svg-sub" style="fill:#252525">removed</text>
+
+                <text x="762" y="378" class="svg-sub">DOM: &lt;html&gt; kept · &lt;section&gt; removed</text>
+                <rect x="762" y="390" width="336" height="46" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="930" y="409" text-anchor="middle" class="svg-step">2,602 B (978 B wire) vs 4,433 B</text>
+                <text x="930" y="426" text-anchor="middle" class="svg-sub">without a state tree: the skip saves 41%</text>
+
+                <text x="10" y="470" class="svg-note">Green: new CacheNode · grey: CacheNode reused on the client · blue: rendered output in the response · dashed blue: skipped node {r: null, p: true, v: null} · red: unmounted.</text>
+                <text x="10" y="488" class="svg-note">Thick black: the navigation request · thin blue: response data. One build, Cache Components off; bytes are decoded unless marked wire.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Bytes, request counts and DOM identity: <code>e8-golden-trace.mjs</code>, one
+              browser session per mode, plus its Node replays without a state tree
+              <span class="recon">measured here</span>. Strip rule
+              <code>app-page-runtime.ts</code>:521-532, 724-732; skip rule
+              <code>walk-tree-with-flight-router-state.tsx</code>:143-154
+              <span class="src">from the code</span>. "Reused" means the
+              <code>CacheNode</code> was kept, not that React skipped re-rendering it
+              <span class="recon">reconstruction</span>. Only panel (c) matches "only the
+              changed segment". The bytes are deterministic for the build; the 50 ms, on a
+              shared 2-vCPU container, is not.
+            </p>
+          </figure>

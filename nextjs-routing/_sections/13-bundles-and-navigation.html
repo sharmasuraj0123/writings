@@ -1,0 +1,325 @@
+          <h2 id="bundles-and-navigation"><span class="secnum">{{S}}</span>Bundles, data, rendering and navigation</h2>
+          <p class="lede">
+            §12's practices cut what a build costs. These cut what a request, a
+            hard load and a visible link cost, in the order of the walk: Proxy,
+            rendering, client code, prefetch, data, serving. Most moved a
+            number in the lab; each rests on a cited code path or doc and has a
+            case where it does not pay.
+          </p>
+
+          <h3>Proxy and config routes</h3>
+          <p>
+            Narrow the matcher, or delete <code>proxy.ts</code>. With no
+            <code>matcher</code> the build records <code>/:path*</code>
+            (<code>build/entries.ts</code>:603-607)
+            <span class="src">from the code</span>, and a no-op Proxy cost
+            +0.93 ms p50 per matched request, +39% (<code>e4-latency.mjs</code>)
+            <span class="recon">measured here</span>. Write
+            <code>'/about/:path*'</code>, not <code>'/about'</code>: the matcher
+            is end-anchored (§05). Excluding a page also excludes its Server
+            Functions (<code>proxy.mdx</code> § Execution order)
+            <span class="src">from the docs</span>.
+          </p>
+          <p>
+            Put static rules in <code>next.config</code>:
+            <code>buildCustomRoute</code> compiles each redirect, rewrite and
+            header source once into a regex and a match function
+            (<code>server/lib/router-utils/filesystem.ts</code>:137-169)
+            <span class="src">from the code</span>. Rules that read the
+            request, such as an auth cookie, still need Proxy or a layout.
+          </p>
+
+          <h3>Request APIs and rendering</h3>
+          <p>
+            Without Cache Components, keep <code>cookies()</code> and
+            <code>headers()</code> out of shared and root layouts. Both throw in
+            a <code>prerender-legacy</code> store
+            (<code>server/request/headers.ts</code>:106-115 for
+            <code>headers()</code>; §07 for the mechanism)
+            <span class="src">from the code</span>, so one call makes the route
+            dynamic; in the root layout, the whole app. The <code>cookies()</code>
+            page took 5.55 ms p50 to first byte against 2.37 ms static, and came
+            back <code>private</code> and <code>no-store</code> (<code>e4-latency.mjs</code>)
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            With Cache Components, push request reads below a
+            <code>&lt;Suspense&gt;</code> and pass promises down unawaited
+            (<code>streaming.mdx</code> § Push dynamic access
+            down) <span class="src">from the docs</span>. §07 measured the
+            trade on <code>/dyn</code>: first byte at 3.63 ms p50 against
+            6.45 ms without Cache Components, but 1.9× the time to last byte
+            and 1.9× the bytes, still <code>private</code> and
+            <code>no-store</code> (<code>e7-latency.mjs</code>)
+            <span class="recon">measured here</span>. On a tiny page the gain
+            is first byte only.
+          </p>
+          <p>
+            List prerenderable params in <code>generateStaticParams</code>: the
+            listed page answered in 2.63 ms p50, a cache <code>HIT</code>
+            (<code>e4-latency.mjs</code>) <span class="recon">measured here</span>.
+            Under Cache Components an empty list is a build error
+            (<code>build/static-paths/app.ts</code>:794-795, 811-813)
+            <span class="src">from the code</span>. The cost is per build:
+            every listed param renders on every build, warm or cold (§12).
+          </p>
+
+          <h3>Client boundaries and heavy code</h3>
+          <p>
+            The docs put <code>'use client'</code> on interactive leaves rather
+            than "large parts of your UI"
+            (<code>server-and-client-components.mdx</code> § Reducing JS bundle
+            size) <span class="src">from the docs</span>. That rule counts code,
+            not rendered output, which a hard load ships twice (§06). In the
+            lab's boundary app, whose root layout holds a 400-entry nav, moving
+            the boundary from two buttons to a client wrapper around the chrome
+            added 38,489 B (6,303 B gzip) of JS to every route, and cut the RSC
+            payload 82% and the HTML 56% (<code>e2-boundary.mjs</code>)
+            <span class="recon">measured here</span>. Figure
+            {{fig-boundary-tradeoff}} draws all three.
+          </p>
+          <p>
+            Weigh code against rendered output. In gzip, the move cost 6,303 B
+            of JS and saved 12,408 B of HTML and 12,089 B of RSC on
+            <code>/</code>. The chunk is cached across pages; the rendered rows
+            return with every hard load <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure" id="fig-boundary-tradeoff">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Three placements of <code>"use client"</code>: code against rendered output on <code>/</code></p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 516" role="img" aria-label="Grouped horizontal bars on one byte axis from 0 to 500,000, for route / of the E2 boundary app built with Turbopack, three variants per group. First-load JS from route-bundle-stats: leaf 464,114, layout-top 502,603 (plus 38,489), page-top 505,869 (plus 41,755); the framework floor on /bare is 463,816. HTML document: leaf 200,807 (gzip 23,707), layout-top 87,754 (gzip 11,299, minus 56 percent), page-top 180,671 (gzip 22,169). Inline self.__next_f flight data in that HTML, in characters: 136,601, 23,892 and 116,521. RSC payload: leaf 119,482 (gzip 14,831), layout-top 21,174 (gzip 2,742, minus 82 percent), page-top 101,548 (gzip 13,430).">
+                <text x="4" y="18" class="svg-lane">E2 BOUNDARY APP · TURBOPACK · ROUTE / · ONE BUILD PER VARIANT</text>
+
+                <rect x="4" y="30" width="14" height="12" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="24" y="40" class="svg-sub">leaf · only two buttons are client</text>
+                <rect x="330" y="30" width="14" height="12" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="350" y="40" class="svg-sub">layout-top · a client wrapper owns the chrome</text>
+                <rect x="666" y="30" width="14" height="12" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="686" y="40" class="svg-sub">page-top · leaf, plus each Article</text>
+
+                <line x1="330" y1="94" x2="330" y2="162" stroke="#deded9"/>
+                <line x1="460" y1="94" x2="460" y2="162" stroke="#deded9"/>
+                <line x1="590" y1="94" x2="590" y2="162" stroke="#deded9"/>
+                <line x1="720" y1="94" x2="720" y2="162" stroke="#deded9"/>
+                <line x1="850" y1="94" x2="850" y2="162" stroke="#deded9"/>
+                <line x1="200" y1="94" x2="200" y2="162" stroke="#b8b8b1"/>
+                <line x1="330" y1="208" x2="330" y2="276" stroke="#deded9"/>
+                <line x1="460" y1="208" x2="460" y2="276" stroke="#deded9"/>
+                <line x1="590" y1="208" x2="590" y2="276" stroke="#deded9"/>
+                <line x1="720" y1="208" x2="720" y2="276" stroke="#deded9"/>
+                <line x1="850" y1="208" x2="850" y2="276" stroke="#deded9"/>
+                <line x1="200" y1="208" x2="200" y2="276" stroke="#b8b8b1"/>
+                <line x1="330" y1="302" x2="330" y2="370" stroke="#deded9"/>
+                <line x1="460" y1="302" x2="460" y2="370" stroke="#deded9"/>
+                <line x1="590" y1="302" x2="590" y2="370" stroke="#deded9"/>
+                <line x1="720" y1="302" x2="720" y2="370" stroke="#deded9"/>
+                <line x1="850" y1="302" x2="850" y2="370" stroke="#deded9"/>
+                <line x1="200" y1="302" x2="200" y2="370" stroke="#b8b8b1"/>
+                <line x1="330" y1="396" x2="330" y2="464" stroke="#deded9"/>
+                <line x1="460" y1="396" x2="460" y2="464" stroke="#deded9"/>
+                <line x1="590" y1="396" x2="590" y2="464" stroke="#deded9"/>
+                <line x1="720" y1="396" x2="720" y2="464" stroke="#deded9"/>
+                <line x1="850" y1="396" x2="850" y2="464" stroke="#deded9"/>
+                <line x1="200" y1="396" x2="200" y2="464" stroke="#b8b8b1"/>
+                <text x="200" y="64" text-anchor="middle" class="svg-sub">0</text>
+                <text x="330" y="64" text-anchor="middle" class="svg-sub">100,000</text>
+                <text x="460" y="64" text-anchor="middle" class="svg-sub">200,000</text>
+                <text x="590" y="64" text-anchor="middle" class="svg-sub">300,000</text>
+                <text x="720" y="64" text-anchor="middle" class="svg-sub">400,000</text>
+                <text x="850" y="64" text-anchor="middle" class="svg-sub">500,000 B</text>
+
+                <!-- G1: first-load JS -->
+                <text x="4" y="90" class="svg-lane">FIRST-LOAD JS · ROUTE-BUNDLE-STATS · RAW B</text>
+                <text x="190" y="110" text-anchor="end" class="svg-sub">leaf</text>
+                <rect x="200" y="98" width="603.4" height="16" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="811" y="110" class="svg-sub" style="fill:#252525">464,114</text>
+                <text x="190" y="132" text-anchor="end" class="svg-sub">layout-top</text>
+                <rect x="200" y="120" width="653.4" height="16" fill="#ece6f3" stroke="#765b98"/>
+                <text x="795" y="132" text-anchor="end" class="svg-sub" style="fill:#252525">+38,489 B · +6,303 gzip</text>
+                <text x="861" y="132" class="svg-sub" style="fill:#252525">502,603</text>
+                <text x="190" y="154" text-anchor="end" class="svg-sub">page-top</text>
+                <rect x="200" y="142" width="657.6" height="16" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="795" y="154" text-anchor="end" class="svg-sub" style="fill:#252525">+41,755 B · +1,705 gzip</text>
+                <text x="865" y="154" class="svg-sub" style="fill:#252525">505,869</text>
+                <line x1="803" y1="94" x2="803" y2="164" stroke="#252525" stroke-width="1.2" stroke-dasharray="3 3"/>
+                <text x="797" y="178" text-anchor="end" class="svg-note">dashed: framework floor, 463,816 B on /bare (the layout alone, leaf)</text>
+
+                <!-- G2: HTML -->
+                <text x="4" y="204" class="svg-lane">HTML DOCUMENT · RAW B</text>
+                <text x="190" y="224" text-anchor="end" class="svg-sub">leaf</text>
+                <rect x="200" y="212" width="261.1" height="16" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="469" y="224" class="svg-sub" style="fill:#252525">200,807 · gzip 23,707</text>
+                <text x="190" y="246" text-anchor="end" class="svg-sub">layout-top</text>
+                <rect x="200" y="234" width="114.1" height="16" fill="#ece6f3" stroke="#765b98"/>
+                <text x="322" y="246" class="svg-sub" style="fill:#252525">87,754 · gzip 11,299 · −56%</text>
+                <text x="190" y="268" text-anchor="end" class="svg-sub">page-top</text>
+                <rect x="200" y="256" width="234.9" height="16" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="443" y="268" class="svg-sub" style="fill:#252525">180,671 · gzip 22,169</text>
+                <rect x="632" y="218" width="232" height="36" fill="#ffffff"/>
+                <text x="640" y="232" class="svg-note">Leaf: 400 nav rows rendered on the server,</text>
+                <text x="640" y="248" class="svg-note">sent as markup and again as Flight data.</text>
+
+                <!-- G3: inline flight -->
+                <text x="4" y="298" class="svg-lane">INLINE FLIGHT IN THAT HTML · CHARACTERS</text>
+                <text x="306" y="298" class="svg-sub">self.__next_f.push(…)</text>
+                <text x="190" y="318" text-anchor="end" class="svg-sub">leaf</text>
+                <rect x="200" y="306" width="177.6" height="16" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="385" y="318" class="svg-sub" style="fill:#252525">136,601</text>
+                <text x="190" y="340" text-anchor="end" class="svg-sub">layout-top</text>
+                <rect x="200" y="328" width="31.1" height="16" fill="#ece6f3" stroke="#765b98"/>
+                <text x="239" y="340" class="svg-sub" style="fill:#252525">23,892</text>
+                <text x="190" y="362" text-anchor="end" class="svg-sub">page-top</text>
+                <rect x="200" y="350" width="151.5" height="16" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="359" y="362" class="svg-sub" style="fill:#252525">116,521</text>
+
+                <!-- G4: RSC payload -->
+                <text x="4" y="392" class="svg-lane">RSC PAYLOAD FOR / · RAW B</text>
+                <text x="190" y="412" text-anchor="end" class="svg-sub">leaf</text>
+                <rect x="200" y="400" width="155.3" height="16" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="363" y="412" class="svg-sub" style="fill:#252525">119,482 · gzip 14,831</text>
+                <text x="190" y="434" text-anchor="end" class="svg-sub">layout-top</text>
+                <rect x="200" y="422" width="27.5" height="16" fill="#ece6f3" stroke="#765b98"/>
+                <text x="235" y="434" class="svg-sub" style="fill:#252525">21,174 · gzip 2,742 · −82%</text>
+                <text x="190" y="456" text-anchor="end" class="svg-sub">page-top</text>
+                <rect x="200" y="444" width="132.0" height="16" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="340" y="456" class="svg-sub" style="fill:#252525">101,548 · gzip 13,430</text>
+                <rect x="632" y="406" width="232" height="36" fill="#ffffff"/>
+                <text x="640" y="420" class="svg-note">Layout-top: the rows leave the payload;</text>
+                <text x="640" y="436" class="svg-note">their data ships in the +38,489-B chunk.</text>
+
+                <line x1="4" y1="474" x2="996" y2="474" stroke="#deded9"/>
+                <text x="4" y="490" class="svg-note">One byte axis for all four groups; inline Flight is counted in characters. Sizes are deterministic.</text>
+                <text x="4" y="506" class="svg-note">Summing &lt;script src&gt; on leaf / gives 576,708 B, of which 112,594 B is a noModule polyfill modern browsers skip.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              High boundary: more JS, much smaller payload. Leaf: less JS,
+              payload shipped twice. Sizes are from <code>e2-boundary.mjs</code>,
+              one Turbopack build per variant (webpack moved the same way);
+              first-load JS is <code>route-bundle-stats</code>
+              <span class="recon">measured here</span>. Summed
+              <code>&lt;script src&gt;</code> tags give 576,708 B for leaf, of
+              which 112,594 B is a <code>noModule</code> polyfill. The synthetic filler
+              gzips 7.6–8.5× here (HTML and RSC), so gzip deltas understate real prose. That the list is
+              cheaper as code is my reading
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            Keep heavy libraries behind a client-side <code>next/dynamic</code>
+            rendered on interaction, and import shared widgets in leaves unless
+            the whole layout uses them. Figure {{fig-what-ships}} has the
+            placements: loaded on click, the 113 KB dependency was in none of 53
+            first loads; from a section layout, in 19
+            (<code>e9-measure.mjs</code>) <span class="recon">measured here</span>.
+            Do not reach for <code>next/dynamic</code> in a Server Component: it
+            does not split there (§10; <code>lazy-loading.mdx</code>:60)
+            <span class="src">from the docs</span>. When not: UI above the fold,
+            which would then wait for its chunk after hydration, and a widget
+            every page under the layout uses, where the layout is the right
+            place <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>Prefetch and navigation</h3>
+          <p>
+            Leave <code>prefetchInlining</code> on, the default
+            (<code>server/config-shared.ts</code>:2414)
+            <span class="src">from the code</span>. On the 12-link page it sent
+            24 requests where inlining off sent 53 and 3.9% more bytes on the
+            wire. Do not
+            raise <code>maxSize</code> to pull a large layout inline: for a
+            4.4 KB layout that took the wire from 17,235 to 53,941 B
+            (<code>e7-nav.mjs</code>; §09, Figure {{fig-inlining-tradeoff}})
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Adopt Cache Components with <code>partialPrefetching</code> when many
+            links share a pattern. The shell vary path replaces non-root params
+            with <code>Fallback</code>
+            (<code>client/components/segment-cache/vary-path.ts</code>:441-463)
+            <span class="src">from the code</span>, so five links to
+            <code>/sec0/a/[id]</code> shared one shell request and the hub's
+            prefetch wire fell 41%, from 15,195 to 9,016 B. The click then cost
+            one request. When not: a page of distinct static links, where there
+            is nothing to share; the 12-link page made 23 requests against 24.
+            Without Cache Components,
+            <code>loading.tsx</code> buys an instant fallback, not a free
+            prefetch: each link still cost two uncacheable requests
+            (<code>e7-nav.mjs</code>) <span class="recon">measured here</span>.
+          </p>
+          <p>
+            On long lists of links to dynamic, cookie-reading or heavy routes,
+            use <code>prefetch={false}</code>, which in the App Router also
+            stops hover prefetch (<code>link.mdx</code> § prefetch), or the
+            docs' <code>HoverPrefetchLink</code>
+            <span class="src">from the docs</span>. A visible link also fetches
+            the target's client chunks: 55,806 B gzipped for the heavy route.
+            When not: static targets people are likely to click. They lose the
+            zero-request click, and with prefetch blocked the heavy route's
+            click became a waterfall, 1,604 B of RSC and then the chunk it named
+            (<code>e9-nav.mjs</code>) <span class="recon">measured here</span>.
+            Without Cache Components, <code>prefetch={true}</code> becomes
+            <code>FetchStrategy.Full</code>, pulling dynamic data into the
+            prefetch (<code>client/app-dir/link.tsx</code>:808-827). Interception
+            appends <code>next-url</code> to <code>Vary</code>
+            (<code>server/base-server.ts</code>:2359-2386)
+            <span class="src">from the code</span>, and the intercepted
+            navigation was a <code>no-store</code> render of 2,687 B decoded
+            (<code>e3-nav.mjs</code>) <span class="recon">measured here</span>;
+            use it where the modal earns that.
+          </p>
+
+          <h3>Data</h3>
+          <p>
+            Keep layouts stable and data-light. A layout cannot pass data to its
+            children, so fetch again in the child (<code>layout.mdx</code>
+            § Fetching Data) <span class="src">from the docs</span>. The repeat
+            is free within a request: <code>createDedupeFetch</code> keys GET and
+            HEAD calls in a <code>React.cache</code>, except calls with a
+            <code>signal</code> or <code>keepalive</code>
+            (<code>server/lib/dedupe-fetch.ts</code>:44-89)
+            <span class="src">from the code</span>. Start independent requests
+            together with <code>Promise.all</code>, and do not call your own
+            Route Handler from a Server Component (<code>fetching-data.mdx</code>,
+            <code>production-checklist.mdx</code>)
+            <span class="src">from the docs</span>. Not measured here. When
+            not: an auth check. A layout the next URL shares does not run again
+            on a soft navigation, in any of §06's three cases, so a session
+            check there misses route changes; put it
+            in the page or the data layer (<code>authentication.mdx</code>
+            § Layouts and auth checks) <span class="src">from the docs</span>.
+          </p>
+
+          <h3>Serving</h3>
+          <p>
+            Decide <code>preloadEntriesOnStart</code> by traffic. On the
+            401-route build it made an immediate first request take 1,242 ms
+            median instead of 394 ms, and saved about 100 ms only after 4 s of
+            idle (§05; <code>e8-cold-prof.mjs</code>,
+            <code>e8-preload-tradeoff.mjs</code>)
+            <span class="recon">measured here</span>. Turn it off where traffic
+            arrives at boot.
+          </p>
+          <p>
+            The default cache for incremental static regeneration (ISR) is
+            per instance: 50 MB in memory
+            (<code>server/config-shared.ts</code>:2304)
+            <span class="src">from the code</span>, plus local disk (§05, §07). For several instances, set
+            <code>cacheHandler</code>
+            with <code>cacheMaxMemorySize: 0</code>, and
+            <code>cacheHandlers</code> for <code>'use cache'</code>
+            (<code>self-hosting.mdx</code> § Configuring Caching). Behind a CDN,
+            forward <code>rsc</code> and keep <code>_rsc</code> in the cache key;
+            <code>revalidatePath</code> does not purge the CDN
+            (<code>cdn-caching.mdx</code>) <span class="src">from the docs</span>.
+            Load fonts and scripts in the layout that needs them; font preloads
+            are keyed by its file path
+            (<code>server/app-render/get-preloadable-fonts.tsx</code>:11-41)
+            <span class="src">from the code</span>. When not: assets every page
+            uses, which belong in the root layout.
+          </p>
