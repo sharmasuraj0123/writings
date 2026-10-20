@@ -1,0 +1,283 @@
+          <h2 id="here-documents"><span class="secnum">{{S}}</span>Here-documents: a queue drained at the newline</h2>
+          <p class="lede">
+            Here-document bodies are not tokens and not grammar. bash queues the
+            redirect when the grammar reduces <code>&lt;&lt; WORD</code>, and reads
+            the bodies raw, in order, when the lexer is about to hand the parser
+            the next unquoted newline. Every working implementation converged on
+            that FIFO. The edge cases are where they diverge.
+          </p>
+
+          <h3>Queued at the reduce, drained at the newline</h3>
+          <p>
+            Only the <code>&lt;&lt;</code> and <code>&lt;&lt;-</code> productions
+            call <code>push_heredoc</code>; here-strings do not
+            (<code>bash/parse.y</code>:622-681). <code>push_heredoc</code> appends
+            the REDIRECT to <code>redir_stack</code>, which holds
+            <code>HEREDOC_MAX</code> = 16 entries (<code>bash/shell.h</code>:172).
+            The 17th is a fatal syntax error that calls <code>exit_shell</code>
+            (<code>bash/parse.y</code>:3106-3117) <span class="src">from the code</span>.
+            Seventeen <code>cat &lt;&lt;E<i>n</i>;</code> on one line print
+            "maximum here-document count exceeded" and exit 2
+            <span class="recon">measured here</span>.
+            <code>gather_here_documents</code> walks the stack from index 0 and
+            calls <code>make_here_document</code> on each entry with
+            <code>PST_HEREDOC</code> set (<code>bash/parse.y</code>:3120-3136).
+            Its main caller is <code>read_token</code>, just before it returns a
+            newline (<code>bash/parse.y</code>:3646-3651)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>  if MBTEST(character == '\n')
+    {
+      /* If we're about to return an unquoted newline, we can go and collect
+	 the text of any pending here document. */
+      if (need_here_doc)
+	gather_here_documents ();</code></pre>
+          <p>
+            Backstops: the <code>compound_list</code> and
+            <code>simple_list</code> actions
+            (<code>bash/parse.y</code>:1265-1266, 1343-1344, 1362, 1377), and so do
+            <code>parse_comsub</code> (4566) and <code>parse_command</code> after
+            <code>yyparse</code> returns (<code>bash/eval.c</code>:371-372)
+            <span class="src">from the code</span>. Trace (c) shows which fires
+            first. Rule 26 reduces <code>LESS_LESS WORD</code>; the next token,
+            <code>';'</code>, shows <code>need_here_doc=1</code> on line 1, no body
+            read. Inside the <code>$( )</code> the count reads 0 (§07 owns that
+            save). After the comsub word, <code>read_token</code> gathers before
+            returning the outer newline (<code>lab/results/trace-c.txt</code>, lines 337-338)
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>LAB HEREDOC gather_here_documents need_here_doc=1 line=1
+LAB LEX tok='\n'(10) last_read_token=WORD token_before_that=WORD two_tokens_ago=';'
+        parser_state=0x0{} need_here_doc=0 line=3</code></pre>
+          <p>
+            (The second line is wrapped.) The line counter jumps from 1 to 3
+            between them: the parser gets <code>'\n'</code> only after both body
+            lines are consumed. Figure {{fig-heredoc-timeline}} lays this out.
+          </p>
+
+          <figure class="figure wide" id="fig-heredoc-timeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Trace (c): the body is read between the last word of line 1 and its newline token</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 560" width="100%" role="img" aria-label="Three input lines across the top: line 1 cat &lt;&lt;A; echo $(case x in x) echo y;; esac), line 2 a body line, line 3 A. Below, six events in order: rule 26 reduces &lt;&lt;A and push_heredoc sets need_here_doc to 1; the parser keeps reading line 1; parse_comsub runs a nested parse with need_here_doc saved at 0; the comsub returns one WORD and the count is 1 again; read_token is about to return the newline and calls gather_here_documents, which reads lines 2 and 3 raw; the newline token reaches yyparse with the line counter at 3. A state lane plots need_here_doc. Bottom left lists the callers of gather_here_documents; bottom right explains the EOF) compatibility branch.">
+                <defs>
+                  <marker id="fig-heredoc-timeline-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-heredoc-timeline-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+
+                <!-- input lines -->
+                <text x="10" y="34" class="svg-lane">INPUT</text>
+                <text x="10" y="48" class="svg-sub">c.sh</text>
+                <rect x="130" y="16" width="470" height="44" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="140" y="32" class="svg-lane">LINE 1</text>
+                <text x="140" y="50" class="svg-sub">cat &lt;&lt;A; echo $(case x in x) echo y;; esac)⏎</text>
+                <rect x="616" y="16" width="330" height="44" rx="5" fill="#f7f7f5" stroke="#3c6f97"/>
+                <text x="626" y="32" class="svg-lane">LINE 2 · BODY</text>
+                <text x="626" y="50" class="svg-sub">body line $HOME-not-expanded? no: expanded⏎</text>
+                <rect x="962" y="16" width="140" height="44" rx="5" fill="#f7f7f5" stroke="#3c6f97"/>
+                <text x="972" y="32" class="svg-lane">LINE 3</text>
+                <text x="972" y="50" class="svg-sub">A⏎</text>
+
+                <!-- bytes edges -->
+                <path d="M200 60 L200 98" fill="none" stroke="#3c6f97" stroke-width="1.1" marker-end="url(#fig-heredoc-timeline-blue)"/>
+                <path d="M420 60 L520 98" fill="none" stroke="#3c6f97" stroke-width="1.1" marker-end="url(#fig-heredoc-timeline-blue)"/>
+                <path d="M780 60 L840 98" fill="none" stroke="#3c6f97" stroke-width="1.1" marker-end="url(#fig-heredoc-timeline-blue)"/>
+                <path d="M1030 60 L890 98" fill="none" stroke="#3c6f97" stroke-width="1.1" marker-end="url(#fig-heredoc-timeline-blue)"/>
+                <text x="640" y="88" class="svg-sub" fill="#3c6f97">read_a_line → yy_getc</text>
+
+                <!-- events -->
+                <text x="10" y="128" class="svg-lane">EVENTS</text>
+                <text x="10" y="142" class="svg-sub">in order</text>
+                <g>
+                  <rect x="130" y="100" width="150" height="100" rx="6" fill="#dfede5" stroke="#367f59"/>
+                  <text x="140" y="118" class="svg-num">1</text><text x="152" y="118" class="svg-step">&lt;&lt;A reduced</text>
+                  <text x="140" y="138" class="svg-sub">rule 26 action:</text>
+                  <text x="140" y="154" class="svg-sub">push_heredoc</text>
+                  <text x="140" y="170" class="svg-sub">redir_stack[0]</text>
+                  <text x="140" y="186" class="svg-sub">no body read</text>
+
+                  <rect x="292" y="100" width="150" height="100" rx="6" fill="#dfede5" stroke="#367f59"/>
+                  <text x="302" y="118" class="svg-num">2</text><text x="314" y="118" class="svg-step">';' and echo</text>
+                  <text x="302" y="138" class="svg-sub">tokens of line 1</text>
+                  <text x="302" y="154" class="svg-sub">keep coming;</text>
+                  <text x="302" y="170" class="svg-sub">parser shifts</text>
+
+                  <rect x="454" y="100" width="150" height="100" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                  <text x="464" y="118" class="svg-num">3</text><text x="476" y="118" class="svg-step">$( ) parse</text>
+                  <text x="464" y="138" class="svg-sub">parse_comsub:</text>
+                  <text x="464" y="154" class="svg-sub">nested yyparse;</text>
+                  <text x="464" y="170" class="svg-sub">count saved,</text>
+                  <text x="464" y="186" class="svg-sub">0 inside (§07)</text>
+
+                  <rect x="616" y="100" width="150" height="100" rx="6" fill="#dfede5" stroke="#367f59"/>
+                  <text x="626" y="118" class="svg-num">4</text><text x="638" y="118" class="svg-step">comsub returns</text>
+                  <text x="626" y="138" class="svg-sub">one WORD of text</text>
+                  <text x="626" y="154" class="svg-sub">count restored</text>
+                  <text x="626" y="170" class="svg-sub">to 1</text>
+
+                  <rect x="778" y="100" width="150" height="100" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                  <text x="788" y="118" class="svg-num">5</text><text x="800" y="118" class="svg-step">'\n' is next</text>
+                  <text x="788" y="138" class="svg-sub">read_token calls</text>
+                  <text x="788" y="154" class="svg-sub">gather_here_</text>
+                  <text x="788" y="170" class="svg-sub">documents: lines</text>
+                  <text x="788" y="186" class="svg-sub">2-3 read raw</text>
+
+                  <rect x="940" y="100" width="162" height="100" rx="6" fill="#dfede5" stroke="#367f59"/>
+                  <text x="950" y="118" class="svg-num">6</text><text x="962" y="118" class="svg-step">'\n' to yyparse</text>
+                  <text x="950" y="138" class="svg-sub">body is the redirect</text>
+                  <text x="950" y="154" class="svg-sub">word; rule 62</text>
+                  <text x="950" y="170" class="svg-sub">reduces next</text>
+                </g>
+                <path d="M280 150 L290 150" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-heredoc-timeline-ink)"/>
+                <path d="M442 150 L452 150" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-heredoc-timeline-ink)"/>
+                <path d="M604 150 L614 150" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-heredoc-timeline-ink)"/>
+                <path d="M766 150 L776 150" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-heredoc-timeline-ink)"/>
+                <path d="M928 150 L938 150" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-heredoc-timeline-ink)"/>
+
+                <!-- state lane: need_here_doc -->
+                <text x="10" y="246" class="svg-lane">STATE</text>
+                <text x="10" y="260" class="svg-sub">need_here_doc</text>
+                <text x="118" y="230" text-anchor="end" class="svg-sub">1</text>
+                <text x="118" y="270" text-anchor="end" class="svg-sub">0</text>
+                <path d="M130 266 L270 266 L270 226 L470 226 L470 266 L620 266 L620 226 L800 226 L800 266 L1102 266" fill="none" stroke="#765b98" stroke-width="2" stroke-dasharray="5 4"/>
+                <text x="290" y="220" class="svg-sub" fill="#765b98">1: one REDIRECT queued</text>
+                <text x="480" y="284" class="svg-sub" fill="#765b98">0 in the nested parse</text>
+                <text x="820" y="284" class="svg-sub" fill="#765b98">0: queue drained</text>
+
+                <!-- line counter -->
+                <text x="10" y="318" class="svg-lane">LINE_NUMBER</text>
+                <path d="M130 314 L1102 314" fill="none" stroke="#deded9"/>
+                <text x="140" y="308" class="svg-sub">1</text>
+                <text x="700" y="308" class="svg-sub">1</text>
+                <text x="800" y="308" class="svg-sub">1 → 3</text>
+                <text x="950" y="308" class="svg-sub">3</text>
+
+                <!-- callers panel -->
+                <rect x="10" y="342" width="520" height="206" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="24" y="364" class="svg-lane">CALLERS OF GATHER_HERE_DOCUMENTS</text>
+                <rect x="24" y="376" width="492" height="38" rx="5" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="34" y="392" class="svg-step">read_token, before an unquoted '\n'</text>
+                <text x="34" y="407" class="svg-sub">parse.y:3646-3651 · the one that fires in trace (c)</text>
+                <text x="34" y="438" class="svg-step">compound_list, simple_list actions</text>
+                <text x="34" y="453" class="svg-sub">parse.y:1265-1266, 1343-1344, 1362, 1377</text>
+                <text x="34" y="480" class="svg-step">parse_comsub, bodies left at the inner end</text>
+                <text x="34" y="495" class="svg-sub">parse.y:4563-4567 · "1 unterminated here-document"</text>
+                <text x="34" y="522" class="svg-step">parse_command, after yyparse returns</text>
+                <text x="34" y="537" class="svg-sub">eval.c:371-372</text>
+
+                <!-- inset: EOF) branch -->
+                <rect x="546" y="342" width="556" height="206" rx="8" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="560" y="364" class="svg-lane">INSET · THE EOF) BRANCH IN MAKE_HERE_DOCUMENT</text>
+                <text x="560" y="388" class="svg-sub">inside $( ), a body line that starts with the delimiter</text>
+                <text x="560" y="404" class="svg-sub">and contains shell_eof_token ')' ends the body</text>
+                <text x="560" y="428" class="svg-sub">shell_ungets (line + redir_len): the rest goes back</text>
+                <text x="560" y="444" class="svg-sub">to the lexer, which then sees the closing )</text>
+                <text x="560" y="468" class="svg-sub">full_line = 0 is set to break the loop, so line 626</text>
+                <text x="560" y="484" class="svg-sub">warns "delimited by end-of-file" though one was found</text>
+                <text x="560" y="512" class="svg-step">x=$(cat &lt;&lt;EOF⏎hi⏎EOF)  →  warning, then [hi]</text>
+                <text x="560" y="534" class="svg-note">CHANGES 5.1: "no longer allow"; 5.3 still accepts it</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The body is consumed while the parser waits for one token. Events,
+              <code>need_here_doc</code> and the 1 → 3 jump are from
+              <code>lab/results/trace-c.txt</code> (instrumented bash@9c46586) <span class="recon">measured here</span>.
+              The caller list and the inset are read from <code>bash/parse.y</code>,
+              <code>eval.c</code> and <code>make_cmd.c</code>:605-627
+              <span class="src">from the code</span>. Green: grammar-side events;
+              purple: the nested parse; orange: the gather. Thick black is event order,
+              thin blue bytes, dashed purple <code>need_here_doc</code>. Red marks
+              the compatibility branch.
+            </p>
+          </figure>
+
+          <h3>Reading a body</h3>
+          <p>
+            <code>read_secondary_line</code> points the prompt at PS2 and calls
+            <code>read_a_line</code>, which takes characters from
+            <code>yy_getc</code> directly. The line buffer of §02 is bypassed
+            (<code>bash/parse.y</code>:2197-2345). Any quoting in the delimiter
+            clears expansion: <code>delim_unquoted</code> tests
+            <code>W_QUOTED</code> (<code>bash/make_cmd.c</code>:533), so
+            <code>E"N"D</code> counts as quoted. <code>&lt;&lt;-</code> strips
+            leading tabs only. The terminator must match exactly and be followed by
+            a newline (<code>bash/make_cmd.c</code>:587-603)
+            <span class="src">from the code</span>. So <code>EOFX</code>, and
+            <code>EOF</code> with two trailing spaces, are body text; bash 5.3.9
+            prints both back <span class="recon">measured here</span>. Running to
+            end of file is a warning (<code>bash/make_cmd.c</code>:626-627), and
+            POSIX permits that. The shell "should, but need not, treat this as a
+            redirection error" (XCU §2.7.4). POSIX frames bodies as a second
+            "major mode": "one or more of the subsequent lines immediately following
+            the next NEWLINE token form the body" (XCU §2.3)
+            <span class="src">from the docs</span>.
+          </p>
+
+          <h3>The EOF) branch</h3>
+          <p>
+            One compatibility branch survives in the body loop,
+            <code>bash/make_cmd.c</code>:605-611 <span class="src">from the code</span>:
+          </p>
+<pre><code>      /* Backwards compatibility here */
+      if (STREQN (line, redir_word, redir_len) &amp;&amp; (parser_state &amp; PST_EOFTOKEN) &amp;&amp; shell_eof_token &amp;&amp; strchr (line+redir_len, shell_eof_token))
+	{
+	  shell_ungets (line + redir_len);
+	  full_line = 0;
+	  break;
+	}</code></pre>
+          <p>
+            Inside <code>$( )</code>, <code>shell_eof_token</code> is
+            <code>')'</code> (§07); a line starting with the delimiter and
+            containing it ends the body. The rest is pushed back with
+            <code>shell_ungets</code>, whose only caller is this branch
+            (<code>bash/parse.y</code>:2924-2973). Setting
+            <code>full_line = 0</code> breaks the loop and also trips the
+            end-of-file warning at line 626. bash CHANGES for 5.1 reads "Changed
+            here-document parsing to no longer allow the end of the here document
+            to delimit a command substitution" (<code>bash/CHANGES</code>:1812-1813)
+            <span class="src">from the docs</span>. The code still accepts it: the
+            entry did not remove the form. On 5.3.9
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>x=$(cat &lt;&lt;EOF ⏎ hi ⏎ EOF) ; echo "[$x]"
+  → warning: here-document at line 1 delimited by end-of-file (wanted `EOF')
+  → [hi]
+echo "[$(cat &lt;&lt;EOF)]" ⏎ hi ⏎ EOF
+  → warning: command substitution: 1 unterminated here-document
+  → [hi]</code></pre>
+          <p>
+            The second case is the <code>parse_comsub</code> backstop: bodies
+            still pending when the inner parse ends are read from the outer input
+            (<code>bash/parse.y</code>:4563-4567) <span class="src">from the code</span>.
+          </p>
+
+          <h3>One algorithm, different edges</h3>
+          <p>
+            mvdan/sh keeps a FIFO and drains it when its lexer emits a newline
+            (<code>sh/syntax/parser.go</code>:779-815). OSH fills a pending list at
+            the next <code>Op_Newline</code> (<code>oils/osh/cmd_parse.py</code>:660-686).
+            ShellCheck reads bodies inside its <code>linefeed</code> combinator
+            (<code>shellcheck/src/ShellCheck/Parser.hs</code>:60-66). brush's
+            tokenizer reorders tokens so each body follows its tag
+            (<code>brush/brush-parser/src/tokenizer.rs</code>:513-648). tree-sitter's
+            generated parser hands context-sensitive tokens to a hand-written C
+            hook, its external scanner (§12); that scanner keeps a stack of
+            pending tags and ends a body on a prefix match. Its <code>heredoc_redirect</code> rule swallows the rest of the
+            line, so two here-docs on one line have no derivation
+            (<code>tree-sitter-bash/src/scanner.c</code>:226-244,
+            <code>grammar.js</code>:542-557) <span class="src">from the code</span>.
+            OSH got there after Andy Chu retracted a 2016 tree walk:
+            "In retrospect, this is the obvious algorithm.  I was being too clever."
+            (oilshell.org/blog/2017/11/28.html) <span class="src">from the docs</span>.
+          </p>
+          <p>
+            On <code>EOF</code> with two trailing spaces, bash keeps reading body text. OSH 0.38.0 ends the body there and runs
+            the next <code>EOF</code> as a command. ShellCheck v0.11.0 ends it with
+            SC1118, and brush rejects the script. tree-sitter rejects both two-on-a-line
+            forms (E1 rows hd02, hd03) <span class="recon">measured here</span>
+            (<code>lab/results/e1-matrix.csv</code>). Unterminated bodies and the
+            other here-doc rows are in §13, where they form the largest group of
+            disagreements.
+          </p>

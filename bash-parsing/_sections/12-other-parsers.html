@@ -1,0 +1,407 @@
+          <h2 id="other-parsers"><span class="secnum">{{S}}</span>Six other ways to write a shell parser</h2>
+          <p class="lede">
+            Every shell parser answers two questions. Who owns the lexer's context? When
+            is each sub-language parsed: <code>$( )</code>, arithmetic, <code>${ }</code>,
+            here-doc bodies, aliases? Bash answers shared globals, and late, as text. The
+            answers predict what each parser accepts and costs (§13).
+          </p>
+
+          <h3>Lineage</h3>
+          <p>
+            Thompson's V6 shell read a whole line into words, then parsed
+            (Research-V6:<code>usr/source/s2/sh.c</code>:152-163)
+            <span class="src">from the code</span>: the last clean lex-then-parse split.
+            Nothing depended on position; <code>if</code> and
+            <code>goto</code> were separate programs <span class="src">from the docs</span>
+            (Wikipedia, "Thompson shell"). Bourne's V7 <code>sh</code> (version string 1978-11-06) is recursive descent
+            in C, dressed as ALGOL 68 by <code>mac.h</code>. <code>term()</code> does <code>reserv++</code>, and <code>word()</code> checks keywords only while <code>reserv</code> is set,
+            clearing it after every token
+            (Research-V7:<code>usr/src/cmd/sh/word.c</code>:45-67, <code>cmd.c</code>:128-142).
+            <code>comsubst()</code> parsed backquoted text during expansion
+            (<code>macro.c</code>:168-185) <span class="src">from the code</span>. Tom Duff wrote that "nobody really knows what the Bourne shell's grammar is",
+            because its routines "all have a flag argument that subtly changes their
+            operation" (doc.cat-v.org/plan_9/4th_edition/papers/rc). KornShell
+            contributed <code>$( )</code>, <code>(( ))</code>, <code>[[ ]]</code> and
+            <code>;&amp;</code>. POSIX.2 published the first grammar in 1992 (XRAT
+            §C.2.6.4, §C.2.9.4; <code>bash/POSIX</code>:12-19) <span class="src">from the docs</span>. Figure {{fig-technique-map}} places
+            the six beside bash and V7.
+          </p>
+
+          <figure class="figure wide" id="fig-technique-map">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Who owns lexer context, and when sub-languages are parsed</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 500" width="100%" role="img" aria-label="Two-dimensional map. The horizontal axis is who owns lexer context, in five columns: shared globals, parser-set flag or field, mode argument per call, generated valid-symbol mask, and none. The vertical axis is when sub-languages are parsed: late and as text at the top, eager into a typed tree at the bottom. Top band: GNU bash (LALR(1) plus hand lexer, 0.186 seconds for 100,000 lines) and V7 sh (recursive descent, not measured) in the shared-globals column; brush (tokenizer plus PEG, 0.865 seconds) in the none column. On the boundary: dash (recursive descent with checkkwd, 0.054 seconds). Bottom band: mvdan/sh (streaming recursive descent, no backtracking, 0.373 seconds parse and print), Oils OSH (modal lexer plus Pratt, 1.52 seconds), tree-sitter-bash (GLR plus external scanner, 1.76 seconds), ShellCheck (Parsec, scannerless, 121.8 seconds full lint). Blue nodes execute scripts, green nodes are editor or linter tooling, mvdan is half blue and half purple because it is a formatter with an interpreter.">
+                <defs>
+                  <linearGradient id="fig-technique-map-half" x1="0" y1="0" x2="1" y2="0">
+                    <stop offset="0.5" stop-color="#e0ebf2"/><stop offset="0.5" stop-color="#ece6f3"/>
+                  </linearGradient>
+                </defs>
+                <!-- bands -->
+                <rect x="150" y="20" width="955" height="190" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="150" y="270" width="955" height="130" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="15" y="40" class="svg-lane">LATE,</text>
+                <text x="15" y="56" class="svg-lane">AS TEXT</text>
+                <text x="15" y="76" class="svg-sub">bodies kept as</text>
+                <text x="15" y="91" class="svg-sub">strings, parsed</text>
+                <text x="15" y="106" class="svg-sub">at expansion</text>
+                <text x="15" y="232" class="svg-lane">MIXED</text>
+                <text x="15" y="290" class="svg-lane">EAGER,</text>
+                <text x="15" y="306" class="svg-lane">TYPED TREE</text>
+                <text x="15" y="326" class="svg-sub">sub-languages</text>
+                <text x="15" y="341" class="svg-sub">parsed into</text>
+                <text x="15" y="356" class="svg-sub">nodes up front</text>
+                <!-- column guides -->
+                <line x1="340" y1="20" x2="340" y2="400" stroke="#deded9" stroke-dasharray="3 4"/>
+                <line x1="530" y1="20" x2="530" y2="400" stroke="#deded9" stroke-dasharray="3 4"/>
+                <line x1="720" y1="20" x2="720" y2="400" stroke="#deded9" stroke-dasharray="3 4"/>
+                <line x1="910" y1="20" x2="910" y2="400" stroke="#deded9" stroke-dasharray="3 4"/>
+                <!-- bash -->
+                <rect x="159" y="36" width="172" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="169" y="56" class="svg-step">GNU bash</text>
+                <text x="169" y="75" class="svg-sub">LALR(1) + hand lexer</text>
+                <text x="169" y="94" class="svg-sub">100k: 0.186 s</text>
+                <!-- V7 -->
+                <rect x="159" y="124" width="172" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="169" y="144" class="svg-step">V7 sh (Bourne)</text>
+                <text x="169" y="163" class="svg-sub">recursive descent</text>
+                <text x="169" y="182" class="svg-sub">not measured</text>
+                <!-- brush -->
+                <rect x="919" y="80" width="176" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="929" y="100" class="svg-step">brush</text>
+                <text x="929" y="119" class="svg-sub">tokenizer + PEG</text>
+                <text x="929" y="138" class="svg-sub">100k: 0.865 s</text>
+                <!-- dash on boundary -->
+                <rect x="349" y="205" width="172" height="70" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="359" y="225" class="svg-step">dash</text>
+                <text x="359" y="244" class="svg-sub">RD + checkkwd; $( )</text>
+                <text x="359" y="263" class="svg-sub">tree · 100k: 0.054 s</text>
+                <!-- bottom band -->
+                <rect x="349" y="300" width="172" height="78" rx="6" fill="url(#fig-technique-map-half)" stroke="#765b98" stroke-width="1.5"/>
+                <text x="359" y="320" class="svg-step">mvdan/sh (shfmt)</text>
+                <text x="359" y="339" class="svg-sub">streaming RD,</text>
+                <text x="359" y="354" class="svg-sub">no backtracking</text>
+                <text x="359" y="370" class="svg-sub">100k: 0.373 s *</text>
+                <rect x="539" y="300" width="172" height="78" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="549" y="320" class="svg-step">Oils / OSH</text>
+                <text x="549" y="339" class="svg-sub">modal lexer</text>
+                <text x="549" y="354" class="svg-sub">+ Pratt arithmetic</text>
+                <text x="549" y="370" class="svg-sub">100k: 1.52 s</text>
+                <rect x="729" y="300" width="172" height="78" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="739" y="320" class="svg-step">tree-sitter-bash</text>
+                <text x="739" y="339" class="svg-sub">GLR + external</text>
+                <text x="739" y="354" class="svg-sub">scanner</text>
+                <text x="739" y="370" class="svg-sub">100k: 1.76 s</text>
+                <rect x="919" y="300" width="176" height="78" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="929" y="320" class="svg-step">ShellCheck</text>
+                <text x="929" y="339" class="svg-sub">Parsec,</text>
+                <text x="929" y="354" class="svg-sub">scannerless</text>
+                <text x="929" y="370" class="svg-sub">100k: 121.8 s *</text>
+                <!-- x axis -->
+                <line x1="150" y1="414" x2="1105" y2="414" stroke="#252525" stroke-width="1.2"/>
+                <text x="159" y="434" class="svg-sub">shared globals</text>
+                <text x="349" y="434" class="svg-sub">parser-set flag</text>
+                <text x="349" y="449" class="svg-sub">or field</text>
+                <text x="539" y="434" class="svg-sub">mode argument</text>
+                <text x="539" y="449" class="svg-sub">on every call</text>
+                <text x="729" y="434" class="svg-sub">generated mask of</text>
+                <text x="729" y="449" class="svg-sub">valid symbols</text>
+                <text x="919" y="434" class="svg-sub">none: scannerless or</text>
+                <text x="919" y="449" class="svg-sub">tokenize everything</text>
+                <text x="159" y="478" class="svg-lane">WHO OWNS LEXER CONTEXT →</text>
+                <text x="600" y="478" class="svg-note">* shfmt times parse + print; ShellCheck has no parse-only mode</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Blue executes scripts, green is editor and linter tooling; mvdan/sh is half
+              purple, a formatter with an interpreter beside it. Placement is a
+              reconstruction from the code cited below. Times are E2 medians for 100,000
+              lines (<code>lab/results/e2-summary.csv</code>; 5 runs after a warm-up,
+              ShellCheck 3 without) using shfmt v3.14.1, brush 0.4.0, Oils 0.38.0 and
+              ShellCheck v0.11.0 releases, on one shared 2-vCPU VM where differences
+              under ~20% are noise.
+            </p>
+          </figure>
+
+          <h3>dash: a flag channel</h3>
+          <p>
+            dash keeps the V7 shape: one C function per level, <code>list</code>,
+            <code>andor</code>, <code>pipeline</code>, <code>command</code>,
+            <code>simplecmd</code> (dash <code>src/parser.c</code>:116-120, master
+            49f04dd). Before each <code>readtoken()</code> the parser sets a three-bit
+            <code>checkkwd</code>, <code>CHKALIAS|CHKKWD|CHKNL</code>, keyword before
+            alias (<code>src/parser.h</code>:72-74;
+            <code>src/parser.c</code>:181-182). Unlike bash, it parses <code>$( )</code>
+            with a recursive <code>list(2)</code> at lex time and keeps the tree
+            (<code>src/parser.c</code>:1523-1636) <span class="src">from the code</span>.
+            It is the fastest parser measured, 0.054 s for 100,000 lines, peak RSS
+            flat at 1.7-2.5 MiB. It accepts 101 of 148 tricky inputs, rejecting mostly
+            bash extensions <span class="recon">measured here</span>.
+          </p>
+
+          <h3>mvdan/sh: the parser tells the lexer</h3>
+          <p>
+            mvdan/sh is streaming, non-backtracking recursive descent in Go over an
+            <code>io.Reader</code>, read in 1 KiB chunks (<code>bufSize = 1 &lt;&lt; 10</code>,
+            <code>sh/syntax/parser.go</code>:575). The parser sets <code>p.quote</code>
+            to one of 21 single-bit states, and <code>preNested</code> saves it around
+            nested constructs, the job <code>save_parser_state</code> does in bash
+            (<code>sh/syntax/parser.go</code>:681-741; … marks omitted states, comments and masks):
+          </p>
+<pre><code>type quoteState uint32
+
+const (
+	// The initial state of the parser.
+	noState quoteState = 1 &lt;&lt; iota
+	…
+	subCmd
+	subCmdBckquo
+	…
+	dblQuotes
+	hdocWord
+	hdocBody
+	…
+	arithmExpr
+	…
+	switchCase
+	…
+)
+…
+func (p *Parser) preNested(quote quoteState) (s saveState) {
+	s.quote, s.buriedHdocs = p.quote, p.buriedHdocs
+	p.buriedHdocs, p.quote = len(p.heredocs), quote
+	return s
+}</code></pre>
+          <p>
+            Keywords are plain <code>_LitWord</code>s, interpreted only at statement
+            start by <code>gotStmtPipe</code> (2245-2323)
+            <span class="src">from the code</span>. The README states the price: "<code>$((</code>
+            and <code>((</code> ambiguity is not supported. Backtracking would complicate
+            the parser and make streaming support via <code>io.Reader</code> impossible"
+            (<code>sh/README.md</code>:71-78) <span class="src">from the docs</span>. So
+            <code>((echo a); echo b)</code>, two subshells in bash, fails in shfmt v3.14.1
+            with "not a valid arithmetic operator" <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Oils/OSH: the mode is an argument</h3>
+          <p>
+            OSH's lexer stores no mode. The caller passes it on every call
+            (<code>oils/frontend/lexer.py</code>:336-349, the first 14 lines of
+            <code>Read</code>):
+          </p>
+<pre><code>    def Read(self, lex_mode):
+        # type: (lex_mode_t) -&gt; Token
+
+        # Inner loop optimization
+        if self.src_line:
+            line_str = self.src_line.content
+        else:
+            line_str = ''
+        line_pos = self.line_pos
+
+        tok_type, end_pos = match.OneToken(lex_mode, line_str, line_pos)
+        if tok_type == Id.Eol_Tok:  # Do NOT add a span for this sentinel!
+            # LineLexer tells Lexer to read a new line.
+            return self.eol_tok</code></pre>
+          <p>
+            Each mode is a regex list; <code>lexer_gen.py</code> emits one
+            <code>switch (lex_mode)</code> with a re2c DFA per mode (274-322).
+            re2c compiles regular expressions into C state machines, so a mode
+            is literally a different automaton. At
+            efaa863 there are 22 modes plus <code>Undefined</code>, under a comment that
+            still says "Fifteen lexer modes for OSH"
+            (<code>oils/frontend/types.asdl</code>:10-39). The only lexer state is a hint stack: <code>$(</code> makes the next
+            <code>)</code> an <code>Eof_RParen</code> (<code>lexer.py</code>:420-498).
+            A <code>$( )</code> is a new CommandParser on the same lexer and line
+            reader, no text copied (<code>oils/osh/word_parse.py</code>:1207-1233).
+            Arithmetic is a Pratt loop, top-down operator precedence in which each
+            operator token carries a binding power and the loop keeps folding
+            while the next operator binds tighter (<code>oils/osh/tdop.py</code>:286-313); the tree
+            is lossless (<code>oils/frontend/syntax.asdl</code>:1-4)
+            <span class="src">from the code</span>.
+            Text is re-parsed in "4 places": here-docs, <code>a[x+1]=</code>, backticks,
+            aliases
+            (<code>oils/doc/parser-architecture.md</code>:86-124)
+            <span class="src">from the docs</span>. OSH executes one logical line at a time;
+            only <code>osh -n</code>, tools and <code>trap</code> parse whole files (<code>oils/core/main_loop.py</code>:1-10;
+            <code>oils/builtin/trap_osh.py</code>:296).
+            100,000 lines take 1.52 s and 144.6 MiB <span class="recon">measured here</span>.
+            Figure {{fig-osh-modes}} shows the modes on one line.
+          </p>
+
+          <figure class="figure" id="fig-osh-modes">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One line, six lexer modes: <code>:-</code> read three ways</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 560" width="100%" role="img" aria-label="The line echo &quot;foo:-bar ${foo:-bar} $(( foo &gt; 1 ? 5:- 5 ))&quot; split into tokens in three rows, each box filled by the OSH lexer mode it was read in. Row 1: echo in ShCommand, the opening quote in ShCommand, foo:-bar and a space as one Lit_Chars token in DQ, ${ in DQ, foo as VSub_Name in VSub_1, :- as VTest_ColonHyphen in VSub_2, bar as Lit_Chars and the closing brace in VSub_ArgDQ, a space in DQ. Row 2: $(( in DQ, then foo, greater-than and 1 in Arith. Row 3: question mark, 5, colon, minus, 5 and the first closing paren in Arith, the second closing paren read in ShCommand and rewritten by a hint to Right_DollarDParen, and the closing quote in DQ. Three numbered marks show :- as literal text, as the default-value operator, and as a ternary colon followed by unary minus. Below, the layer stack: line reader, LineLexer, Lexer with hint stack, WordParser, then CommandParser or TdopParser, with the mode passed back to the lexer on each Read. At the bottom, the mode count: 8 in 2016, 14 in February 2019, 22 plus Undefined at efaa863.">
+                <defs>
+                  <marker id="fig-osh-modes-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-osh-modes-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                  <marker id="fig-osh-modes-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="15" y="22" class="svg-lane">ROW 1</text>
+                <!-- row 1: y 32..76 -->
+                <rect x="15" y="32" width="72" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="25" y="50" class="svg-step">echo</text><text x="25" y="68" class="svg-sub">Lit_Chars</text>
+                <rect x="93" y="32" width="116" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="103" y="50" class="svg-step">"</text><text x="103" y="68" class="svg-sub">Left_DoubleQuote</text>
+                <rect x="215" y="32" width="80" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="225" y="50" class="svg-step">foo:-bar␣</text><text x="225" y="68" class="svg-sub">Lit_Chars</text>
+                <rect x="301" y="32" width="116" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="311" y="50" class="svg-step">${</text><text x="311" y="68" class="svg-sub">Left_DollarBrace</text>
+                <rect x="423" y="32" width="72" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="433" y="50" class="svg-step">foo</text><text x="433" y="68" class="svg-sub">VSub_Name</text>
+                <rect x="501" y="32" width="122" height="44" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="511" y="50" class="svg-step">:-</text><text x="511" y="68" class="svg-sub">VTest_ColonHyphen</text>
+                <rect x="629" y="32" width="72" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="639" y="50" class="svg-step">bar</text><text x="639" y="68" class="svg-sub">Lit_Chars</text>
+                <rect x="707" y="32" width="122" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="717" y="50" class="svg-step">}</text><text x="717" y="68" class="svg-sub">Right_DollarBrace</text>
+                <rect x="835" y="32" width="72" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="845" y="50" class="svg-step">␣</text><text x="845" y="68" class="svg-sub">Lit_Chars</text>
+                <!-- marks row 1 -->
+                <text x="225" y="94" class="svg-num">1 literal text</text>
+                <text x="511" y="94" class="svg-num">2 default-value operator</text>
+                <!-- row 2: y 112..156 -->
+                <text x="15" y="106" class="svg-lane">ROW 2</text>
+                <rect x="15" y="114" width="122" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="25" y="132" class="svg-step">$((</text><text x="25" y="150" class="svg-sub">Left_DollarDParen</text>
+                <rect x="143" y="114" width="116" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="153" y="132" class="svg-step">foo</text><text x="153" y="150" class="svg-sub">Lit_ArithVarLike</text>
+                <rect x="265" y="114" width="84" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="275" y="132" class="svg-step">&gt;</text><text x="275" y="150" class="svg-sub">Arith_Great</text>
+                <rect x="355" y="114" width="78" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="365" y="132" class="svg-step">1</text><text x="365" y="150" class="svg-sub">Lit_Digits</text>
+                <text x="450" y="140" class="svg-note">spaces in Arith are Ignored_Space, not drawn</text>
+                <!-- row 3: y 188..232 -->
+                <text x="15" y="182" class="svg-lane">ROW 3</text>
+                <rect x="15" y="190" width="84" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="25" y="208" class="svg-step">?</text><text x="25" y="226" class="svg-sub">Arith_QMark</text>
+                <rect x="105" y="190" width="78" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="115" y="208" class="svg-step">5</text><text x="115" y="226" class="svg-sub">Lit_Digits</text>
+                <rect x="189" y="190" width="84" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="199" y="208" class="svg-step">:</text><text x="199" y="226" class="svg-sub">Arith_Colon</text>
+                <rect x="279" y="190" width="84" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="289" y="208" class="svg-step">-</text><text x="289" y="226" class="svg-sub">Arith_Minus</text>
+                <rect x="369" y="190" width="78" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="379" y="208" class="svg-step">5</text><text x="379" y="226" class="svg-sub">Lit_Digits</text>
+                <rect x="453" y="190" width="90" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="463" y="208" class="svg-step">)</text><text x="463" y="226" class="svg-sub">Arith_RParen</text>
+                <rect x="549" y="190" width="128" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="559" y="208" class="svg-step">)  via hint</text><text x="559" y="226" class="svg-sub">Right_DollarDParen</text>
+                <rect x="683" y="190" width="122" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="693" y="208" class="svg-step">"</text><text x="693" y="226" class="svg-sub">Right_DoubleQuote</text>
+                <text x="199" y="252" class="svg-num">3 ternary colon, then unary minus</text>
+                <!-- legend -->
+                <rect x="15" y="270" width="14" height="14" fill="#f7f7f5" stroke="#b8b8b1"/><text x="35" y="282" class="svg-sub">ShCommand</text>
+                <rect x="125" y="270" width="14" height="14" fill="#e0ebf2" stroke="#3c6f97"/><text x="145" y="282" class="svg-sub">DQ</text>
+                <rect x="185" y="270" width="14" height="14" fill="#ece6f3" stroke="#765b98"/><text x="205" y="282" class="svg-sub">VSub_1</text>
+                <rect x="265" y="270" width="14" height="14" fill="#f7e3c8" stroke="#d98226"/><text x="285" y="282" class="svg-sub">VSub_2</text>
+                <rect x="345" y="270" width="14" height="14" fill="#dfede5" stroke="#367f59"/><text x="365" y="282" class="svg-sub">VSub_ArgDQ</text>
+                <rect x="455" y="270" width="14" height="14" fill="#f3dfdc" stroke="#ad4b43"/><text x="475" y="282" class="svg-sub">Arith</text>
+                <text x="530" y="282" class="svg-note">bash prints: foo:-bar bar -5</text>
+                <!-- layer stack -->
+                <line x1="15" y1="304" x2="985" y2="304" stroke="#deded9"/>
+                <text x="15" y="326" class="svg-lane">THE LAYERS</text>
+                <rect x="15" y="340" width="140" height="54" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="25" y="360" class="svg-step">line reader</text><text x="25" y="380" class="svg-sub">one line at a time</text>
+                <rect x="185" y="340" width="150" height="54" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="195" y="360" class="svg-step">LineLexer</text><text x="195" y="380" class="svg-sub">NUL-terminated line</text>
+                <rect x="365" y="340" width="150" height="54" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="375" y="360" class="svg-step">Lexer</text><text x="375" y="380" class="svg-sub">hint stack only</text>
+                <rect x="545" y="340" width="150" height="54" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="555" y="360" class="svg-step">WordParser</text><text x="555" y="380" class="svg-sub">picks the mode</text>
+                <rect x="725" y="340" width="260" height="54" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="735" y="360" class="svg-step">CommandParser / TdopParser</text><text x="735" y="380" class="svg-sub">commands / Pratt arithmetic</text>
+                <path d="M157 367 L181 367" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-osh-modes-blue)"/>
+                <path d="M337 367 L361 367" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-osh-modes-blue)"/>
+                <path d="M517 367 L541 367" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-osh-modes-blue)"/>
+                <path d="M697 367 L721 367" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-osh-modes-blue)"/>
+                <path d="M620 396 C620 428, 440 428, 440 398" fill="none" stroke="#765b98" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#fig-osh-modes-purple)"/>
+                <text x="460" y="440" class="svg-sub" fill="#765b98">Read(lex_mode) on every token</text>
+                <!-- mode count history -->
+                <line x1="15" y1="462" x2="985" y2="462" stroke="#deded9"/>
+                <text x="15" y="484" class="svg-lane">MODE COUNT</text>
+                <rect x="15" y="496" width="150" height="44" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="25" y="514" class="svg-step">8 modes</text><text x="25" y="532" class="svg-sub">blog, 2016-10-19</text>
+                <rect x="215" y="496" width="150" height="44" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="225" y="514" class="svg-step">14 modes</text><text x="225" y="532" class="svg-sub">blog, 2019-02-07</text>
+                <rect x="415" y="496" width="270" height="44" rx="6" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="425" y="514" class="svg-step">22 modes + Undefined at efaa863</text><text x="425" y="532" class="svg-sub">comment: "Fifteen lexer modes"</text>
+                <path d="M167 518 L211 518" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-osh-modes-ink)"/>
+                <path d="M367 518 L411 518" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-osh-modes-ink)"/>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Fill is the lexer mode a token was read in. Names and Ids are read from <code>oils/frontend/types.asdl</code>:10-39 and
+              <code>lexer_def.py</code>; which mode reads each token, including the second
+              <code>)</code> after <code>_SetNext(ShCommand)</code>, is a reconstruction
+              from <code>oils/osh/word_parse.py</code>:1567-1600, not an OSH trace. Thin blue arrows carry tokens; dashed purple is the mode passed down. Bash's
+              output is measured (<code>/usr/bin/bash</code> 5.3.9); mode counts are from
+              two dated oilshell.org posts and the enum.
+            </p>
+          </figure>
+
+          <h3>ShellCheck: no lexer at all</h3>
+          <p>
+            ShellCheck's parser is one 3,673-line Haskell module over
+            <code>ParsecT String</code>, with no token stream. Parsec is a
+            parser-combinator library: each grammar rule is a Haskell function
+            that consumes characters, and rules compose by sequence and
+            alternative
+            (<code>shellcheck/src/ShellCheck/Parser.hs</code>:56-57). The <code>linefeed</code> combinator itself reads pending here-doc bodies
+            (60-66). Ambiguity is
+            resolved by backtracking: <code>readAmbiguous</code> tries the expected
+            parse, then the alternative, and notes SC1102 or SC1105 if it won
+            (1689-1700; the notes at 1637, 2882). The undecidable <code>a[k]</code> is re-parsed after the fact, as a string
+            key if a <code>declare -A</code> (or <code>local</code>,
+            <code>typeset</code>) of the name appears anywhere in the file (3558-3602;
+            <code>ASTLib.hs</code>:630-649). A real syntax error yields no AST
+            (<code>prRoot = Nothing</code>), only SC1072, SC1073 and SC1009
+            (3494-3556) <span class="src">from the code</span>.
+            Linting 100,000 lines takes 121.8 s and 1,855 MiB
+            <span class="recon">measured here</span>.
+          </p>
+
+          <h3>tree-sitter-bash: the generated parser asks the lexer</h3>
+          <p>
+            A 1,201-line <code>grammar.js</code> generates a 350,631-line
+            <code>parser.c</code> with <code>STATE_COUNT 7571</code>
+            (<code>tree-sitter-bash/src/parser.c</code>:17-24). tree-sitter
+            generates GLR tables, generalized LR: where the grammar declares a
+            conflict, the parser forks and runs both readings until one dies.
+            bash's grammar declares six, among them
+            <code>[$.command, $.variable_assignments]</code>
+            (<code>grammar.js</code>:47-54). The generated lexer
+            looks only for tokens valid in the current state. The rest goes to a 1,217-line external scanner handed a
+            <code>valid_symbols</code> mask: here-doc pieces, <code>_concat</code>,
+            <code>variable_name</code>, regexes, extglobs (<code>src/scanner.c</code>:9-39).
+            For incremental reparsing its here-doc stack must serialize into at most
+            1,024 bytes each time the scanner recognises a token
+            (<code>src/tree_sitter/parser.h</code>:14; <code>scanner.c</code>:87-155)
+            <span class="src">from the code</span>. Error recovery always yields a tree, with ERROR nodes. It accepts 8 inputs
+            <code>bash -n</code> rejects, including <code>echo a; }</code>, and rejects
+            21 that bash accepts <span class="recon">measured here</span>.
+          </p>
+
+          <h3>brush: tokenize everything, then PEG</h3>
+          <p>
+            brush's tokenizer knows no grammar and emits only <code>Operator</code> and
+            <code>Word</code> tokens (<code>brush/brush-parser/src/tokenizer.rs</code>:45-50)
+            and reorders the stream so each here-doc body follows its tag (513-648). A
+            <code>peg</code> 0.8.6 grammar whose rules mirror POSIX §2.10 then
+            backtracks over the tokens: <code>compound_command</code> tries
+            <code>arithmetic_command</code> before <code>subshell</code>, and an unmatched
+            <code>)</code> means "we need to backtrack"
+            (<code>src/parser/peg.rs</code>:97-130). Words, arithmetic and comsub bodies
+            stay strings until expansion. Parsing the whole file first, brush forces
+            extglob on (<code>brush-core/src/shell.rs</code>:241-244)
+            and expands aliases at execution, "a total hack"
+            (<code>src/interp.rs</code>:1243) <span class="src">from the code</span>. A
+            syntax error after <code>exit 0</code> makes brush run nothing; bash, dash
+            and OSH run up to the exit. 100,000 lines take 0.865 s and 241.9 MiB, ~2.5 KiB a line <span class="recon">measured here</span>.
+          </p>

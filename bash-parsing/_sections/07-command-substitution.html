@@ -1,0 +1,364 @@
+          <h2 id="command-substitution"><span class="secnum">{{S}}</span>Command substitution: a recursive yyparse that keeps only text</h2>
+          <p class="lede">
+            Since bash 5.2 the lexer handles <code>$(</code> by calling the real
+            parser again, on the same input, from inside itself. The tree is
+            thrown away; the word keeps only the tree printed back as text.
+            Expansion parses that text again to find where it ends, and the
+            forked child parses it a third time to run it. Backquotes never got
+            this treatment.
+          </p>
+          <p>
+            The changelog entry of 6/19/2021 reads: "rewrite to recursively call
+            the parser (yyparse()) and return a string constructed from the
+            resulting parse tree. Probably will only work with bison"
+            (<code>bash/CWRU/changelog</code>:1386-1394). It shipped in 5.2 on
+            2022-09-26. Since 4.0 bash had parsed <code>$( )</code> only to find
+            its closing delimiter (<code>bash/COMPAT</code>:303-306), and AOSA
+            §3.4's "duplicates rather more of the token-reading code than is
+            optimal" describes that older code <span class="src">from the docs</span>.
+          </p>
+
+          <h3>Read time: tricking the parser</h3>
+          <p>
+            <code>parse_comsub</code> first peeks one character. Another
+            <code>(</code> means arithmetic, by POSIX interpretation 217, and it
+            only collects a matched pair (<code>bash/parse.y</code>:4463-4471).
+            Otherwise it sets up a nested parse, <code>bash/parse.y</code>:4499-4549,
+            with block comments trimmed and … marking omitted lines (locals,
+            the funsub flag (a funsub is <code>${ cmd; }</code>, the in-process form bash 5.3 added, <code>bash/NEWS</code>:57-58), the <code>global_command</code> save, here-doc and
+            counter resets, the <code>BASH_COMPAT</code> extglob block)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>  save_parser_state (&amp;ps);
+  …
+  parser_state &amp;= ~(PST_REGEXP|PST_EXTPAT|PST_CONDCMD|PST_CONDEXPR|PST_COMPASSIGN);
+  …
+  parser_state &amp;= ~(PST_CASEPAT|PST_ALEXPNEXT|PST_SUBSHELL|PST_REDIRLIST);
+  parser_state |= PST_CMDSUBST|PST_EOFTOKEN|PST_NOEXPAND;
+  …
+  shell_eof_token = close;
+  …
+  if (expand_aliases)
+    expand_aliases = posixly_correct != 0;
+  …
+  current_token = '\n';				/* XXX */
+  token_to_read = (open == '(') ? DOLPAREN : DOLBRACE;	/* let's trick the parser ) */
+  parsing_command = 1;	/* saved as part of sh_parser_state_t */
+  r = yyparse ();</code></pre>
+          <p>
+            <code>save_parser_state</code> copies the flags, token history,
+            here-doc stack, alias stack, token buffer and even <code>$?</code>
+            (<code>bash/parse.y</code>:7221-7282). It must be done by hand:
+            Bison's LR stacks are locals of <code>yyparse</code>, but
+            <code>yychar</code> and <code>yylval</code> are globals
+            (<code>bash/y.tab.c</code>:1743-1776). <code>DOLPAREN</code> is
+            "never created by yylex" (<code>bash/parse.y</code>:403). The
+            grammar takes it through <code>inputunit</code>'s alternative
+            <code>comsub</code>, whose rule is <code>DOLPAREN compound_list
+            ')'</code>, and the closing <code>)</code> arrives as
+            <code>shell_eof_token</code> (<code>bash/parse.y</code>:446-452,
+            1105-1113) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The instrumented build shows it on the post's second example, whose
+            first line is:
+          </p>
+<pre><code>cat &lt;&lt;A; echo $(case x in x) echo y;; esac)</code></pre>
+          <p>
+            The outer parser has shifted <code>echo</code>
+            into state 13 and asked for a token
+            (<code>lab/results/trace-c.txt</code>) <span class="recon">measured here</span>:
+          </p>
+<pre><code>Stack now 0 56 139 13
+Reading a token
+LAB COMSUB parse_comsub: nested yyparse begins, token_to_read=DOLPAREN shell_eof_token=')' parser_state=0x408040{PST_CMDSUBST|PST_EOFTOKEN|PST_NOEXPAND}
+Starting parse
+Entering state 0
+…
+Shifting token DOLPAREN ()
+Entering state 28</code></pre>
+          <p>
+            The inner parse accepts by rule 2, <code>inputunit: comsub</code>.
+            The frozen outer parser then receives one <code>WORD</code>
+            <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Text, not tree</h3>
+          <p>
+            That word is built from the tree, <code>bash/parse.y</code>:4626-4646
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>  saved_strings = pushed_string_list;
+  restore_parser_state (&amp;ps);
+  pushed_string_list = saved_strings;
+
+  simplecmd_lineno = save_lineno;
+
+  tcmd = print_comsub (parsed_command);		/* returns static memory */
+  retlen = strlen (tcmd);
+  if (open == '(')			/* ) */
+    {
+      if (tcmd[0] == '(')		/* ) need a space to prevent arithmetic expansion */
+	retlen++;
+      ret = xmalloc (retlen + 2);
+      if (tcmd[0] == '(')			/* ) */
+	{
+	  ret[0] = ' ';
+	  strcpy (ret + 1, tcmd);
+	}
+      else
+	strcpy (ret, tcmd);
+    }</code></pre>
+          <p>
+            The space stops a re-print that starts with <code>(</code> from
+            reading as <code>$((</code>. Then <code>dispose_command</code> frees
+            the tree (<code>bash/parse.y</code>:4672). <code>declare -f</code>
+            exposes the re-print, run on <code>/usr/bin/bash</code> 5.3.9
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ bash -c 'f(){ echo $(echo a   ;   echo b) "${ echo c;}" `echo   d`; }; declare -f f'
+f ()
+{
+    echo $(echo a; echo b) "${ echo c; }" `echo   d`
+}</code></pre>
+          <p>
+            Spacing in <code>$( )</code> is normalised and the funsub gains a
+            <code>;</code>. The backquote body keeps its three spaces. In trace
+            (c) the stored word spans four lines in <code>print_cmd.c</code>'s
+            layout <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Three parses of one <code>$( )</code></h3>
+          <p>
+            Figure {{fig-three-parses}} follows the text. At expansion,
+            <code>extract_command_subst</code> calls
+            <code>xparse_dolparen</code> to find where the substitution ends
+            (<code>bash/subst.c</code>:1262-1276). It sets
+            <code>expand_aliases = 0</code>, injects <code>DOLPAREN</code> again
+            and runs <code>parse_string</code> (<code>bash/parse.y</code>:4686-4826).
+            The end comes from <code>rewind_input_string</code>, which backs the
+            string pointer up by the unconsumed tail, under its author's note
+            "need to do more validation on xchars value for sanity -- test
+            cases." (<code>bash/parse.y</code>:1809-1830) <span class="src">from the code</span>.
+            The trace shows <code>parser_state</code> 0x8040 (no
+            <code>PST_NOEXPAND</code>) and a <code>cm_case</code> tree nothing
+            uses <span class="recon">measured here</span>.
+          </p>
+          <p>
+            After the fork, the child strips <code>CTLESC</code> markers, the quoting bytes of §10, with
+            <code>remove_quoted_escapes</code>, turns aliases back on outside
+            posix mode and parses a third time (<code>bash/subst.c</code>:7376-7413)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>rc = parse_and_execute (string, "command substitution", pflags|SEVAL_NOHIST);</code></pre>
+          <p>
+            In trace (c) the first two parses run in pid 263985, the third in
+            pid 263987 <span class="recon">measured here</span>. Not every
+            <code>$( )</code> gets three. An unquoted here-doc body skips the
+            read-time parse. <code>$((</code> and <code>SX_COMPLETE</code>
+            extraction is textual (<code>bash/subst.c</code>:1267-1268).
+            <code>$(&lt;file)</code> can skip the child (§10). <code>${ cmd;
+            }</code> runs the third parse in-process (<code>bash/subst.c</code>:6925-7117)
+            <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-three-parses">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One <code>$( )</code>, three parses: read time, expansion, child</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 640" width="100%" role="img" aria-label="Three horizontal swim lanes for echo $(case x in x) echo y;; esac). Lane 1, read time inside the outer yylex: parse_comsub checks for $((, calls save_parser_state, sets parser_state 0x408040, sets shell_eof_token, current_token and token_to_read DOLPAREN, runs a nested yyparse from state 0 that shifts DOLPAREN into state 28 while the outer stack 0 56 139 13 is frozen, then print_comsub re-prints the tree, the tree is disposed and the word keeps the text. Lane 2, expansion in the parent: extract_command_subst calls xparse_dolparen, which injects DOLPAREN and runs parse_string with parser_state 0x8040 and aliases off; rewind_input_string finds the end; the cm_case tree is discarded. Lane 3, the child after fork: command_substitute, remove_quoted_escapes, aliases back on outside posix mode, parse_and_execute with SEVAL_NOHIST, and the case command runs in pid 263987. A notes row lists the exceptions.">
+                <defs>
+                  <marker id="fig-three-parses-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-three-parses-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-three-parses-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <!-- 1 · READ TIME -->
+                <text x="16" y="52" class="svg-lane">1 · READ TIME</text>
+                <text x="16" y="72" class="svg-sub">inside the outer</text>
+                <text x="16" y="87" class="svg-sub">yylex, pid 263985</text>
+                <text x="16" y="112" class="svg-sub" fill="#d98226">aliases: only in</text>
+                <text x="16" y="127" class="svg-sub" fill="#d98226">posix mode</text>
+                <rect x="180" y="36" width="168" height="114" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="190" y="56" class="svg-step">parse_comsub</text>
+                <text x="190" y="76" class="svg-sub">next char '(' ?</text>
+                <text x="190" y="91" class="svg-sub">no: not $((</text>
+                <text x="190" y="106" class="svg-sub">save_parser_state</text>
+                <path d="M350 93.0 L365 93.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="368" y="36" width="168" height="114" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="378" y="56" class="svg-step">set flags</text>
+                <text x="378" y="76" class="svg-sub">parser_state =</text>
+                <text x="378" y="91" class="svg-sub">0x408040:</text>
+                <text x="378" y="106" class="svg-sub">PST_CMDSUBST|</text>
+                <text x="378" y="121" class="svg-sub">PST_EOFTOKEN|</text>
+                <text x="378" y="136" class="svg-sub">PST_NOEXPAND</text>
+                <path d="M538 93.0 L553 93.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="556" y="36" width="168" height="114" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="566" y="56" class="svg-step">trick the parser</text>
+                <text x="566" y="76" class="svg-sub">shell_eof_token=')'</text>
+                <text x="566" y="91" class="svg-sub">current_token='\n'</text>
+                <text x="566" y="106" class="svg-sub">token_to_read =</text>
+                <text x="566" y="121" class="svg-sub">  DOLPAREN</text>
+                <path d="M726 93.0 L741 93.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="744" y="36" width="168" height="114" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="754" y="56" class="svg-step">nested yyparse</text>
+                <text x="754" y="76" class="svg-sub">state 0, shift</text>
+                <text x="754" y="91" class="svg-sub">DOLPAREN -&gt; state 28</text>
+                <text x="754" y="106" class="svg-sub">accept by rule 2:</text>
+                <text x="754" y="121" class="svg-sub">inputunit: comsub</text>
+                <text x="754" y="136" class="svg-sub">r = 0</text>
+                <path d="M914 93.0 L929 93.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="932" y="36" width="168" height="114" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.5"/>
+                <text x="942" y="56" class="svg-step">print_comsub</text>
+                <text x="942" y="76" class="svg-sub">tree -&gt; text</text>
+                <text x="942" y="91" class="svg-sub">dispose_command</text>
+                <text x="942" y="106" class="svg-sub">the WORD holds</text>
+                <text x="942" y="121" class="svg-sub">the re-print</text>
+                <!-- 2 · EXPANSION -->
+                <text x="16" y="258" class="svg-lane">2 · EXPANSION</text>
+                <text x="16" y="278" class="svg-sub">in the parent,</text>
+                <text x="16" y="293" class="svg-sub">pid 263985</text>
+                <text x="16" y="318" class="svg-sub" fill="#d98226">aliases: off</text>
+                <text x="16" y="333" class="svg-sub" fill="#d98226">(expand_aliases=0)</text>
+                <rect x="180" y="242" width="168" height="114" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="190" y="262" class="svg-step">find the end</text>
+                <text x="190" y="282" class="svg-sub">extract_command_subst</text>
+                <text x="190" y="297" class="svg-sub">$(( or SX_COMPLETE:</text>
+                <text x="190" y="312" class="svg-sub">textual instead</text>
+                <path d="M350 299.0 L365 299.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="368" y="242" width="168" height="114" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="378" y="262" class="svg-step">xparse_dolparen</text>
+                <text x="378" y="282" class="svg-sub">save parser and</text>
+                <text x="378" y="297" class="svg-sub">input-line state</text>
+                <text x="378" y="312" class="svg-sub">expand_aliases = 0</text>
+                <text x="378" y="327" class="svg-sub">inject DOLPAREN</text>
+                <path d="M538 299.0 L553 299.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="556" y="242" width="168" height="114" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="566" y="262" class="svg-step">parse_string</text>
+                <text x="566" y="282" class="svg-sub">parser_state =</text>
+                <text x="566" y="297" class="svg-sub">0x8040:</text>
+                <text x="566" y="312" class="svg-sub">PST_CMDSUBST|</text>
+                <text x="566" y="327" class="svg-sub">PST_EOFTOKEN</text>
+                <text x="566" y="342" class="svg-sub">no PST_NOEXPAND</text>
+                <path d="M726 299.0 L741 299.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="744" y="242" width="168" height="114" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="754" y="262" class="svg-step">rewind_input_string</text>
+                <text x="754" y="282" class="svg-sub">string -= xchars</text>
+                <text x="754" y="297" class="svg-sub">(unconsumed tail)</text>
+                <text x="754" y="312" class="svg-sub">-&gt; end index</text>
+                <path d="M914 299.0 L929 299.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="932" y="242" width="168" height="114" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.5"/>
+                <text x="942" y="262" class="svg-step">tree discarded</text>
+                <text x="942" y="282" class="svg-sub">a cm_case, unused</text>
+                <text x="942" y="297" class="svg-sub">only the end index</text>
+                <text x="942" y="312" class="svg-sub">is kept</text>
+                <!-- 3 · CHILD -->
+                <text x="16" y="464" class="svg-lane">3 · CHILD</text>
+                <text x="16" y="484" class="svg-sub">after fork,</text>
+                <text x="16" y="499" class="svg-sub">pid 263987</text>
+                <text x="16" y="524" class="svg-sub" fill="#d98226">aliases: back on</text>
+                <text x="16" y="539" class="svg-sub" fill="#d98226">outside posix mode</text>
+                <rect x="180" y="448" width="168" height="114" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="190" y="468" class="svg-step">command_substitute</text>
+                <text x="190" y="488" class="svg-sub">fork; the child</text>
+                <text x="190" y="503" class="svg-sub">gets the text</text>
+                <path d="M350 505.0 L365 505.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="368" y="448" width="168" height="114" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="378" y="468" class="svg-step">strip markers</text>
+                <text x="378" y="488" class="svg-sub">remove_quoted_</text>
+                <text x="378" y="503" class="svg-sub">  escapes</text>
+                <text x="378" y="518" class="svg-sub">CTLESC out (§10)</text>
+                <path d="M538 505.0 L553 505.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="556" y="448" width="168" height="114" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="566" y="468" class="svg-step">aliases back on</text>
+                <text x="566" y="488" class="svg-sub">expand_aliases =</text>
+                <text x="566" y="503" class="svg-sub">posixly_correct == 0</text>
+                <text x="566" y="518" class="svg-sub">unless backquote</text>
+                <path d="M726 505.0 L741 505.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="744" y="448" width="168" height="114" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="754" y="468" class="svg-step">parse_and_execute</text>
+                <text x="754" y="488" class="svg-sub">"command</text>
+                <text x="754" y="503" class="svg-sub">  substitution"</text>
+                <text x="754" y="518" class="svg-sub">pflags|SEVAL_NOHIST</text>
+                <text x="754" y="533" class="svg-sub">third yyparse</text>
+                <path d="M914 505.0 L929 505.0" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-three-parses-ink)"/>
+                <rect x="932" y="448" width="168" height="114" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="942" y="468" class="svg-step">run the tree</text>
+                <text x="942" y="488" class="svg-sub">cm_case -&gt; echo y</text>
+                <text x="942" y="503" class="svg-sub">output read by</text>
+                <text x="942" y="518" class="svg-sub">the parent (§10)</text>
+                <path d="M368 166 L912 166" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4"/>
+                <text x="372" y="182" class="svg-sub" fill="#765b98">outer yyparse frozen: stack 0 56 139 13, at "Reading a token"</text>
+                <path d="M264.0 150 L264.0 166 L362 166" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-three-parses-purple)"/>
+                <text x="270.0" y="162" class="svg-sub" fill="#765b98">saved: ps</text>
+                <path d="M918 166 L1016.0 166 L1016.0 152" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-three-parses-purple)"/>
+                <text x="922" y="182" class="svg-sub" fill="#765b98">restore_parser_state</text>
+                <path d="M1080 150 L1080 206 L264.0 206 L264.0 239" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-three-parses-blue)"/>
+                <text x="274.0" y="224" class="svg-sub">data: the word, i.e. the re-printed text "$(case x in x)" + 3 more lines</text>
+                <path d="M1016.0 356 L1016.0 412 L264.0 412 L264.0 445" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-three-parses-blue)"/>
+                <text x="274.0" y="430" class="svg-sub">data: the same text, handed to command_substitute</text>
+                <rect x="16" y="578" width="1088" height="54" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1"/>
+                <text x="28" y="594" class="svg-lane">EXCEPTIONS</text>
+                <text x="130" y="597" class="svg-note">$((…: parse_matched_pair (P_ARITH), no lane 1; lane 2 is textual</text>
+                <text x="130" y="613" class="svg-note">unquoted here-doc body: no lane 1; errors appear at expansion</text>
+                <text x="510" y="597" class="svg-note">`…`: lane 1 never runs; the first real parse is in the child</text>
+                <text x="510" y="613" class="svg-note">$(&lt;file): the parent parses it and may skip lane 3</text>
+                <text x="880" y="597" class="svg-note">${ cmd; }: lane 3 runs in-process</text>
+                <text x="880" y="613" class="svg-note">("nofork comsub"), no fork</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Only the third parse keeps its tree. Blue boxes parse, red boxes
+              discard a tree, green boxes run in the child; thick black is
+              sequence, thin blue the text handed on, dashed purple the saved
+              outer state; orange is each lane's alias policy. Steps and flags
+              are read from <code>bash/parse.y</code> and <code>bash/subst.c</code>
+              at the lines cited in the text <span class="src">from the code</span>;
+              states, <code>parser_state</code> values and pids are from
+              <code>lab/results/trace-c.txt</code> <span class="recon">measured here</span>;
+              the exceptions row is not traced.
+            </p>
+          </figure>
+
+          <h3>What the extra parses change</h3>
+          <p>
+            A syntax error in <code>$( )</code> is caught while the line is
+            read, so nothing on the line runs, and <code>bash -n</code> sees it
+            too. Exit status is §09's <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ bash -c 'echo before; echo $(if)'
+bash: -c: line 1: syntax error near unexpected token `)'
+bash: -c: line 1: `echo before; echo $(if)'</code></pre>
+          <p>
+            Backquotes are still scanned by <code>parse_matched_pair</code>
+            (<code>bash/parse.y</code>:5422), textually since 3.2
+            (<code>bash/COMPAT</code>:266-271) <span class="src">from the code</span>.
+            A script of <code>echo `for`</code> then <code>echo next</code>
+            passes <code>bash -n</code>; run, it prints the child's syntax
+            error, labelled <code>command substitution: line 1</code>, then
+            <code>next</code>, and exits 0 <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Aliases follow the lanes. With <code>shopt -s expand_aliases</code>,
+            a script that defines <code>f() { echo $(hi); }</code> and then
+            <code>alias hi="echo LATE"</code> prints <code>LATE</code> from
+            <code>f</code>. Under <code>--posix</code> it prints <code>hi:
+            command not found</code>: posix mode expanded aliases at read time,
+            before <code>hi</code> existed <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <code>$((</code> has a fallback. When <code>chk_arithsub</code>
+            finds unbalanced parentheses, <code>param_expand</code> jumps to
+            <code>comsub</code> (<code>bash/subst.c</code>:10832-10864)
+            <span class="src">from the code</span>. So this passes
+            <code>bash -n</code> and prints <code>hi there</code>, while dash
+            0.5.12 says <code>Syntax error: Missing '))'</code>
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>echo $((echo hi); (echo there))</code></pre>
+          <p>
+            POSIX §2.6.3 asks for bash's reading: "shall only parse the
+            expansion as a command substitution if it determines that it
+            cannot" <span class="src">from the docs</span>.
+          </p>

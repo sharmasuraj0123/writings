@@ -1,0 +1,193 @@
+          <h2 id="input-layer"><span class="secnum">{{S}}</span>Bytes in: the input layer and the line buffer</h2>
+          <p class="lede">
+            Before a single token exists, bash has already changed the text.
+            In an interactive shell history expansion has run; backslash-newline pairs are gone, and
+            alias bodies may stand in for the real input. The lexer reads only
+            a one-line buffer, refilled one physical line at a time. That is
+            where "one line is the unit" (§09) starts.
+          </p>
+
+          <h3>One vtable for four sources</h3>
+          <p>
+            All parser input goes through one global
+            <code>BASH_INPUT bash_input</code>: a stream type, a name, a
+            location union and a getter/ungetter pair. The type is one of
+            <code>st_none</code>, <code>st_stdin</code>,
+            <code>st_stream</code>, <code>st_string</code>,
+            <code>st_bstream</code> (<code>bash/input.h</code>:29, 72-84), and
+            <code>init_yy_io</code> installs the pair that
+            <code>yy_getc</code> calls through
+            (<code>bash/parse.y</code>:1583-1597)
+            <span class="src">from the code</span>.
+            <code>set_bash_input</code> picks readline, bash's buffered-fd
+            reader or stdio (<code>bash/shell.c</code>:1728-1755);
+            <code>bash -c</code> never reaches it. <code>-c</code>,
+            <code>eval</code>, <code>source</code> and traps arrive as strings
+            through <code>parse_and_execute</code>, which calls
+            <code>push_stream</code> and installs the string getter (<code>bash/shell.c</code>:1483;
+            <code>bash/builtins/evalstring.c</code>:340, 357)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>Scripts: a buffer that rewinds before each fork</h3>
+          <p>
+            A script on a seekable fd gets a buffer of min(file size,
+            <code>MAX_INPUT_BUFFER_SIZE</code>), which is 8192 bytes, or 8172
+            under bash's own malloc. An unseekable fd gets one byte
+            (<code>bash/input.c</code>:129-133, 392). Before each fork,
+            <code>sync_buffered_stream</code> seeks the fd back to the byte the
+            parser actually consumed (<code>bash/input.c</code>:552-565;
+            <code>bash/jobs.c</code>:2297-2302)
+            <span class="src">from the code</span>. Two oddities follow. A
+            script piped into bash shares stdin, one byte at a time, with the
+            commands it runs <span class="recon">measured here</span>,
+            <code>/usr/bin/bash</code> 5.3.9:
+          </p>
+<pre><code>$ printf 'read line\necho "read got: $line"\necho done\n' | bash
+done</code></pre>
+          <p>
+            <code>read</code> took the script's second line as data. And text
+            appended to a running script runs, not because of the buffer size: <code>b_fill_buffer</code> calls
+            <code>read()</code> again on every refill and tests only
+            <code>B_ERROR</code> first ("try making read errors `sticky'"),
+            so EOF is not sticky
+            (<code>bash/input.c</code>:488-530)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>The line buffer</h3>
+          <p>
+            Apart from the two exceptions at the bottom of Figure
+            {{fig-input-layer}}, the lexer never calls the getter.
+            <code>shell_getc</code>
+            serves bytes from a static buffer, <code>shell_input_line</code>
+            (<code>bash/parse.y</code>:303-309), and refills it only when the
+            line is used up <em>and</em> no pushed string waits on
+            <code>pushed_string_list</code> (2498-2504). A refill reads to the
+            newline and skips NUL bytes; when history is on
+            (<code>remember_on_history</code>) it runs history expansion through
+            <code>pre_process_line</code> (2645-2680); under
+            <code>set -v</code> it echoes the line unless
+            <code>shell_eof_token</code> is set, which is how a nested
+            <code>$( )</code> parse avoids echoing twice (2704-2717); and it
+            puts the newline back (2729-2747)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Backslash-newline dies here, below the tokenizer.
+            <code>bash/parse.y</code>:2842-2868, the alias comment trimmed:
+          </p>
+<pre><code>  if MBTEST(uc == '\\' &amp;&amp; remove_quoted_newline &amp;&amp; shell_input_line[shell_input_line_index] == '\n')
+    {
+	if (SHOULD_PROMPT ())
+	  prompt_again (0);
+	line_number++;
+
+	/* … */
+#if defined (ALIAS)
+	if (expanding_alias () &amp;&amp; shell_input_line[shell_input_line_index+1] == '\0')
+	  {
+	    uc = 0;
+	    goto pop_alias;
+	  }
+	else if (expanding_alias () &amp;&amp; shell_input_line[shell_input_line_index+1] != '\0')
+	  {
+	    shell_input_line_index++;	/* skip newline */
+	    goto next_alias_char;	/* and get next character */
+	  }
+	else
+#endif
+	  goto restart_read;
+    }</code></pre>
+          <p>
+            <code>prompt_again</code> only selects and decodes PS2; it prints
+            nothing. The jump to <code>restart_read</code> fetches the next
+            physical line, so the two halves meet before any token is formed
+            <span class="src">from the code</span>. Callers turn the deletion
+            off inside single quotes: <code>read_token_word</code> passes
+            <code>cd != '\''</code>, and no pending literal-next character, as
+            <code>remove_quoted_newline</code>
+            (<code>bash/parse.y</code>:5718-5719)
+            <span class="src">from the code</span>. The consequence is visible
+            in row lc02 of E1, this post's matrix of 148 tricky inputs run through ten parse-only columns, one accept/reject bit each (§13). The row is this 19-byte input:
+          </p>
+<pre><code>echo a &amp;\
+&amp; echo b</code></pre>
+          <p>
+            Bash and dash read <code>&amp;&amp;</code> and print
+            <code>a</code> and <code>b</code>. shfmt, OSH, ShellCheck,
+            tree-sitter and the brush 0.4.0 release reject it; brush-parser at
+            <code>bd19d10</code> accepts (<code>lab/scripts/run_e1.py</code>
+            → <code>lab/results/e1-matrix.md</code>)
+            <span class="recon">measured here</span>. Tree-sitter's grammar
+            lists <code>/\\\r?\n/</code> among its <code>extras</code>, tokens
+            allowed <em>between</em> tokens, so a continuation can never sit
+            inside one (<code>tree-sitter-bash/grammar.js</code>:103-108)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            One check runs before the line buffer exists. A NUL byte in a
+            script's first line makes bash refuse the file:
+            <code>cannot execute binary file</code>, exit 126, nothing parsed
+            (<code>bash/shell.c</code>:1685-1691)
+            <span class="src">from the code</span>; confirmed with
+            <code>/usr/bin/bash</code> on a one-line file
+            <span class="recon">measured here</span>. That is E1 row mi03,
+            where every parser except bash accepts, and §13 explains why the
+            row is a scoring artifact.
+          </p>
+
+          <figure class="figure wide" id="fig-input-layer">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">From source to <code>read_token</code>: where the text is rewritten before it is tokenized</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row" style="grid-template-columns: 150px 1fr 1fr">
+                  <div class="stack-cell head" style="grid-row: span 2">Sources</div>
+                  <div class="stack-cell hl-blue">readline: interactive shell with line editing</div>
+                  <div class="stack-cell hl-blue">bash's buffered fd: scripts; one byte when unseekable</div>
+                  <div class="stack-cell hl-blue">stdio: interactive without editing</div>
+                  <div class="stack-cell hl-blue">strings: <code>-c</code>, <code>eval</code>, <code>source</code>, traps via <code>parse_and_execute</code></div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 150px 1fr">
+                  <div class="stack-cell head">bash_input</div>
+                  <div class="stack-cell hl-blue">stream type + getter/ungetter vtable; <code>push_stream</code> saves the old source (<code>bash/input.h</code>:29, 72-84)</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 150px 1fr 1fr 1fr">
+                  <div class="stack-cell head">shell_getc: refill</div>
+                  <div class="stack-cell hl-blue">one physical line into <code>shell_input_line</code>; NULs skipped; <code>set -v</code> echo</div>
+                  <div class="stack-cell hl-orange">history expansion: <code>pre_process_line</code></div>
+                  <div class="stack-cell hl-orange">newline re-appended</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 150px 1fr 1fr 1fr">
+                  <div class="stack-cell head">shell_getc: serve</div>
+                  <div class="stack-cell hl-blue">one byte at <code>shell_input_line_index</code></div>
+                  <div class="stack-cell hl-orange">backslash-newline deleted, <code>restart_read</code></div>
+                  <div class="stack-cell hl-purple">alias text from <code>pushed_string_list</code> served first (§05)</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 150px 1fr">
+                  <div class="stack-cell head">read_token</div>
+                  <div class="stack-cell hl-blue">sees only what <code>shell_getc</code> hands it (§03)</div>
+                </div>
+                <div class="stack-row" style="grid-template-columns: 150px 1fr 1fr">
+                  <div class="stack-cell head">Exceptions</div>
+                  <div class="stack-cell">here-doc bodies: <code>read_a_line</code> → <code>yy_getc</code>, raw (§06)</div>
+                  <div class="stack-cell"><code>time_command_acceptable</code> peeks past the index</div>
+                </div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              Every row is read from the code at <code>9c46586</code>
+              (<code>bash/input.h</code>, <code>bash/shell.c</code>,
+              <code>bash/input.c</code>, <code>bash/parse.y</code>:2197-2315,
+              2475-2920, 3286-3337). Blue cells pass bytes through; orange
+              cells rewrite the text before any token exists; purple is alias
+              push-back. Uncoloured cells bypass the line buffer. The running
+              example crosses it in one refill: the trace shows a single
+              <code>shell_getc</code> read of the whole line with the parser in
+              state 0 and <code>parser_state</code> 0x0
+              (<code>lab/results/trace-a.txt</code>), measured.
+            </p>
+          </figure>
