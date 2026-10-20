@@ -152,7 +152,7 @@ def validate(slugdir: pathlib.Path):
     ids = set(re.findall(r'\bid="([^"]+)"', s))
     dangling = sorted(h for h in set(re.findall(r'href="#([^"]+)"', s)) if h not in ids and h != '<id>')
     if dangling: problems.append(f"dangling anchors: {dangling}")
-    for m in re.finditer(r'(?:href|src)="((?:\.\./)[^"#]+)"', s):
+    for m in re.finditer(r'(?:href|src)="((?:\.\./|assets/)[^"#]+)"', s):
         t = (slugdir / m.group(1)).resolve()
         if not (t.exists() or (t / "index.html").exists()): problems.append(f"missing relative target {m.group(1)}")
     secnums = re.findall(r'<span class="secnum">(\d+)</span>', s)
