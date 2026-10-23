@@ -5,7 +5,8 @@ Every document folder with an index.html becomes one manifest entry:
   - whitepaper/index.html, what-is-quirq/ -> section "foundations"
   - research/<slug>/index.html            -> section "research"
   - every other post listed in posts.json -> section "research", or
-    section "chromium" when its slug starts with "chromium/"
+    section "chromium" when its slug starts with "chromium/", or section "git"
+    when it starts with "git/"
 
 The loader at research/index.html fetches the manifest at runtime, so a new
 log starts loading as soon as this script has run once:
@@ -88,7 +89,7 @@ def main() -> int:
         entry["date"] = previous.get(entry["path"], entry["date"])
         entries.append(entry)
 
-    # Root-level posts (and the chromium/ collection) are indexed by posts.json;
+    # Root-level posts (and the chromium/ and git/ collections) are indexed by posts.json;
     # mirror them here so the research log and the viewer never disagree.
     posts = json.loads((ROOT / "posts.json").read_text(encoding="utf-8")).get("posts", [])
     # posts.json carries the measured reading time (words ÷ 225, prose only); it wins.
@@ -104,13 +105,14 @@ def main() -> int:
         index = ROOT / slug / "index.html"
         if not index.is_file():
             continue
-        section = "chromium" if slug.startswith("chromium/") else "research"
+        section = ("chromium" if slug.startswith("chromium/")
+                   else "git" if slug.startswith("git/") else "research")
         entries.append({"slug": slug.split("/")[-1], "path": f"{slug}/", "section": section,
                         **meta_of(index), "date": post.get("published") or date_of(index),
                         "minutes": post.get("readingMinutes") or meta_of(index)["minutes"]})
         seen.add(f"{slug}/")
 
-    order = {"foundations": 0, "research": 1, "chromium": 2}
+    order = {"foundations": 0, "research": 1, "chromium": 2, "git": 3}
     entries.sort(key=lambda e: (order.get(e["section"], 9), e["date"]))
     entries.reverse()  # newest first within a section; sections keep their blocks
 

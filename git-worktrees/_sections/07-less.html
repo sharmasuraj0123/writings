@@ -1,0 +1,65 @@
+          <h2 id="less"><span class="secnum">{{S}}</span>Fewer files, fewer objects</h2>
+          <p class="lede">
+            A worktree avoids copying history, but it still checks out every file. Sparse checkout
+            reduces the files an agent gets. Partial clone reduces the objects the repository fetches
+            in the first place. They work at different layers and combine with worktrees.
+          </p>
+
+          <h3>Sparse checkout: fewer files per worktree</h3>
+          <p>
+            <code>git sparse-checkout set &lt;dir&gt;…</code> limits the working tree to the listed
+            directories. Cone mode, the default, takes directory names and always includes the files
+            at the top level (<code>Documentation/git-sparse-checkout.adoc</code>:25-26, 68)
+            <span class="src">from the docs</span>. Files outside the cone stay in the index with
+            the <em>skip-worktree</em> bit set, and git does not expect them on disk (233-242). The
+            patterns are stored in <code>info/sparse-checkout</code>, which §02 showed is private
+            to each worktree. Running <code>set</code> turns on <code>extensions.worktreeConfig</code>
+            so that the cone settings stay per-worktree as well (51-57).
+          </p>
+          <p>
+            For an agent assigned one area of a repository, this is the right default. In the lab,
+            a worktree limited to <code>Documentation/</code> held 1,503 of git's 4,765 tracked
+            files, used 16.6 MB instead of 58.8 MB, and took 304 ms instead of 1,026 ms to create
+            <span class="recon">measured here</span>. The order matters. Use
+            <code>worktree add --no-checkout</code>, then <code>sparse-checkout set</code>, then
+            <code>checkout</code>. Otherwise the full tree is written first and then deleted. And
+            when the current worktree is sparse, <code>add</code> copies its patterns into the new
+            one (<code>builtin/worktree.c</code>:574-575).
+          </p>
+<pre><code>git worktree add --no-checkout ../wt-docs -b agent/docs-7
+git -C ../wt-docs sparse-checkout set --cone Documentation
+git -C ../wt-docs checkout agent/docs-7</code></pre>
+
+          <h3>Partial clone: fewer objects in the store</h3>
+          <p>
+            <code>git clone --filter=blob:none</code> fetches every commit and tree but only the blobs
+            the checkout needs. The pack it receives is marked as a <em>promisor packfile</em> by a
+            sibling <code>&lt;name&gt;.promisor</code> file. Any object it refers to but doesn't
+            contain is treated as promised by the remote and fetched on demand when needed
+            (<code>Documentation/technical/partial-clone.adoc</code>:95-125)
+            <span class="src">from the docs</span>. A partial clone and its worktrees share one
+            promisor store, so a blob one agent fetched is there for the rest.
+          </p>
+          <p>
+            In the lab, a blobless clone of git.git was 128.8 MB of <code>.git</code> instead of
+            312.1 MB, and took 33.0 s instead of 61.9 s <span class="recon">measured here</span>.
+            Both were served over <code>file://</code> by a local <code>upload-pack</code> on the
+            same two cores. A real network would change the times but not which method wins. The
+            cost moves to later: <code>git log -p</code>, <code>blame</code> or a checkout of an
+            old commit fetches blobs as it goes, and each fetch needs the remote to be reachable.
+          </p>
+
+          <h3>Two kinds of clone that share objects</h3>
+          <p>
+            A clone from a local path hardlinks the object files rather than copying them. All
+            three object files in the lab's local clone had a link count above one, and its
+            <code>.git</code> took 712 KB of new disk space <span class="recon">measured here</span>.
+            <code>clone --shared</code> goes further. It copies nothing and writes the source's
+            object directory into <code>objects/info/alternates</code>. The manual calls this
+            "a possibly dangerous operation": if the source repository later drops a commit that
+            the clone still uses, maintenance in the source can delete it
+            (<code>Documentation/git-clone.adoc</code>:87-93) <span class="src">from the docs</span>.
+            Both kinds of clone are separate repositories with their own refs, config and stash, so
+            they avoid every red row in Figure {{fig-ledger}}. In exchange, the agents no longer
+            see each other's branches without a fetch.
+          </p>

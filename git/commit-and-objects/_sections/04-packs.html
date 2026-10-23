@@ -1,0 +1,333 @@
+          <h2 id="packs"><span class="secnum">{{S}}</span>Packs and deltas</h2>
+          <p class="lede">
+            Loose objects are fine for the last few commits. For everything else git uses packs: one file holding
+            many objects, most of them stored as a delta against another object in the same pack. The delta format
+            is two operations, copy and insert, on raw bytes. Git does not store diffs of files. It stores byte
+            recipes, usually pointing backwards in time.
+          </p>
+          <p>
+            A pack begins with <code>PACK</code>, a network-order version (git writes 2, reads 2 or 3) and an object
+            count (<code>pack.h</code>:14-22). The entries follow, and the file ends with a hash of every preceding
+            byte, which is also the pack's file name <span class="src">from the code</span>. The examples below come
+            from a lab repository with one 40-line file, <code>a.txt</code>, committed twice: the second commit
+            changed line 020 and appended a line, and <code>git repack -adq</code> produced a 574-byte pack of six
+            objects <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Entry headers and the two delta types</h3>
+          <p>
+            Each entry starts with a type and an inflated size, written by
+            <code>encode_in_pack_object_header()</code>, <code>pack-write.c</code>:516-526
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	c = (type &lt;&lt; 4) | (size &amp; 15);
+	size &gt;&gt;= 4;
+	while (size) {
+		if (n == hdr_len)
+			die("object size is too enormous to format");
+		*hdr++ = c | 0x80;
+		c = size &amp; 0x7f;
+		size &gt;&gt;= 7;
+		n++;
+	}
+	*hdr = c;</code></pre>
+          <p>
+            The high bit means "more bytes follow", bits 4-6 hold the type, and the size is spread low bits first.
+            The first commit in the lab pack starts <code>96 0a</code>: type 1, size 6 + (10 &lt;&lt; 4) = 166. The
+            newer blob starts <code>bb 88 01</code>: type 3, size 2,187 <span class="recon">measured here</span>.
+            Types 6 and 7 are deltas. <code>OBJ_REF_DELTA</code> names its base by object id.
+            <code>OBJ_OFS_DELTA</code> names it by a distance back from its own offset, encoded with a twist:
+            <code>packfile.c</code>:1288-1302 <span class="src">from the code</span>.
+          </p>
+<pre><code>	if (type == OBJ_OFS_DELTA) {
+		unsigned used = 0;
+		unsigned char c = base_info[used++];
+		base_offset = c &amp; 127;
+		while (c &amp; 128) {
+			base_offset += 1;
+			if (!base_offset || MSB(base_offset, 7))
+				return 0;  /* overflow */
+			c = base_info[used++];
+			base_offset = (base_offset &lt;&lt; 7) + (c &amp; 127);
+		}
+		base_offset = delta_obj_offset - base_offset;
+		if (base_offset &lt;= 0 || base_offset &gt;= delta_obj_offset)
+			return 0;  /* out of bound */</code></pre>
+          <p>
+            The offset is big-endian, and each continuation adds 1 before shifting. So a two-byte offset starts at
+            128, not 0, and no value has two encodings <span class="recon">reconstruction</span>. The same +1-bias
+            varint reappears in index v4 and in reftable (<a href="../state-and-wire/#reftable">Part 2</a>). The last check
+            rejects any base at or after the delta itself, and the writer guarantees that never happens:
+            <code>write_one()</code> writes a delta's base first, using offset 1 as a recursion sentinel
+            (<code>builtin/pack-objects.c</code>:806-835) <span class="src">from the code</span>. OFS offsets always
+            point backwards. REF deltas remain mainly for thin packs, sent over the wire, whose bases are on the receiver
+            and not in the pack; <code>index-pack --fix-thin</code> appends those bases, turning a 3-object pack into
+            a 4-object one <span class="recon">measured here</span>.
+          </p>
+
+          <h3>The copy/insert codec</h3>
+          <p>
+            A delta is the base size, the result size, then opcodes. A byte with the high bit set is a COPY: bits
+            0-3 say which offset bytes follow and bits 4-6 which size bytes. Any other non-zero byte is an INSERT of
+            that many literal bytes, 1 to 127. Opcode 0 is reserved and rejected. The interpreter is
+            <code>patch_delta()</code>, <code>patch-delta.c</code>:39-71 (macro body and bounds checks trimmed)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	while (data &lt; top) {
+		cmd = *data++;
+		if (cmd &amp; 0x80) {
+			unsigned long cp_off = 0, cp_size = 0;
+			…
+			PARSE_CP_PARAM(0x01, cp_off, 0);
+			PARSE_CP_PARAM(0x02, cp_off, 8);
+			PARSE_CP_PARAM(0x04, cp_off, 16);
+			PARSE_CP_PARAM(0x08, cp_off, 24);
+			PARSE_CP_PARAM(0x10, cp_size, 0);
+			PARSE_CP_PARAM(0x20, cp_size, 8);
+			PARSE_CP_PARAM(0x40, cp_size, 16);
+#undef PARSE_CP_PARAM
+			if (cp_size == 0) cp_size = 0x10000;
+			…
+			memcpy(out, (char *) src_buf + cp_off, cp_size);
+			out += cp_size;
+			size -= cp_size;
+		} else if (cmd) {
+			…
+			memcpy(out, data, cmd);
+			out += cmd;
+			data += cmd;
+			size -= cmd;</code></pre>
+          <p>
+            The decoder accepts 24-bit copy sizes, but the encoder in <code>diff-delta.c</code> never emits a copy
+            longer than 64 KiB (<code>diff-delta.c</code>:434-466) <span class="src">from the code</span>. In the lab
+            pack, the older 2,160-byte blob is a 22-byte delta against the newer one. Figure {{fig-pack-entry}}
+            decodes it. The old line 020 was not copied as a line. It was rebuilt from 7 bytes of line 028, one
+            inserted <code>"0"</code>, and 53 bytes that straddle two other lines <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-pack-entry">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One pack entry, an OFS_DELTA, and the delta opcode tape</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 584" role="img" aria-label="Top: the bits of the pack entry header e6 01 and the offset varint 81 20, giving an OFS_DELTA of size 22 whose base is 288 bytes back, at offset 231. Middle: the 22-byte delta as an opcode tape, with each copy drawn from the 2187-byte base into the 2160-byte result and one inserted byte. Bottom: the old line 020 rebuilt from a 7-byte copy, an inserted 0 and a 53-byte copy.">
+                <defs><marker id="pe-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker></defs>
+                <text x="30.0" y="24" text-anchor="start" class="svg-lane">1 · ENTRY HEADER AT PACK OFFSET 519, THEN THE BASE OFFSET</text>
+                <text x="134.0" y="40" text-anchor="middle" class="svg-step">0xe6</text>
+                <rect x="30.0" y="48" width="26.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="43.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="56.0" y="48" width="26.0" height="26" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="69.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="82.0" y="48" width="26.0" height="26" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="95.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="108.0" y="48" width="26.0" height="26" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="121.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="134.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="147.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="160.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="173.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="186.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="199.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="212.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="225.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="364.0" y="40" text-anchor="middle" class="svg-step">0x01</text>
+                <rect x="260.0" y="48" width="26.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="273.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="286.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="299.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="312.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="325.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="338.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="351.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="364.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="377.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="390.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="403.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="416.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="429.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="442.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="455.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="624.0" y="40" text-anchor="middle" class="svg-step">0x81</text>
+                <rect x="520.0" y="48" width="26.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="533.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="546.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="559.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="572.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="585.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="598.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="611.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="624.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="637.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="650.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="663.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="676.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="689.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="702.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="715.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="854.0" y="40" text-anchor="middle" class="svg-step">0x20</text>
+                <rect x="750.0" y="48" width="26.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="763.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="776.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="789.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="802.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="815.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="828.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="841.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="854.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="867.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="880.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="893.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="906.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="919.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="932.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="945.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <line x1="32" y1="80" x2="54" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="43.0" y="110" text-anchor="middle" class="svg-sub">more</text>
+                <line x1="58" y1="80" x2="132" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="95.0" y="96" text-anchor="middle" class="svg-sub">type 110 = 6</text>
+                <line x1="136" y1="80" x2="236" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="186.0" y="96" text-anchor="middle" class="svg-sub">size 6</text>
+                <line x1="262" y1="80" x2="284" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="273.0" y="110" text-anchor="middle" class="svg-sub">last</text>
+                <line x1="288" y1="80" x2="466" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="377.0" y="96" text-anchor="middle" class="svg-sub">size += 1 &lt;&lt; 4</text>
+                <line x1="522" y1="80" x2="544" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="533.0" y="110" text-anchor="middle" class="svg-sub">more</text>
+                <line x1="548" y1="80" x2="726" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="637.0" y="96" text-anchor="middle" class="svg-sub">1</text>
+                <line x1="752" y1="80" x2="774" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="763.0" y="110" text-anchor="middle" class="svg-sub">last</text>
+                <line x1="778" y1="80" x2="956" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="867.0" y="96" text-anchor="middle" class="svg-sub">0x20 = 32</text>
+                <text x="30.0" y="138" text-anchor="start" class="svg-step">OFS_DELTA, delta size 6 + 16 = 22</text>
+                <text x="520.0" y="138" text-anchor="start" class="svg-step">offset: (1 + 1) &lt;&lt; 7 + 32 = 288 · base at 519 − 288 = 231</text>
+                <line x1="490" y1="44" x2="490" y2="146" stroke="#deded9"/>
+                <text x="30.0" y="186" text-anchor="start" class="svg-lane">2 · THE 22-BYTE DELTA AS AN OPCODE TAPE</text>
+                <rect x="30.0" y="200" width="40.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">8b</text>
+                <rect x="70.0" y="200" width="40.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="90.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">11</text>
+                <rect x="118.0" y="200" width="40.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="138.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">f0</text>
+                <rect x="158.0" y="200" width="40.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="178.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">10</text>
+                <rect x="206.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="226.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">b0</text>
+                <rect x="246.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="266.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">38</text>
+                <rect x="286.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="306.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">04</text>
+                <rect x="334.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="354.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">93</text>
+                <rect x="374.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="394.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">f0</text>
+                <rect x="414.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="434.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">05</text>
+                <rect x="454.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="474.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">07</text>
+                <rect x="502.0" y="200" width="40.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="522.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">01</text>
+                <rect x="542.0" y="200" width="40.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="562.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">30</text>
+                <rect x="590.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="610.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">93</text>
+                <rect x="630.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="650.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">20</text>
+                <rect x="670.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="690.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">05</text>
+                <rect x="710.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="730.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">35</text>
+                <rect x="758.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="778.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">b3</text>
+                <rect x="798.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="818.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">7d</text>
+                <rect x="838.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="858.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">04</text>
+                <rect x="878.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="898.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">fb</text>
+                <rect x="918.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="938.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">03</text>
+                <text x="70.0" y="244" text-anchor="middle" class="svg-sub">base 2187</text>
+                <text x="158.0" y="244" text-anchor="middle" class="svg-sub">result 2160</text>
+                <text x="266.0" y="244" text-anchor="middle" class="svg-sub">COPY 0+1080</text>
+                <text x="414.0" y="244" text-anchor="middle" class="svg-sub">COPY 1520+7</text>
+                <text x="542.0" y="244" text-anchor="middle" class="svg-sub">INSERT "0"</text>
+                <text x="670.0" y="244" text-anchor="middle" class="svg-sub">COPY 1312+53</text>
+                <text x="858.0" y="244" text-anchor="middle" class="svg-sub">COPY 1149+1019</text>
+                <text x="30.0" y="282" text-anchor="start" class="svg-sub">BASE: the newer blob, 2,187 bytes, stored whole (line 020 now reads "LINE 020 changed", plus an appended tail)</text>
+                <rect x="40" y="290" width="1000.0" height="24" rx="2" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="40.0" y="290" width="493.8" height="24" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="565.4" y="290" width="465.9" height="24" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="639.9" y="290" width="24.2" height="24" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="735.0" y="290" width="3.2" height="24" fill="#ece6f3" stroke="#765b98"/>
+                <text x="30.0" y="372" text-anchor="start" class="svg-sub">RESULT: the older blob, 2,160 bytes, stored as this delta</text>
+                <rect x="40" y="380" width="987.7" height="24" rx="2" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="40.0" y="380" width="493.8" height="24" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="533.8" y="380" width="3.2" height="24" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="537.0" y="380" width="2.5" height="24" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="537.5" y="380" width="24.2" height="24" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="561.7" y="380" width="465.9" height="24" fill="#e0ebf2" stroke="#3c6f97"/>
+                <line x1="451.5" y1="316" x2="451.5" y2="376" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pe-data)"/>
+                <line x1="736.4" y1="316" x2="535.2" y2="376" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pe-data)"/>
+                <line x1="651.8" y1="316" x2="549.4" y2="376" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pe-data)"/>
+                <line x1="798.1" y1="316" x2="794.5" y2="376" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pe-data)"/>
+                <text x="286.9" y="306" text-anchor="middle" class="svg-sub">lines 000-019 (1,080 B)</text>
+                <text x="899.6" y="306" text-anchor="middle" class="svg-sub">lines 021-039, no tail (1,019 B)</text>
+                <text x="286.9" y="396" text-anchor="middle" class="svg-sub">copy 1,080</text>
+                <text x="794.5" y="396" text-anchor="middle" class="svg-sub">copy 1,019</text>
+                <text x="30.0" y="436" text-anchor="start" class="svg-lane">3 · THE OLD LINE 020, REBUILT FROM THREE OPS (BYTE-LEVEL, NOT LINE-LEVEL)</text>
+                <text x="60.2" y="460" text-anchor="middle" class="svg-num">1</text>
+                <rect x="30.0" y="466" width="60.4" height="28" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="60.2" y="484.0" text-anchor="middle" class="svg-sub" style="fill:#252525">line 02</text>
+                <text x="107.6" y="460" text-anchor="middle" class="svg-num">2</text>
+                <rect x="96.4" y="466" width="22.4" height="28" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="107.6" y="484.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="301.1" y="460" text-anchor="middle" class="svg-num">3</text>
+                <rect x="124.8" y="466" width="352.5" height="28" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="301.1" y="484.0" text-anchor="middle" class="svg-sub" style="fill:#252525">: the quick brown fox jumps over the lazy dog⏎line 02</text>
+                <text x="535.8" y="460" text-anchor="middle" class="svg-num">4</text>
+                <rect x="483.3" y="466" width="104.9" height="28" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="535.8" y="484.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1: the quick …</text>
+                <text x="30.0" y="516" text-anchor="start" class="svg-num">1</text>
+                <text x="42.0" y="516" text-anchor="start" class="svg-sub">copy 7 bytes of base line 028</text>
+                <text x="330.0" y="516" text-anchor="start" class="svg-num">2</text>
+                <text x="342.0" y="516" text-anchor="start" class="svg-sub">insert "0"</text>
+                <text x="30.0" y="534" text-anchor="start" class="svg-num">3</text>
+                <text x="42.0" y="534" text-anchor="start" class="svg-sub">copy 53: the rest of a line and the start of the next</text>
+                <text x="420.0" y="534" text-anchor="start" class="svg-num">4</text>
+                <text x="432.0" y="534" text-anchor="start" class="svg-sub">copy 1,019: lines 021-039</text>
+                <text x="30.0" y="568" text-anchor="start" class="svg-note">Ops are drawn in result order. Offsets and sizes are decoded from the bytes in the tape; 1,080 + 7 + 1 + 53 + 1,019 = 2,160.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Deltas are byte copies and inserts, usually backwards: the newest version is whole and the old one
+              points at it. Blue and purple are copied bytes (purple marks the short copies that rebuild line 020),
+              orange is inserted or size data, grey is framing. Bytes are from the lab pack and
+              <code>git verify-pack -v</code> <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>How pack-objects picks a base</h3>
+          <p>
+            <code>pack-objects</code> does not look at history to choose bases. It sorts candidates with
+            <code>type_size_sort()</code> (<code>builtin/pack-objects.c</code>:2641-2681): by type, by a hash of the
+            path name, preferred bases first, then delta islands, then size from largest down. The comment above it
+            gives the reason for the last key: "the bigger file is likely the more recent one. The deepest deltas are
+            therefore the oldest objects which are less susceptible to be accessed often"
+            <span class="src">from the code</span>. It then slides a window of 10 candidates over that list, with a
+            maximum chain depth of 50, clamped at 4,095 because depth lives in a 12-bit field
+            (<code>OE_DEPTH_BITS</code>). Existing deltas are reused when their base is also being written. The
+            result is the lab pack's shape: the newer blob whole, the older one a delta
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            On git.git the pack holds 421,871 objects in 324,086,703 bytes. Undeltified, the same objects total
+            8.35 GB, so the pack is 25.8 times smaller. Trees are 95.5% deltified and blobs 92.5%; commits only 5.3%
+            <span class="recon">measured here</span>. A sweep of window and depth on a 34,297-object subset (git.git
+            at v1.5.0, one thread, no reuse) shows the defaults sit near the knee: 10/50 gave 8,260,676 bytes in
+            10.7 s, 250/250 gave 7,195,904 bytes (13% smaller) in 49.4 s, and 0/0, no deltas, gave 121,877,126 bytes
+            <span class="recon">measured here</span>. On the same subset <code>--name-hash-version=2</code> came out
+            0.4% larger and <code>--path-walk</code> 6.2% smaller. That path-walk run was given a plain object list
+            rather than <code>--revs</code>, so treat it as indicative.
+          </p>

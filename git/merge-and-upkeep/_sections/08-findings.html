@@ -1,0 +1,227 @@
+          <h2 id="findings"><span class="secnum">{{S}}</span>The findings register</h2>
+          <p>
+            Reading v2.55.0 line by line against its manual turns up mismatches. Figure {{fig-register}} lists
+            all of them, in four groups. Group A is three real bugs in v2.55.0 that upstream has already fixed
+            after the tag: the fixes are on <code>master</code>, <code>next</code> and <code>seen</code> but in
+            no release yet. None of them was found here; each was reported or fixed upstream, and the register
+            records the introducing commit, the fix and a reproduction. Group B is five latent bugs or gaps still
+            present at <code>origin/seen</code> as fetched on 21 October 2026. Group C is 29 places where the
+            documentation and the code disagree; the code wins. Group D is behaviour that is documented, or
+            deliberate, but surprises people.
+          </p>
+          <p>
+            The reproductions for A1, A2, B1, B2, B3 and D1 were re-run for this post with
+            <code>git version 2.55.0</code>, and each printed what the register says <span class="recon">measured here</span>. The others come
+            from the dossier's lab runs and the verification passes behind it.
+          </p>
+          <p>
+            Upstream keeps moving, and a few changes since the tag touch rows below. On <code>master</code>:
+            <code>USE_NSEC</code> became the runtime setting <code>core.useNanosec</code>
+            (<code>3a21fe8cf9</code>, D24), reftable's reflog timezones were fixed (<code>e14e2b6cf2</code>), and
+            <code>init.defaultRefFormat</code> was renamed <code>init.defaultRefStorageFormat</code>
+            (<code>53d995c53f</code>). Only on <code>seen</code>, <code>core.indexLockTimeout</code>
+            (<code>fd1a1fc743</code>) would let the index lock wait (D19). None is in a release yet.
+          </p>
+
+          <figure class="figure wide" id="fig-register">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Findings register for git v2.55.0: fixed after the tag, latent, doc drift, gotchas</p>
+            </div>
+            <div class="figure-body">
+              <details open>
+                <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">A · REAL BUGS IN v2.55.0, FIXED UPSTREAM AFTER THE TAG (3)</summary>
+                <table style="font-size: 13px">
+                  <thead><tr><th>#</th><th>Finding</th><th>Code</th><th>Introduced → fixed</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr><td>A1</td><td>Reflog expiry defaults swapped: every entry expires after 30 days, unreachable ones after 90, the reverse of the docs. Hits <code>reflog expire</code>, <code>gc</code> and the maintenance reflog task.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">reflog.h:25-28; docs config/gc.adoc:115-122, git-reflog.adoc:114-124</td><td>8565827570 (v2.50.0) → 60cf500551, 2026-09-24</td><td class="hl-green" style="background: var(--green-soft)">fixed on master, untagged</td></tr>
+                    <tr><td>A2</td><td><code>uploadpack.allowRefInWant</code> plus <code>clone --depth</code> dies: the server sends wanted-refs before shallow-info.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:1815-1816; fetch-pack.c:1851-1856; gitprotocol-v2.adoc:391-393</td><td>516e2b76bd, 733020517a (v2.19.0) → 191740edaa, 2026-09-16</td><td class="hl-green" style="background: var(--green-soft)">fixed on master, untagged</td></tr>
+                    <tr><td>A3</td><td>A split commit-graph write recomputes lower layers' levels: 0.10 s instead of 0.016 s per one-commit layer. Output is correct.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-graph.c:2606-2608; reader 919-920</td><td>199d452758 (v2.52.0) → 8ea36f63d8, 2026-07-09</td><td class="hl-green" style="background: var(--green-soft)">fixed on master, untagged</td></tr>
+                  </tbody>
+                </table>
+              </details>
+              <details style="margin: 6px 0 22px">
+                <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for A</summary>
+                <pre><code># A1: no config; reflog.h defaults
+git init -q -b main rl &amp;&amp; cd rl; now=$(date +%s); d(){ echo "@$((now - $1*86400)) +0000"; }
+for a in 100 60 45 20 1; do echo $a&gt;f; git add f
+  GIT_COMMITTER_DATE="$(d $a)" GIT_AUTHOR_DATE="$(d $a)" git commit -qm c$a; done
+echo u&gt;h; git add h; GIT_COMMITTER_DATE="$(d 35)" GIT_AUTHOR_DATE="$(d 35)" git commit -qm u35
+GIT_COMMITTER_DATE="$(d 1)" git reset -q --hard HEAD~1
+git reflog expire --all --verbose   # prunes c100, c60, c45, u35; keeps c20, c1, the reset
+
+# A2: needs a repository srv with at least one commit
+git -C srv config uploadpack.allowRefInWant true
+git -c protocol.version=2 clone -q --depth 1 file://$PWD/srv rw1
+# fatal: expected 'packfile', received 'shallow-info'
+
+# A3: ~/git-ref/lab/scratch/maintenance/topo.sh and topo2.sh
+# two-layer chain, then one commit with: commit-graph write --split=no-merge --stdin-commits</code></pre>
+              </details>
+
+              <details open>
+                <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">B · LATENT BUGS AND GAPS, UNFIXED AT origin/seen (5)</summary>
+                <table style="font-size: 13px">
+                  <thead><tr><th>#</th><th>Finding</th><th>Code</th><th>History</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr><td>B1</td><td><code>index.skipHash</code> with <code>core.splitIndex</code> silently drops every staged entry: the shared index is named after a null hash, and a null base means "not split".</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">read-cache.c:3268, 2369</td><td>skipHash since ee1f0c242e (v2.40.0); tests for the pair disabled in 7cce609e08 (v2.55.0); first bad commit not bisected</td><td class="hl-red" style="background: var(--red-soft)">unfixed; Scalar turns skipHash on</td></tr>
+                    <tr><td>B2</td><td>The end-of-index-entries extension can never validate in a SHA-256 repository, so threaded index loading is dead there.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">read-cache.c:3543 (size uses GIT_SHA1_RAWSZ), 3567, 3632-3644</td><td>EOIE/IEOT v2.20.0; SHA-256 repos v2.29.0; the writer change not traced</td><td class="hl-red" style="background: var(--red-soft)">unfixed</td></tr>
+                    <tr><td>B3</td><td><code>feature.experimental</code> and <code>feature.manyFiles</code> never enable path-walk packing: line 78 resets the cascaded value when the key is unset.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">repo-settings.c:57, 63, 78; builtin/pack-objects.c:5188-5197</td><td>4f7f571204 (v2.51.0)</td><td class="hl-red" style="background: var(--red-soft)">unfixed</td></tr>
+                    <tr><td>B4</td><td>Rebase and cherry-pick never reuse ort's cached renames; <code>git replay</code> does (1 rename pass against 8).</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">sequencer.c:781, 784-791; merge-ort.c:4966-4980, 5145-5157</td><td>since the ort rename cache; the design doc says it is dropped only when a rebase stops</td><td class="hl-red" style="background: var(--red-soft)">unfixed; a missed optimisation</td></tr>
+                    <tr><td>B5</td><td>The commit-graph writer's edge guard (0x7fffffff) is looser than the documented cap (0x70000000 = "no parent").</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-graph.c:2676; gitformat-commit-graph.adoc:32-35</td><td>—</td><td class="hl-red" style="background: var(--red-soft)">latent, theoretical</td></tr>
+                  </tbody>
+                </table>
+              </details>
+              <details style="margin: 6px 0 22px">
+                <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for B</summary>
+                <pre><code># B1
+git init -q sk; git -C sk config index.skipHash true; git -C sk config core.splitIndex true
+for i in 1 2 3 4 5; do echo $i &gt; sk/f$i; done; git -C sk add f1 f2 f3 f4 f5
+git -C sk ls-files | wc -l    # 0
+git -C sk status --short      # ?? f1 … ?? f5
+
+# B2: the reader probes 64 bytes before EOF; EOIE sits 76 before it
+git init -q --object-format=sha256 s &amp;&amp; echo a &gt; s/a &amp;&amp; git -C s -c index.threads=true add a
+python3 -c "d=open('s/.git/index','rb').read(); print(len(d), d.rfind(b'EOIE'), d[-64:-60])"
+# 168 92 b'\xe3\xb0\xc4B'
+
+# B3: count path-walk regions (run inside any repository)
+for c in "" "-c feature.experimental=true" "-c feature.manyFiles=true" "-c pack.usePathWalk=true"; do
+  echo HEAD | GIT_TRACE2_EVENT=$PWD/t2.json git $c pack-objects --revs --stdout &gt;/dev/null
+  grep -c '"label":"path-walk"' t2.json; rm t2.json; done
+# 0 0 0 2
+
+# B4: ~/git-ref/lab/scratch/merge/tools/rename-cache.sh (N=800, K=8, M=400)
+# replay: 1 diffcore_rename call; rebase: 8</code></pre>
+              </details>
+
+              <details open>
+                <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">C · DOCUMENTATION DRIFT: DOC AND CODE DISAGREE, THE CODE WINS (29)</summary>
+                <table style="font-size: 13px">
+                  <thead><tr><th>#</th><th>What the doc says, and what the code does</th><th>Doc</th><th>Code</th><th>Since</th></tr></thead>
+                  <tbody>
+                    <tr><td>C1</td><td><code>core.fsync=committed</code> "equivalent to objects"; the code adds refs. The described default is wrong too.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/core.adoc:678-681</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">write-or-die.h:33-38</td><td>v2.36.0 (bc22d845c4)</td></tr>
+                    <tr><td>C2</td><td><code>index.threads</code> "defaults to true"; unset means 1 thread.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/index.adoc:26-27</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config.c:2547; read-cache.c:2257-2258</td><td>v2.20.0 (2a9dedef2e)</td></tr>
+                    <tr><td>C3</td><td>MIDX version "defaults to 2"; v1 is written.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-pack.adoc:377-379</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">midx-write.c:1279-1282</td><td>v2.54.0 revert (a12382f994)</td></tr>
+                    <tr><td>C4</td><td>Pseudo-pack order "descending by pack ID"; the code sorts ascending, and the doc contradicts itself at :538-539.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-pack.adoc:530-531</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">midx-write.c:644-657</td><td>—</td></tr>
+                    <tr><td>C5</td><td>BTMP "encodes three pieces of information", then lists two; disk holds two u32 per pack.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-pack.adoc:575-577</td><td>measured BTMP</td><td>—</td></tr>
+                    <tr><td>C6</td><td>Bitmap type indexes "after the hash cache"; they start at offset 32 and the hash cache is last. "20-byte checksum" is 32 bytes in SHA-256.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/bitmap-format.adoc:95-97</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pack-bitmap-write.c:1365-1441</td><td>—</td></tr>
+                    <tr><td>C7</td><td>A <code>DIR_BITS</code> name hash from a 2006 IRC log that the code never implemented.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/pack-heuristics.adoc:151-153</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pack-objects.h:204-222</td><td>2006</td></tr>
+                    <tr><td>C8</td><td>idx v3 signature spelled with a digit zero; the code's is a letter O.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/hash-function-transition.adoc:219</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pack.h:41</td><td>copied forward on seen</td></tr>
+                    <tr><td>C9</td><td><code>gitformat-loose(5)</code> documents <code>map-*.map</code> files; 2.55 writes a text <code>loose-object-idx</code>.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-loose.adoc:12-13</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">loose.c:15, 80, 140, 182</td><td>v2.54.0</td></tr>
+                    <tr><td>C10</td><td>Bloom filter size in "64-bit words"; the code uses bytes.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-commit-graph.adoc:157-159</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">bloom.h:30-32, 47</td><td>—</td></tr>
+                    <tr><td>C11</td><td>Second Bloom seed printed as 0x7e646e2; the code's is 0x7e646e2c.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-commit-graph.adoc:149</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">bloom.c:228-229</td><td>—</td></tr>
+                    <tr><td>C12</td><td><code>reftable.geometricFactor</code> "maximum factor of 256"; the code dies above 255.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/reftable.adoc:47-48</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs/reftable-backend.c:353-354</td><td>—</td></tr>
+                    <tr><td>C13</td><td>Glossary: per-worktree refs are HEAD and refs/bisect/; the code adds refs/worktree/, refs/rewritten/ and root refs.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">glossary-content.adoc:494-498</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs.c:881-886</td><td>—</td></tr>
+                    <tr><td>C14</td><td>Glossary: root refs use only upper case and underscores; <code>is_root_ref()</code> also accepts a hyphen.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">glossary-content.adoc:565-585</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs.c:908</td><td>minor</td></tr>
+                    <tr><td>C15</td><td><code>AUTO_MERGE</code> written when a merge "resulted in conflicts"; it is written after clean merges too.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">revisions.adoc:75-78</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">merge-ort.c:4924-4955</td><td>v2.32.0 (5291828df8)</td></tr>
+                    <tr><td>C16</td><td>rerere normalises across conflict styles; diff3 changes the conflict id, zdiff3 does not.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/rerere.adoc:9-19</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">xdiff/xmerge.c:534-541; rerere.c:367-466</td><td>—</td></tr>
+                    <tr><td>C17</td><td><code>allowTipSHA1InWant</code> and friends describe refusals that apply only to protocol v0/v1; v2 serves any object by id.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/uploadpack.adoc:6-23</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:1472-1505</td><td>v2.18.0</td></tr>
+                    <tr><td>C18</td><td>Comment says the unconfigured client default is v0; the code returns v2.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">protocol.h:32-38</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">protocol.c:46</td><td>v2.29.0 (eb049759fb)</td></tr>
+                    <tr><td>C19</td><td>bundle-uri comment "Convert all refs/heads/"; every refs/&lt;x&gt; maps to refs/bundles/&lt;x&gt;, as the design doc says.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">bundle-uri.c:432-433 (comment)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">bundle-uri.c:432-456</td><td>comment only</td></tr>
+                    <tr><td>C20</td><td>Opt in to Rust with <code>WITH_RUST=YesPlease</code>; no such knob. Rust is on unless <code>NO_RUST</code>.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">BreakingChanges.adoc:201-203</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">Makefile:497-499, 1595-1597</td><td>2.52-era text</td></tr>
+                    <tr><td>C21</td><td><code>feature.adoc</code> promises path-walk under experimental (never delivered, B3) and omits it from manyFiles, which sets it.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/feature.adoc:24-26, 34-47</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">repo-settings.c:57, 63, 78</td><td>v2.51.0</td></tr>
+                    <tr><td>C22</td><td>Comment names the PID file <code>foo-pid.lock</code>; code and docs use <code>foo~pid.lock</code>.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">lockfile.c:90-107 (comment)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">lockfile.h:136</td><td>v2.54.0 (dbdcab6b89)</td></tr>
+                    <tr><td>C23</td><td>Comment: the shared index gets a zero timestamp; the code copies the live one.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">split-index.c:109-110 (comment)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">split-index.c:110</td><td>stale comment</td></tr>
+                    <tr><td>C24</td><td>Split commit-graph merge rule "less than"; the code uses &lt;=.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/commit-graph.adoc:272-296</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-graph.c:2280-2324</td><td>minor</td></tr>
+                    <tr><td>C25</td><td>MIDX header byte for base files "always zero" is written and never read; chains use a BASE chunk.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-pack.adoc:391-392</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">midx-write.c:36-51</td><td>minor</td></tr>
+                    <tr><td>C26</td><td>ort "defaults to histogram" while diffs use <code>diff.algorithm</code>: incomplete, since porcelain merges honour <code>diff.algorithm</code> and plumbing does not.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">merge-strategies.adoc:96-102</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">merge-ort.c:5473-5481, 5513-5523</td><td>v2.50.0 (2e806d8464)</td></tr>
+                    <tr><td>C27</td><td><code>need_to_gc()</code> comment says too many packs runs <code>repack -A -d -l</code>; with cruft packs it is <code>--cruft</code>.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:664-715 (comment)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:628-648</td><td>stale comment</td></tr>
+                    <tr><td>C28</td><td>The v2 grammar spells "acknowledgements"; the header and the code say "acknowledgments".</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitprotocol-v2.adoc:391-394</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:1690</td><td>cosmetic</td></tr>
+                    <tr><td>C29</td><td>reftable's 2017 problem statement calls packed-refs lookup a linear scan; the code binary-searches the mapped file.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/reftable.adoc:10-13</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs/packed-backend.c:590-640</td><td>historical</td></tr>
+                  </tbody>
+                </table>
+                <p style="font-size: 13px; color: var(--ink-faint); margin: 10px 0 22px">Every C item is unfixed at origin/seen. Doc paths are under <code>Documentation/</code>. To reproduce one, read the two locations side by side; C1, C3 to C6, C9 to C11 and C15 were also confirmed by measuring what git writes.</p>
+              </details>
+
+              <details open>
+                <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">D · DOCUMENTED OR DELIBERATE, BUT SURPRISING (26)</summary>
+                <table style="font-size: 13px">
+                  <thead><tr><th>#</th><th>Behaviour</th><th>Code</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr><td>D1</td><td><code>-M5</code> means 50% and <code>-M05</code> means 5%: the digits are a decimal fraction.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">diff.c:6344-6377</td><td class="hl-purple" style="background: var(--purple-soft)">documented</td></tr>
+                    <tr><td>D2</td><td><code>git gc</code> ignores <code>commitGraph.changedPaths</code>; only <code>commit-graph write</code> reads it.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/commit-graph.c:207-220; builtin/gc.c:1056-1059</td><td class="hl-purple" style="background: var(--purple-soft)">documented scope</td></tr>
+                    <tr><td>D3</td><td>Protocol v2 serves any existing object by id, including dangling commits and hidden refs' tips.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:1472-1505</td><td class="hl-purple" style="background: var(--purple-soft)">in the protocol spec</td></tr>
+                    <tr><td>D4</td><td>Push still speaks protocol v0 over every transport.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">connect.c:1411-1417</td><td class="hl-purple" style="background: var(--purple-soft)">NEEDSWORK, open</td></tr>
+                    <tr><td>D5</td><td><code>pre-commit</code> runs after the trees and the index are written; a rejecting hook leaves them on disk.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/commit.c:482-494</td><td class="hl-purple" style="background: var(--purple-soft)">reproduced</td></tr>
+                    <tr><td>D6</td><td>Auto-maintenance roughly doubles a tiny commit: 8.4 ms against 3.9 ms.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/commit.c:1964-1967</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D7</td><td>Every commit takes and drops <code>AUTO_MERGE.lock</code> and <code>packed-refs.lock</code>; a stale <code>packed-refs.lock</code> costs each commit about 1 s.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">sequencer.c:2988-2989</td><td class="hl-purple" style="background: var(--purple-soft)">open at seen</td></tr>
+                    <tr><td>D8</td><td>Files backend readers see intermediate states of a multi-ref transaction; reftable readers see none.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs/files-backend.c:3293-3331</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D9</td><td><code>gc --auto</code> counts <code>objects/17/</code> only, and porcelain no longer calls it.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:470-482; odb/source-loose.c:535-560</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D10</td><td>A non-empty <code>gc.log</code> blocks detached auto-gc for a day.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:791-832</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D11</td><td>Bloom filters still default to murmur3 v1, which mishandles high bytes on signed-char platforms.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-graph.c:2626</td><td class="hl-purple" style="background: var(--purple-soft)">open at seen</td></tr>
+                    <tr><td>D12</td><td>Only <code>git fsck</code> verifies the index checksum.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">read-cache.c:1701-1730</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D13</td><td>By default nothing on the commit path is fsynced; reflog appends have no fsync call.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">write-or-die.h:33-35; refs/files-backend.c:2016</td><td class="hl-purple" style="background: var(--purple-soft)">configurable</td></tr>
+                    <tr><td>D14</td><td>Plain <code>git merge-base</code> may stop at the first base; merges use all.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-reach.c:149-156</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D15</td><td>The rename limit bounds sources × destinations, after the cheap stages: 7000 for merges, 1000 for diffs.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">diffcore-rename.c:1086-1128</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D16</td><td>Default Myers is heuristic, and on git.git history slower and wordier than patience and histogram.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">xdiff/xdiffi.c:30-49, 351-355</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D17</td><td>"In-memory" merges write blobs and trees; only <code>merge-tree --quiet</code> avoids it, outer merge only.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">merge-ort.c:2200-2271, 3829-3869</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D18</td><td>reftable: git never queries the object index it writes; D/F conflicts still enforced; cross-worktree transactions commit stack by stack.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">reftable/table.c:614-634; refs/reftable-backend.c:1371-1375</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D19</td><td>The index lock never waits; ref locks retry for 100 ms, <code>packed-refs</code> for 1000 ms.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">lockfile.h:205-209; refs.c:997-998</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D20</td><td><code>online_cpus()</code> ignores cgroup quotas: git saw 8 CPUs on a 2-CPU quota.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">thread-utils.c:21-61</td><td class="hl-purple" style="background: var(--purple-soft)">unchanged</td></tr>
+                    <tr><td>D21</td><td>After <code>fetch --unshallow</code>, following an old tag took a second connection and two rounds.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:561-571</td><td class="hl-purple" style="background: var(--purple-soft)">measured; intent unknown</td></tr>
+                    <tr><td>D22</td><td>The <code>skipping</code> negotiator can over-fetch when the common commit is not a tip: 6,001 objects against 3,004.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">negotiator/skipping.c:130-212</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D23</td><td>Geometric maintenance rarely prunes unreachable objects.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:1570-1617</td><td class="hl-purple" style="background: var(--purple-soft)">documented trade-off</td></tr>
+                    <tr><td>D24</td><td><code>USE_NSEC</code> is off on Linux: nanoseconds are recorded but not compared.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">statinfo.c:64-105; Makefile:200-211</td><td class="hl-purple" style="background: var(--purple-soft)">runtime switch on master</td></tr>
+                    <tr><td>D25</td><td>A bitmap count of <code>A ^B</code> can be smaller, and exact, than the plain walk's.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pack-bitmap.c:2103-2257</td><td class="hl-purple" style="background: var(--purple-soft)">measured</td></tr>
+                    <tr><td>D26</td><td>Protocol v2 is not cheaper on tiny repositories; its win is <code>ref-prefix</code> at scale.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ls-refs.c:194-211</td><td class="hl-purple" style="background: var(--purple-soft)">measured</td></tr>
+                  </tbody>
+                </table>
+              </details>
+              <details style="margin: 6px 0 0">
+                <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for D</summary>
+                <pre><code>D1   git diff -M5 --name-status A B; git diff -M05 --name-status A B
+     # on a weakly similar rename: D/A under -M5, R0nn under -M05
+D2   git -c commitGraph.changedPaths=true gc     # no BIDX/BDAT chunks
+     git commit-graph write --reachable --changed-paths   # adds them
+D3   git -c protocol.version=2 fetch file://$PWD/srv &lt;dangling-oid&gt;   # fetched
+     git -c protocol.version=0 fetch file://$PWD/srv &lt;dangling-oid&gt;   # refused
+D4   GIT_TRACE=1 git -c protocol.version=2 push file://$PWD/srv main   # no GIT_PROTOCOL
+D5   a pre-commit hook that exits 1: index 184 → 245 B, loose objects 2 → 4, kept
+D6   ~/git-ref/lab/scratch/history/tools/time-commit.sh, with and without maintenance.auto=false
+D7   touch .git/packed-refs.lock; git commit --allow-empty -m x   # ~1 s, error, succeeds
+D8   ~/git-ref/lab/refs-visibility.sh
+D9   ~/git-ref/lab/scratch/maintenance/mkblobs.py: 27 vs 28 objects in objects/17
+D10  leave a non-empty .git/gc.log; git gc --auto does nothing for a day
+D11  git commit-graph write --reachable --changed-paths   # BDAT header (1, 7, 10)
+D12  flip the last byte of .git/index: git ls-files exits 0, git fsck exits 128
+D13  GIT_TRACE2_PERF=… git commit …   # fsync/hardware-flush counters stay 0
+D14  git merge-base --all A B (2 bases) vs git merge-base A B (1) on a criss-cross
+D15  ~/git-ref/lab/scratch/merge/tools/rename-scale.sh
+D16  ~/git-ref/lab/scratch/merge/tools/diff-algos.sh
+D17  git merge-tree --write-tree A B (2 loose objects) vs --quiet (0), on a gc'd clone
+D18  in a reftable repo: git update-ref refs/heads/topic/x HEAD  # refused, topic exists
+D19  touch .git/index.lock; git add x        # fails at once
+D20  getconf _NPROCESSORS_ONLN vs nproc and /sys/fs/cgroup/cpu.max
+D21  transport walkthrough W5: clone --depth 1, fetch --unshallow, fetch a tag
+D22  ~/git-ref/lab/transport-negotiation-c.sh (N=5000)
+D23  git show d9bccf2ec3   # the strategy's own commit message
+D24  same-second edit after git add: the entry is smudged, not compared by ns
+D25  git rev-list --count --objects v2.55.0 ^v2.54.0, with and without bitmaps
+D26  ~/git-ref/lab/transport-lsrefs.sh</code></pre>
+              </details>
+            </div>
+            <p class="figure-caption">
+              Three real bugs fixed upstream after 2.55, five latent ones still open, and a long tail of
+              documentation that drifted from the code. Status is as of <code>origin/seen</code> fetched
+              2026-10-21; green means fixed on master but in no tag, red means unfixed.
+            </p>
+          </figure>
+
+          <p>
+            Read by subsystem, the register follows the collection's thesis. Git is an append-only store of
+            objects surrounded by a few small mutable files, and each file is either a pointer or a cache with
+            its own consistency story. Objects need no lock, and no finding touches how an object is named or stored.
+            Mutable files publish by rename, and two of the fixed bugs sit at that edge: reflog expiry, which
+            decides what a pointer's history protects, and the shallow-clone section order on the wire. The
+            rest cluster around derived data: the index as a cache (B1, B2, C2), the commit-graph and its
+            filters (A3, B5, C10, C11, D2, D11), packs and their indexes (C3 to C7)
+            <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            That is where git's surprises live: where one consistency story meets another. A cache whose
+            freshness test is a timestamp. A ref backend atomic per ref, not per transaction. A deletion that
+            relies on a two-week clock and on writers touching mtimes. Publishing that is atomic but, by default,
+            not durable. Merging and upkeep add no new kind of state. They add objects, rebuild what can be
+            rebuilt, and wait for the clock before throwing anything away.
+          </p>

@@ -1,0 +1,61 @@
+          <h2 id="merge-bases"><span class="secnum">{{S}}</span>Where two histories meet</h2>
+          <p class="lede">
+            <a href="../commit-and-objects/">Part 1</a> showed that git's history is an append-only store of
+            objects named by their hashes. <a href="../state-and-wire/">Part 2</a> showed the small mutable
+            files around it: the index and the refs, each published by a rename. This part covers the two
+            jobs that run on top of both. Merging combines two lines of history, and it only ever adds
+            objects. Upkeep keeps the store fast, and it does that by rebuilding derived data and by
+            deleting with a clock instead of a lock. The collection's thesis holds here too: everything
+            that makes git fast can be thrown away and rebuilt from the objects.
+          </p>
+          <p>
+            A merge starts by finding the merge base: the newest commit both sides share. That commit is
+            the "before" for a three-way merge. Git finds it in <code>paint_down_to_common()</code> in
+            <code>commit-reach.c</code>. It walks a priority queue backwards from both tips. Commits reached
+            from the first tip get the flag <code>PARENT1</code>; commits reached from the second get
+            <code>PARENT2</code>. A commit that ends up with both flags is a common ancestor. It is marked
+            <code>RESULT</code>, and its parents are marked <code>STALE</code>, because anything older than
+            a common ancestor cannot be the best one. The four flags are object flag bits 16 to 19
+            <span class="src">from the code</span>.
+          </p>
+          <p>The core of the loop is <code>commit-reach.c:144-160</code>:</p>
+          <pre><code>		flags = commit-&gt;object.flags &amp; (PARENT1 | PARENT2 | STALE);
+		if (flags == (PARENT1 | PARENT2)) {
+			if (!(commit-&gt;object.flags &amp; RESULT)) {
+				commit-&gt;object.flags |= RESULT;
+				tail = commit_list_append(commit, tail);
+				/*
+				 * The queue is generation-ordered; no
+				 * remaining common ancestor can be a
+				 * descendant of this one.
+				 */
+				if (!(mb_flags &amp; MERGE_BASE_FIND_ALL) &amp;&amp;
+				    generation &lt; GENERATION_NUMBER_INFINITY)
+					break;
+			}
+			/* Mark parents of a found merge stale */
+			flags |= STALE;
+		}</code></pre>
+          <p>
+            The <code>break</code> is new in v2.55.0. Commit <code>93e5b1680e</code> lets plain
+            <code>git merge-base</code> stop at the first common ancestor when the queue is ordered by
+            generation number. Its message reports 5,229 ms falling to 24 ms. The same release made the
+            loop's "is anything left to do" check O(1) (<code>a186b7797a</code>), about 27× faster inside
+            this function on a 3.7-million-commit monorepo, per its message <span class="src">from the code</span>.
+            Merges never take the shortcut. They pass <code>MERGE_BASE_FIND_ALL</code>, because a merge
+            needs every base.
+          </p>
+          <p>
+            Generation numbers come from the commit-graph file (<a href="#commit-graph">section 06</a>). They
+            are what make this walk cheap. On git.git, the merge behind <code>bc5204569f</code> ("Git
+            2.43-rc0") has 54 merge bases. <code>git merge-base --all</code> on its two parents took 21 ms
+            with a commit-graph and 1,142 ms without, median of 5 runs with
+            <code>lab/scratch/merge/tools/mb-time.sh</code>. The single-base form took 11 ms
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Several bases is the "criss-cross" case: each side has already merged the other once. It is
+            not rare. In a 1-in-6 sample of git.git's two-parent merges, 125 of 3,498 (3.6%) had more than
+            one base <span class="recon">measured here</span>. The next section shows what merge-ort does
+            with more than one base.
+          </p>

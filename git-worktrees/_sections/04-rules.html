@@ -1,0 +1,116 @@
+          <h2 id="rules"><span class="secnum">{{S}}</span>The rules that keep worktrees apart</h2>
+          <p class="lede">
+            Git enforces two rules for you. A branch can be checked out in at most one worktree, and
+            garbage collection treats every worktree's <code>HEAD</code> and index as live. Everything
+            else in the shared column of Figure {{fig-split}} is unguarded, and that is where parallel
+            agents step on each other.
+          </p>
+
+          <h3>Rule 1: one branch, one worktree</h3>
+          <p>
+            <code>die_if_checked_out</code> walks every worktree and dies if any has the branch
+            (<code>branch.c</code>:847-863). Its callers are <code>git worktree add</code>
+            (<code>builtin/worktree.c</code>:488), <code>git switch</code> and <code>git checkout</code>
+            (<code>builtin/checkout.c</code>:1652, which <code>--ignore-other-worktrees</code> skips) and
+            <code>git rebase</code> (<code>builtin/rebase.c</code>:1704). The check that matters is
+            <code>is_shared_symref</code>, <code>worktree.c</code>:504-519
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	if (wt-&gt;is_bare)
+		return 0;
+
+	if (wt-&gt;is_detached &amp;&amp; !strcmp(symref, "HEAD")) {
+		if (is_worktree_being_rebased(wt, target))
+			return 1;
+		if (is_worktree_being_bisected(wt, target))
+			return 1;
+	}
+
+	refs = get_worktree_ref_store(wt);
+	symref_target = refs_resolve_ref_unsafe(refs, symref, 0,
+						NULL, &amp;flags);
+	if ((flags &amp; REF_ISSYMREF) &amp;&amp;
+	    symref_target &amp;&amp; !strcmp(symref_target, target))
+		return 1;</code></pre>
+          <p>
+            The detached case is the subtle part. During a rebase, <code>HEAD</code> is detached, yet
+            the branch is still claimed: the rebase will move it when it finishes. A second worktree
+            that checked it out in the meantime would have its branch moved underneath it. The
+            reason for the rule is simple. A branch is a shared ref. Two indexes building commits on
+            top of it would each advance it from a parent the other has already left behind.
+            <span class="recon">reconstruction</span>
+          </p>
+          <p>
+            The lab hit the rule both ways <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ git -C ../wt1 checkout agent-2
+fatal: 'agent-2' is already used by worktree at '/home/coder/git-ref/lab/work/wt2'
+$ git worktree add ../wtX agent-3
+fatal: 'agent-3' is already used by worktree at '/home/coder/git-ref/lab/work/wt3'</code></pre>
+          <p>
+            <code>--force</code> skips the check (<code>builtin/worktree.c</code>:487). For agents,
+            don't. Give each agent its own branch, or use <code>--detach</code> and create the branch
+            only when the work is ready.
+          </p>
+
+          <h3>Rule 2: gc sees every worktree</h3>
+          <p>
+            An agent's staged but uncommitted file is only a blob in the shared object store, and
+            nothing in <code>refs/</code> points to it. If gc only looked at refs, a
+            <code>git gc</code> started in any other worktree could delete it. It doesn't, because
+            reachability walks every worktree. <code>add_index_objects_to_pending</code> reads each
+            worktree's index file (<code>revision.c</code>:1829-1857), and
+            <code>other_head_refs</code> adds each worktree's <code>HEAD</code>
+            (<code>reachable.c</code>:314, 322) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The lab tested it <span class="recon">measured here</span>. I staged a new file in
+            <code>wt3</code>, never committed it, and ran <code>git gc --prune=now</code> from the
+            hub. Afterwards <code>git cat-file -t 974785ff</code> still answered <code>blob</code>.
+            Two limits remain. A file that was never staged isn't in the object store at all, so gc
+            has nothing to protect. And a worktree whose directory was deleted stops protecting
+            anything once it is pruned (§06).
+          </p>
+
+          <h3>What is shared and unguarded</h3>
+          <p>
+            Everything else in the common directory has no owner. Figure {{fig-ledger}} lists what
+            the lab showed for each.
+          </p>
+
+          <figure class="figure wide" id="fig-ledger">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Hazard ledger: what one agent's action does to the others</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead><tr><th>Shared thing</th><th>Probe (lab)</th><th>Observed</th><th>What to do</th></tr></thead>
+                <tbody>
+                  <tr><td><code>refs/heads/*</code></td><td>P1: check out a branch another worktree has</td><td class="hl-green" style="background: var(--green-soft)">refused: "already used by worktree"</td><td>one branch per agent</td></tr>
+                  <tr><td>objects</td><td>P5: <code>gc --prune=now</code> while a blob is staged only in <code>wt3</code></td><td class="hl-green" style="background: var(--green-soft)">blob kept</td><td>nothing; gc is worktree-aware</td></tr>
+                  <tr><td><code>refs/stash</code></td><td>P2: <code>stash</code> in <code>wt1</code>, <code>stash list</code> in <code>wt2</code></td><td class="hl-red" style="background: var(--red-soft)"><code>stash@{0}: WIP on agent-1</code> appears in wt2</td><td>no <code>stash pop</code> in agent scripts; commit to a WIP branch</td></tr>
+                  <tr><td><code>config</code></td><td>P4: <code>git config core.editor ed</code> in <code>wt1</code></td><td class="hl-red" style="background: var(--red-soft)">wt2 reads <code>ed</code></td><td><code>extensions.worktreeConfig</code> + <code>config --worktree</code></td></tr>
+                  <tr><td><code>hooks/</code></td><td>(by the table in §02)</td><td class="hl-orange" style="background: var(--orange-soft)">one hook set for all worktrees</td><td>hooks must not assume one checkout</td></tr>
+                  <tr><td>branch names</td><td>P3: <code>update-ref refs/heads/note-from-wt1</code></td><td class="hl-orange" style="background: var(--orange-soft)">visible in wt2 at once</td><td>namespace per agent: <code>agent/&lt;id&gt;/…</code></td></tr>
+                  <tr><td><code>refs/worktree/*</code></td><td>P3: <code>update-ref refs/worktree/mark</code></td><td class="hl-green" style="background: var(--green-soft)">invisible to wt2</td><td>use for an agent's private bookmarks</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Green: git keeps worktrees apart. Red: one agent's action shows up in another's
+              worktree. Orange: shared by design, so it needs a convention. All probes are in
+              <code>lab/hazards.sh</code>, run on git 2.55.0.
+            </p>
+          </figure>
+
+          <p>
+            Config is the one with a built-in fix. With <code>extensions.worktreeConfig</code> set
+            to true, <code>git config --worktree</code> writes to
+            <code>.git/worktrees/&lt;name&gt;/config.worktree</code>, and other worktrees don't read
+            it. In the lab, <code>wt1</code> then read <code>vi</code> and <code>wt2</code> still
+            read <code>ed</code> <span class="recon">measured here</span>. <code>git sparse-checkout
+            set</code> turns this extension on by itself, so that one worktree's sparse settings
+            don't leak into the others (<code>Documentation/git-sparse-checkout.adoc</code>:51-57)
+            <span class="src">from the docs</span>.
+          </p>

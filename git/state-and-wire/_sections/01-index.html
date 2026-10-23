@@ -1,0 +1,222 @@
+          <h2 id="index"><span class="secnum">{{S}}</span>The index: a stat cache that becomes a tree</h2>
+          <p class="lede">
+            <a href="../commit-and-objects/">Part 1</a> ended with a store that never changes. An object is named by
+            the hash of its bytes, so a writer never needs a lock: if the name exists, the content is already there.
+            Everything else in <code>.git</code> does change. The index, the refs, the reflogs and the
+            conversation between two repositories are small, mutable and shared. Each is either a pointer or a
+            cache, and each has its own consistency story. This part reads those stories from git v2.55.0, starting
+            with the file every <code>git add</code> rewrites.
+          </p>
+          <p>
+            The index (<code>.git/index</code>) is one binary file: a 12-byte header, the entries sorted by path,
+            typed extensions, and a trailing hash. The header is <code>DIRC</code> ("dircache"), a version from 2
+            to 4 and an entry count, all big-endian <span class="src">from the code</span>. An entry is ten 32-bit
+            stat words, the object id and a 16-bit flags word, then the path. <code>read-cache.c</code>:1667-1684:
+          </p>
+<pre><code>struct ondisk_cache_entry {
+	struct cache_time ctime;
+	struct cache_time mtime;
+	uint32_t dev;
+	uint32_t ino;
+	uint32_t mode;
+	uint32_t uid;
+	uint32_t gid;
+	uint32_t size;
+	/*
+	 * unsigned char hash[hashsz];
+	 * uint16_t flags;
+	 * if (flags &amp; CE_EXTENDED)
+	 *	uint16_t flags2;
+	 */
+	unsigned char data[GIT_MAX_RAWSZ + 2 * sizeof(uint16_t)];
+	char name[FLEX_ARRAY];
+};</code></pre>
+          <p>
+            That is 62 fixed bytes under SHA-1. The flags word holds assume-valid (bit 15), extended (bit 14), a
+            2-bit merge stage and a 12-bit name length (<code>read-cache-ll.h</code>:34-37). In versions 2 and 3 the
+            name is NUL-padded so each entry ends on an 8-byte boundary. Figure {{fig-index-entry}} is a real entry,
+            from a three-file repository whose index came to 317 bytes <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-index-entry">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One index entry, byte by byte, and the same paths in version 4</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 500" role="img" aria-label="A 72-byte version 2 index entry for README: ctime, mtime, dev, ino, mode, uid, gid, size, a 20-byte object id, a 2-byte flags word, the 6-byte name and 4 bytes of padding. Below, version 4 stores each path as a strip count plus a suffix; and bars compare sizes.">
+                <text x="56" y="30" class="svg-lane">INDEX v2 ENTRY · README · 72 BYTES AT FILE OFFSET 12</text>
+                <!-- offsets -->
+                <text x="56" y="54" class="svg-num" text-anchor="middle">0</text>
+                <text x="168" y="54" class="svg-num" text-anchor="middle">8</text>
+                <text x="280" y="54" class="svg-num" text-anchor="middle">16</text>
+                <text x="336" y="54" class="svg-num" text-anchor="middle">20</text>
+                <text x="392" y="54" class="svg-num" text-anchor="middle">24</text>
+                <text x="448" y="54" class="svg-num" text-anchor="middle">28</text>
+                <text x="504" y="54" class="svg-num" text-anchor="middle">32</text>
+                <text x="560" y="54" class="svg-num" text-anchor="middle">36</text>
+                <text x="616" y="54" class="svg-num" text-anchor="middle">40</text>
+                <text x="896" y="54" class="svg-num" text-anchor="middle">60</text>
+                <text x="924" y="54" class="svg-num" text-anchor="middle">62</text>
+                <text x="1008" y="54" class="svg-num" text-anchor="middle">68</text>
+                <text x="1064" y="54" class="svg-num" text-anchor="middle">72</text>
+                <!-- stat fields -->
+                <rect x="56" y="62" width="112" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="168" y="62" width="112" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="280" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="336" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="392" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="448" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="504" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="560" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="616" y="62" width="280" height="40" fill="#dfede5" stroke="#367f59"/>
+                <rect x="896" y="62" width="28" height="40" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="924" y="62" width="84" height="40" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="1008" y="62" width="56" height="40" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="112" y="87" class="svg-step" text-anchor="middle">ctime</text>
+                <text x="224" y="87" class="svg-step" text-anchor="middle">mtime</text>
+                <text x="308" y="87" class="svg-step" text-anchor="middle">dev</text>
+                <text x="364" y="87" class="svg-step" text-anchor="middle">ino</text>
+                <text x="420" y="87" class="svg-step" text-anchor="middle">mode</text>
+                <text x="476" y="87" class="svg-step" text-anchor="middle">uid</text>
+                <text x="532" y="87" class="svg-step" text-anchor="middle">gid</text>
+                <text x="588" y="87" class="svg-step" text-anchor="middle">size</text>
+                <text x="756" y="87" class="svg-step" text-anchor="middle">object id (20 bytes)</text>
+                <text x="966" y="87" class="svg-step" text-anchor="middle">README</text>
+                <text x="1036" y="87" class="svg-step" text-anchor="middle">pad</text>
+                <!-- values -->
+                <text x="112" y="122" class="svg-sub" text-anchor="middle">1792671528 s</text>
+                <text x="112" y="138" class="svg-sub" text-anchor="middle">920658538 ns</text>
+                <text x="224" y="122" class="svg-sub" text-anchor="middle">1792671528 s</text>
+                <text x="224" y="138" class="svg-sub" text-anchor="middle">920658538 ns</text>
+                <text x="308" y="122" class="svg-sub" text-anchor="middle">2128</text>
+                <text x="364" y="122" class="svg-sub" text-anchor="middle">2889566</text>
+                <text x="420" y="138" class="svg-sub" text-anchor="middle">00 00 81 a4</text>
+                <text x="476" y="122" class="svg-sub" text-anchor="middle">1000</text>
+                <text x="532" y="122" class="svg-sub" text-anchor="middle">1000</text>
+                <text x="588" y="122" class="svg-sub" text-anchor="middle">9</text>
+                <text x="756" y="122" class="svg-sub" text-anchor="middle">89931ee4751c9760ea2c…9012</text>
+                <text x="910" y="138" class="svg-sub" text-anchor="middle">00 06</text>
+                <text x="1036" y="122" class="svg-sub" text-anchor="middle">00×4</text>
+                <!-- zooms -->
+                <path d="M420 144 L420 166" stroke="#b8b8b1" stroke-width="1"/>
+                <rect x="270" y="166" width="300" height="44" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="284" y="185" class="svg-sub">mode 0x81a4 = type 1000 (regular file)</text>
+                <text x="284" y="201" class="svg-sub">           + permission bits 0644</text>
+                <path d="M910 144 L910 166" stroke="#b8b8b1" stroke-width="1"/>
+                <rect x="660" y="166" width="404" height="44" rx="3" fill="#ffffff" stroke="#d98226"/>
+                <text x="674" y="185" class="svg-sub">flags 0x0006: assume-valid 0 · extended 0</text>
+                <text x="674" y="201" class="svg-sub">             stage 00 · name length 6</text>
+                <text x="56" y="232" class="svg-note">blue = stat cache · green = what the entry names · orange = flags · purple = path · grey = NUL padding to a multiple of 8</text>
+
+                <!-- v4 lane -->
+                <text x="56" y="276" class="svg-lane">INDEX v4 · PATH = STRIP N BYTES OF THE PREVIOUS PATH, THEN A SUFFIX · NO PADDING</text>
+                <rect x="56" y="290" width="100" height="36" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="106" y="313" class="svg-sub" text-anchor="middle">62 bytes</text>
+                <rect x="156" y="290" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="172" y="313" class="svg-sub" text-anchor="middle">00</text>
+                <rect x="188" y="290" width="226" height="36" fill="#ece6f3" stroke="#765b98"/>
+                <text x="198" y="313" class="svg-sub">Documentation/git-add.adoc\0</text>
+
+                <rect x="440" y="290" width="100" height="36" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="490" y="313" class="svg-sub" text-anchor="middle">62 bytes</text>
+                <rect x="540" y="290" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="556" y="313" class="svg-sub" text-anchor="middle">07</text>
+                <rect x="572" y="290" width="82" height="36" fill="#ece6f3" stroke="#765b98"/>
+                <text x="582" y="313" class="svg-sub">m.adoc\0</text>
+
+                <rect x="680" y="290" width="100" height="36" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="730" y="313" class="svg-sub" text-anchor="middle">62 bytes</text>
+                <rect x="780" y="290" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="796" y="313" class="svg-sub" text-anchor="middle">06</text>
+                <rect x="812" y="290" width="104" height="36" fill="#ece6f3" stroke="#765b98"/>
+                <text x="822" y="313" class="svg-sub">pply.adoc\0</text>
+
+                <text x="440" y="346" class="svg-sub">drop 7 of "…git-add.adoc" → Documentation/git-am.adoc</text>
+                <text x="680" y="364" class="svg-sub">drop 6 of "…git-am.adoc" → Documentation/git-apply.adoc</text>
+
+                <!-- size bars -->
+                <text x="56" y="404" class="svg-lane">FILE SIZE, v2 VS v4</text>
+                <text x="56" y="428" class="svg-sub">those 3 entries</text>
+                <rect x="300" y="416" width="600" height="14" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="912" y="428" class="svg-sub">v2 312 B</text>
+                <rect x="300" y="434" width="509" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="821" y="446" class="svg-sub">v4 265 B</text>
+                <text x="56" y="470" class="svg-sub">git.git, 4,765 entries</text>
+                <rect x="300" y="458" width="600" height="14" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="912" y="470" class="svg-sub">v2 453,478 B</text>
+                <rect x="300" y="476" width="490" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="802" y="488" class="svg-sub">v4 370,478 B (−18%)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The index is a stat cache keyed by path: 40 of every entry's 62 fixed bytes describe the file on disk,
+              not its content. Version 4 gives up alignment for prefix compression. Bytes from <code>annot.py</code> in
+              <code>~/git-ref/lab/scratch/index/tools/</code>, run on the repository described in the text.
+            </p>
+          </figure>
+
+          <p>
+            The whole 317-byte file adds up: a 12-byte header, three entries of 72, 72 and 80 bytes
+            (<code>src/main.c</code> is a 10-character name and so gets 8 bytes of padding), a 61-byte
+            <code>TREE</code> extension, and a 20-byte SHA-1 over everything before it. The recorded nanoseconds are
+            real even though this build never compares them <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The default version is 3, and it is demoted to 2 on every write unless some entry needs the extended
+            flags (<code>read-cache.c</code>:1628, 2848-2850) <span class="src">from the code</span>. Version 4
+            prefix-compresses paths. The strip count uses the same +1-bias varint that Part 1 showed in
+            <code>OFS_DELTA</code> offsets. On git.git it saved 18%. On a 400,000-entry synthetic index it saved 24%
+            but read slower single-threaded, 127 against 106 ms <span class="recon">measured here</span>.
+          </p>
+          <h3>Why stat data</h3>
+          <p>
+            The stat words let <code>git status</code> say "unchanged" without reading a file.
+            <code>match_stat_data()</code> (<code>statinfo.c</code>:64-105) always compares mtime and size; ctime,
+            uid, gid and inode only under <code>core.trustctime</code> and <code>core.checkStat</code>; nanoseconds
+            only when built with <code>USE_NSEC</code>, which Linux builds lack <span class="src">from the code</span>.
+            One <code>lstat</code> and a compare per path. On git.git a default <code>status</code> made 4,764
+            <code>lstat</code> calls. With the fsmonitor daemon (new for Linux in v2.55.0) it made 0, and the median
+            fell from 28.7 to 10.2 ms with fsmonitor and the untracked cache, n = 31 <span class="recon">measured
+            here</span>, <code>matrix.sh</code>. A read-only command can still write: <code>status</code> rewrites
+            the index when something changed or an entry is racy, and only if the file on disk still has the hash
+            it read (<code>repo_update_index_if_able()</code>, <code>read-cache.c</code>:2748-2757)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>How the index becomes a tree</h3>
+          <p>
+            The <code>TREE</code> extension caches one tree id per directory, in preorder:
+            <code>path\0</code>, an entry count, a subtree count, the id. In the repository of Figure
+            {{fig-index-entry}} the root node reads <code>'' 3 1</code> followed by <code>cf9d639a…</code>, which is
+            <code>HEAD^{tree}</code>. Every index change sets the count to −1 on each directory up to the root.
+            <code>update_one()</code> skips a valid node whose tree object exists (<code>cache-tree.c</code>:294-297):
+          </p>
+<pre><code>	if (0 &lt;= it-&gt;entry_count &amp;&amp;
+	    odb_has_object(the_repository-&gt;objects, &amp;it-&gt;oid,
+			   ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR))
+		return it-&gt;entry_count;</code></pre>
+          <p>
+            <code>git commit</code> then hands <code>cache_tree-&gt;oid</code> straight to
+            <code>commit_tree_extended()</code> (<code>builtin/commit.c</code>:1938) <span class="src">from the
+            code</span>. On git.git, <code>write-tree</code> with the extension stripped spent 48.5 ms rebuilding
+            trees; with it intact the region was never entered <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Extensions whose name starts A–Z are optional caches a reader may skip. Lowercase <code>link</code>
+            (split index) and <code>sdir</code> (sparse index) change the meaning of the entries, so an older reader
+            must refuse (<code>read-cache.c</code>:59-76). The trailing hash is checked only by
+            <code>git fsck</code>, since v2.13.0, because checking it on every read cost too much.
+          </p>
+          <h3>Three things that are wrong in v2.55.0</h3>
+          <p>
+            All three are still present at origin/seen <span class="src">from the code</span>. First,
+            <code>index.skipHash</code> plus <code>core.splitIndex</code> loses staged entries. Skip-hash writes a
+            null trailer, the shared index is named after it, and the reader treats a null base as "not split"
+            (<code>read-cache.c</code>:2369). Five files added, <code>ls-files</code> shows zero
+            <span class="recon">measured here</span>. Second, the <code>EOIE</code> extension can never validate in
+            a SHA-256 repository: <code>EOIE_SIZE</code> is <code>4 + GIT_SHA1_RAWSZ</code>
+            (<code>read-cache.c</code>:3543) while the writer emits a 32-byte hash, so threaded index loading
+            silently never runs there. Third, <code>Documentation/config/index.adoc</code> says
+            <code>index.threads</code> "Defaults to 'true'", but unset has meant one thread since v2.20.0
+            (<code>read-cache.c</code>:2257-2258). <a href="../merge-and-upkeep/">Part 3</a> lists reproductions.
+          </p>

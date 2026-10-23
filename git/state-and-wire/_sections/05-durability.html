@@ -1,0 +1,77 @@
+          <h2 id="durability"><span class="secnum">{{S}}</span>Atomic, not durable</h2>
+          <p class="lede">
+            Every mutable file so far is published the same way: write a complete new file, then rename it over the
+            old one. A reader never sees a torn file. Whether the new file survives a power cut is a separate
+            question, and by default git answers it for packs only.
+          </p>
+          <p>
+            Durability is configured by <code>core.fsync</code>, a set of components. The default is
+            <code>write-or-die.h</code>:27-35:
+          </p>
+<pre><code>#define FSYNC_COMPONENTS_OBJECTS (FSYNC_COMPONENT_LOOSE_OBJECT | \
+				  FSYNC_COMPONENT_PACK)
+
+#define FSYNC_COMPONENTS_DERIVED_METADATA (FSYNC_COMPONENT_PACK_METADATA | \
+					   FSYNC_COMPONENT_COMMIT_GRAPH)
+
+#define FSYNC_COMPONENTS_DEFAULT ((FSYNC_COMPONENTS_OBJECTS | \
+				   FSYNC_COMPONENTS_DERIVED_METADATA) &amp; \
+				  ~FSYNC_COMPONENT_LOOSE_OBJECT)</code></pre>
+          <p>
+            Packs, pack indexes and bitmaps, and the commit-graph are synced. Loose objects are masked out. The index
+            and refs are not in the set at all <span class="src">from the code</span>. Counting trace2
+            hardware flushes: <code>git update-ref</code>, <code>git add</code> and <code>hash-object -w</code> each
+            made 0 by default; <code>core.fsync=reference</code> gave 1 under <code>files</code> and 2 under reftable,
+            and <code>core.fsync=index</code> gave 1. A whole traced <code>add</code> plus <code>commit</code> made no
+            <code>fsync</code> or <code>fdatasync</code> call <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Two details. <code>Documentation/config/core.adoc</code> says <code>committed</code> "is currently
+            equivalent to <code>objects</code>", but since <code>bc22d845c4</code> (v2.36.0) the code adds
+            <code>reference</code> (<code>write-or-die.h</code>:37-38); measured, <code>update-ref</code> flushes once
+            under <code>committed</code> and never under <code>objects</code>. And reflog appends have no fsync call at
+            all: the only one in <code>refs/files-backend.c</code> is at line 2016, for the loose-ref lockfile
+            <span class="src">from the code</span>. After a crash the rename can outlive the bytes it published, a
+            ref naming an object whose file was never flushed. Whether that happens depends on the filesystem's
+            ordering. Anyone who needs commits to survive should set <code>core.fsync=committed</code> or
+            <code>added</code> <span class="recon">reconstruction</span>. Figure {{fig-locks}} lists every structure
+            in the collection, with its lock, its patience and its commit point.
+          </p>
+
+          <figure class="figure wide" id="fig-locks">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Locks and durability for every on-disk structure in git v2.55.0</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Structure</th><th>Lock</th><th>Waits</th><th>Commit point</th><th>Synced by default?</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Loose object</td><td>none; temp file</td><td>—</td><td><code>link()</code>; an existing copy wins</td><td class="hl-red" style="background: var(--red-soft)">No (0 flushes)</td></tr>
+                  <tr><td>Pack, <code>.idx</code>, <code>.rev</code>, bitmap</td><td>none; temp files</td><td>—</td><td>rename, <code>.idx</code> last</td><td class="hl-green" style="background: var(--green-soft)">Yes</td></tr>
+                  <tr><td>Pushed objects</td><td>none; quarantine dir</td><td>—</td><td>migrated after <code>pre-receive</code></td><td>as their type</td></tr>
+                  <tr><td>Multi-pack index</td><td>lockfile</td><td>0 ms</td><td>rename</td><td class="hl-green" style="background: var(--green-soft)">Yes</td></tr>
+                  <tr><td>Index</td><td><code>index.lock</code></td><td>0 ms</td><td>rename</td><td class="hl-red" style="background: var(--red-soft)">No (0; 1 with <code>index</code>)</td></tr>
+                  <tr><td>Loose ref</td><td><code>&lt;ref&gt;.lock</code></td><td>100 ms</td><td>one rename per ref</td><td class="hl-red" style="background: var(--red-soft)">No (0; 1 with <code>reference</code>)</td></tr>
+                  <tr><td><code>HEAD</code> in a commit</td><td><code>HEAD.lock</code>, log only</td><td>100 ms</td><td>unlinked; <code>HEAD</code> untouched</td><td class="hl-red" style="background: var(--red-soft)">No</td></tr>
+                  <tr><td><code>packed-refs</code></td><td><code>packed-refs.lock</code></td><td>1000 ms</td><td>rename of <code>packed-refs.new</code></td><td class="hl-red" style="background: var(--red-soft)">No</td></tr>
+                  <tr><td>Reflog (<code>files</code>)</td><td>none; <code>O_APPEND</code></td><td>—</td><td>append</td><td class="hl-red" style="background: var(--red-soft)">Never: no fsync call</td></tr>
+                  <tr><td>reftable stack</td><td><code>tables.list.lock</code></td><td>100 ms</td><td>one rename per stack</td><td class="hl-red" style="background: var(--red-soft)">No (0; 2 with <code>reference</code>)</td></tr>
+                  <tr><td><code>AUTO_MERGE</code></td><td>own lock; delete also takes <code>packed-refs.lock</code></td><td>100 / 1000 ms</td><td>rename or unlink</td><td class="hl-red" style="background: var(--red-soft)">No</td></tr>
+                  <tr><td><code>MERGE_HEAD</code>, <code>MERGE_MSG</code>, <code>COMMIT_EDITMSG</code></td><td>none</td><td>—</td><td>written in place</td><td class="hl-red" style="background: var(--red-soft)">No</td></tr>
+                  <tr><td>Commit-graph</td><td><code>commit-graph.lock</code></td><td>0 ms</td><td>rename</td><td class="hl-green" style="background: var(--green-soft)">Yes</td></tr>
+                  <tr><td>Maintenance</td><td><code>maintenance.lock</code></td><td>0 ms; <code>--auto</code> exits quietly</td><td>—</td><td>n/a</td></tr>
+                  <tr><td><code>gc</code></td><td><code>gc.pid.lock</code></td><td>0 ms, plus a 12-hour rule</td><td>rename</td><td>n/a</td></tr>
+                  <tr><td>Prune</td><td>none</td><td>—</td><td>deletes unreachable objects older than 2 weeks</td><td>n/a</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Four lock policies, not one: no lock for objects, 0 ms for the index and the derived files, 100 ms for a
+              ref, 1000 ms for <code>packed-refs</code>. Every commit point is a rename or a link; only pack data and
+              the commit-graph are synced unless <code>core.fsync</code> says otherwise. Flush counts are trace2
+              <code>fsync/hardware-flush</code>, measured here; the rest is read from the code.
+            </p>
+          </figure>

@@ -1,0 +1,242 @@
+          <h2 id="renames-conflicts"><span class="secnum">{{S}}</span>Renames, line diffs and conflicts</h2>
+          <p>
+            Git stores no renames. The first README called that a design choice: rename information is
+            "implicit in the trees involved" (<a href="#history">section 07</a>). So every merge and every
+            <code>diff -M</code> has to guess. <code>diffcore_rename_extended()</code> guesses in three stages,
+            cheapest first, and each stage removes pairs before the next one runs (Figure {{fig-renames}}).
+          </p>
+          <p>
+            Stage one pairs deleted and added paths whose blob ids are equal. Stage two pairs paths whose
+            basename appears exactly once on each side, if their contents are similar enough. The bar is set
+            in <code>diffcore-rename.c:1495-1504</code>:
+          </p>
+          <pre><code>		/* Determine minimum score to match basenames */
+		double factor = 0.5;
+		char *basename_factor = getenv("GIT_BASENAME_FACTOR");
+		int min_basename_score;
+
+		if (basename_factor)
+			factor = strtol(basename_factor, NULL, 10)/100.0;
+		assert(factor >= 0.0 &amp;&amp; factor &lt;= 1.0);
+		min_basename_score = minimum_score +
+			(int)(factor * (MAX_SCORE - minimum_score));</code></pre>
+          <p>
+            At the default 50% threshold that is 75%. The environment variable is undocumented
+            <span class="src">from the code</span>. Only what is left reaches stage three: a matrix that
+            scores every remaining source against every remaining destination. Each file is cut into chunks
+            (a line, or 64 bytes), the chunks are hashed modulo 107927, and the score is the bytes copied
+            times 60000 over the larger size. The rename limit is checked just before the matrix, and it bounds
+            the matrix's <em>area</em>: sources × destinations against the limit squared. The limit is 1000
+            for diffs (<code>diff.c:58</code>) and 7000 for merges (<code>merge-ort.c:3442-3443</code>).
+          </p>
+
+          <figure class="figure wide" id="fig-renames">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The rename funnel, with measured cost at each exit</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 360" role="img" aria-label="Unmatched paths flow through exact matching, unique-basename matching, a limit check on the matrix area, then the N by M similarity matrix. Measured times rise from 12 ms for exact moves to 10,984 ms for 3,200 inexact renames. An inset shows a 92% score computed from 144 copied bytes out of 156.">
+                <defs>
+                  <marker id="ren-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="ren-dat" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">diffcore_rename_extended(): CHEAPEST STAGE FIRST</text>
+                <rect x="20" y="44" width="170" height="80" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="68" class="svg-step">unmatched paths</text>
+                <text x="32" y="90" class="svg-sub">deleted = sources</text>
+                <text x="32" y="108" class="svg-sub">added = destinations</text>
+                <rect x="226" y="44" width="190" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="238" y="68" class="svg-step">1 · exact</text>
+                <text x="238" y="90" class="svg-sub">same blob id (oidhash)</text>
+                <text x="238" y="108" class="svg-sub">earliest path wins</text>
+                <rect x="452" y="44" width="200" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="464" y="68" class="svg-step">2 · unique basename</text>
+                <text x="464" y="90" class="svg-sub">one of each name</text>
+                <text x="464" y="108" class="svg-sub">score ≥ 75% at -M50%</text>
+                <polygon points="730,44 778,84 730,124 682,84" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="730" y="88" text-anchor="middle" class="svg-step">limit²</text>
+                <rect x="808" y="44" width="262" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="820" y="68" class="svg-step">3 · N×M similarity matrix</text>
+                <text x="820" y="90" class="svg-sub">chunk hashes, 4 best per dst</text>
+                <text x="820" y="108" class="svg-sub">copied × 60000 / max size</text>
+                <line x1="192" y1="84" x2="222" y2="84" stroke="#252525" stroke-width="2" marker-end="url(#ren-ctl)"/>
+                <line x1="418" y1="84" x2="448" y2="84" stroke="#252525" stroke-width="2" marker-end="url(#ren-ctl)"/>
+                <line x1="654" y1="84" x2="680" y2="84" stroke="#252525" stroke-width="2" marker-end="url(#ren-ctl)"/>
+                <line x1="780" y1="84" x2="804" y2="84" stroke="#252525" stroke-width="2" marker-end="url(#ren-ctl)"/>
+                <!-- exits -->
+                <line x1="321" y1="126" x2="321" y2="148" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#ren-dat)"/>
+                <rect x="236" y="150" width="170" height="46" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="321" y="169" text-anchor="middle" class="svg-sub">found: 12 ms (N=800)</text>
+                <text x="321" y="187" text-anchor="middle" class="svg-sub">18 ms (N=3,200)</text>
+                <line x1="552" y1="126" x2="552" y2="148" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#ren-dat)"/>
+                <rect x="462" y="150" width="180" height="46" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="552" y="169" text-anchor="middle" class="svg-sub">found: 209 / 290 /</text>
+                <text x="552" y="187" text-anchor="middle" class="svg-sub">683 ms</text>
+                <line x1="730" y1="126" x2="730" y2="148" stroke="#ad4b43" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <rect x="664" y="150" width="132" height="46" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="730" y="169" text-anchor="middle" class="svg-sub">over: skip</text>
+                <text x="730" y="187" text-anchor="middle" class="svg-sub">0 renames</text>
+                <line x1="939" y1="126" x2="939" y2="148" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#ren-dat)"/>
+                <rect x="822" y="150" width="234" height="46" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="939" y="169" text-anchor="middle" class="svg-sub">found: 488 / 1,903 /</text>
+                <text x="939" y="187" text-anchor="middle" class="svg-sub">10,984 ms</text>
+                <text x="105" y="168" text-anchor="middle" class="svg-note">N = 800 / 1,600 / 3,200</text>
+                <text x="105" y="186" text-anchor="middle" class="svg-note">files moved and edited</text>
+                <text x="545" y="222" text-anchor="middle" class="svg-note">limit: 1000 for diffs (diff.c:58), 7000 for merges (merge-ort.c:3442-3443); diff -M at N=1,600 found 0 inexact renames</text>
+                <line x1="20" y1="240" x2="1070" y2="240" stroke="#deded9"/>
+                <!-- inset -->
+                <text x="20" y="264" class="svg-lane">INSET: ONE SCORE (old.txt → new.txt)</text>
+                <text x="20" y="295" class="svg-sub">old.txt 151 B</text>
+                <rect x="130" y="282" width="453" height="18" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="130" y="282" width="432" height="18" fill="#dfede5" stroke="#367f59"/>
+                <text x="20" y="327" class="svg-sub">new.txt 156 B</text>
+                <rect x="130" y="314" width="468" height="18" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="130" y="314" width="432" height="18" fill="#dfede5" stroke="#367f59"/>
+                <text x="346" y="346" text-anchor="middle" class="svg-note">144 bytes in matching chunks</text>
+                <text x="640" y="292" class="svg-sub">src_copied = 144</text>
+                <text x="640" y="312" class="svg-sub">144 × 60000 / max(151, 156) = 55384</text>
+                <text x="640" y="332" class="svg-step">→ 92%, printed as R092</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Most renames never reach the quadratic stage, and the rename limit is an area checked last.
+              Timings: <code>git diff -M -l0</code> on synthetic 40-line files, median of 3, from
+              <code>rename-scale.sh</code>; the red exit is the same N=1,600 run with the default limit.
+            </p>
+          </figure>
+
+          <p>
+            The scaling is what the funnel predicts. Moving 3,200 edited files under new names took
+            10,984 ms. Keeping their basenames took 683 ms; unedited moves took 18 ms
+            <span class="recon">measured here</span>. One documented surprise sits in the option parser:
+            <code>-M5</code> means 50%, because the digits are read as a decimal fraction
+            (<code>diff.c:6344-6377</code>; <code>Documentation/diff-options.adoc:585-589</code>).
+          </p>
+          <p>
+            Once paths are paired, file contents go to <code>xdl_merge()</code>. One-sided changes are
+            taken, identical changes accepted, and overlaps become conflicts. Git asks for the
+            <code>ZEALOUS</code> level, which shrinks a conflict by moving lines both sides share outside
+            the markers. The <code>diff3</code> and <code>zdiff3</code> styles are capped at
+            <code>EAGER</code>, because diff3 output "does not make sense for anything more aggressive";
+            zdiff3 then trims identical lines at the edges (<code>xdiff/xmerge.c:534-541, 655-663</code>).
+            ort diffs with histogram, chosen in v2.31.0 because, in its author's words, "I really don't like
+            silent mismerges". Plain <code>git diff</code> still defaults to Myers with cost cut-offs. On the
+            whole v2.30.0..v2.55.0 diff it took 2,286 ms and printed the most lines; histogram took 1,820 ms
+            and patience 1,547 ms. The excess came from <code>po/*.po</code> translation files
+            <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-conflicts">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One conflict in three styles, and the rerere id each one produces</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 340" role="img" aria-label="Three columns show the same conflict in merge, diff3 and zdiff3 style. In merge and zdiff3 the shared line Y side sits outside the markers; in diff3 it stays inside. rerere strips labels, sorts the sides and hashes them: merge and zdiff3 give id 9c7007f3, diff3 gives a8ade8ef.">
+                <defs>
+                  <marker id="cfl-dat" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="cfl-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ad4b43"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">merge (default)</text>
+                <text x="250" y="22" class="svg-lane">diff3</text>
+                <text x="480" y="22" class="svg-lane">zdiff3</text>
+                <rect x="20" y="32" width="210" height="244" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="250" y="32" width="210" height="244" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="480" y="32" width="210" height="244" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <!-- merge column -->
+                <rect x="28" y="93" width="194" height="16" fill="#e0ebf2"/>
+                <rect x="28" y="127" width="194" height="16" fill="#dfede5"/>
+                <rect x="28" y="161" width="194" height="16" fill="#f7e3c8"/>
+                <text x="34" y="54" class="svg-sub">a</text>
+                <text x="34" y="71" class="svg-sub">b</text>
+                <text x="34" y="88" class="svg-sub">&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</text>
+                <text x="34" y="105" class="svg-sub">X main</text>
+                <text x="34" y="122" class="svg-sub">=======</text>
+                <text x="34" y="139" class="svg-sub">X side</text>
+                <text x="34" y="156" class="svg-sub">&gt;&gt;&gt;&gt;&gt;&gt;&gt; side</text>
+                <text x="34" y="173" class="svg-sub">Y side</text>
+                <text x="34" y="190" class="svg-sub">d</text>
+                <text x="34" y="207" class="svg-sub">e</text>
+                <!-- diff3 column -->
+                <rect x="258" y="93" width="194" height="33" fill="#e0ebf2"/>
+                <rect x="258" y="144" width="194" height="16" fill="#ffffff"/>
+                <rect x="258" y="178" width="194" height="33" fill="#dfede5"/>
+                <rect x="258" y="110" width="194" height="16" fill="#f3dfdc"/>
+                <rect x="258" y="195" width="194" height="16" fill="#f3dfdc"/>
+                <text x="264" y="54" class="svg-sub">a</text>
+                <text x="264" y="71" class="svg-sub">b</text>
+                <text x="264" y="88" class="svg-sub">&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</text>
+                <text x="264" y="105" class="svg-sub">X main</text>
+                <text x="264" y="122" class="svg-sub">Y side</text>
+                <text x="264" y="139" class="svg-sub">||||||| f66523a</text>
+                <text x="264" y="156" class="svg-sub">c</text>
+                <text x="264" y="173" class="svg-sub">=======</text>
+                <text x="264" y="190" class="svg-sub">X side</text>
+                <text x="264" y="207" class="svg-sub">Y side</text>
+                <text x="264" y="224" class="svg-sub">&gt;&gt;&gt;&gt;&gt;&gt;&gt; side</text>
+                <text x="264" y="241" class="svg-sub">d</text>
+                <text x="264" y="258" class="svg-sub">e</text>
+                <!-- zdiff3 column -->
+                <rect x="488" y="93" width="194" height="16" fill="#e0ebf2"/>
+                <rect x="488" y="127" width="194" height="16" fill="#ffffff"/>
+                <rect x="488" y="161" width="194" height="16" fill="#dfede5"/>
+                <rect x="488" y="195" width="194" height="16" fill="#f7e3c8"/>
+                <text x="494" y="54" class="svg-sub">a</text>
+                <text x="494" y="71" class="svg-sub">b</text>
+                <text x="494" y="88" class="svg-sub">&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</text>
+                <text x="494" y="105" class="svg-sub">X main</text>
+                <text x="494" y="122" class="svg-sub">||||||| f66523a</text>
+                <text x="494" y="139" class="svg-sub">c</text>
+                <text x="494" y="156" class="svg-sub">=======</text>
+                <text x="494" y="173" class="svg-sub">X side</text>
+                <text x="494" y="190" class="svg-sub">&gt;&gt;&gt;&gt;&gt;&gt;&gt; side</text>
+                <text x="494" y="207" class="svg-sub">Y side</text>
+                <text x="494" y="224" class="svg-sub">d</text>
+                <text x="494" y="241" class="svg-sub">e</text>
+                <!-- notes under columns -->
+                <text x="125" y="298" text-anchor="middle" class="svg-note">ZEALOUS: shared line moved out</text>
+                <text x="355" y="298" text-anchor="middle" class="svg-note">capped at EAGER: it stays in</text>
+                <text x="585" y="298" text-anchor="middle" class="svg-note">EAGER, then edges trimmed</text>
+                <!-- rerere -->
+                <text x="740" y="22" class="svg-lane">rerere</text>
+                <rect x="740" y="32" width="330" height="58" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="752" y="54" class="svg-step">normalise the conflict</text>
+                <text x="752" y="76" class="svg-sub">drop labels and base, sort sides</text>
+                <rect x="740" y="108" width="330" height="58" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="752" y="130" class="svg-step">id = sha1(side \0 side \0)</text>
+                <text x="752" y="152" class="svg-sub">"X main\n\0X side\n\0"</text>
+                <rect x="740" y="184" width="330" height="58" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="752" y="206" class="svg-step">9c7007f3… (merge and zdiff3)</text>
+                <text x="752" y="228" class="svg-sub">rr-cache/&lt;id&gt;/preimage, postimage</text>
+                <rect x="740" y="258" width="330" height="58" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="752" y="280" class="svg-step">a8ade8ef… (diff3)</text>
+                <text x="752" y="302" class="svg-sub">"Y side" is in both sides: no match</text>
+                <line x1="905" y1="92" x2="905" y2="104" stroke="#252525" stroke-width="2"/>
+                <line x1="905" y1="168" x2="905" y2="180" stroke="#252525" stroke-width="2"/>
+                <line x1="692" y1="100" x2="736" y2="62" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#cfl-dat)"/>
+                <line x1="462" y1="250" x2="736" y2="290" stroke="#ad4b43" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#cfl-red)"/>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              rerere's id is the hash of the conflict's two sides, and diff3 changes the sides. Blue: ours;
+              green: theirs; orange: the shared line outside the markers; red: the shared line inside them.
+              Output of the dossier's walkthroughs W2 and W8 (<code>walk-a-b.sh</code>).
+            </p>
+          </figure>
+
+          <p>
+            That id matters for <code>git rerere</code>, which replays recorded resolutions. It names a
+            conflict by hashing its two sides, labels and base removed, sorted. In the reproduction, merge and
+            zdiff3 styles gave the same id; diff3 gave a different one, because the shared line stayed inside
+            its sides. <code>Documentation/technical/rerere.adoc:9-19</code> promises normalisation across
+            styles, which holds for zdiff3 only (finding C16) <span class="recon">measured here</span>.
+          </p>
+          <p>
+            One cache goes unused. ort can reuse renames found for the previous pick of a rebase, but the
+            sequencer zeroes its result for each pick (<code>sequencer.c:781</code>) and
+            <code>merge_switch_to_result()</code> frees the cache. <code>git replay</code> keeps one result
+            and benefits: on an 8-commit topic over 800 renamed files it ran rename detection once (995 ms),
+            where <code>git rebase</code> ran it 8 times (2,981 ms) <span class="recon">measured here</span>.
+            That is finding B4.
+          </p>

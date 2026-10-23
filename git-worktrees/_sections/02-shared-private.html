@@ -1,0 +1,98 @@
+          <h2 id="shared-private"><span class="secnum">{{S}}</span>What is shared and what is private</h2>
+          <p class="lede">
+            A linked worktree has two directories behind it: its own small admin directory under
+            <code>.git/worktrees/&lt;name&gt;/</code>, and the main repository's <code>.git</code>, which
+            git calls the common directory. Every path git resolves inside <code>.git</code> goes to
+            one of the two, and a short hard-coded table decides which.
+          </p>
+          <p>
+            The table is <code>common_list</code> in <code>path.c</code>:98-124
+            <span class="src">from the code</span>. Each row has three flags: whether the path is
+            ignored by garbage reporting, whether it is a directory, and whether it belongs to the
+            common directory (the struct is at <code>path.c</code>:89-96). Lines 98-123, verbatim:
+          </p>
+<pre><code>static struct common_dir common_list[] = {
+	{ 0, 1, 1, "branches" },
+	{ 0, 1, 1, "common" },
+	{ 0, 1, 1, "hooks" },
+	{ 0, 1, 1, "info" },
+	{ 0, 0, 0, "info/sparse-checkout" },
+	{ 1, 1, 1, "logs" },
+	{ 1, 0, 0, "logs/HEAD" },
+	{ 0, 1, 0, "logs/refs/bisect" },
+	{ 0, 1, 0, "logs/refs/rewritten" },
+	{ 0, 1, 0, "logs/refs/worktree" },
+	{ 0, 1, 1, "lost-found" },
+	{ 0, 1, 1, "objects" },
+	{ 0, 1, 1, "refs" },
+	{ 0, 1, 0, "refs/bisect" },
+	{ 0, 1, 0, "refs/rewritten" },
+	{ 0, 1, 0, "refs/worktree" },
+	{ 0, 1, 1, "remotes" },
+	{ 0, 1, 1, "worktrees" },
+	{ 0, 1, 1, "rr-cache" },
+	{ 0, 1, 1, "svn" },
+	{ 0, 0, 1, "config" },
+	{ 1, 0, 1, "gc.pid" },
+	{ 0, 0, 1, "packed-refs" },
+	{ 0, 0, 1, "shallow" },
+	{ 0, 0, 0, NULL }</code></pre>
+          <p>
+            Read the third column. A path is shared when it, or the nearest listed directory above
+            it, has a 1 there. <code>objects</code>, <code>refs</code>, <code>config</code>,
+            <code>hooks</code>, <code>packed-refs</code> and <code>rr-cache</code> are shared.
+            Inside the shared <code>refs</code> directory, three subtrees are carved back out as
+            private: <code>refs/bisect</code>, <code>refs/rewritten</code> and
+            <code>refs/worktree</code>. So is <code>info/sparse-checkout</code>, which lets each
+            worktree have its own sparse patterns (§07). Anything not in the table at all, such as
+            <code>HEAD</code>, <code>index</code>, <code>ORIG_HEAD</code>, <code>MERGE_HEAD</code>
+            and the <code>rebase-merge/</code> state directory, defaults to private.
+            <span class="recon">reconstruction</span> of the lookup from the trie code that follows
+            the table.
+          </p>
+          <p>
+            The ref store makes the same split by name. <code>refs.c</code>:881-886
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>int is_per_worktree_ref(const char *refname)
+{
+	return starts_with(refname, "refs/worktree/") ||
+	       starts_with(refname, "refs/bisect/") ||
+	       starts_with(refname, "refs/rewritten/");
+}</code></pre>
+          <p>
+            Root refs count as per-worktree too. <code>is_current_worktree_ref</code>
+            (<code>refs.c</code>:941-943) accepts any all-caps name such as <code>HEAD</code>,
+            <code>ORIG_HEAD</code> or <code>AUTO_MERGE</code>. Everything else, notably every
+            <code>refs/heads/*</code> branch, every tag, every remote-tracking ref and
+            <code>refs/stash</code>, is shared. A worktree can still read another worktree's private
+            refs by spelling them <code>worktrees/&lt;name&gt;/refs/worktree/...</code> or
+            <code>main-worktree/HEAD</code> (<code>parse_worktree_ref</code>, 945-991)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            I checked this on a hub with four worktrees <span class="recon">measured here</span>.
+            A ref written in <code>wt1</code> as <code>refs/worktree/mark</code> was invisible to
+            <code>for-each-ref</code> in <code>wt2</code>. In <code>wt2</code>,
+            <code>git rev-parse worktrees/wt1/refs/worktree/mark</code> resolved it to
+            <code>e9019fcafe</code>. A branch written in <code>wt1</code> showed up in
+            <code>wt2</code> immediately.
+          </p>
+
+          <figure class="figure" id="fig-split">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Where each part of <code>.git</code> lives when there are worktrees</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row"><div class="stack-cell head">Shared — common dir</div><div class="stack-cell hl-blue" style="background: var(--blue-soft)"><code>objects/</code> · <code>refs/heads</code>, <code>refs/tags</code>, <code>refs/remotes</code>, <code>refs/stash</code> · <code>packed-refs</code> · <code>config</code> · <code>hooks/</code> · <code>info/</code> · <code>rr-cache/</code> · <code>shallow</code> · <code>worktrees/</code></div></div>
+                <div class="stack-row"><div class="stack-cell head">Private — per worktree</div><div class="stack-cell hl-green" style="background: var(--green-soft)"><code>HEAD</code> · <code>index</code> · <code>logs/HEAD</code> · <code>ORIG_HEAD</code>, <code>MERGE_HEAD</code>, <code>FETCH_HEAD</code>, <code>AUTO_MERGE</code> · <code>refs/worktree/*</code>, <code>refs/bisect/*</code>, <code>refs/rewritten/*</code> · <code>info/sparse-checkout</code> · rebase/merge/bisect state</div></div>
+                <div class="stack-row"><div class="stack-cell head">Private only if asked</div><div class="stack-cell hl-purple" style="background: var(--purple-soft)"><code>config.worktree</code>, read only when <code>extensions.worktreeConfig</code> is true (§04)</div></div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              Branches, tags, the stash and config are shared. Everything that says where you are or
+              what you are in the middle of is private. The purple row is opt-in.
+            </p>
+          </figure>

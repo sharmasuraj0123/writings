@@ -1,0 +1,183 @@
+          <h2 id="pack-indexes"><span class="secnum">{{S}}</span>Indexes over packs</h2>
+          <p class="lede">
+            A pack can only be parsed from the front. Random access needs a side file that maps an object id to
+            an offset. That is the <code>.idx</code>, and like every other speed structure in git it is derived
+            data: <code>git index-pack</code> can rebuild it from the pack alone.
+          </p>
+          <p>
+            An <code>.idx</code> v2 file is the magic <code>\377tOc</code>, the version, a 256-entry fanout table,
+            the sorted object ids, their CRC32s, their 4-byte offsets, an optional table of 8-byte offsets, the pack's
+            checksum and its own (<code>Documentation/gitformat-pack.adoc</code>:285-319). The magic was chosen so
+            that v1 readers fail: read as <code>fanout[0]</code> it is an impossible object count
+            (<code>pack.h</code>:24-41) <span class="src">from the code</span>. The lab pack's index is 1,240 bytes:
+            8 + 1,024 + 6 × (20 + 4 + 4) + 20 + 20 <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <code>fanout[b]</code> counts the objects whose first byte is at most <code>b</code>, so the objects
+            starting with byte <code>b</code> sit in rows <code>fanout[b-1]</code> to <code>fanout[b]</code>.
+            <code>bsearch_hash()</code>, <code>hash-lookup.c</code>:112-129, bisects only that slice
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	hi = ntohl(fanout_nbo[*hash]);
+	lo = ((*hash == 0x0) ? 0 : ntohl(fanout_nbo[*hash - 1]));
+
+	while (lo &lt; hi) {
+		unsigned mi = lo + (hi - lo) / 2;
+		int cmp = hashcmp(table + mi * stride, hash,
+				  the_repository-&gt;hash_algo);
+
+		if (!cmp) {
+			if (result)
+				*result = mi;
+			return 1;
+		}
+		if (cmp &gt; 0)
+			hi = mi;
+		else
+			lo = mi + 1;
+	}</code></pre>
+          <p>
+            The same function serves the multi-pack-index and the commit-graph. An offset with the high bit set is
+            not an offset but <code>0x80000000 | n</code>, a row in the 64-bit table, used once a pack passes 2 GiB
+            (<code>pack-write.c</code>:150-172). The CRC table exists so a repack can copy compressed bytes from one
+            pack into another without inflating them and still detect corruption <span class="src">from the code</span>.
+            Figure {{fig-idx}} traces one lookup.
+          </p>
+
+          <figure class="figure wide" id="fig-idx">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Looking up 5fc0a8b9 through an <code>.idx</code> v2</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 500" role="img" aria-label="Looking up object 5fc0a8b9 in a six-object .idx: the 256-entry cumulative fanout narrows the search to rows 2 to 3, one comparison finds row 2, its 32-bit offset 0x1b0 has the high bit clear, so the object is at pack offset 432. An inset shows the .rev file mapping pack order back to index rows.">
+                <defs><marker id="ix-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker><marker id="ix-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker></defs>
+                <text x="30" y="24" text-anchor="start" class="svg-lane">1 · FANOUT: fanout[b] = NUMBER OF OBJECTS WHOSE FIRST BYTE IS ≤ b</text>
+                <rect x="412.5" y="60" width="7.5" height="84" fill="#f7e3c8"/>
+                <polyline fill="none" stroke="#3c6f97" stroke-width="1.6" points="60.0,140.0 63.8,140.0 63.8,140.0 67.5,140.0 67.5,140.0 71.2,140.0 71.2,140.0 75.0,140.0 75.0,140.0 78.8,140.0 78.8,140.0 82.5,140.0 82.5,140.0 86.2,140.0 86.2,140.0 90.0,140.0 90.0,140.0 93.8,140.0 93.8,140.0 97.5,140.0 97.5,140.0 101.2,140.0 101.2,140.0 105.0,140.0 105.0,140.0 108.8,140.0 108.8,140.0 112.5,140.0 112.5,140.0 116.2,140.0 116.2,140.0 120.0,140.0 120.0,140.0 123.8,140.0 123.8,140.0 127.5,140.0 127.5,140.0 131.2,140.0 131.2,140.0 135.0,140.0 135.0,140.0 138.8,140.0 138.8,140.0 142.5,140.0 142.5,140.0 146.2,140.0 146.2,140.0 150.0,140.0 150.0,140.0 153.8,140.0 153.8,140.0 157.5,140.0 157.5,140.0 161.2,140.0 161.2,140.0 165.0,140.0 165.0,140.0 168.8,140.0 168.8,140.0 172.5,140.0 172.5,140.0 176.2,140.0 176.2,140.0 180.0,140.0 180.0,140.0 183.8,140.0 183.8,140.0 187.5,140.0 187.5,140.0 191.2,140.0 191.2,140.0 195.0,140.0 195.0,140.0 198.8,140.0 198.8,140.0 202.5,140.0 202.5,128.0 206.2,128.0 206.2,128.0 210.0,128.0 210.0,128.0 213.8,128.0 213.8,128.0 217.5,128.0 217.5,128.0 221.2,128.0 221.2,128.0 225.0,128.0 225.0,128.0 228.8,128.0 228.8,128.0 232.5,128.0 232.5,128.0 236.2,128.0 236.2,128.0 240.0,128.0 240.0,128.0 243.8,128.0 243.8,128.0 247.5,128.0 247.5,128.0 251.2,128.0 251.2,128.0 255.0,128.0 255.0,128.0 258.8,128.0 258.8,128.0 262.5,128.0 262.5,128.0 266.2,128.0 266.2,128.0 270.0,128.0 270.0,128.0 273.8,128.0 273.8,128.0 277.5,128.0 277.5,128.0 281.2,128.0 281.2,128.0 285.0,128.0 285.0,128.0 288.8,128.0 288.8,128.0 292.5,128.0 292.5,128.0 296.2,128.0 296.2,128.0 300.0,128.0 300.0,128.0 303.8,128.0 303.8,128.0 307.5,128.0 307.5,128.0 311.2,128.0 311.2,116.0 315.0,116.0 315.0,116.0 318.8,116.0 318.8,116.0 322.5,116.0 322.5,116.0 326.2,116.0 326.2,116.0 330.0,116.0 330.0,116.0 333.8,116.0 333.8,116.0 337.5,116.0 337.5,116.0 341.2,116.0 341.2,116.0 345.0,116.0 345.0,116.0 348.8,116.0 348.8,116.0 352.5,116.0 352.5,116.0 356.2,116.0 356.2,116.0 360.0,116.0 360.0,116.0 363.8,116.0 363.8,116.0 367.5,116.0 367.5,116.0 371.2,116.0 371.2,116.0 375.0,116.0 375.0,116.0 378.8,116.0 378.8,116.0 382.5,116.0 382.5,116.0 386.2,116.0 386.2,116.0 390.0,116.0 390.0,116.0 393.8,116.0 393.8,116.0 397.5,116.0 397.5,116.0 401.2,116.0 401.2,116.0 405.0,116.0 405.0,116.0 408.8,116.0 408.8,116.0 412.5,116.0 412.5,116.0 416.2,116.0 416.2,104.0 420.0,104.0 420.0,104.0 423.8,104.0 423.8,104.0 427.5,104.0 427.5,104.0 431.2,104.0 431.2,104.0 435.0,104.0 435.0,104.0 438.8,104.0 438.8,104.0 442.5,104.0 442.5,104.0 446.2,104.0 446.2,104.0 450.0,104.0 450.0,104.0 453.8,104.0 453.8,104.0 457.5,104.0 457.5,104.0 461.2,104.0 461.2,104.0 465.0,104.0 465.0,104.0 468.8,104.0 468.8,104.0 472.5,104.0 472.5,104.0 476.2,104.0 476.2,104.0 480.0,104.0 480.0,104.0 483.8,104.0 483.8,104.0 487.5,104.0 487.5,104.0 491.2,104.0 491.2,104.0 495.0,104.0 495.0,104.0 498.8,104.0 498.8,104.0 502.5,104.0 502.5,104.0 506.2,104.0 506.2,104.0 510.0,104.0 510.0,104.0 513.8,104.0 513.8,104.0 517.5,104.0 517.5,104.0 521.2,104.0 521.2,104.0 525.0,104.0 525.0,104.0 528.8,104.0 528.8,104.0 532.5,104.0 532.5,104.0 536.2,104.0 536.2,104.0 540.0,104.0 540.0,104.0 543.8,104.0 543.8,104.0 547.5,104.0 547.5,104.0 551.2,104.0 551.2,104.0 555.0,104.0 555.0,104.0 558.8,104.0 558.8,104.0 562.5,104.0 562.5,104.0 566.2,104.0 566.2,104.0 570.0,104.0 570.0,104.0 573.8,104.0 573.8,104.0 577.5,104.0 577.5,104.0 581.2,104.0 581.2,104.0 585.0,104.0 585.0,104.0 588.8,104.0 588.8,104.0 592.5,104.0 592.5,104.0 596.2,104.0 596.2,92.0 600.0,92.0 600.0,92.0 603.8,92.0 603.8,92.0 607.5,92.0 607.5,92.0 611.2,92.0 611.2,92.0 615.0,92.0 615.0,92.0 618.8,92.0 618.8,92.0 622.5,92.0 622.5,92.0 626.2,92.0 626.2,92.0 630.0,92.0 630.0,92.0 633.8,92.0 633.8,92.0 637.5,92.0 637.5,92.0 641.2,92.0 641.2,92.0 645.0,92.0 645.0,92.0 648.8,92.0 648.8,92.0 652.5,92.0 652.5,92.0 656.2,92.0 656.2,92.0 660.0,92.0 660.0,92.0 663.8,92.0 663.8,92.0 667.5,92.0 667.5,92.0 671.2,92.0 671.2,92.0 675.0,92.0 675.0,92.0 678.8,92.0 678.8,92.0 682.5,92.0 682.5,92.0 686.2,92.0 686.2,92.0 690.0,92.0 690.0,92.0 693.8,92.0 693.8,92.0 697.5,92.0 697.5,92.0 701.2,92.0 701.2,92.0 705.0,92.0 705.0,92.0 708.8,92.0 708.8,92.0 712.5,92.0 712.5,92.0 716.2,92.0 716.2,92.0 720.0,92.0 720.0,92.0 723.8,92.0 723.8,92.0 727.5,92.0 727.5,92.0 731.2,92.0 731.2,92.0 735.0,92.0 735.0,92.0 738.8,92.0 738.8,92.0 742.5,92.0 742.5,92.0 746.2,92.0 746.2,92.0 750.0,92.0 750.0,92.0 753.8,92.0 753.8,92.0 757.5,92.0 757.5,92.0 761.2,92.0 761.2,92.0 765.0,92.0 765.0,92.0 768.8,92.0 768.8,92.0 772.5,92.0 772.5,92.0 776.2,92.0 776.2,80.0 780.0,80.0 780.0,80.0 783.8,80.0 783.8,80.0 787.5,80.0 787.5,80.0 791.2,80.0 791.2,80.0 795.0,80.0 795.0,80.0 798.8,80.0 798.8,80.0 802.5,80.0 802.5,80.0 806.2,80.0 806.2,80.0 810.0,80.0 810.0,80.0 813.8,80.0 813.8,80.0 817.5,80.0 817.5,80.0 821.2,80.0 821.2,80.0 825.0,80.0 825.0,80.0 828.8,80.0 828.8,80.0 832.5,80.0 832.5,80.0 836.2,80.0 836.2,80.0 840.0,80.0 840.0,80.0 843.8,80.0 843.8,80.0 847.5,80.0 847.5,80.0 851.2,80.0 851.2,80.0 855.0,80.0 855.0,80.0 858.8,80.0 858.8,80.0 862.5,80.0 862.5,80.0 866.2,80.0 866.2,80.0 870.0,80.0 870.0,80.0 873.8,80.0 873.8,80.0 877.5,80.0 877.5,68.0 881.2,68.0 881.2,68.0 885.0,68.0 885.0,68.0 888.8,68.0 888.8,68.0 892.5,68.0 892.5,68.0 896.2,68.0 896.2,68.0 900.0,68.0 900.0,68.0 903.8,68.0 903.8,68.0 907.5,68.0 907.5,68.0 911.2,68.0 911.2,68.0 915.0,68.0 915.0,68.0 918.8,68.0 918.8,68.0 922.5,68.0 922.5,68.0 926.2,68.0 926.2,68.0 930.0,68.0 930.0,68.0 933.8,68.0 933.8,68.0 937.5,68.0 937.5,68.0 941.2,68.0 941.2,68.0 945.0,68.0 945.0,68.0 948.8,68.0 948.8,68.0 952.5,68.0 952.5,68.0 956.2,68.0 956.2,68.0 960.0,68.0 960.0,68.0 963.8,68.0 963.8,68.0 967.5,68.0 967.5,68.0 971.2,68.0 971.2,68.0 975.0,68.0 975.0,68.0 978.8,68.0 978.8,68.0 982.5,68.0 982.5,68.0 986.2,68.0 986.2,68.0 990.0,68.0 990.0,68.0 993.8,68.0 993.8,68.0 997.5,68.0 997.5,68.0 1001.2,68.0 1001.2,68.0 1005.0,68.0 1005.0,68.0 1008.8,68.0 1008.8,68.0 1012.5,68.0 1012.5,68.0 1016.2,68.0 1016.2,68.0 1020.0,68.0"/>
+                <line x1="60" y1="142" x2="1020" y2="142" stroke="#b8b8b1"/>
+                <text x="61.9" y="158" text-anchor="middle" class="svg-sub">0x00</text>
+                <text x="418.1" y="158" text-anchor="middle" class="svg-sub">0x5f</text>
+                <text x="1018.1" y="158" text-anchor="middle" class="svg-sub">0xff</text>
+                <text x="52" y="144" text-anchor="end" class="svg-sub">0</text>
+                <text x="52" y="108" text-anchor="end" class="svg-sub">3</text>
+                <text x="52" y="72" text-anchor="end" class="svg-sub">6</text>
+                <text x="404.5" y="80" text-anchor="end" class="svg-sub" style="fill:#252525">lo = fanout[0x5e] = 2</text>
+                <text x="428.0" y="80" text-anchor="start" class="svg-sub" style="fill:#252525">hi = fanout[0x5f] = 3</text>
+                <text x="1020" y="60" text-anchor="end" class="svg-sub">1,024 bytes; fanout[0xff] = 6 objects</text>
+                <text x="30" y="196" text-anchor="start" class="svg-lane">2 · SORTED IDS, CRC32s AND 32-BIT OFFSETS (SEPARATE TABLES, SAME ROW ORDER)</text>
+                <text x="38" y="220" text-anchor="start" class="svg-lane">ROW</text>
+                <text x="88" y="220" text-anchor="start" class="svg-lane">OBJECT ID</text>
+                <text x="238" y="220" text-anchor="start" class="svg-lane">CRC32</text>
+                <text x="368" y="220" text-anchor="start" class="svg-lane">OFFSET</text>
+                <rect x="30" y="228" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="243" text-anchor="start" class="svg-sub" style="fill:#252525">0</text>
+                <text x="88" y="243" text-anchor="start" class="svg-sub" style="fill:#252525">261d6df6…</text>
+                <text x="238" y="243" text-anchor="start" class="svg-sub" style="fill:#252525">bdcb41e3</text>
+                <text x="368" y="243" text-anchor="start" class="svg-sub" style="fill:#252525">0x00000207</text>
+                <rect x="30" y="252" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="267" text-anchor="start" class="svg-sub" style="fill:#252525">1</text>
+                <text x="88" y="267" text-anchor="start" class="svg-sub" style="fill:#252525">43ebb351…</text>
+                <text x="238" y="267" text-anchor="start" class="svg-sub" style="fill:#252525">d20ff2eb</text>
+                <text x="368" y="267" text-anchor="start" class="svg-sub" style="fill:#252525">0x000000e7</text>
+                <rect x="30" y="276" width="460" height="22" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="38" y="291" text-anchor="start" class="svg-sub" style="fill:#252525">2</text>
+                <text x="88" y="291" text-anchor="start" class="svg-sub" style="fill:#252525">5fc0a8b9…</text>
+                <text x="238" y="291" text-anchor="start" class="svg-sub" style="fill:#252525">3d5b093d</text>
+                <text x="368" y="291" text-anchor="start" class="svg-sub" style="fill:#252525">0x000001b0</text>
+                <rect x="30" y="300" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="315" text-anchor="start" class="svg-sub" style="fill:#252525">3</text>
+                <text x="88" y="315" text-anchor="start" class="svg-sub" style="fill:#252525">8f95acbe…</text>
+                <text x="238" y="315" text-anchor="start" class="svg-sub" style="fill:#252525">25eede50</text>
+                <text x="368" y="315" text-anchor="start" class="svg-sub" style="fill:#252525">0x0000000c</text>
+                <rect x="30" y="324" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="339" text-anchor="start" class="svg-sub" style="fill:#252525">4</text>
+                <text x="88" y="339" text-anchor="start" class="svg-sub" style="fill:#252525">bf674fe6…</text>
+                <text x="238" y="339" text-anchor="start" class="svg-sub" style="fill:#252525">9a61e6ac</text>
+                <text x="368" y="339" text-anchor="start" class="svg-sub" style="fill:#252525">0x000001db</text>
+                <rect x="30" y="348" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="363" text-anchor="start" class="svg-sub" style="fill:#252525">5</text>
+                <text x="88" y="363" text-anchor="start" class="svg-sub" style="fill:#252525">da9e32e0…</text>
+                <text x="238" y="363" text-anchor="start" class="svg-sub" style="fill:#252525">abc5e591</text>
+                <text x="368" y="363" text-anchor="start" class="svg-sub" style="fill:#252525">0x00000089</text>
+                <text x="30" y="388" text-anchor="start" class="svg-note">one comparison in rows [2, 3) hits row 2</text>
+                <rect x="540" y="228" width="250" height="70" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="552" y="250" text-anchor="start" class="svg-step">0x000001b0: high bit clear</text>
+                <text x="552" y="270" text-anchor="start" class="svg-sub">→ pack offset 432</text>
+                <text x="552" y="288" text-anchor="start" class="svg-sub">set → row in the 64-bit table</text>
+                <line x1="492" y1="287" x2="536" y2="266" stroke="#252525" stroke-width="2" marker-end="url(#ix-ctl)"/>
+                <rect x="820" y="210" width="230" height="130" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="832" y="230" text-anchor="start" class="svg-step">.rev (RIDX), 76 bytes</text>
+                <text x="832" y="250" text-anchor="start" class="svg-sub">pack order → idx row</text>
+                <rect x="832" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="846" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">3</text>
+                <rect x="866" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="880" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">5</text>
+                <rect x="900" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="914" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="934" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="948" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">2</text>
+                <rect x="968" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="982" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">4</text>
+                <rect x="1002" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="1016" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="832" y="306" text-anchor="start" class="svg-sub">the .idx stores no sizes:</text>
+                <text x="832" y="324" text-anchor="start" class="svg-sub">size = next offset − this one</text>
+                <text x="30" y="424" text-anchor="start" class="svg-lane">3 · THE 574-BYTE PACK, BY OFFSET</text>
+                <rect x="40.0" y="436" width="20.9" height="30" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50.5" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">hdr</text>
+                <rect x="60.9" y="436" width="217.8" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="169.8" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">commit 8f95</text>
+                <rect x="278.7" y="436" width="163.8" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="360.6" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">commit da9e</text>
+                <rect x="442.4" y="436" width="350.2" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="617.5" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">blob 43eb, 2,187 B</text>
+                <rect x="792.6" y="436" width="74.9" height="30" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="830.1" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">tree</text>
+                <rect x="867.5" y="436" width="76.7" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="905.9" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">tree</text>
+                <rect x="944.2" y="436" width="61.0" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="974.7" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">Δ</text>
+                <rect x="1005.2" y="436" width="34.8" height="30" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1022.6" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">sum</text>
+                <text x="792.6" y="486" text-anchor="middle" class="svg-sub">432: 5fc0a8b9, a 33-byte tree</text>
+                <path d="M665 298 C 665 360, 829.2 380, 829.2 432" fill="none" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#ix-data)"/>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              One byte of fanout, one binary search, one offset; sizes come from the reverse index. Orange marks the
+              path of this lookup, purple the <code>.rev</code> inset. All values are from the lab pack's
+              <code>.idx</code> and <code>.rev</code>, cross-checked with <code>git show-index</code>
+              <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>Side files, and the order they appear in</h3>
+          <p>
+            The <code>.idx</code> stores no sizes. An object's extent is the next offset minus its own, which needs
+            the objects in pack order. The <code>.rev</code> file (<code>RIDX</code>) stores exactly that mapping, one
+            u32 per object; without it git sorts the offsets in memory, and it is written by
+            default since v2.41.0. Cruft packs add a <code>.mtimes</code> file, one timestamp per object, because
+            expiry needs per-object ages that only loose files used to carry (<a href="../merge-and-upkeep/#prune">Part 3</a> covers why)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            When a pack is written, the <code>.pack</code>, <code>.rev</code>, <code>.mtimes</code> and bitmap are
+            renamed into place first and the <code>.idx</code> last (<code>pack-write.c</code>:561-599). Readers find
+            packs by their <code>.idx</code>, so that last rename publishes the pack. Pushed objects are the exception:
+            quarantine migration orders <code>.keep</code>, <code>.pack</code>, <code>.rev</code>, <code>.idx</code>,
+            then every other file after the <code>.idx</code> (<code>tmp-objdir.c</code>:193-206)
+            <span class="src">from the code</span>. On receipt, <code>index-pack</code> also compares every incoming
+            object that already exists locally byte for byte and dies with "SHA1 COLLISION FOUND" on a mismatch
+            (<code>builtin/index-pack.c</code>:883-926).
+          </p>
+          <p>
+            Many packs mean many binary searches. The multi-pack-index repeats the same tables in chunks
+            (<code>OIDF</code>, <code>OIDL</code>, <code>OOFF</code>, <code>LOFF</code>) across all packs, keeping one
+            copy of each object: from the preferred pack, else the newest (<code>midx-write.c</code>:203-224)
+            <span class="src">from the code</span>. Its format documentation has drifted. It says the
+            version defaults to 2, while the code writes 1 (measured byte <code>01</code>); it says packs in the
+            bitmap order are sorted descending, while the comparator sorts ascending; and it says the
+            <code>BTMP</code> chunk "encodes three pieces of information" and then lists two
+            <span class="recon">measured here</span>. <a href="../merge-and-upkeep/#findings">Part 3's findings register</a> lists these with the rest.
+          </p>
