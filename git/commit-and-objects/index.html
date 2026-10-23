@@ -1,0 +1,2735 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Git v2.55.0 taken apart, part 1: one traced commit, loose object bytes and names, the object lookup chain, pack deltas, .idx fanout lookup, and reachability bitmaps, with measured numbers."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/git/commit-and-objects/" />
+    <meta property="og:title" content="The commit and its objects" />
+    <meta property="og:description" content="Part 1 of a three-part git teardown at v2.55.0 (e9019fca): one git add plus git commit traced call by call (five loose objects, six locks, one publishing rename, zero fsyncs), then the object header and hash, the lookup chain across sources, packs with backwards OFS deltas and a copy/insert codec, the .idx fanout lookup, and bitmaps that cut git.git's object count from 9.3 s to 0.14 s." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/git/commit-and-objects/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="The commit and its objects" />
+    <meta name="twitter:description" content="Git v2.55.0 taken apart, part 1: one commit traced call by call, then objects, packs, deltas, .idx lookup and bitmaps, with real bytes." />
+    <title>The commit and its objects — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · One commit, every write</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#one-commit">01 · One commit, every write</a>
+        <a class="toc-parent" href="#objects">02 · An object is a header and a hash</a>
+        <a class="toc-parent" href="#lookup">03 · Finding an object</a>
+        <a class="toc-parent" href="#packs">04 · Packs and deltas</a>
+        <a class="toc-parent" href="#pack-indexes">05 · Indexes over packs</a>
+        <a class="toc-parent" href="#bitmaps">06 · Bitmaps: counting without walking</a>
+        <a class="toc-parent" href="#sources">07 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#one-commit">01 · One commit, every write</a>
+        <a href="#objects">02 · Header and hash</a>
+        <a href="#lookup">03 · Finding an object</a>
+        <a href="#packs">04 · Packs and deltas</a>
+        <a href="#pack-indexes">05 · Indexes over packs</a>
+        <a href="#bitmaps">06 · Bitmaps</a>
+        <a href="#sources">07 · Sources</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Languages & Tools</p>
+        <h1>The commit and its objects<span class="status-pill">Teardown</span></h1>
+        <p class="dek">
+          A git commit is five small zlib files, two rewrites of the index, six lock files and one rename. This first part of a three-part teardown traces one git add and one git commit through git v2.55.0, call by call, then follows the objects they write: how an object is named, where git looks for it, how packs store it as a backwards byte delta, and how fanout tables and bitmaps make finding and counting objects cheap.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 23 October 2026 · Subject: <code>git@e9019fca</code> (v2.55.0) · Part 1 of 3 · Read from the source and the manual; measured on this machine</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#one-commit">One commit, every write</a></li>
+          <li><a href="#objects">An object is a header and a hash</a></li>
+          <li><a href="#lookup">Finding an object</a></li>
+          <li><a href="#packs">Packs and deltas</a></li>
+          <li><a href="#pack-indexes">Indexes over packs</a></li>
+          <li><a href="#bitmaps">Bitmaps: counting without walking</a></li>
+          <li><a href="#sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from git at <code>e9019fca</code>
+              (tag <code>v2.55.0</code>, 29 June 2026), cited as a path and line number from the repository root;
+              the manual pages are cited under <code>Documentation/</code>. <span class="recon">measured here</span>
+              marks a number, a byte dump or a behaviour observed with <code>git version 2.55.0</code> on a 2-vCPU Linux
+              box, either in a two-file lab repository with pinned dates (so every object id below is reproducible) or
+              on a clone of git.git. Timings name their sample size; pack timings move by up to 40% between sessions,
+              while byte counts and object counts are exact. <span class="recon">reconstruction</span> marks a judgement
+              I drew from those sources rather than read in one place.
+            </p>
+            <p>
+              This is Part 1 of 3 of <a href="../">Git, taken apart</a>. <a href="../state-and-wire/">Part 2</a> covers
+              the index, refs and the wire; <a href="../merge-and-upkeep/">Part 3</a> covers merging, maintenance and
+              history, and ends with the findings register.
+            </p>
+          </div>
+
+          <h2 id="one-commit"><span class="secnum">01</span>One commit, every write</h2>
+          <p class="lede">
+            Git is an append-only, content-addressed object store surrounded by a handful of small mutable
+            files. Each of those files is either a pointer or a cache, and each has its own consistency story.
+            Objects never change, so writing one needs no lock. The mutable files are published by writing a
+            complete new copy and renaming it over the old one. Everything that makes git fast is derived data
+            that can be rebuilt from the objects. This collection reads git v2.55.0 along those lines. Part 1
+            covers the store: one traced commit, then the objects it writes and the packs, indexes and bitmaps
+            that hold them.
+          </p>
+          <p>
+            The lab repository holds two files, <code>README</code> (<code>hello\n</code>) and
+            <code>src/main.c</code>, with author and committer dates pinned so every object id below is
+            reproducible. The machine has no <code>strace</code>, so an <code>LD_PRELOAD</code> shim
+            (<code>fstrace.c</code>) logged every open, rename, link, unlink, mkdir and exec with a microsecond
+            offset <span class="recon">measured here</span>. Before doing anything, every git process walks up
+            from the current directory and asks <code>is_git_directory()</code> three questions: is there a valid
+            <code>HEAD</code>, an <code>objects/</code> directory and a <code>refs/</code> directory
+            (<code>setup.c</code>:414-452) <span class="src">from the code</span>. It then reads
+            <code>.git/config</code> three times <span class="recon">measured here</span>.
+          </p>
+
+          <h3>git add: lock first, then hash</h3>
+          <p>
+            <code>git add README src/main.c</code> takes <code>index.lock</code> <em>before</em> it reads the
+            index (<code>builtin/add.c</code>:454, 495). The lock is a tempfile opened
+            <code>O_RDWR|O_CREAT|O_EXCL</code>, the same create-exclusively-then-rename protocol Linus wrote into
+            <code>update-cache.c</code> on 7 April 2005 <span class="src">from the code</span>. For each file, git
+            hashes <code>"blob &lt;size&gt;\0"</code> plus the content, calls <code>access()</code> on the final
+            path to see whether the object already exists, and creates <code>tmp_obj_XXXXXX</code>, mode 0444, in
+            the two-hex-digit fan-out directory. On a fresh repository that open fails with
+            <code>ENOENT</code>, so git makes the directory and retries. It deflates at zlib level 1, then
+            <code>link()</code>s the temp file to its final name and <code>unlink()</code>s the temp
+            <span class="recon">measured here</span>. The 21-byte file for <code>hello\n</code> is exactly
+            <code>zlib.compress(b"blob 6\x00hello\n", 1)</code>. Its name, <code>ce013625…</code>, is the SHA-1
+            of the <em>uncompressed</em> bytes. §02 takes that apart.
+          </p>
+          <p>
+            Then the 184-byte index is written into the lock, the lock is <code>stat</code>ed to record its
+            mtime for the <a href="../state-and-wire/#racy-git">racy-git check</a> (Part 2), and the lock is renamed over <code>index</code>. The whole
+            <code>add</code> is 92 intercepted calls, 15 of which change <code>.git/</code>; the median wall time
+            over 21 fresh repositories is 2.3 ms <span class="recon">measured here</span>.
+          </p>
+
+          <h3>git commit: trees before hooks</h3>
+          <p>
+            A plain <code>git commit -m</code> with no paths takes the COMMIT_AS_IS branch,
+            <code>builtin/commit.c</code>:482-494 <span class="src">from the code</span>:
+          </p>
+<pre><code>	if (!only &amp;&amp; !pathspec.nr) {
+		repo_hold_locked_index(the_repository, &amp;index_lock,
+				       LOCK_DIE_ON_ERROR);
+		refresh_cache_or_die(refresh_flags);
+		if (the_repository-&gt;index-&gt;cache_changed
+		    || !cache_tree_fully_valid(the_repository-&gt;index-&gt;cache_tree))
+			cache_tree_update(the_repository-&gt;index, WRITE_TREE_SILENT);
+		if (write_locked_index(the_repository-&gt;index, &amp;index_lock,
+				       COMMIT_LOCK | SKIP_IF_UNCHANGED))
+			die(_("unable to write new index file"));
+		commit_style = COMMIT_AS_IS;
+		ret = repo_get_index_file(the_repository);
+		goto out;</code></pre>
+          <p>
+            <code>cache_tree_update()</code> writes the <code>src</code> tree (51 bytes on disk) and the root
+            tree (80 bytes), and the index is rewritten with a 53-byte TREE extension, all before git even looks
+            for a <code>pre-commit</code> hook. A rejecting <code>pre-commit</code> therefore leaves both trees
+            and the new index on disk; the verification pass reproduced that <span class="recon">measured here</span>.
+            Hooks are found by <code>access(X_OK)</code> on exact names (<code>hook.c</code>:26-36), so the
+            shipped <code>*.sample</code> files never run <span class="src">from the code</span>. The commit
+            object (122 bytes on disk) follows.
+          </p>
+          <p>
+            The commit becomes visible through one ref transaction on <code>HEAD</code>
+            (<code>sequencer.c</code>:1282-1290). The files backend splits it in two: a log-only update of
+            <code>HEAD</code>, whose <code>HEAD.lock</code> is created and released empty, and a real update of
+            <code>refs/heads/main</code>, whose lock receives 41 bytes, 40 hex digits and a newline
+            (<code>refs/files-backend.c</code>:2537-2551) <span class="src">from the code</span>. Both reflogs are
+            appended with <code>O_APPEND</code>, 160 bytes each. Then
+            <code>rename(main.lock, main)</code>. <strong>That rename is the instant the commit exists.</strong>
+            Before it, a reader sees the old branch; after it, the new one. Figure 1 shows
+            every write in order.
+          </p>
+
+          <figure class="figure wide" id="fig-commit-trace">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">One <code>git add</code> and one <code>git commit</code>, every write in order</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 697" role="img" aria-label="Every write of git add and git commit in a two-file repository, in time order, in six lanes: objects, index, refs, logs, hooks and the maintenance child. Lock lifetimes are orange bars; the rename of refs/heads/main.lock is the moment the commit becomes visible.">
+                <text x="20" y="30" class="svg-lane">TIME</text>
+                <text x="128" y="30" class="svg-lane">OBJECTS/</text>
+                <line x1="120" y1="40" x2="120" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="284" y="30" class="svg-lane">INDEX</text>
+                <line x1="276" y1="40" x2="276" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="440" y="30" class="svg-lane">REFS/</text>
+                <line x1="432" y1="40" x2="432" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="596" y="30" class="svg-lane">LOGS/</text>
+                <line x1="588" y1="40" x2="588" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="752" y="30" class="svg-lane">HOOKS</text>
+                <line x1="744" y1="40" x2="744" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="908" y="30" class="svg-lane">CHILD PROCESS</text>
+                <line x1="900" y1="40" x2="900" y2="641" stroke="#deded9" stroke-width="1"/>
+                <rect x="14" y="56" width="1052" height="20" rx="3" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="22" y="70" class="svg-sub" style="fill:#252525">$ git add README src/main.c</text>
+                <rect x="14" y="185" width="1052" height="20" rx="3" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="22" y="199" class="svg-sub" style="fill:#252525">$ git commit -q -m 'first commit'</text>
+                <rect x="280" y="79" width="4" height="90" rx="1" fill="#d98226"/>
+                <rect x="280" y="208" width="4" height="71" rx="1" fill="#d98226"/>
+                <rect x="436" y="341" width="4" height="128" rx="1" fill="#d98226"/>
+                <rect x="442" y="360" width="4" height="90" rx="1" fill="#d98226"/>
+                <rect x="436" y="493" width="4" height="52" rx="1" fill="#d98226"/>
+                <rect x="442" y="512" width="4" height="33" rx="1" fill="#d98226"/>
+                <rect x="904" y="569" width="4" height="52" rx="1" fill="#d98226"/>
+                <rect x="914" y="550" width="2" height="71" fill="#b8b8b1"/>
+                <text x="20" y="90" class="svg-sub">+1.875 ms</text>
+                <text x="298" y="90" class="svg-sub" style="fill:#252525">index.lock O_EXCL</text>
+                <text x="20" y="109" class="svg-sub">+3.114 ms</text>
+                <text x="142" y="109" class="svg-sub" style="fill:#252525">mkdir ce/, tmp_obj_*</text>
+                <text x="20" y="128" class="svg-sub">+3.306 ms</text>
+                <text x="142" y="128" class="svg-sub" style="fill:#252525">link ce/0136… 21 B</text>
+                <text x="20" y="147" class="svg-sub">+3.786 ms</text>
+                <text x="142" y="147" class="svg-sub" style="fill:#252525">link 78/f2de… 45 B</text>
+                <text x="20" y="166" class="svg-sub">+3.965 ms</text>
+                <text x="298" y="166" class="svg-sub" style="fill:#252525">rename: index 184 B</text>
+                <text x="20" y="219" class="svg-sub">+1.853 ms</text>
+                <text x="298" y="219" class="svg-sub" style="fill:#252525">index.lock O_EXCL</text>
+                <text x="20" y="238" class="svg-sub">+2.544 ms</text>
+                <text x="142" y="238" class="svg-sub" style="fill:#252525">src tree, 51 B</text>
+                <text x="20" y="257" class="svg-sub">+2.813 ms</text>
+                <text x="142" y="257" class="svg-sub" style="fill:#252525">root tree, 80 B</text>
+                <text x="20" y="276" class="svg-sub">+3.111 ms</text>
+                <text x="298" y="276" class="svg-sub" style="fill:#252525">rename: 245 B + TREE</text>
+                <text x="20" y="295" class="svg-sub">+3.153 ms</text>
+                <text x="766" y="295" class="svg-sub" style="fill:#252525">pre-commit probed</text>
+                <text x="20" y="314" class="svg-sub">+3.809 ms</text>
+                <text x="142" y="314" class="svg-sub" style="fill:#252525">commit, 122 B</text>
+                <text x="20" y="333" class="svg-sub">+3.971 ms</text>
+                <text x="766" y="333" class="svg-sub" style="fill:#252525">ref-tx: preparing</text>
+                <text x="20" y="352" class="svg-sub">+4.039 ms</text>
+                <text x="454" y="352" class="svg-sub" style="fill:#252525">HEAD.lock, empty</text>
+                <text x="20" y="371" class="svg-sub">+4.112 ms</text>
+                <text x="454" y="371" class="svg-sub" style="fill:#252525">main.lock ← 41 B</text>
+                <text x="20" y="390" class="svg-sub">+4.168 ms</text>
+                <text x="766" y="390" class="svg-sub" style="fill:#252525">ref-tx: prepared</text>
+                <text x="20" y="409" class="svg-sub">+4.254 ms</text>
+                <text x="610" y="409" class="svg-sub" style="fill:#252525">logs/HEAD +160 B</text>
+                <text x="20" y="428" class="svg-sub">+4.371 ms</text>
+                <text x="610" y="428" class="svg-sub" style="fill:#252525">…/heads/main +160 B</text>
+                <text x="20" y="447" class="svg-sub">+4.399 ms</text>
+                <rect x="448" y="434" width="132" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.6"/>
+                <text x="454" y="447" class="svg-sub" style="fill:#ad4b43;font-weight:700">rename main.lock</text>
+                <text x="596" y="447" class="svg-note" style="fill:#ad4b43">← the commit exists from here</text>
+                <text x="20" y="466" class="svg-sub">+4.437 ms</text>
+                <text x="454" y="466" class="svg-sub" style="fill:#252525">unlink HEAD.lock</text>
+                <text x="20" y="485" class="svg-sub">+4.447 ms</text>
+                <text x="766" y="485" class="svg-sub" style="fill:#252525">ref-tx: committed</text>
+                <text x="20" y="504" class="svg-sub">+4.550 ms</text>
+                <text x="454" y="504" class="svg-sub" style="fill:#252525">AUTO_MERGE.lock</text>
+                <text x="20" y="523" class="svg-sub">+4.597 ms</text>
+                <text x="454" y="523" class="svg-sub" style="fill:#252525">packed-refs.lock</text>
+                <text x="20" y="542" class="svg-sub">+4.668 ms</text>
+                <text x="454" y="542" class="svg-sub" style="fill:#252525">both unlinked</text>
+                <text x="20" y="561" class="svg-sub">+5.314 ms</text>
+                <text x="922" y="561" class="svg-sub" style="fill:#252525">spawn maintenance</text>
+                <text x="20" y="580" class="svg-sub">+8.561 ms</text>
+                <text x="922" y="580" class="svg-sub" style="fill:#252525">lock, opendir 17/</text>
+                <text x="20" y="599" class="svg-sub">+9.891 ms</text>
+                <text x="766" y="599" class="svg-sub" style="fill:#252525">post-commit probed</text>
+                <text x="20" y="618" class="svg-sub">+10.113 ms</text>
+                <text x="922" y="618" class="svg-sub" style="fill:#252525">unlink (detached)</text>
+                <rect x="14" y="655" width="1052" height="34" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="26" y="668" width="14" height="8" rx="1" fill="#d98226"/>
+                <text x="48" y="676" class="svg-sub">lock file held (created O_EXCL, then renamed or unlinked)</text>
+                <text x="560" y="676" class="svg-sub" style="fill:#252525;font-weight:700">fsync / fdatasync calls: 0</text>
+                <text x="790" y="676" class="svg-sub">add: 92 calls · commit: 286</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              A commit is five loose files, two index rewrites and six short-lived lock files. It becomes real at
+              one rename (red), and nothing is fsynced. Offsets are microseconds from process start in one traced
+              run (run 2 of 3; the call order matched across runs); read-only probes are omitted. Orange bars are
+              lock lifetimes <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>The cleanup costs as much as the commit</h3>
+          <p>
+            Every commit then deletes <code>AUTO_MERGE</code> unconditionally (<code>sequencer.c</code>:2988-2989).
+            Since v2.44.0 that is a ref deletion, and a deletion in the files backend opens a
+            <code>packed-refs</code> transaction. So a clean commit in a repository with neither file still
+            creates and removes <code>AUTO_MERGE.lock</code> and <code>packed-refs.lock</code>
+            <span class="src">from the code</span>. A stale <code>packed-refs.lock</code> left by a crashed
+            process makes every commit wait about one second and print an error, though the commit still
+            succeeds <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Finally <code>git maintenance run --auto</code> runs as a child. It takes
+            <code>objects/maintenance.lock</code>, estimates the loose objects by reading only
+            <code>objects/17/</code>, finds nothing to do and exits. On this tiny repository that child is about
+            half the wall time: 8.4 ms median per commit by default against 3.9 ms with
+            <code>maintenance.auto=false</code> (N=21 each; a re-run gave 7.8 against 3.8)
+            <span class="recon">measured here</span>. In total, the root commit is 286 intercepted calls, 46 of
+            which change <code>.git/</code>, across six lock files. There is no <code>fsync</code> or
+            <code>fdatasync</code> anywhere in the trace <span class="recon">measured here</span>, because the
+            default <code>core.fsync</code> set leaves out loose objects, the index and refs
+            (<code>write-or-die.h</code>:27-35) <span class="src">from the code</span>.
+          </p>
+
+          <h3>The second commit, and the plumbing underneath</h3>
+          <p>
+            Changing <code>README</code> and committing again writes one blob, one tree and one commit. The
+            <code>src</code> subtree is not re-hashed: its cache-tree node is still valid and its object exists,
+            so <code>update_one()</code> returns early (<code>cache-tree.c</code>:294-297)
+            <span class="src">from the code</span>. Replaying both commits with plumbing (<code>hash-object
+            -w</code>, <code>update-index</code>, <code>write-tree</code>, <code>commit-tree</code>,
+            <code>update-ref</code>) produced all eight loose files and both reflogs byte for byte
+            <span class="recon">measured here</span>. The porcelain adds no hidden state.
+          </p>
+
+          <h3>Where each part picks up</h3>
+          <p>
+            Every structure in Figure 1 has a section. The objects lane is this part: §02
+            names an object, §03 finds one, §04 to §06 pack, index and count them.
+            <a href="../state-and-wire/">Part 2</a> takes the mutable lanes: <a href="../state-and-wire/#index">the
+            index file</a> and its stat cache, <a href="../state-and-wire/#refs">refs and reflogs</a>, why every
+            publish is <a href="../state-and-wire/#durability">atomic but not durable</a>, and how objects and refs
+            move over <a href="../state-and-wire/#wire">the wire</a>. <a href="../merge-and-upkeep/">Part 3</a>
+            covers merging, <a href="../merge-and-upkeep/#maintenance">the maintenance child</a>, and the history of
+            the design, and ends with <a href="../merge-and-upkeep/#findings">the register</a> of bugs and
+            documentation drift found along the way. The
+            companion field guide <a href="../../git-worktrees/">One repository, many agents</a> covers the
+            worktree split.
+          </p>
+
+          <h2 id="objects"><span class="secnum">02</span>An object is a header and a hash</h2>
+          <p class="lede">
+            Git stores four kinds of object: commit, tree, blob and tag, enum values 1 to 4
+            (<code>object.h</code>:98-111). Every object is a short text header, a NUL, and a payload. Its name is
+            one hash over all of it. Nothing else about an object is part of its identity: not the file name,
+            not the compression, not where it is stored.
+          </p>
+          <p>
+            The header is built by <code>format_object_header()</code>, <code>object-file.c</code>:90-99
+            <span class="src">from the code</span>. The <code>+ 1</code> counts the NUL that
+            <code>xsnprintf</code> writes:
+          </p>
+<pre><code>int format_object_header(char *str, size_t size, enum object_type type,
+			 size_t objsize)
+{
+	const char *name = type_name(type);
+
+	if (!name)
+		BUG("could not get a type name for 'enum object_type' value %d", type);
+
+	return xsnprintf(str, size, "%s %"PRIuMAX, name, (uintmax_t)objsize) + 1;
+}</code></pre>
+          <p>
+            <code>hash_object_body()</code> (<code>object-file.c</code>:318-327) then feeds the header and the
+            payload into one hash context. So the name can be reproduced with any hashing tool
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ printf 'blob 6\0hello\n' | sha1sum
+ce013625030ba8dba906f756967f9e9ca394464a  -
+$ git hash-object README
+ce013625030ba8dba906f756967f9e9ca394464a</code></pre>
+
+          <figure class="figure wide" id="fig-loose-object">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">Anatomy of a loose object: the bytes that are hashed, and two files that hold them</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 430" role="img" aria-label="The 13 bytes blob 6, NUL, hello, newline, hashed to ce013625; below, the 21-byte zlib level 1 file and the 24-byte level 0 file, which differ but carry the same name.">
+                <defs><marker id="lo-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker></defs>
+                <text x="30" y="26" class="svg-lane">1 · WHAT IS HASHED (13 BYTES, INFLATED)</text>
+                <rect x="30" y="40" width="44" height="30" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="52.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">62</text>
+                <rect x="74" y="40" width="44" height="30" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="96.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6c</text>
+                <rect x="118" y="40" width="44" height="30" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="140.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6f</text>
+                <rect x="162" y="40" width="44" height="30" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="184.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">62</text>
+                <rect x="206" y="40" width="44" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="228.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">20</text>
+                <rect x="250" y="40" width="44" height="30" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="272.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">36</text>
+                <rect x="294" y="40" width="44" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="316.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">00</text>
+                <rect x="338" y="40" width="44" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="360.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">68</text>
+                <rect x="382" y="40" width="44" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="404.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">65</text>
+                <rect x="426" y="40" width="44" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="448.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6c</text>
+                <rect x="470" y="40" width="44" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="492.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6c</text>
+                <rect x="514" y="40" width="44" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="536.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6f</text>
+                <rect x="558" y="40" width="44" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="580.0" y="59.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0a</text>
+                <line x1="32" y1="86" x2="204" y2="86" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="118.0" y="100" text-anchor="middle" class="svg-sub">type "blob"</text>
+                <line x1="208" y1="86" x2="248" y2="86" stroke="#b8b8b1" stroke-width="1.4"/>
+                <text x="228.0" y="100" text-anchor="middle" class="svg-sub">SP</text>
+                <line x1="252" y1="86" x2="292" y2="86" stroke="#d98226" stroke-width="1.4"/>
+                <text x="272.0" y="100" text-anchor="middle" class="svg-sub">size "6"</text>
+                <line x1="296" y1="86" x2="336" y2="86" stroke="#765b98" stroke-width="1.4"/>
+                <text x="316.0" y="100" text-anchor="middle" class="svg-sub">NUL</text>
+                <line x1="340" y1="86" x2="600" y2="86" stroke="#367f59" stroke-width="1.4"/>
+                <text x="470.0" y="100" text-anchor="middle" class="svg-sub">payload "hello\n"</text>
+                <line x1="610" y1="55" x2="662" y2="55" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#lo-data)"/>
+                <text x="616" y="47" class="svg-sub">SHA-1</text>
+                <rect x="668" y="38" width="382" height="34" rx="3" fill="#ffffff" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="678" y="53" class="svg-sub" style="fill:#252525">ce013625030ba8dba906</text>
+                <text x="678" y="66" class="svg-sub" style="fill:#252525">f756967f9e9ca394464a</text>
+                <text x="668" y="94" class="svg-note">the name; SHA-256 of the same bytes is 2cf8d83d…ebb4</text>
+                <text x="30" y="146" class="svg-lane">2 · objects/ce/013625… ON DISK: zlib LEVEL 1 (21 BYTES)</text>
+                <rect x="30" y="160" width="40" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">78</text>
+                <rect x="70" y="160" width="40" height="30" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="90.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">01</text>
+                <rect x="110" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="130.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">4b</text>
+                <rect x="150" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="170.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">ca</text>
+                <rect x="190" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="210.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">c9</text>
+                <rect x="230" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="250.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">4f</text>
+                <rect x="270" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="290.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">52</text>
+                <rect x="310" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="330.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">30</text>
+                <rect x="350" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="370.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">63</text>
+                <rect x="390" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="410.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">c8</text>
+                <rect x="430" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="450.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">48</text>
+                <rect x="470" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="490.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">cd</text>
+                <rect x="510" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="530.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">c9</text>
+                <rect x="550" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="570.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">c9</text>
+                <rect x="590" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="610.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">e7</text>
+                <rect x="630" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="650.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">02</text>
+                <rect x="670" y="160" width="40" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="690.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">00</text>
+                <rect x="710" y="160" width="40" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="730.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1d</text>
+                <rect x="750" y="160" width="40" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="770.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">c5</text>
+                <rect x="790" y="160" width="40" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="810.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">04</text>
+                <rect x="830" y="160" width="40" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="850.0" y="179.0" text-anchor="middle" class="svg-sub" style="fill:#252525">14</text>
+                <line x1="32" y1="206" x2="68" y2="206" stroke="#b8b8b1" stroke-width="1.4"/>
+                <text x="50.0" y="220" text-anchor="middle" class="svg-sub">CMF</text>
+                <line x1="72" y1="206" x2="108" y2="206" stroke="#d98226" stroke-width="1.4"/>
+                <text x="90.0" y="234" text-anchor="middle" class="svg-sub">FLG: level 1</text>
+                <line x1="112" y1="206" x2="708" y2="206" stroke="#367f59" stroke-width="1.4"/>
+                <text x="410.0" y="220" text-anchor="middle" class="svg-sub">one fixed-Huffman deflate block holding the 13 bytes</text>
+                <line x1="712" y1="206" x2="868" y2="206" stroke="#765b98" stroke-width="1.4"/>
+                <text x="790.0" y="234" text-anchor="middle" class="svg-sub">adler32 of the 13 bytes</text>
+                <text x="882" y="180" class="svg-note">level 9 would</text>
+                <text x="882" y="194" class="svg-note">start 78 da</text>
+                <text x="30" y="266" class="svg-lane">3 · SAME OBJECT AT LEVEL 0 (STORED BLOCK, 24 BYTES): DIFFERENT FILE, SAME NAME</text>
+                <rect x="30" y="280" width="36" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="48.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">78</text>
+                <rect x="66" y="280" width="36" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="84.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">01</text>
+                <rect x="102" y="280" width="36" height="30" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="120.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">01</text>
+                <rect x="138" y="280" width="36" height="30" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="156.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0d</text>
+                <rect x="174" y="280" width="36" height="30" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="192.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">00</text>
+                <rect x="210" y="280" width="36" height="30" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="228.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">f2</text>
+                <rect x="246" y="280" width="36" height="30" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="264.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">ff</text>
+                <rect x="282" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="300.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">62</text>
+                <rect x="318" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="336.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6c</text>
+                <rect x="354" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="372.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6f</text>
+                <rect x="390" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="408.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">62</text>
+                <rect x="426" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="444.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">20</text>
+                <rect x="462" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="480.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">36</text>
+                <rect x="498" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="516.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">00</text>
+                <rect x="534" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="552.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">68</text>
+                <rect x="570" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="588.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">65</text>
+                <rect x="606" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="624.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6c</text>
+                <rect x="642" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="660.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6c</text>
+                <rect x="678" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="696.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">6f</text>
+                <rect x="714" y="280" width="36" height="30" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="732.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0a</text>
+                <rect x="750" y="280" width="36" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="768.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1d</text>
+                <rect x="786" y="280" width="36" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="804.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">c5</text>
+                <rect x="822" y="280" width="36" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="840.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">04</text>
+                <rect x="858" y="280" width="36" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="876.0" y="299.0" text-anchor="middle" class="svg-sub" style="fill:#252525">14</text>
+                <line x1="32" y1="326" x2="100" y2="326" stroke="#b8b8b1" stroke-width="1.4"/>
+                <text x="66.0" y="340" text-anchor="middle" class="svg-sub">zlib hdr</text>
+                <line x1="104" y1="326" x2="136" y2="326" stroke="#d98226" stroke-width="1.4"/>
+                <text x="120.0" y="354" text-anchor="middle" class="svg-sub">stored</text>
+                <line x1="140" y1="326" x2="208" y2="326" stroke="#d98226" stroke-width="1.4"/>
+                <text x="174.0" y="340" text-anchor="middle" class="svg-sub">LEN 13</text>
+                <line x1="212" y1="326" x2="280" y2="326" stroke="#d98226" stroke-width="1.4"/>
+                <text x="246.0" y="354" text-anchor="middle" class="svg-sub">NLEN</text>
+                <line x1="284" y1="326" x2="748" y2="326" stroke="#367f59" stroke-width="1.4"/>
+                <text x="516.0" y="340" text-anchor="middle" class="svg-sub">"blob 6\0hello\n" in clear</text>
+                <line x1="752" y1="326" x2="892" y2="326" stroke="#765b98" stroke-width="1.4"/>
+                <text x="822.0" y="354" text-anchor="middle" class="svg-sub">adler32</text>
+                <rect x="30" y="372" width="1020" height="44" rx="3" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="44" y="392" class="svg-sub" style="fill:#252525">Rows 2 and 3 inflate to row 1, so both files are named ce013625…. A byte-for-byte comparison of two loose files</text>
+                <text x="44" y="408" class="svg-sub" style="fill:#252525">would report a false collision, which is why the v2.47.0 collision check skips loose objects.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The name hashes the uncompressed bytes. The compression level changes the file but not the name.
+              Colours mark fields: blue type, orange size and zlib parameters, purple terminators and checksums,
+              green content. All bytes are dumps from the lab repository <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>Compression is not identity</h3>
+          <p>
+            Loose objects are deflated at <code>Z_BEST_SPEED</code> (<code>environment.c</code>:722), which is why
+            every loose file starts <code>78 01</code>. At level 9 it would start <code>78 da</code>; the name and
+            the adler32 trailer stay the same (Figure 2) <span class="recon">measured here</span>.
+            One object can therefore have several valid files. That is why the byte-for-byte collision check added
+            in v2.47.0 (<code>b1b8dfde69</code>) exempts loose objects <span class="src">from the code</span>. A
+            writer that finds the object already present only freshens its mtime and discards the new data
+            (<code>odb/source-loose.c</code>:613-624). The rule has flipped once: in the first commit,
+            <code>e83c5163</code>, the name was the SHA-1 of the <em>compressed</em> file, and
+            <code>d98b46f8d9</code> reversed that on 20 April 2005 <span class="src">from the code</span>.
+          </p>
+
+          <h3>Collisions and the second SHA-1</h3>
+          <p>
+            The header is also why the SHAttered PDFs do not collide as blobs: the <code>blob 422435\0</code>
+            prefix moves the colliding blocks, and the two files get different ids
+            <span class="recon">measured here</span>. The real defence is sha1dc, the default since v2.13.0. When
+            it detects a collision attack, <code>git_SHA1DCFinal()</code> dies with "SHA-1 appears to be part of a collision attack"
+            (<code>sha1dc_git.c</code>:17-26) instead of carrying on with the suspect
+            hash
+            <span class="src">from the code</span>. Git also carries an "unsafe" SHA-1 in
+            <code>struct git_hash_algo</code>, without collision detection, for speed. It is used only for the
+            checksums that <code>hashfd()</code> writes at the end of files git generates itself: packs,
+            <code>.idx</code>, <code>.rev</code>, bitmaps, the multi-pack-index, the commit-graph and the index
+            (<code>csum-file.c</code>:178, 246) <span class="src">from the code</span>.
+          </p>
+
+          <h3>Trees and commits</h3>
+          <p>
+            A tree entry is <code>"&lt;octal mode&gt; &lt;name&gt;\0"</code> followed by the child's id as
+            <em>raw</em> bytes, 20 for SHA-1 and 32 for SHA-256. Directories are written <code>40000</code>, not
+            <code>040000</code>; a zero-padded mode would change the hash, and fsck warns about it. Entries are
+            sorted by <code>base_name_compare()</code> (<code>tree.c</code>:99-116), which treats the end of a
+            directory's name as <code>/</code>. That is why the file <code>a.c</code> sorts before the directory
+            <code>a</code> (Figure 3) <span class="src">from the code</span>. The bytes also keep
+            history that the tools hide: <code>mktree</code> preserves a <code>100664</code> mode, left over from early git, which recorded every permission bit, which
+            <code>ls-tree</code> prints as <code>100644</code> and fsck tolerates unless run with
+            <code>--strict</code> <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-tree-entry">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">A tree in two hash widths, and the trailing-slash sort rule</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 440" role="img" aria-label="The root tree of the lab repository as bytes in SHA-1 (96-byte payload) and SHA-256 (132-byte payload): mode, space, name, NUL and a raw binary object id per entry; and the sort order of a-b, a.c, directory a and a0 by memcmp and by git.">
+                <defs><marker id="te-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker></defs>
+                <text x="30" y="172" class="svg-lane">SHA-1 ROOT TREE · 8-BYTE HEADER + 96-BYTE PAYLOAD · 20-BYTE IDS</text>
+                <rect x="30" y="120" width="78" height="32" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="69.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">tree 96\0</text>
+                <rect x="108" y="120" width="60" height="32" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="138.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">100644</text>
+                <rect x="168" y="120" width="54" height="32" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="195.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a.c\0</text>
+                <rect x="222" y="120" width="126" height="32" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="285.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">f2ad6c76… raw</text>
+                <rect x="348" y="120" width="54" height="32" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="375.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">40000</text>
+                <rect x="402" y="120" width="40" height="32" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="422.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a\0</text>
+                <rect x="442" y="120" width="126" height="32" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="505.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">ab69b4ab… raw</text>
+                <rect x="568" y="120" width="60" height="32" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="598.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">100644</text>
+                <rect x="628" y="120" width="96" height="32" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="676.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">hello.txt\0</text>
+                <rect x="724" y="120" width="126" height="32" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="787.0" y="140.0" text-anchor="middle" class="svg-sub" style="fill:#252525">ce013625… raw</text>
+                <text x="30" y="258" class="svg-lane">SHA-256 ROOT TREE · 9-BYTE HEADER + 132-BYTE PAYLOAD · 32-BYTE IDS</text>
+                <rect x="30" y="206" width="78" height="32" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="69.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">tree 132\0</text>
+                <rect x="108" y="206" width="60" height="32" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="138.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">100644</text>
+                <rect x="168" y="206" width="54" height="32" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="195.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a.c\0</text>
+                <rect x="222" y="206" width="188" height="32" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="316.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">2abe107e… 32 raw bytes</text>
+                <rect x="410" y="206" width="54" height="32" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="437.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">40000</text>
+                <rect x="464" y="206" width="40" height="32" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="484.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a\0</text>
+                <rect x="504" y="206" width="188" height="32" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="598.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">16797f8b… 32 raw bytes</text>
+                <rect x="692" y="206" width="60" height="32" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="722.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">100644</text>
+                <rect x="752" y="206" width="96" height="32" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="800.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">hello.txt\0</text>
+                <rect x="848" y="206" width="188" height="32" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="942.0" y="226.0" text-anchor="middle" class="svg-sub" style="fill:#252525">2cf8d83d… 32 raw bytes</text>
+                <rect x="219.0" y="44" width="132" height="34" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="285.0" y="66" text-anchor="middle" class="svg-sub" style="fill:#252525">blob "c\n"</text>
+                <line x1="285.0" y1="116" x2="285.0" y2="82" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#te-data)"/>
+                <rect x="439.0" y="44" width="132" height="34" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="505.0" y="66" text-anchor="middle" class="svg-sub" style="fill:#252525">tree a/ (holds x)</text>
+                <line x1="505.0" y1="116" x2="505.0" y2="82" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#te-data)"/>
+                <rect x="721.0" y="44" width="132" height="34" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="787.0" y="66" text-anchor="middle" class="svg-sub" style="fill:#252525">blob "hello\n"</text>
+                <line x1="787.0" y1="116" x2="787.0" y2="82" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#te-data)"/>
+                <text x="864" y="134" class="svg-note">104 bytes inflated</text>
+                <text x="864" y="148" class="svg-note">"40000", not "040000"</text>
+                <text x="30" y="310" class="svg-lane">THE SORT RULE: ENTRIES a-b (FILE), a.c (FILE), a (DIRECTORY), a0 (FILE)</text>
+                <text x="30" y="338" class="svg-sub" style="fill:#252525">memcmp on the names</text>
+                <rect x="30" y="350" width="78" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="69.0" y="369.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a</text>
+                <rect x="116" y="350" width="78" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="155.0" y="369.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a-b</text>
+                <rect x="202" y="350" width="78" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="241.0" y="369.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a.c</text>
+                <rect x="288" y="350" width="78" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="327.0" y="369.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a0</text>
+                <text x="410" y="338" class="svg-sub" style="fill:#252525">git: a directory compares as name + "/"</text>
+                <rect x="410" y="350" width="78" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="449.0" y="369.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a-b</text>
+                <rect x="496" y="350" width="78" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="535.0" y="369.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a.c</text>
+                <rect x="582" y="350" width="78" height="30" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="621.0" y="369.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a/</text>
+                <rect x="668" y="350" width="78" height="30" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="707.0" y="369.0" text-anchor="middle" class="svg-sub" style="fill:#252525">a0</text>
+                <text x="790" y="362" class="svg-note">byte order: "-" 2d &lt; "." 2e</text>
+                <text x="790" y="378" class="svg-note">&lt; "/" 2f &lt; "0" 30</text>
+                <text x="30" y="414" class="svg-sub">base_name_compare(), tree.c:99-116 · the lab tree above is ordered a.c, a/, hello.txt by the same rule</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Trees store raw binary ids and sort directories as if their names ended in "/". Orange is the mode,
+              green the name and its NUL, blue the raw id; blue arrows point at the child objects. Byte counts are
+              from a lab repository built twice, once per hash <span class="recon">measured here</span>. Widths are
+              not to scale except for the ids.
+            </p>
+          </figure>
+
+          <p>
+            A commit is <code>tree</code>, zero or more <code>parent</code> lines, <code>author</code>,
+            <code>committer</code>, optional headers, a blank line and the message. <code>parse_commit_buffer()</code>
+            is positional: it expects <code>tree &lt;hex&gt;\n</code> at byte 0, then parents, then reads only the
+            committer date (<code>commit.c</code>:516-598) <span class="src">from the code</span>. Parent order is
+            part of the identity. Linus's comment from <code>e83c5163</code> still sits in
+            <code>commit.c</code>:1708-1712: "This ordering means that the same exact tree merged with a different
+            order of parents will be a _different_ changeset even if everything else stays the same."
+          </p>
+
+          <h3>SHA-256: repositories yes, interop no</h3>
+          <p>
+            SHA-256 repositories have worked since v2.29.0, and <code>Documentation/BreakingChanges.adoc</code>
+            makes SHA-256 the default for new repositories in Git 3.0, with "no plan to deprecate the 'sha1' object
+            format". Interoperability is unfinished <span class="src">from the code</span>. Translating between the
+            two hashes (<code>compatObjectFormat</code>) needs a Rust build since v2.54.0, or git dies with
+            "compatibility hash algorithm support requires Rust" (<code>repository.c</code>:197-209). The mapping is
+            kept in a text <code>objects/loose-object-idx</code>, while <code>gitformat-loose(5)</code> documents a
+            binary <code>object-map/</code> that 2.55 never writes. And pack index v3, which the transition plan needs
+            for packs, does not exist: the reader rejects every <code>.idx</code> version except 2
+            (<code>packfile.c</code>:200-207) <span class="recon">measured here</span>.
+          </p>
+
+          <h2 id="lookup"><span class="secnum">03</span>Finding an object</h2>
+          <p class="lede">
+            A name says nothing about where an object lives. It might be a loose file, an entry in one of several
+            packs, an object in an alternate repository, or nowhere yet in a partial clone. Git answers with one
+            ordered chain of places to look, and the first hit wins.
+          </p>
+          <p>
+            The entry point is <code>odb_read_object_info_extended()</code>, which calls
+            <code>do_oid_object_info_extended()</code> (<code>odb.c</code>:550-617, 699-714)
+            <span class="src">from the code</span>. An id in the repository's <em>compat</em> hash is first mapped
+            to the storage hash. Replace refs are applied, the null id is rejected, and the in-memory source is
+            asked. That source holds one object: the empty tree, for either hash. The empty blob is not virtual
+            <span class="recon">measured here</span>. One nuance: the in-memory source is probed
+            with the original id, not the replaced one. Then come the real sources, <code>odb.c</code>:563-573:
+          </p>
+<pre><code>	if (!odb_source_read_object_info(odb-&gt;inmemory_objects, oid, oi, flags))
+		return 0;
+
+	odb_prepare_alternates(odb);
+
+	while (1) {
+		struct odb_source *source;
+
+		for (source = odb-&gt;sources; source; source = source-&gt;next)
+			if (!odb_source_read_object_info(source, real, oi, flags))
+				return 0;</code></pre>
+          <p>
+            The list holds the primary <code>.git/objects</code> first, then each alternate in order. Within a
+            "files" source the pack store answers before the loose store (<code>odb/source-files.c</code>:51-62),
+            and within the pack store the multi-pack-index answers before the individual packs, which are tried in
+            most-recently-used order (<code>packfile.c</code>:2149-2170) <span class="src">from the code</span>.
+            Before answering, <code>fill_pack_entry()</code> checks that the pack can still be opened, because a
+            concurrent repack may have deleted it. Figure 4 draws the whole chain.
+          </p>
+
+          <figure class="figure wide" id="fig-lookup">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">Where git v2.55 looks for an object, in order</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 430" role="img" aria-label="Flowchart of object lookup in git 2.55: compat mapping, replace refs, null id check, the in-memory source, then each object source in order (primary then alternates), each trying the multi-pack-index, then packs in most-recently-used order, then loose objects; then a second read that rescans packs only, submodule sources, one promisor fetch, and failure. A sidebar shows how a packed delta is read.">
+                <defs><marker id="lk-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker><marker id="lk-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker></defs>
+                <text x="30" y="26" class="svg-lane">odb_read_object_info_extended() · FIRST HIT RETURNS</text>
+                <rect x="30" y="44" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="40" y="64" class="svg-num">1</text>
+                <text x="56" y="64" class="svg-step">compat map</text>
+                <text x="56" y="82" class="svg-sub">sha256 ↔ sha1 id</text>
+                <rect x="222" y="44" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="232" y="64" class="svg-num">2</text>
+                <text x="248" y="64" class="svg-step">replace refs</text>
+                <text x="248" y="82" class="svg-sub">oid → real</text>
+                <rect x="414" y="44" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="424" y="64" class="svg-num">3</text>
+                <text x="440" y="64" class="svg-step">null id?</text>
+                <text x="440" y="82" class="svg-sub">reject</text>
+                <rect x="606" y="44" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="616" y="64" class="svg-num">4</text>
+                <text x="632" y="64" class="svg-step">in-memory</text>
+                <text x="632" y="82" class="svg-sub">empty tree only</text>
+                <line x1="202" y1="70" x2="218" y2="70" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="394" y1="70" x2="410" y2="70" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="586" y1="70" x2="602" y2="70" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="30" y="130" width="746" height="160" rx="4" fill="#ffffff" stroke="#252525" stroke-width="1.2"/>
+                <text x="40" y="150" class="svg-num">5</text>
+                <text x="56" y="150" class="svg-step">each source in list order</text>
+                <text x="250" y="150" class="svg-sub">for (source = odb-&gt;sources; …) · odb.c:563-573</text>
+                <rect x="46" y="166" width="346" height="110" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="56" y="186" class="svg-step">primary: .git/objects</text>
+                <text x="236" y="186" class="svg-sub">local wins by order</text>
+                <rect x="56" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="106" y="226" text-anchor="middle" class="svg-step">MIDX</text>
+                <text x="106" y="244" text-anchor="middle" class="svg-sub">fanout lookup</text>
+                <line x1="156" y1="231" x2="166" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="168" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="218" y="226" text-anchor="middle" class="svg-step">packs</text>
+                <text x="218" y="244" text-anchor="middle" class="svg-sub">MRU order</text>
+                <line x1="268" y1="231" x2="278" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="280" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="330" y="226" text-anchor="middle" class="svg-step">loose</text>
+                <text x="330" y="244" text-anchor="middle" class="svg-sub">xx/ files</text>
+                <rect x="414" y="166" width="346" height="110" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="424" y="186" class="svg-step">alternates</text>
+                <text x="604" y="186" class="svg-sub">info/alternates</text>
+                <rect x="424" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="474" y="226" text-anchor="middle" class="svg-step">MIDX</text>
+                <text x="474" y="244" text-anchor="middle" class="svg-sub">fanout lookup</text>
+                <line x1="524" y1="231" x2="534" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="536" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="586" y="226" text-anchor="middle" class="svg-step">packs</text>
+                <text x="586" y="244" text-anchor="middle" class="svg-sub">MRU order</text>
+                <line x1="636" y1="231" x2="646" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="648" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="698" y="226" text-anchor="middle" class="svg-step">loose</text>
+                <text x="698" y="244" text-anchor="middle" class="svg-sub">xx/ files</text>
+                <line x1="398" y1="231" x2="410" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="691" y1="98" x2="691" y2="126" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="30" y="330" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="40" y="350" class="svg-num">6</text>
+                <text x="56" y="350" class="svg-step">second read</text>
+                <text x="56" y="368" class="svg-sub">packs rescanned</text>
+                <rect x="222" y="330" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="232" y="350" class="svg-num">7</text>
+                <text x="248" y="350" class="svg-step">submodule sources</text>
+                <text x="248" y="368" class="svg-sub">registered, retry</text>
+                <rect x="414" y="330" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="424" y="350" class="svg-num">8</text>
+                <text x="440" y="350" class="svg-step">promisor fetch</text>
+                <text x="440" y="368" class="svg-sub">once, then retry</text>
+                <rect x="606" y="330" width="170" height="52" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="616" y="350" class="svg-num">9</text>
+                <text x="632" y="350" class="svg-step">missing</text>
+                <text x="632" y="368" class="svg-sub">die if corrupt</text>
+                <line x1="115" y1="292" x2="115" y2="326" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="202" y1="356" x2="218" y2="356" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="394" y1="356" x2="410" y2="356" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="586" y1="356" x2="602" y2="356" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <text x="30" y="410" class="svg-note">Step 6 runs unless the caller passed OBJECT_INFO_QUICK; a pack written since the first pass is found here.</text>
+                <line x1="792" y1="40" x2="792" y2="400" stroke="#deded9"/>
+                <text x="806" y="26" class="svg-lane">READING A PACKED DELTA</text>
+                <rect x="806" y="50" width="150" height="40" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="818" y="75" class="svg-step">delta (depth 2)</text>
+                <line x1="846" y1="92" x2="846" y2="116" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="806" y="120" width="150" height="40" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="818" y="145" class="svg-step">delta (depth 1)</text>
+                <line x1="846" y1="162" x2="846" y2="186" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="916" y1="118" x2="916" y2="94" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#lk-data)"/>
+                <rect x="806" y="190" width="150" height="40" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="818" y="215" class="svg-step">base: inflate</text>
+                <line x1="916" y1="188" x2="916" y2="164" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#lk-data)"/>
+                <text x="806" y="254" class="svg-sub">down: walk the chain</text>
+                <text x="806" y="270" class="svg-sub">up: apply each delta</text>
+                <rect x="806" y="284" width="250" height="54" rx="3" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="816" y="304" class="svg-step">delta_base_cache, 96 MiB</text>
+                <text x="816" y="324" class="svg-sub">LRU of inflated bases</text>
+                <text x="806" y="362" class="svg-sub">without the cache, log -p</text>
+                <text x="806" y="378" class="svg-sub">took 1.60-1.70 s, not 0.74-0.91 s</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Packs before loose, local before alternates. In 2.55 the "local first" rule comes from the order of
+              the source list, not from the pack sorter. Black arrows are control flow; blue boxes are object
+              sources; the dashed purple box is a cache. Read from <code>odb.c</code>, <code>packfile.c</code> and
+              <code>odb/</code> <span class="src">from the code</span>; the <code>log -p</code> timings are two
+              alternating runs on git.git <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <p>
+            If every source misses, git tries once more with <code>OBJECT_INFO_SECOND_READ</code>, unless the caller
+            asked for a quick answer. The pack directories are rescanned and loose objects are skipped
+            (<code>packfile.c</code>:2201-2202; <code>odb/source-loose.c</code>:213-217). That catches a pack a
+            concurrent fetch or repack published after the first pass <span class="recon">reconstruction</span>. Then registered submodule sources are added
+            and the chain retried. Finally, in a partial clone, one <code>promisor_remote_get_direct()</code> fetches
+            the object from the server, unless the caller passed <code>SKIP_FETCH_OBJECT</code>
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two details contradict common belief. Git does not check loose objects first; for object info, packs
+            come first in every source. And the comparator <code>sort_pack()</code> still contains a branch that
+            puts local packs before alternate packs, but in 2.55 that branch is dead: each source now owns its own
+            pack store, so a store never mixes local and alternate packs <span class="src">from the code</span>.
+            Local-first comes from the source order alone. The exception is the streaming path for small blobs: the pack stream
+            refuses small objects, so loose is tried next, and a corrupt loose copy prints <code>inflate: data stream error</code> before git falls back to
+            the pack and outputs the right content <span class="recon">measured here</span>.
+          </p>
+          <p>
+            This structure is new. The "files" source arrived in v2.54.0 (<code>cb506a8a69</code>), the loose-object
+            source struct in v2.53.0 (<code>ece43d9dc7</code>) with its pluggable read callback in v2.55.0
+            (<code>584338ed92</code>), and the in-memory source in v2.55.0 (<code>822d403651</code>)
+            <span class="src">from the code</span>. Each source is a <code>struct odb_source</code> with its own
+            callbacks, which leaves room for object stores that are not directories of files.
+            <span class="recon">reconstruction</span>
+          </p>
+
+          <h2 id="packs"><span class="secnum">04</span>Packs and deltas</h2>
+          <p class="lede">
+            Loose objects are fine for the last few commits. For everything else git uses packs: one file holding
+            many objects, most of them stored as a delta against another object in the same pack. The delta format
+            is two operations, copy and insert, on raw bytes. Git does not store diffs of files. It stores byte
+            recipes, usually pointing backwards in time.
+          </p>
+          <p>
+            A pack begins with <code>PACK</code>, a network-order version (git writes 2, reads 2 or 3) and an object
+            count (<code>pack.h</code>:14-22). The entries follow, and the file ends with a hash of every preceding
+            byte, which is also the pack's file name <span class="src">from the code</span>. The examples below come
+            from a lab repository with one 40-line file, <code>a.txt</code>, committed twice: the second commit
+            changed line 020 and appended a line, and <code>git repack -adq</code> produced a 574-byte pack of six
+            objects <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Entry headers and the two delta types</h3>
+          <p>
+            Each entry starts with a type and an inflated size, written by
+            <code>encode_in_pack_object_header()</code>, <code>pack-write.c</code>:516-526
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	c = (type &lt;&lt; 4) | (size &amp; 15);
+	size &gt;&gt;= 4;
+	while (size) {
+		if (n == hdr_len)
+			die("object size is too enormous to format");
+		*hdr++ = c | 0x80;
+		c = size &amp; 0x7f;
+		size &gt;&gt;= 7;
+		n++;
+	}
+	*hdr = c;</code></pre>
+          <p>
+            The high bit means "more bytes follow", bits 4-6 hold the type, and the size is spread low bits first.
+            The first commit in the lab pack starts <code>96 0a</code>: type 1, size 6 + (10 &lt;&lt; 4) = 166. The
+            newer blob starts <code>bb 88 01</code>: type 3, size 2,187 <span class="recon">measured here</span>.
+            Types 6 and 7 are deltas. <code>OBJ_REF_DELTA</code> names its base by object id.
+            <code>OBJ_OFS_DELTA</code> names it by a distance back from its own offset, encoded with a twist:
+            <code>packfile.c</code>:1288-1302 <span class="src">from the code</span>.
+          </p>
+<pre><code>	if (type == OBJ_OFS_DELTA) {
+		unsigned used = 0;
+		unsigned char c = base_info[used++];
+		base_offset = c &amp; 127;
+		while (c &amp; 128) {
+			base_offset += 1;
+			if (!base_offset || MSB(base_offset, 7))
+				return 0;  /* overflow */
+			c = base_info[used++];
+			base_offset = (base_offset &lt;&lt; 7) + (c &amp; 127);
+		}
+		base_offset = delta_obj_offset - base_offset;
+		if (base_offset &lt;= 0 || base_offset &gt;= delta_obj_offset)
+			return 0;  /* out of bound */</code></pre>
+          <p>
+            The offset is big-endian, and each continuation adds 1 before shifting. So a two-byte offset starts at
+            128, not 0, and no value has two encodings <span class="recon">reconstruction</span>. The same +1-bias
+            varint reappears in index v4 and in reftable (<a href="../state-and-wire/#reftable">Part 2</a>). The last check
+            rejects any base at or after the delta itself, and the writer guarantees that never happens:
+            <code>write_one()</code> writes a delta's base first, using offset 1 as a recursion sentinel
+            (<code>builtin/pack-objects.c</code>:806-835) <span class="src">from the code</span>. OFS offsets always
+            point backwards. REF deltas remain mainly for thin packs, sent over the wire, whose bases are on the receiver
+            and not in the pack; <code>index-pack --fix-thin</code> appends those bases, turning a 3-object pack into
+            a 4-object one <span class="recon">measured here</span>.
+          </p>
+
+          <h3>The copy/insert codec</h3>
+          <p>
+            A delta is the base size, the result size, then opcodes. A byte with the high bit set is a COPY: bits
+            0-3 say which offset bytes follow and bits 4-6 which size bytes. Any other non-zero byte is an INSERT of
+            that many literal bytes, 1 to 127. Opcode 0 is reserved and rejected. The interpreter is
+            <code>patch_delta()</code>, <code>patch-delta.c</code>:39-71 (macro body and bounds checks trimmed)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	while (data &lt; top) {
+		cmd = *data++;
+		if (cmd &amp; 0x80) {
+			unsigned long cp_off = 0, cp_size = 0;
+			…
+			PARSE_CP_PARAM(0x01, cp_off, 0);
+			PARSE_CP_PARAM(0x02, cp_off, 8);
+			PARSE_CP_PARAM(0x04, cp_off, 16);
+			PARSE_CP_PARAM(0x08, cp_off, 24);
+			PARSE_CP_PARAM(0x10, cp_size, 0);
+			PARSE_CP_PARAM(0x20, cp_size, 8);
+			PARSE_CP_PARAM(0x40, cp_size, 16);
+#undef PARSE_CP_PARAM
+			if (cp_size == 0) cp_size = 0x10000;
+			…
+			memcpy(out, (char *) src_buf + cp_off, cp_size);
+			out += cp_size;
+			size -= cp_size;
+		} else if (cmd) {
+			…
+			memcpy(out, data, cmd);
+			out += cmd;
+			data += cmd;
+			size -= cmd;</code></pre>
+          <p>
+            The decoder accepts 24-bit copy sizes, but the encoder in <code>diff-delta.c</code> never emits a copy
+            longer than 64 KiB (<code>diff-delta.c</code>:434-466) <span class="src">from the code</span>. In the lab
+            pack, the older 2,160-byte blob is a 22-byte delta against the newer one. Figure 5
+            decodes it. The old line 020 was not copied as a line. It was rebuilt from 7 bytes of line 028, one
+            inserted <code>"0"</code>, and 53 bytes that straddle two other lines <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-pack-entry">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">One pack entry, an OFS_DELTA, and the delta opcode tape</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 584" role="img" aria-label="Top: the bits of the pack entry header e6 01 and the offset varint 81 20, giving an OFS_DELTA of size 22 whose base is 288 bytes back, at offset 231. Middle: the 22-byte delta as an opcode tape, with each copy drawn from the 2187-byte base into the 2160-byte result and one inserted byte. Bottom: the old line 020 rebuilt from a 7-byte copy, an inserted 0 and a 53-byte copy.">
+                <defs><marker id="pe-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker></defs>
+                <text x="30.0" y="24" text-anchor="start" class="svg-lane">1 · ENTRY HEADER AT PACK OFFSET 519, THEN THE BASE OFFSET</text>
+                <text x="134.0" y="40" text-anchor="middle" class="svg-step">0xe6</text>
+                <rect x="30.0" y="48" width="26.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="43.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="56.0" y="48" width="26.0" height="26" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="69.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="82.0" y="48" width="26.0" height="26" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="95.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="108.0" y="48" width="26.0" height="26" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="121.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="134.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="147.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="160.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="173.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="186.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="199.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="212.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="225.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="364.0" y="40" text-anchor="middle" class="svg-step">0x01</text>
+                <rect x="260.0" y="48" width="26.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="273.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="286.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="299.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="312.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="325.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="338.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="351.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="364.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="377.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="390.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="403.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="416.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="429.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="442.0" y="48" width="26.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="455.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="624.0" y="40" text-anchor="middle" class="svg-step">0x81</text>
+                <rect x="520.0" y="48" width="26.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="533.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="546.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="559.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="572.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="585.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="598.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="611.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="624.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="637.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="650.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="663.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="676.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="689.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="702.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="715.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="854.0" y="40" text-anchor="middle" class="svg-step">0x20</text>
+                <rect x="750.0" y="48" width="26.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="763.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="776.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="789.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="802.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="815.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="828.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="841.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="854.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="867.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="880.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="893.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="906.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="919.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="932.0" y="48" width="26.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="945.0" y="65.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <line x1="32" y1="80" x2="54" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="43.0" y="110" text-anchor="middle" class="svg-sub">more</text>
+                <line x1="58" y1="80" x2="132" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="95.0" y="96" text-anchor="middle" class="svg-sub">type 110 = 6</text>
+                <line x1="136" y1="80" x2="236" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="186.0" y="96" text-anchor="middle" class="svg-sub">size 6</text>
+                <line x1="262" y1="80" x2="284" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="273.0" y="110" text-anchor="middle" class="svg-sub">last</text>
+                <line x1="288" y1="80" x2="466" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="377.0" y="96" text-anchor="middle" class="svg-sub">size += 1 &lt;&lt; 4</text>
+                <line x1="522" y1="80" x2="544" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="533.0" y="110" text-anchor="middle" class="svg-sub">more</text>
+                <line x1="548" y1="80" x2="726" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="637.0" y="96" text-anchor="middle" class="svg-sub">1</text>
+                <line x1="752" y1="80" x2="774" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="763.0" y="110" text-anchor="middle" class="svg-sub">last</text>
+                <line x1="778" y1="80" x2="956" y2="80" stroke="#252525" stroke-width="1"/>
+                <text x="867.0" y="96" text-anchor="middle" class="svg-sub">0x20 = 32</text>
+                <text x="30.0" y="138" text-anchor="start" class="svg-step">OFS_DELTA, delta size 6 + 16 = 22</text>
+                <text x="520.0" y="138" text-anchor="start" class="svg-step">offset: (1 + 1) &lt;&lt; 7 + 32 = 288 · base at 519 − 288 = 231</text>
+                <line x1="490" y1="44" x2="490" y2="146" stroke="#deded9"/>
+                <text x="30.0" y="186" text-anchor="start" class="svg-lane">2 · THE 22-BYTE DELTA AS AN OPCODE TAPE</text>
+                <rect x="30.0" y="200" width="40.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">8b</text>
+                <rect x="70.0" y="200" width="40.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="90.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">11</text>
+                <rect x="118.0" y="200" width="40.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="138.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">f0</text>
+                <rect x="158.0" y="200" width="40.0" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="178.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">10</text>
+                <rect x="206.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="226.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">b0</text>
+                <rect x="246.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="266.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">38</text>
+                <rect x="286.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="306.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">04</text>
+                <rect x="334.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="354.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">93</text>
+                <rect x="374.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="394.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">f0</text>
+                <rect x="414.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="434.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">05</text>
+                <rect x="454.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="474.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">07</text>
+                <rect x="502.0" y="200" width="40.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="522.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">01</text>
+                <rect x="542.0" y="200" width="40.0" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="562.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">30</text>
+                <rect x="590.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="610.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">93</text>
+                <rect x="630.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="650.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">20</text>
+                <rect x="670.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="690.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">05</text>
+                <rect x="710.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="730.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">35</text>
+                <rect x="758.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="778.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">b3</text>
+                <rect x="798.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="818.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">7d</text>
+                <rect x="838.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="858.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">04</text>
+                <rect x="878.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="898.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">fb</text>
+                <rect x="918.0" y="200" width="40.0" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="938.0" y="217.0" text-anchor="middle" class="svg-sub" style="fill:#252525">03</text>
+                <text x="70.0" y="244" text-anchor="middle" class="svg-sub">base 2187</text>
+                <text x="158.0" y="244" text-anchor="middle" class="svg-sub">result 2160</text>
+                <text x="266.0" y="244" text-anchor="middle" class="svg-sub">COPY 0+1080</text>
+                <text x="414.0" y="244" text-anchor="middle" class="svg-sub">COPY 1520+7</text>
+                <text x="542.0" y="244" text-anchor="middle" class="svg-sub">INSERT "0"</text>
+                <text x="670.0" y="244" text-anchor="middle" class="svg-sub">COPY 1312+53</text>
+                <text x="858.0" y="244" text-anchor="middle" class="svg-sub">COPY 1149+1019</text>
+                <text x="30.0" y="282" text-anchor="start" class="svg-sub">BASE: the newer blob, 2,187 bytes, stored whole (line 020 now reads "LINE 020 changed", plus an appended tail)</text>
+                <rect x="40" y="290" width="1000.0" height="24" rx="2" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="40.0" y="290" width="493.8" height="24" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="565.4" y="290" width="465.9" height="24" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="639.9" y="290" width="24.2" height="24" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="735.0" y="290" width="3.2" height="24" fill="#ece6f3" stroke="#765b98"/>
+                <text x="30.0" y="372" text-anchor="start" class="svg-sub">RESULT: the older blob, 2,160 bytes, stored as this delta</text>
+                <rect x="40" y="380" width="987.7" height="24" rx="2" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="40.0" y="380" width="493.8" height="24" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="533.8" y="380" width="3.2" height="24" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="537.0" y="380" width="2.5" height="24" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="537.5" y="380" width="24.2" height="24" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="561.7" y="380" width="465.9" height="24" fill="#e0ebf2" stroke="#3c6f97"/>
+                <line x1="451.5" y1="316" x2="451.5" y2="376" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pe-data)"/>
+                <line x1="736.4" y1="316" x2="535.2" y2="376" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pe-data)"/>
+                <line x1="651.8" y1="316" x2="549.4" y2="376" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pe-data)"/>
+                <line x1="798.1" y1="316" x2="794.5" y2="376" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pe-data)"/>
+                <text x="286.9" y="306" text-anchor="middle" class="svg-sub">lines 000-019 (1,080 B)</text>
+                <text x="899.6" y="306" text-anchor="middle" class="svg-sub">lines 021-039, no tail (1,019 B)</text>
+                <text x="286.9" y="396" text-anchor="middle" class="svg-sub">copy 1,080</text>
+                <text x="794.5" y="396" text-anchor="middle" class="svg-sub">copy 1,019</text>
+                <text x="30.0" y="436" text-anchor="start" class="svg-lane">3 · THE OLD LINE 020, REBUILT FROM THREE OPS (BYTE-LEVEL, NOT LINE-LEVEL)</text>
+                <text x="60.2" y="460" text-anchor="middle" class="svg-num">1</text>
+                <rect x="30.0" y="466" width="60.4" height="28" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="60.2" y="484.0" text-anchor="middle" class="svg-sub" style="fill:#252525">line 02</text>
+                <text x="107.6" y="460" text-anchor="middle" class="svg-num">2</text>
+                <rect x="96.4" y="466" width="22.4" height="28" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="107.6" y="484.0" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="301.1" y="460" text-anchor="middle" class="svg-num">3</text>
+                <rect x="124.8" y="466" width="352.5" height="28" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="301.1" y="484.0" text-anchor="middle" class="svg-sub" style="fill:#252525">: the quick brown fox jumps over the lazy dog⏎line 02</text>
+                <text x="535.8" y="460" text-anchor="middle" class="svg-num">4</text>
+                <rect x="483.3" y="466" width="104.9" height="28" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="535.8" y="484.0" text-anchor="middle" class="svg-sub" style="fill:#252525">1: the quick …</text>
+                <text x="30.0" y="516" text-anchor="start" class="svg-num">1</text>
+                <text x="42.0" y="516" text-anchor="start" class="svg-sub">copy 7 bytes of base line 028</text>
+                <text x="330.0" y="516" text-anchor="start" class="svg-num">2</text>
+                <text x="342.0" y="516" text-anchor="start" class="svg-sub">insert "0"</text>
+                <text x="30.0" y="534" text-anchor="start" class="svg-num">3</text>
+                <text x="42.0" y="534" text-anchor="start" class="svg-sub">copy 53: the rest of a line and the start of the next</text>
+                <text x="420.0" y="534" text-anchor="start" class="svg-num">4</text>
+                <text x="432.0" y="534" text-anchor="start" class="svg-sub">copy 1,019: lines 021-039</text>
+                <text x="30.0" y="568" text-anchor="start" class="svg-note">Ops are drawn in result order. Offsets and sizes are decoded from the bytes in the tape; 1,080 + 7 + 1 + 53 + 1,019 = 2,160.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Deltas are byte copies and inserts, usually backwards: the newest version is whole and the old one
+              points at it. Blue and purple are copied bytes (purple marks the short copies that rebuild line 020),
+              orange is inserted or size data, grey is framing. Bytes are from the lab pack and
+              <code>git verify-pack -v</code> <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>How pack-objects picks a base</h3>
+          <p>
+            <code>pack-objects</code> does not look at history to choose bases. It sorts candidates with
+            <code>type_size_sort()</code> (<code>builtin/pack-objects.c</code>:2641-2681): by type, by a hash of the
+            path name, preferred bases first, then delta islands, then size from largest down. The comment above it
+            gives the reason for the last key: "the bigger file is likely the more recent one. The deepest deltas are
+            therefore the oldest objects which are less susceptible to be accessed often"
+            <span class="src">from the code</span>. It then slides a window of 10 candidates over that list, with a
+            maximum chain depth of 50, clamped at 4,095 because depth lives in a 12-bit field
+            (<code>OE_DEPTH_BITS</code>). Existing deltas are reused when their base is also being written. The
+            result is the lab pack's shape: the newer blob whole, the older one a delta
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            On git.git the pack holds 421,871 objects in 324,086,703 bytes. Undeltified, the same objects total
+            8.35 GB, so the pack is 25.8 times smaller. Trees are 95.5% deltified and blobs 92.5%; commits only 5.3%
+            <span class="recon">measured here</span>. A sweep of window and depth on a 34,297-object subset (git.git
+            at v1.5.0, one thread, no reuse) shows the defaults sit near the knee: 10/50 gave 8,260,676 bytes in
+            10.7 s, 250/250 gave 7,195,904 bytes (13% smaller) in 49.4 s, and 0/0, no deltas, gave 121,877,126 bytes
+            <span class="recon">measured here</span>. On the same subset <code>--name-hash-version=2</code> came out
+            0.4% larger and <code>--path-walk</code> 6.2% smaller. That path-walk run was given a plain object list
+            rather than <code>--revs</code>, so treat it as indicative.
+          </p>
+
+          <h2 id="pack-indexes"><span class="secnum">05</span>Indexes over packs</h2>
+          <p class="lede">
+            A pack can only be parsed from the front. Random access needs a side file that maps an object id to
+            an offset. That is the <code>.idx</code>, and like every other speed structure in git it is derived
+            data: <code>git index-pack</code> can rebuild it from the pack alone.
+          </p>
+          <p>
+            An <code>.idx</code> v2 file is the magic <code>\377tOc</code>, the version, a 256-entry fanout table,
+            the sorted object ids, their CRC32s, their 4-byte offsets, an optional table of 8-byte offsets, the pack's
+            checksum and its own (<code>Documentation/gitformat-pack.adoc</code>:285-319). The magic was chosen so
+            that v1 readers fail: read as <code>fanout[0]</code> it is an impossible object count
+            (<code>pack.h</code>:24-41) <span class="src">from the code</span>. The lab pack's index is 1,240 bytes:
+            8 + 1,024 + 6 × (20 + 4 + 4) + 20 + 20 <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <code>fanout[b]</code> counts the objects whose first byte is at most <code>b</code>, so the objects
+            starting with byte <code>b</code> sit in rows <code>fanout[b-1]</code> to <code>fanout[b]</code>.
+            <code>bsearch_hash()</code>, <code>hash-lookup.c</code>:112-129, bisects only that slice
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	hi = ntohl(fanout_nbo[*hash]);
+	lo = ((*hash == 0x0) ? 0 : ntohl(fanout_nbo[*hash - 1]));
+
+	while (lo &lt; hi) {
+		unsigned mi = lo + (hi - lo) / 2;
+		int cmp = hashcmp(table + mi * stride, hash,
+				  the_repository-&gt;hash_algo);
+
+		if (!cmp) {
+			if (result)
+				*result = mi;
+			return 1;
+		}
+		if (cmp &gt; 0)
+			hi = mi;
+		else
+			lo = mi + 1;
+	}</code></pre>
+          <p>
+            The same function serves the multi-pack-index and the commit-graph. An offset with the high bit set is
+            not an offset but <code>0x80000000 | n</code>, a row in the 64-bit table, used once a pack passes 2 GiB
+            (<code>pack-write.c</code>:150-172). The CRC table exists so a repack can copy compressed bytes from one
+            pack into another without inflating them and still detect corruption <span class="src">from the code</span>.
+            Figure 6 traces one lookup.
+          </p>
+
+          <figure class="figure wide" id="fig-idx">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">Looking up 5fc0a8b9 through an <code>.idx</code> v2</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 500" role="img" aria-label="Looking up object 5fc0a8b9 in a six-object .idx: the 256-entry cumulative fanout narrows the search to rows 2 to 3, one comparison finds row 2, its 32-bit offset 0x1b0 has the high bit clear, so the object is at pack offset 432. An inset shows the .rev file mapping pack order back to index rows.">
+                <defs><marker id="ix-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker><marker id="ix-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker></defs>
+                <text x="30" y="24" text-anchor="start" class="svg-lane">1 · FANOUT: fanout[b] = NUMBER OF OBJECTS WHOSE FIRST BYTE IS ≤ b</text>
+                <rect x="412.5" y="60" width="7.5" height="84" fill="#f7e3c8"/>
+                <polyline fill="none" stroke="#3c6f97" stroke-width="1.6" points="60.0,140.0 63.8,140.0 63.8,140.0 67.5,140.0 67.5,140.0 71.2,140.0 71.2,140.0 75.0,140.0 75.0,140.0 78.8,140.0 78.8,140.0 82.5,140.0 82.5,140.0 86.2,140.0 86.2,140.0 90.0,140.0 90.0,140.0 93.8,140.0 93.8,140.0 97.5,140.0 97.5,140.0 101.2,140.0 101.2,140.0 105.0,140.0 105.0,140.0 108.8,140.0 108.8,140.0 112.5,140.0 112.5,140.0 116.2,140.0 116.2,140.0 120.0,140.0 120.0,140.0 123.8,140.0 123.8,140.0 127.5,140.0 127.5,140.0 131.2,140.0 131.2,140.0 135.0,140.0 135.0,140.0 138.8,140.0 138.8,140.0 142.5,140.0 142.5,140.0 146.2,140.0 146.2,140.0 150.0,140.0 150.0,140.0 153.8,140.0 153.8,140.0 157.5,140.0 157.5,140.0 161.2,140.0 161.2,140.0 165.0,140.0 165.0,140.0 168.8,140.0 168.8,140.0 172.5,140.0 172.5,140.0 176.2,140.0 176.2,140.0 180.0,140.0 180.0,140.0 183.8,140.0 183.8,140.0 187.5,140.0 187.5,140.0 191.2,140.0 191.2,140.0 195.0,140.0 195.0,140.0 198.8,140.0 198.8,140.0 202.5,140.0 202.5,128.0 206.2,128.0 206.2,128.0 210.0,128.0 210.0,128.0 213.8,128.0 213.8,128.0 217.5,128.0 217.5,128.0 221.2,128.0 221.2,128.0 225.0,128.0 225.0,128.0 228.8,128.0 228.8,128.0 232.5,128.0 232.5,128.0 236.2,128.0 236.2,128.0 240.0,128.0 240.0,128.0 243.8,128.0 243.8,128.0 247.5,128.0 247.5,128.0 251.2,128.0 251.2,128.0 255.0,128.0 255.0,128.0 258.8,128.0 258.8,128.0 262.5,128.0 262.5,128.0 266.2,128.0 266.2,128.0 270.0,128.0 270.0,128.0 273.8,128.0 273.8,128.0 277.5,128.0 277.5,128.0 281.2,128.0 281.2,128.0 285.0,128.0 285.0,128.0 288.8,128.0 288.8,128.0 292.5,128.0 292.5,128.0 296.2,128.0 296.2,128.0 300.0,128.0 300.0,128.0 303.8,128.0 303.8,128.0 307.5,128.0 307.5,128.0 311.2,128.0 311.2,116.0 315.0,116.0 315.0,116.0 318.8,116.0 318.8,116.0 322.5,116.0 322.5,116.0 326.2,116.0 326.2,116.0 330.0,116.0 330.0,116.0 333.8,116.0 333.8,116.0 337.5,116.0 337.5,116.0 341.2,116.0 341.2,116.0 345.0,116.0 345.0,116.0 348.8,116.0 348.8,116.0 352.5,116.0 352.5,116.0 356.2,116.0 356.2,116.0 360.0,116.0 360.0,116.0 363.8,116.0 363.8,116.0 367.5,116.0 367.5,116.0 371.2,116.0 371.2,116.0 375.0,116.0 375.0,116.0 378.8,116.0 378.8,116.0 382.5,116.0 382.5,116.0 386.2,116.0 386.2,116.0 390.0,116.0 390.0,116.0 393.8,116.0 393.8,116.0 397.5,116.0 397.5,116.0 401.2,116.0 401.2,116.0 405.0,116.0 405.0,116.0 408.8,116.0 408.8,116.0 412.5,116.0 412.5,116.0 416.2,116.0 416.2,104.0 420.0,104.0 420.0,104.0 423.8,104.0 423.8,104.0 427.5,104.0 427.5,104.0 431.2,104.0 431.2,104.0 435.0,104.0 435.0,104.0 438.8,104.0 438.8,104.0 442.5,104.0 442.5,104.0 446.2,104.0 446.2,104.0 450.0,104.0 450.0,104.0 453.8,104.0 453.8,104.0 457.5,104.0 457.5,104.0 461.2,104.0 461.2,104.0 465.0,104.0 465.0,104.0 468.8,104.0 468.8,104.0 472.5,104.0 472.5,104.0 476.2,104.0 476.2,104.0 480.0,104.0 480.0,104.0 483.8,104.0 483.8,104.0 487.5,104.0 487.5,104.0 491.2,104.0 491.2,104.0 495.0,104.0 495.0,104.0 498.8,104.0 498.8,104.0 502.5,104.0 502.5,104.0 506.2,104.0 506.2,104.0 510.0,104.0 510.0,104.0 513.8,104.0 513.8,104.0 517.5,104.0 517.5,104.0 521.2,104.0 521.2,104.0 525.0,104.0 525.0,104.0 528.8,104.0 528.8,104.0 532.5,104.0 532.5,104.0 536.2,104.0 536.2,104.0 540.0,104.0 540.0,104.0 543.8,104.0 543.8,104.0 547.5,104.0 547.5,104.0 551.2,104.0 551.2,104.0 555.0,104.0 555.0,104.0 558.8,104.0 558.8,104.0 562.5,104.0 562.5,104.0 566.2,104.0 566.2,104.0 570.0,104.0 570.0,104.0 573.8,104.0 573.8,104.0 577.5,104.0 577.5,104.0 581.2,104.0 581.2,104.0 585.0,104.0 585.0,104.0 588.8,104.0 588.8,104.0 592.5,104.0 592.5,104.0 596.2,104.0 596.2,92.0 600.0,92.0 600.0,92.0 603.8,92.0 603.8,92.0 607.5,92.0 607.5,92.0 611.2,92.0 611.2,92.0 615.0,92.0 615.0,92.0 618.8,92.0 618.8,92.0 622.5,92.0 622.5,92.0 626.2,92.0 626.2,92.0 630.0,92.0 630.0,92.0 633.8,92.0 633.8,92.0 637.5,92.0 637.5,92.0 641.2,92.0 641.2,92.0 645.0,92.0 645.0,92.0 648.8,92.0 648.8,92.0 652.5,92.0 652.5,92.0 656.2,92.0 656.2,92.0 660.0,92.0 660.0,92.0 663.8,92.0 663.8,92.0 667.5,92.0 667.5,92.0 671.2,92.0 671.2,92.0 675.0,92.0 675.0,92.0 678.8,92.0 678.8,92.0 682.5,92.0 682.5,92.0 686.2,92.0 686.2,92.0 690.0,92.0 690.0,92.0 693.8,92.0 693.8,92.0 697.5,92.0 697.5,92.0 701.2,92.0 701.2,92.0 705.0,92.0 705.0,92.0 708.8,92.0 708.8,92.0 712.5,92.0 712.5,92.0 716.2,92.0 716.2,92.0 720.0,92.0 720.0,92.0 723.8,92.0 723.8,92.0 727.5,92.0 727.5,92.0 731.2,92.0 731.2,92.0 735.0,92.0 735.0,92.0 738.8,92.0 738.8,92.0 742.5,92.0 742.5,92.0 746.2,92.0 746.2,92.0 750.0,92.0 750.0,92.0 753.8,92.0 753.8,92.0 757.5,92.0 757.5,92.0 761.2,92.0 761.2,92.0 765.0,92.0 765.0,92.0 768.8,92.0 768.8,92.0 772.5,92.0 772.5,92.0 776.2,92.0 776.2,80.0 780.0,80.0 780.0,80.0 783.8,80.0 783.8,80.0 787.5,80.0 787.5,80.0 791.2,80.0 791.2,80.0 795.0,80.0 795.0,80.0 798.8,80.0 798.8,80.0 802.5,80.0 802.5,80.0 806.2,80.0 806.2,80.0 810.0,80.0 810.0,80.0 813.8,80.0 813.8,80.0 817.5,80.0 817.5,80.0 821.2,80.0 821.2,80.0 825.0,80.0 825.0,80.0 828.8,80.0 828.8,80.0 832.5,80.0 832.5,80.0 836.2,80.0 836.2,80.0 840.0,80.0 840.0,80.0 843.8,80.0 843.8,80.0 847.5,80.0 847.5,80.0 851.2,80.0 851.2,80.0 855.0,80.0 855.0,80.0 858.8,80.0 858.8,80.0 862.5,80.0 862.5,80.0 866.2,80.0 866.2,80.0 870.0,80.0 870.0,80.0 873.8,80.0 873.8,80.0 877.5,80.0 877.5,68.0 881.2,68.0 881.2,68.0 885.0,68.0 885.0,68.0 888.8,68.0 888.8,68.0 892.5,68.0 892.5,68.0 896.2,68.0 896.2,68.0 900.0,68.0 900.0,68.0 903.8,68.0 903.8,68.0 907.5,68.0 907.5,68.0 911.2,68.0 911.2,68.0 915.0,68.0 915.0,68.0 918.8,68.0 918.8,68.0 922.5,68.0 922.5,68.0 926.2,68.0 926.2,68.0 930.0,68.0 930.0,68.0 933.8,68.0 933.8,68.0 937.5,68.0 937.5,68.0 941.2,68.0 941.2,68.0 945.0,68.0 945.0,68.0 948.8,68.0 948.8,68.0 952.5,68.0 952.5,68.0 956.2,68.0 956.2,68.0 960.0,68.0 960.0,68.0 963.8,68.0 963.8,68.0 967.5,68.0 967.5,68.0 971.2,68.0 971.2,68.0 975.0,68.0 975.0,68.0 978.8,68.0 978.8,68.0 982.5,68.0 982.5,68.0 986.2,68.0 986.2,68.0 990.0,68.0 990.0,68.0 993.8,68.0 993.8,68.0 997.5,68.0 997.5,68.0 1001.2,68.0 1001.2,68.0 1005.0,68.0 1005.0,68.0 1008.8,68.0 1008.8,68.0 1012.5,68.0 1012.5,68.0 1016.2,68.0 1016.2,68.0 1020.0,68.0"/>
+                <line x1="60" y1="142" x2="1020" y2="142" stroke="#b8b8b1"/>
+                <text x="61.9" y="158" text-anchor="middle" class="svg-sub">0x00</text>
+                <text x="418.1" y="158" text-anchor="middle" class="svg-sub">0x5f</text>
+                <text x="1018.1" y="158" text-anchor="middle" class="svg-sub">0xff</text>
+                <text x="52" y="144" text-anchor="end" class="svg-sub">0</text>
+                <text x="52" y="108" text-anchor="end" class="svg-sub">3</text>
+                <text x="52" y="72" text-anchor="end" class="svg-sub">6</text>
+                <text x="404.5" y="80" text-anchor="end" class="svg-sub" style="fill:#252525">lo = fanout[0x5e] = 2</text>
+                <text x="428.0" y="80" text-anchor="start" class="svg-sub" style="fill:#252525">hi = fanout[0x5f] = 3</text>
+                <text x="1020" y="60" text-anchor="end" class="svg-sub">1,024 bytes; fanout[0xff] = 6 objects</text>
+                <text x="30" y="196" text-anchor="start" class="svg-lane">2 · SORTED IDS, CRC32s AND 32-BIT OFFSETS (SEPARATE TABLES, SAME ROW ORDER)</text>
+                <text x="38" y="220" text-anchor="start" class="svg-lane">ROW</text>
+                <text x="88" y="220" text-anchor="start" class="svg-lane">OBJECT ID</text>
+                <text x="238" y="220" text-anchor="start" class="svg-lane">CRC32</text>
+                <text x="368" y="220" text-anchor="start" class="svg-lane">OFFSET</text>
+                <rect x="30" y="228" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="243" text-anchor="start" class="svg-sub" style="fill:#252525">0</text>
+                <text x="88" y="243" text-anchor="start" class="svg-sub" style="fill:#252525">261d6df6…</text>
+                <text x="238" y="243" text-anchor="start" class="svg-sub" style="fill:#252525">bdcb41e3</text>
+                <text x="368" y="243" text-anchor="start" class="svg-sub" style="fill:#252525">0x00000207</text>
+                <rect x="30" y="252" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="267" text-anchor="start" class="svg-sub" style="fill:#252525">1</text>
+                <text x="88" y="267" text-anchor="start" class="svg-sub" style="fill:#252525">43ebb351…</text>
+                <text x="238" y="267" text-anchor="start" class="svg-sub" style="fill:#252525">d20ff2eb</text>
+                <text x="368" y="267" text-anchor="start" class="svg-sub" style="fill:#252525">0x000000e7</text>
+                <rect x="30" y="276" width="460" height="22" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="38" y="291" text-anchor="start" class="svg-sub" style="fill:#252525">2</text>
+                <text x="88" y="291" text-anchor="start" class="svg-sub" style="fill:#252525">5fc0a8b9…</text>
+                <text x="238" y="291" text-anchor="start" class="svg-sub" style="fill:#252525">3d5b093d</text>
+                <text x="368" y="291" text-anchor="start" class="svg-sub" style="fill:#252525">0x000001b0</text>
+                <rect x="30" y="300" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="315" text-anchor="start" class="svg-sub" style="fill:#252525">3</text>
+                <text x="88" y="315" text-anchor="start" class="svg-sub" style="fill:#252525">8f95acbe…</text>
+                <text x="238" y="315" text-anchor="start" class="svg-sub" style="fill:#252525">25eede50</text>
+                <text x="368" y="315" text-anchor="start" class="svg-sub" style="fill:#252525">0x0000000c</text>
+                <rect x="30" y="324" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="339" text-anchor="start" class="svg-sub" style="fill:#252525">4</text>
+                <text x="88" y="339" text-anchor="start" class="svg-sub" style="fill:#252525">bf674fe6…</text>
+                <text x="238" y="339" text-anchor="start" class="svg-sub" style="fill:#252525">9a61e6ac</text>
+                <text x="368" y="339" text-anchor="start" class="svg-sub" style="fill:#252525">0x000001db</text>
+                <rect x="30" y="348" width="460" height="22" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="38" y="363" text-anchor="start" class="svg-sub" style="fill:#252525">5</text>
+                <text x="88" y="363" text-anchor="start" class="svg-sub" style="fill:#252525">da9e32e0…</text>
+                <text x="238" y="363" text-anchor="start" class="svg-sub" style="fill:#252525">abc5e591</text>
+                <text x="368" y="363" text-anchor="start" class="svg-sub" style="fill:#252525">0x00000089</text>
+                <text x="30" y="388" text-anchor="start" class="svg-note">one comparison in rows [2, 3) hits row 2</text>
+                <rect x="540" y="228" width="250" height="70" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="552" y="250" text-anchor="start" class="svg-step">0x000001b0: high bit clear</text>
+                <text x="552" y="270" text-anchor="start" class="svg-sub">→ pack offset 432</text>
+                <text x="552" y="288" text-anchor="start" class="svg-sub">set → row in the 64-bit table</text>
+                <line x1="492" y1="287" x2="536" y2="266" stroke="#252525" stroke-width="2" marker-end="url(#ix-ctl)"/>
+                <rect x="820" y="210" width="230" height="130" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="832" y="230" text-anchor="start" class="svg-step">.rev (RIDX), 76 bytes</text>
+                <text x="832" y="250" text-anchor="start" class="svg-sub">pack order → idx row</text>
+                <rect x="832" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="846" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">3</text>
+                <rect x="866" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="880" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">5</text>
+                <rect x="900" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="914" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="934" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="948" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">2</text>
+                <rect x="968" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="982" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">4</text>
+                <rect x="1002" y="262" width="28" height="24" rx="2" fill="#ffffff" stroke="#765b98"/>
+                <text x="1016" y="279" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="832" y="306" text-anchor="start" class="svg-sub">the .idx stores no sizes:</text>
+                <text x="832" y="324" text-anchor="start" class="svg-sub">size = next offset − this one</text>
+                <text x="30" y="424" text-anchor="start" class="svg-lane">3 · THE 574-BYTE PACK, BY OFFSET</text>
+                <rect x="40.0" y="436" width="20.9" height="30" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="50.5" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">hdr</text>
+                <rect x="60.9" y="436" width="217.8" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="169.8" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">commit 8f95</text>
+                <rect x="278.7" y="436" width="163.8" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="360.6" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">commit da9e</text>
+                <rect x="442.4" y="436" width="350.2" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="617.5" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">blob 43eb, 2,187 B</text>
+                <rect x="792.6" y="436" width="74.9" height="30" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="830.1" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">tree</text>
+                <rect x="867.5" y="436" width="76.7" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="905.9" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">tree</text>
+                <rect x="944.2" y="436" width="61.0" height="30" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="974.7" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">Δ</text>
+                <rect x="1005.2" y="436" width="34.8" height="30" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="1022.6" y="455" text-anchor="middle" class="svg-sub" style="fill:#252525">sum</text>
+                <text x="792.6" y="486" text-anchor="middle" class="svg-sub">432: 5fc0a8b9, a 33-byte tree</text>
+                <path d="M665 298 C 665 360, 829.2 380, 829.2 432" fill="none" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#ix-data)"/>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              One byte of fanout, one binary search, one offset; sizes come from the reverse index. Orange marks the
+              path of this lookup, purple the <code>.rev</code> inset. All values are from the lab pack's
+              <code>.idx</code> and <code>.rev</code>, cross-checked with <code>git show-index</code>
+              <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>Side files, and the order they appear in</h3>
+          <p>
+            The <code>.idx</code> stores no sizes. An object's extent is the next offset minus its own, which needs
+            the objects in pack order. The <code>.rev</code> file (<code>RIDX</code>) stores exactly that mapping, one
+            u32 per object; without it git sorts the offsets in memory, and it is written by
+            default since v2.41.0. Cruft packs add a <code>.mtimes</code> file, one timestamp per object, because
+            expiry needs per-object ages that only loose files used to carry (<a href="../merge-and-upkeep/#prune">Part 3</a> covers why)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            When a pack is written, the <code>.pack</code>, <code>.rev</code>, <code>.mtimes</code> and bitmap are
+            renamed into place first and the <code>.idx</code> last (<code>pack-write.c</code>:561-599). Readers find
+            packs by their <code>.idx</code>, so that last rename publishes the pack. Pushed objects are the exception:
+            quarantine migration orders <code>.keep</code>, <code>.pack</code>, <code>.rev</code>, <code>.idx</code>,
+            then every other file after the <code>.idx</code> (<code>tmp-objdir.c</code>:193-206)
+            <span class="src">from the code</span>. On receipt, <code>index-pack</code> also compares every incoming
+            object that already exists locally byte for byte and dies with "SHA1 COLLISION FOUND" on a mismatch
+            (<code>builtin/index-pack.c</code>:883-926).
+          </p>
+          <p>
+            Many packs mean many binary searches. The multi-pack-index repeats the same tables in chunks
+            (<code>OIDF</code>, <code>OIDL</code>, <code>OOFF</code>, <code>LOFF</code>) across all packs, keeping one
+            copy of each object: from the preferred pack, else the newest (<code>midx-write.c</code>:203-224)
+            <span class="src">from the code</span>. Its format documentation has drifted. It says the
+            version defaults to 2, while the code writes 1 (measured byte <code>01</code>); it says packs in the
+            bitmap order are sorted descending, while the comparator sorts ascending; and it says the
+            <code>BTMP</code> chunk "encodes three pieces of information" and then lists two
+            <span class="recon">measured here</span>. <a href="../merge-and-upkeep/#findings">Part 3's findings register</a> lists these with the rest.
+          </p>
+
+          <h2 id="bitmaps"><span class="secnum">06</span>Bitmaps: counting without walking</h2>
+          <p class="lede">
+            To serve a clone or a fetch, git must know which objects are reachable from the wanted commits and not
+            from the ones the client has. Without help that means walking every commit and every tree. A
+            reachability bitmap stores the answer for selected commits as one bit per object, so the walk becomes
+            a few bitwise operations.
+          </p>
+          <p>
+            Bit <em>n</em> is the <em>n</em>th object in pack order, not in object-id order. Ids are effectively
+            random, and bitmaps over them "would have no locality, and thus compress poorly"
+            (<code>Documentation/technical/bitmap-format.adoc</code>:13-30) <span class="src">from the code</span>.
+            Each bitmap is EWAH-compressed: run-length words that skip long stretches of zeros or ones, followed by
+            literal words. A <code>.bitmap</code> file holds a header (<code>BITM</code>, version 1, flags 0x5 by
+            default), four type bitmaps marking which positions are commits, trees, blobs and tags, one entry per
+            selected commit, and a name-hash cache last (<code>pack-bitmap-write.c</code>:1365-1441). Figure
+            7 shows the lab file. The format document says the type bitmaps come "after the hash
+            cache"; in the file they start at byte 32, right after the header <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Not every commit gets a bitmap. The writer takes all of the 100 most recent commits, then one commit
+            per gap, with gaps growing from about 100 to 5,000 commits, preferring ref tips and merges
+            (<code>pack-bitmap-write.c</code>:1014-1101). The heuristic is JGit's, and the 2013 commit that added it
+            calls it "a simplified version" <span class="src">from the code</span>. On git.git, with 85,708 commits
+            and 1,031 refs, the writer chose 321 commits and wrote a 2,043,482-byte <code>.bitmap</code>
+            <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-bitmaps">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">Bitmaps: the file, one count done by hand, and the counting win on git.git</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 440" role="img" aria-label="Left: the 248-byte lab .bitmap file, a header, four type bitmaps from offset 32, two commit entries and the name-hash cache last. Middle: the HEAD bitmap AND NOT the parent bitmap leaves three bits, one commit, one tree and one blob. Right: bars comparing object counting on git.git, 9.3 seconds without bitmaps and 0.14 with, and clone-style pack generation, 17.37 against 2.56 seconds.">
+                <text x="30" y="24" text-anchor="start" class="svg-lane">1 · THE LAB .bitmap, 248 BYTES</text>
+                <text x="66" y="58" text-anchor="end" class="svg-sub">@0</text>
+                <rect x="74" y="40" width="262" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="84" y="57" text-anchor="start" class="svg-sub" style="fill:#252525">header: BITM v1, flags 0x5, 2 entries</text>
+                <text x="66" y="88" text-anchor="end" class="svg-sub">@32</text>
+                <rect x="74" y="70" width="262" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="84" y="87" text-anchor="start" class="svg-sub" style="fill:#252525">type bitmap: commits</text>
+                <text x="66" y="118" text-anchor="end" class="svg-sub">@60</text>
+                <rect x="74" y="100" width="262" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="84" y="117" text-anchor="start" class="svg-sub" style="fill:#252525">type bitmap: trees</text>
+                <text x="66" y="148" text-anchor="end" class="svg-sub">@88</text>
+                <rect x="74" y="130" width="262" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="84" y="147" text-anchor="start" class="svg-sub" style="fill:#252525">type bitmap: blobs</text>
+                <text x="66" y="178" text-anchor="end" class="svg-sub">@116</text>
+                <rect x="74" y="160" width="262" height="26" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="84" y="177" text-anchor="start" class="svg-sub" style="fill:#252525">type bitmap: tags (empty)</text>
+                <text x="66" y="208" text-anchor="end" class="svg-sub">@136</text>
+                <rect x="74" y="190" width="262" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="84" y="207" text-anchor="start" class="svg-sub" style="fill:#252525">commit da9e (idx 5): 0x32</text>
+                <text x="66" y="238" text-anchor="end" class="svg-sub">@170</text>
+                <rect x="74" y="220" width="262" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="84" y="237" text-anchor="start" class="svg-sub" style="fill:#252525">commit 8f95, HEAD (idx 3): 0x3f</text>
+                <text x="66" y="268" text-anchor="end" class="svg-sub">@204</text>
+                <rect x="74" y="250" width="262" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="84" y="267" text-anchor="start" class="svg-sub" style="fill:#252525">name-hash cache, idx order</text>
+                <text x="66" y="298" text-anchor="end" class="svg-sub">@228</text>
+                <rect x="74" y="280" width="262" height="26" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="84" y="297" text-anchor="start" class="svg-sub" style="fill:#252525">trailer: SHA-1 of the file</text>
+                <text x="30" y="330" text-anchor="start" class="svg-note">Type bitmaps sit right after the header;</text>
+                <text x="30" y="346" text-anchor="start" class="svg-note">the doc says "after the hash cache".</text>
+                <line x1="356" y1="36" x2="356" y2="420" stroke="#deded9"/>
+                <text x="376" y="24" text-anchor="start" class="svg-lane">2 · COUNT HEAD ^HEAD~1 WITH THE LAB BITMAPS</text>
+                <text x="376" y="50" text-anchor="start" class="svg-sub">bit = position in pack order:</text>
+                <text x="574" y="50" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="574" y="66" text-anchor="middle" class="svg-sub">8f95</text>
+                <text x="608" y="50" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="608" y="66" text-anchor="middle" class="svg-sub">da9e</text>
+                <text x="642" y="50" text-anchor="middle" class="svg-sub" style="fill:#252525">2</text>
+                <text x="642" y="66" text-anchor="middle" class="svg-sub">43eb</text>
+                <text x="676" y="50" text-anchor="middle" class="svg-sub" style="fill:#252525">3</text>
+                <text x="676" y="66" text-anchor="middle" class="svg-sub">5fc0</text>
+                <text x="710" y="50" text-anchor="middle" class="svg-sub" style="fill:#252525">4</text>
+                <text x="710" y="66" text-anchor="middle" class="svg-sub">bf67</text>
+                <text x="744" y="50" text-anchor="middle" class="svg-sub" style="fill:#252525">5</text>
+                <text x="744" y="66" text-anchor="middle" class="svg-sub">261d</text>
+                <text x="376" y="98" text-anchor="start" class="svg-sub" style="fill:#252525">HEAD (stored)</text>
+                <rect x="560" y="80" width="28" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="574" y="98" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="594" y="80" width="28" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="608" y="98" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="628" y="80" width="28" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="642" y="98" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="662" y="80" width="28" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="676" y="98" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="696" y="80" width="28" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="710" y="98" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="730" y="80" width="28" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="744" y="98" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="376" y="136" text-anchor="start" class="svg-sub" style="fill:#252525">HEAD~1 (stored)</text>
+                <rect x="560" y="118" width="28" height="26" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="574" y="136" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="594" y="118" width="28" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="608" y="136" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="628" y="118" width="28" height="26" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="642" y="136" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="662" y="118" width="28" height="26" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="676" y="136" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="696" y="118" width="28" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="710" y="136" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="730" y="118" width="28" height="26" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="744" y="136" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="376" y="174" text-anchor="start" class="svg-sub" style="fill:#252525">want AND NOT have</text>
+                <rect x="560" y="156" width="28" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="574" y="174" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="594" y="156" width="28" height="26" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="608" y="174" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="628" y="156" width="28" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="642" y="174" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="662" y="156" width="28" height="26" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="676" y="174" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="696" y="156" width="28" height="26" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="710" y="174" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="730" y="156" width="28" height="26" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="744" y="174" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="376" y="212" text-anchor="start" class="svg-sub">AND with each type bitmap, then popcount:</text>
+                <text x="376" y="243" text-anchor="start" class="svg-sub" style="fill:#252525">commits</text>
+                <rect x="560" y="226" width="28" height="24" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="574" y="243" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="594" y="226" width="28" height="24" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="608" y="243" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="628" y="226" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="642" y="243" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="662" y="226" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="676" y="243" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="696" y="226" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="710" y="243" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="730" y="226" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="744" y="243" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="772" y="243" text-anchor="start" class="svg-step">→ 1</text>
+                <text x="376" y="275" text-anchor="start" class="svg-sub" style="fill:#252525">trees</text>
+                <rect x="560" y="258" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="574" y="275" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="594" y="258" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="608" y="275" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="628" y="258" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="642" y="275" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="662" y="258" width="28" height="24" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="676" y="275" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="696" y="258" width="28" height="24" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="710" y="275" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="730" y="258" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="744" y="275" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <text x="772" y="275" text-anchor="start" class="svg-step">→ 1</text>
+                <text x="376" y="307" text-anchor="start" class="svg-sub" style="fill:#252525">blobs</text>
+                <rect x="560" y="290" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="574" y="307" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="594" y="290" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="608" y="307" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="628" y="290" width="28" height="24" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="642" y="307" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="662" y="290" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="676" y="307" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="696" y="290" width="28" height="24" rx="2" fill="#ffffff" stroke="#deded9"/>
+                <text x="710" y="307" text-anchor="middle" class="svg-sub" style="fill:#252525">0</text>
+                <rect x="730" y="290" width="28" height="24" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="744" y="307" text-anchor="middle" class="svg-sub" style="fill:#252525">1</text>
+                <text x="772" y="307" text-anchor="start" class="svg-step">→ 1</text>
+                <text x="376" y="348" text-anchor="start" class="svg-note">A tip without a stored bitmap is walked until</text>
+                <text x="376" y="364" text-anchor="start" class="svg-note">it reaches a commit that has one; that bitmap</text>
+                <text x="376" y="380" text-anchor="start" class="svg-note">is ORed in. Haves are built the same way.</text>
+                <line x1="812" y1="36" x2="812" y2="420" stroke="#deded9"/>
+                <text x="832" y="24" text-anchor="start" class="svg-lane">3 · GIT.GIT, SECONDS</text>
+                <text x="832" y="60" text-anchor="start" class="svg-sub" style="fill:#252525">rev-list --count --objects --all</text>
+                <rect x="832" y="70" width="118.8" height="22" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="956.8333333333334" y="85" text-anchor="start" class="svg-sub" style="fill:#252525">9.3 s</text>
+                <rect x="832" y="98" width="2" height="22" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="840" y="113" text-anchor="start" class="svg-sub" style="fill:#252525">0.14 s</text>
+                <text x="832" y="164" text-anchor="start" class="svg-sub" style="fill:#252525">pack-objects --all --stdout</text>
+                <rect x="832" y="174" width="222.0" height="22" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="840" y="189" text-anchor="start" class="svg-sub" style="fill:#252525">17.37 s</text>
+                <rect x="832" y="202" width="32.7" height="22" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="870.7111111111111" y="217" text-anchor="start" class="svg-sub" style="fill:#252525">2.56 s</text>
+                <text x="832" y="260" text-anchor="start" class="svg-sub">counting: about 66×</text>
+                <text x="832" y="276" text-anchor="start" class="svg-sub">bitmap count 3,813, walk 3,815</text>
+                <text x="832" y="292" text-anchor="start" class="svg-sub">for v2.55.0 ^v2.54.0; the bitmap</text>
+                <text x="832" y="308" text-anchor="start" class="svg-sub">answer is the exact one</text>
+                <text x="832" y="332" text-anchor="start" class="svg-sub">clone: pack-reused 421871</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Bits in pack order make reachability a bitwise AND: 66 times faster here, and more exact than the walk.
+              Green rows are stored commit bitmaps, blue rows type bitmaps, orange the result; in panel 3, grey bars ran without bitmaps and blue bars with them. Panels 1 and 2 use the
+              lab pack's real bitmaps (the AND and popcount are done by hand); panel 3 is timed on git.git, where pack
+              timings moved by up to 40% between sessions <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>The walk, as set operations</h3>
+          <p>
+            <code>prepare_bitmap_walk()</code> splits the requested tips into wants and haves. For each tip it ORs
+            in a stored bitmap if there is one. Otherwise it walks back from the tip until it reaches a commit that
+            has a bitmap, ORs that in, and adds the objects it passed on the way. It then computes wants AND NOT
+            haves, and counting by type is a popcount of the result ANDed with each type bitmap
+            (<code>pack-bitmap.c</code>:1514-1638, 2103-2257, 2612-2658) <span class="src">from the code</span>. It
+            gives up when the walk is limited by a pathspec, because bits know nothing about paths.
+          </p>
+          <p>
+            On git.git, <code>rev-list --count --objects --all</code> counted 421,871 objects in 9.3 to 9.5 s without
+            bitmaps and 0.136 to 0.144 s with a multi-pack bitmap, about 66 times faster; a later re-run gave 9.055 and
+            0.127 s <span class="recon">measured here</span>. The two methods also disagree, and the bitmap is the one
+            that is right. For <code>v2.55.0 ^v2.54.0</code> the plain walk reported 3,815 objects and the bitmap
+            3,813. The two extra objects, a blob and a tree, are reachable from <code>v2.54.0</code>; the walk
+            over-approximates the difference <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Bitmaps also let <code>pack-objects</code> skip work when serving a clone. If the leading words of the
+            result are all ones, the matching prefix of the existing pack is copied byte for byte,
+            <code>builtin/pack-objects.c</code>:1219-1233 (one comment and bookkeeping line trimmed)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	while (pos &lt; end &amp;&amp; reuse_packfile_bitmap-&gt;words[pos] == (eword_t)~0)
+		pos++;
+
+	if (pos) {
+		off_t to_write;
+
+		written = (pos * BITS_IN_EWORD);
+		to_write = pack_pos_to_offset(reuse_packfile-&gt;p, written)
+			- sizeof(struct pack_header);
+		…
+		hashflush(out);
+		copy_pack_data(out, reuse_packfile-&gt;p, w_curs,
+			sizeof(struct pack_header), to_write);</code></pre>
+          <p>
+            A clone-style <code>pack-objects --all --stdout</code> on git.git took 2.56 s with bitmaps, reported
+            <code>pack-reused 421871 (from 1)</code>, and produced exactly the 324,086,703 bytes of the pack on disk.
+            Without bitmaps it took 17.37 s, counting and compressing objects first <span class="recon">measured here</span>.
+            <code>pack-objects</code> uses bitmaps by default only when writing to stdout, which is how it serves
+            fetches and clones. For an on-disk repack it avoids them, citing pack quality and robustness
+            (<code>builtin/pack-objects.c</code>:5322-5342) <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="sources"><span class="secnum">07</span>Sources</h2>
+          <ul>
+            <li><a href="https://github.com/git/git/tree/v2.55.0">git/git at <code>v2.55.0</code></a> (<code>e9019fcafe</code>, 29 June 2026). Code read: <code>object-file.c</code>, <code>odb.c</code>, <code>odb/</code>, <code>tree.c</code>, <code>commit.c</code>, <code>builtin/commit.c</code>, <code>sequencer.c</code>, <code>refs/files-backend.c</code>, <code>write-or-die.h</code>, <code>packfile.c</code>, <code>pack-write.c</code>, <code>patch-delta.c</code>, <code>diff-delta.c</code>, <code>builtin/pack-objects.c</code>, <code>builtin/index-pack.c</code>, <code>hash-lookup.c</code>, <code>midx-write.c</code>, <code>pack-bitmap.c</code>, <code>pack-bitmap-write.c</code>.</li>
+            <li><code>Documentation/gitformat-pack.adoc</code>, <code>gitformat-loose.adoc</code>, <code>technical/bitmap-format.adoc</code> and <code>BreakingChanges.adoc</code> at the same commit, and the history commits named in the text (<code>e83c5163</code>, <code>d98b46f8d9</code>, <code>b1b8dfde69</code>, <code>7cc8f97108</code> and the object-source series).</li>
+            <li>The lab, at <code>~/git-ref/lab/scratch/history/tools/</code>: <code>fstrace.c</code> (the <code>LD_PRELOAD</code> shim), <code>trace-commit.sh</code>, <code>time-commit.sh</code> and <code>plumbing-replay.sh</code> (§01). The pack, index and bitmap dumps (§04 to §06) came from a scratch repository that was deleted after the run; its exact inputs are given in §04, so the ids reproduce.</li>
+          </ul>
+          <p class="footnote">
+            <strong>Provenance.</strong> Every path, line number and excerpt was read from the pinned checkout. Numbers marked "measured here" come from <code>git version 2.55.0</code>
+            on a 2-vCPU Linux box (git's own CPU count reports 8), in the two-file lab repository, the six-object pack
+            repository or a clone of git.git. Commit timings are medians of 21 runs; pack timings are single or paired
+            runs that moved by up to 40% between sessions, so read them as ratios. The syscall shim sees only calls that
+            go through the PLT and misses glibc-internal opens. The mechanisms marked "reconstruction" are mine. I did
+            not verify why upstream's git.git pack deltifies 5.3% of its commits, did not measure
+            <code>pack-objects</code> output with more than one thread, bitmap lookup tables or pseudo-merges, and did
+            not trace a commit under the reftable backend. The path-walk comparison ran without <code>--revs</code>. Linus's 2017
+            comments on SHAttered are not quoted, because lore.kernel.org refused every request.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Git, taken apart</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../state-and-wire/">Part 2: Mutable state and the wire</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../merge-and-upkeep/">Part 3: Combining, keeping, and how it got here</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../../git-worktrees/">One repository, many agents</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,173 @@
+          <h2 id="wire"><span class="secnum">{{S}}</span>The wire: pkt-lines and protocol v2</h2>
+          <p class="lede">
+            Moving state between repositories means agreeing on refs, then shipping a pack. Every byte of that
+            conversation, in every transport, is framed the same way, and protocol v2 changed the conversation far
+            more than the framing.
+          </p>
+          <p>
+            The frame is the pkt-line: four hex digits giving a length that counts the four digits themselves, then
+            the payload. <code>000eversion 2\n</code> is 14 bytes, 4 plus 10. The maximum is 65,520 bytes in total
+            (<code>LARGE_PACKET_MAX</code>, <code>pkt-line.h</code>:233). Lengths that cannot hold a payload are
+            reused as markers, in <code>pkt-line.c</code>:434-451:
+          </p>
+<pre><code>	} else if (!len) {
+		packet_trace("0000", 4, 0);
+		*pktlen = 0;
+		return PACKET_READ_FLUSH;
+	} else if (len == 1) {
+		packet_trace("0001", 4, 0);
+		*pktlen = 0;
+		return PACKET_READ_DELIM;
+	} else if (len == 2) {
+		packet_trace("0002", 4, 0);
+		*pktlen = 0;
+		return PACKET_READ_RESPONSE_END;
+	} else if (len &lt; 4) {</code></pre>
+          <p>
+            <code>0000</code> ends a message, <code>0001</code> separates sections within one, <code>0002</code> ends
+            a response over stateless HTTP, and <code>0003</code> is an error. When a pack and progress share one
+            stream, each pkt-line carries a band byte after its length: 1 for pack data, 2 for progress (printed as
+            <code>remote: …</code>), 3 for a fatal error. New in v2.55.0, control characters in remote sideband text are
+            masked, with ANSI colour still allowed by default (<code>sideband.allowControlCharacters</code>)
+            <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-wire">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">pkt-line framing, and a clone in protocol v0 and v2</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 500" role="img" aria-label="Top: annotated pkt-lines: 000e version 2, the flush, delim and response-end markers, a band-1 packet carrying the start of a pack, and a 6-byte band-1 packet carrying the final byte. Bottom: a v0 clone where the server sends every ref first, beside a v2 clone where the client asks for refs by prefix.">
+                <defs>
+                  <marker id="fig-wire-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="56" y="26" class="svg-lane">PKT-LINES · BYTES FROM A v2 CLONE OVER file://</text>
+                <rect x="56" y="40" width="50" height="30" fill="#f7e3c8" stroke="#d98226"/><text x="81" y="59" class="svg-sub" text-anchor="middle">000e</text>
+                <rect x="106" y="40" width="100" height="30" fill="#ffffff" stroke="#b8b8b1"/><text x="156" y="59" class="svg-sub" text-anchor="middle">version 2\n</text>
+                <rect x="226" y="40" width="50" height="30" fill="#f7f7f5" stroke="#252525"/><text x="251" y="59" class="svg-sub" text-anchor="middle">0000</text>
+                <rect x="296" y="40" width="50" height="30" fill="#f7f7f5" stroke="#252525"/><text x="321" y="59" class="svg-sub" text-anchor="middle">0001</text>
+                <rect x="366" y="40" width="50" height="30" fill="#f7f7f5" stroke="#252525"/><text x="391" y="59" class="svg-sub" text-anchor="middle">0002</text>
+                <rect x="436" y="40" width="50" height="30" fill="#f7e3c8" stroke="#d98226"/><text x="461" y="59" class="svg-sub" text-anchor="middle">01e6</text>
+                <rect x="486" y="40" width="30" height="30" fill="#e0ebf2" stroke="#3c6f97"/><text x="501" y="59" class="svg-sub" text-anchor="middle">01</text>
+                <rect x="516" y="40" width="210" height="30" fill="#ffffff" stroke="#b8b8b1"/><text x="621" y="59" class="svg-sub" text-anchor="middle">PACK 00000002 00000007 …</text>
+                <rect x="746" y="40" width="50" height="30" fill="#f7e3c8" stroke="#d98226"/><text x="771" y="59" class="svg-sub" text-anchor="middle">0006</text>
+                <rect x="796" y="40" width="30" height="30" fill="#e0ebf2" stroke="#3c6f97"/><text x="811" y="59" class="svg-sub" text-anchor="middle">01</text>
+                <rect x="826" y="40" width="40" height="30" fill="#ffffff" stroke="#b8b8b1"/><text x="846" y="59" class="svg-sub" text-anchor="middle">58</text>
+                <text x="131" y="90" class="svg-sub" text-anchor="middle">14 = 4 + 10</text>
+                <text x="251" y="90" class="svg-sub" text-anchor="middle">flush</text>
+                <text x="321" y="90" class="svg-sub" text-anchor="middle">delim</text>
+                <text x="391" y="90" class="svg-sub" text-anchor="middle">resp-end</text>
+                <text x="581" y="90" class="svg-sub" text-anchor="middle">486 = 4 + band byte + 481 pack bytes</text>
+                <text x="806" y="90" class="svg-sub" text-anchor="middle">last byte, alone</text>
+                <text x="890" y="52" class="svg-sub">band 1 pack · 2 progress</text>
+                <text x="890" y="68" class="svg-sub">band 3 fatal error</text>
+
+                <!-- v0 panel -->
+                <text x="56" y="138" class="svg-lane">v0 CLONE · THE SERVER SPEAKS FIRST</text>
+                <text x="100" y="162" class="svg-step" text-anchor="middle">client</text>
+                <text x="480" y="162" class="svg-step" text-anchor="middle">upload-pack</text>
+                <line x1="100" y1="170" x2="100" y2="390" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <line x1="480" y1="170" x2="480" y2="390" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="290" y="200" class="svg-sub" text-anchor="middle">every ref; capabilities after a NUL</text>
+                <path d="M480 208 L104 208" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="290" y="240" class="svg-sub" text-anchor="middle">want + chosen capabilities, want …</text>
+                <path d="M100 248 L476 248" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="290" y="280" class="svg-sub" text-anchor="middle">0000 · done (a clone has no haves)</text>
+                <path d="M100 288 L476 288" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="290" y="320" class="svg-sub" text-anchor="middle">NAK, then PACK in band 1</text>
+                <path d="M480 328 L104 328" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+
+                <!-- v2 panel -->
+                <text x="580" y="138" class="svg-lane">v2 CLONE · THE CLIENT ASKS</text>
+                <text x="624" y="162" class="svg-step" text-anchor="middle">client</text>
+                <text x="1024" y="162" class="svg-step" text-anchor="middle">upload-pack</text>
+                <line x1="624" y1="170" x2="624" y2="390" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <line x1="1024" y1="170" x2="1024" y2="390" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="824" y="200" class="svg-sub" text-anchor="middle">capabilities only: ls-refs, fetch=…, 0000</text>
+                <path d="M1024 208 L628 208" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="824" y="240" class="svg-sub" text-anchor="middle">command=ls-refs · 0001 · ref-prefix refs/heads/ …</text>
+                <path d="M624 248 L1020 248" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="824" y="280" class="svg-sub" text-anchor="middle">only refs under a requested prefix</text>
+                <path d="M1024 288 L628 288" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="824" y="320" class="svg-sub" text-anchor="middle">command=fetch · 0001 · want … / done</text>
+                <path d="M624 328 L1020 328" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="824" y="360" class="svg-sub" text-anchor="middle">packfile · PACK in band 1</text>
+                <path d="M1024 368 L628 368" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+
+                <rect x="56" y="414" width="1008" height="70" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="72" y="438" class="svg-sub">11,101 refs, measured: full advertisement 704,410 B in v0 and 702,972 B in v2 (ls-refs with no prefix)</text>
+                <text x="72" y="458" class="svg-sub">up-to-date fetch origin main --no-tags: 202 B in v2 (ref-prefix) vs 704,410 B in v0</text>
+                <text x="72" y="476" class="svg-sub">plain fetch origin main also asks for refs/tags/ to follow tags: 72,892 B back</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              v2's saving is ref filtering, not framing, and tag following gives much of it back. Top bytes from a
+              <code>tee</code> wrapper around <code>git-upload-pack</code>; the measurements from
+              <code>transport-lsrefs.sh</code>, three repetitions.
+            </p>
+          </figure>
+
+          <h3>Asking for v2</h3>
+          <p>
+            A client asks for v2 unless <code>protocol.version</code> says otherwise (<code>protocol.c</code>:46); the
+            comment in <code>protocol.h</code>:32-37 still says the unconfigured default is v0, stale since v2.29.0.
+            The server takes the highest <code>version=N</code> it finds in <code>GIT_PROTOCOL</code> and falls back to
+            v0. Each transport smuggles that variable its own way <span class="src">from the code</span>. git://
+            appends <code>version=2</code> after a second NUL in its first packet (<code>connect.c</code>:1263-1267).
+            ssh passes <code>-o SendEnv=GIT_PROTOCOL</code>, which works only with OpenSSH and only if the server's
+            sshd accepts the variable. file:// sets the environment variable directly, and HTTP sends a
+            <code>Git-Protocol: version=2</code> header. An old server ignores all of these and speaks v0, which is
+            why the scheme could ship without a flag day <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            v2 became the default in v2.26.0 (<code>684ceae32d</code>), was reverted in v2.27.0
+            (<code>11c7f2a30b</code>) after fetches of the kernel gave up negotiating too early, sat behind
+            <code>feature.experimental</code> in v2.28.0, and has been the default since v2.29.0
+            (<code>eb049759fb</code>). The fix that made the second attempt stick is in <a href="#negotiation-push">§07</a>.
+          </p>
+          <h3>Where v2 saves bytes</h3>
+          <p>
+            In v0 the server writes every ref before reading anything, with its capabilities hidden after a NUL on the
+            first line. In v2 it sends a short capability list and waits. The client then sends commands. Each is a
+            capability block, a <code>0001</code> delimiter, arguments and a flush. A clone sends
+            <code>ref-prefix refs/heads/</code>, <code>ref-prefix refs/tags/</code> and <code>ref-prefix HEAD</code>,
+            and the server hands the prefixes straight to the ref backend's prefix iterator (<code>ls-refs.c</code>:202-211)
+            <span class="src">from the code</span>. The spec calls <code>ref-prefix</code> "purely for optimization".
+            Here is the clone's <code>ls-refs</code> request as it crossed the pipe, one pkt-line per row
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>0014 command=ls-refs\n
+001a agent=git/2.55.0-Linux        no LF: written with packet_write_fmt("agent=%s")
+0016 object-format=sha1            no LF either; receivers must accept both
+0001                               delim: capabilities end, arguments begin
+0009 peel\n
+000c symrefs\n
+000b unborn\n
+001b ref-prefix refs/heads/\n
+001a ref-prefix refs/tags/\n
+0014 ref-prefix HEAD\n
+0000                               flush: end of command</code></pre>
+          <p>
+            The server had advertised <code>agent</code>, <code>ls-refs=unborn</code>, <code>fetch=shallow
+            wait-for-done</code>, <code>server-option</code> and <code>object-format=sha1</code>. Optional features such
+            as <code>filter</code> appear only when the server's config turns them on. Its first reply line was
+            <code>0050</code>: 80 bytes holding <code>HEAD</code>'s id and <code>symref-target:refs/heads/main</code>.
+          </p>
+          <p>
+            It is the whole optimization. In a repository with 11,101 refs the full listing is about 704 KB in either
+            version. An up-to-date <code>git fetch origin main --no-tags</code> exchanged 202 bytes in v2 against
+            704,410 in v0 <span class="recon">measured here</span>. Most fetches do not look like that. Plain
+            <code>git fetch origin main</code> also asks for <code>refs/tags/</code> to follow tags, and received
+            72,892 bytes. <code>git ls-remote origin main</code> sends no prefix at all, because its patterns are tail
+            matches done on the client, and got the full 702,972 bytes.
+          </p>
+          <p>
+            Over HTTP, v2 is <code>stateless-connect</code>. <code>GET info/refs</code> with the
+            <code>Git-Protocol</code> header returns only capabilities, 144 bytes against v0's 560 for the small
+            test repository. Every command is then one POST: 181 bytes up and 313 down for <code>ls-refs</code>, 323 up and
+            1,140 down for the fetch. The server holds no state between POSTs. The remote helper injects a
+            <code>0002</code> after each response, and <code>fetch-pack</code> checks for it, so a truncated HTTP body
+            is an error rather than a short answer. The byte counts are <span class="recon">measured here</span>;
+            the reason for the marker is my <span class="recon">reconstruction</span>.
+          </p>

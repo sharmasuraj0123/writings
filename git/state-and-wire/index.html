@@ -1,0 +1,2406 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Git's mutable state and transport, read from the git 2.55 source: the index format and racy git, lock timeouts, refs and reftable, atomic-but-not-durable publishing, pkt-lines and protocol v2, fetch negotiation and the push quarantine. Part 2 of Git, taken apart."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/git/state-and-wire/" />
+    <meta property="og:title" content="Mutable state and the wire" />
+    <meta property="og:description" content="Part 2 of Git, taken apart. The index (a 62-byte stat record per path, a TREE cache, racy-git smudging), the 0/100/1000 ms lock policies, files vs reftable under a concurrent reader, the fsync defaults, pkt-line bytes, why protocol v2 saves bytes only through ref-prefix, negotiation rounds, and how a push sits in quarantine until pre-receive accepts it." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/git/state-and-wire/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Mutable state and the wire" />
+    <meta name="twitter:description" content="Git's index, refs, reftable, fsync defaults and wire protocol, read from v2.55.0 and measured. Part 2 of Git, taken apart." />
+    <title>Mutable state and the wire — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · The index: a stat cache that becomes a tree</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#index">01 · The index: a stat cache that becomes a tree</a>
+        <a class="toc-parent" href="#racy-git">02 · Racy git and the lock that never waits</a>
+        <a class="toc-parent" href="#refs">03 · Refs and what readers see</a>
+        <a class="toc-parent" href="#reftable">04 · reftable: one rename per transaction</a>
+        <a class="toc-parent" href="#durability">05 · Atomic, not durable</a>
+        <a class="toc-parent" href="#wire">06 · The wire: pkt-lines and protocol v2</a>
+        <a class="toc-parent" href="#negotiation-push">07 · Negotiation and push</a>
+        <a class="toc-parent" href="#sources">08 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#index">01 · The index</a>
+        <a href="#racy-git">02 · Racy git and locks</a>
+        <a href="#refs">03 · Refs and readers</a>
+        <a href="#reftable">04 · reftable</a>
+        <a href="#durability">05 · Atomic, not durable</a>
+        <a href="#wire">06 · The wire</a>
+        <a href="#negotiation-push">07 · Negotiation and push</a>
+        <a href="#sources">08 · Sources</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Languages & Tools</p>
+        <h1>Mutable state and the wire<span class="status-pill">Teardown</span></h1>
+        <p class="dek">
+          Git's objects never change, so they need no lock. Everything around them does change: the index, the refs, the reflogs, and the conversation between two repositories. This part reads those small mutable files and the wire protocol from git v2.55.0: the index as a stat cache that becomes a tree, racy git, what a reader sees while refs move, reftable's one-rename commit, why every publish is atomic but nothing is fsynced by default, pkt-lines and protocol v2, negotiation, and the push quarantine.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 23 October 2026 · Subject: <code>git@e9019fca</code> (v2.55.0) · Part 2 of 3 · Read from the source and the manual; measured on this machine</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#index">The index: a stat cache that becomes a tree</a></li>
+          <li><a href="#racy-git">Racy git and the lock that never waits</a></li>
+          <li><a href="#refs">Refs and what readers see</a></li>
+          <li><a href="#reftable">reftable: one rename per transaction</a></li>
+          <li><a href="#durability">Atomic, not durable</a></li>
+          <li><a href="#wire">The wire: pkt-lines and protocol v2</a></li>
+          <li><a href="#negotiation-push">Negotiation and push</a></li>
+          <li><a href="#sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from git at <code>e9019fca</code>
+              (tag <code>v2.55.0</code>, 29 June 2026), cited as a path and line number from the repository root;
+              the manual pages are cited under <code>Documentation/</code>. <span class="recon">measured here</span>
+              marks a number, byte dump or behaviour observed with <code>git version 2.55.0</code> on a 2-vCPU Linux
+              box; each says which script in <code>~/git-ref/lab/</code> produced it. <span class="recon">reconstruction</span>
+              marks a judgement I drew from those sources rather than read in one place.
+            </p>
+            <p>
+              This is Part 2 of 3 of <a href="../">Git, taken apart</a>. <a href="../commit-and-objects/">Part 1</a>
+              covers the commit and its objects; <a href="../merge-and-upkeep/">Part 3</a> covers merging, upkeep and
+              history.
+            </p>
+          </div>
+
+          <h2 id="index"><span class="secnum">01</span>The index: a stat cache that becomes a tree</h2>
+          <p class="lede">
+            <a href="../commit-and-objects/">Part 1</a> ended with a store that never changes. An object is named by
+            the hash of its bytes, so a writer never needs a lock: if the name exists, the content is already there.
+            Everything else in <code>.git</code> does change. The index, the refs, the reflogs and the
+            conversation between two repositories are small, mutable and shared. Each is either a pointer or a
+            cache, and each has its own consistency story. This part reads those stories from git v2.55.0, starting
+            with the file every <code>git add</code> rewrites.
+          </p>
+          <p>
+            The index (<code>.git/index</code>) is one binary file: a 12-byte header, the entries sorted by path,
+            typed extensions, and a trailing hash. The header is <code>DIRC</code> ("dircache"), a version from 2
+            to 4 and an entry count, all big-endian <span class="src">from the code</span>. An entry is ten 32-bit
+            stat words, the object id and a 16-bit flags word, then the path. <code>read-cache.c</code>:1667-1684:
+          </p>
+<pre><code>struct ondisk_cache_entry {
+	struct cache_time ctime;
+	struct cache_time mtime;
+	uint32_t dev;
+	uint32_t ino;
+	uint32_t mode;
+	uint32_t uid;
+	uint32_t gid;
+	uint32_t size;
+	/*
+	 * unsigned char hash[hashsz];
+	 * uint16_t flags;
+	 * if (flags &amp; CE_EXTENDED)
+	 *	uint16_t flags2;
+	 */
+	unsigned char data[GIT_MAX_RAWSZ + 2 * sizeof(uint16_t)];
+	char name[FLEX_ARRAY];
+};</code></pre>
+          <p>
+            That is 62 fixed bytes under SHA-1. The flags word holds assume-valid (bit 15), extended (bit 14), a
+            2-bit merge stage and a 12-bit name length (<code>read-cache-ll.h</code>:34-37). In versions 2 and 3 the
+            name is NUL-padded so each entry ends on an 8-byte boundary. Figure 1 is a real entry,
+            from a three-file repository whose index came to 317 bytes <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-index-entry">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">One index entry, byte by byte, and the same paths in version 4</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 500" role="img" aria-label="A 72-byte version 2 index entry for README: ctime, mtime, dev, ino, mode, uid, gid, size, a 20-byte object id, a 2-byte flags word, the 6-byte name and 4 bytes of padding. Below, version 4 stores each path as a strip count plus a suffix; and bars compare sizes.">
+                <text x="56" y="30" class="svg-lane">INDEX v2 ENTRY · README · 72 BYTES AT FILE OFFSET 12</text>
+                <!-- offsets -->
+                <text x="56" y="54" class="svg-num" text-anchor="middle">0</text>
+                <text x="168" y="54" class="svg-num" text-anchor="middle">8</text>
+                <text x="280" y="54" class="svg-num" text-anchor="middle">16</text>
+                <text x="336" y="54" class="svg-num" text-anchor="middle">20</text>
+                <text x="392" y="54" class="svg-num" text-anchor="middle">24</text>
+                <text x="448" y="54" class="svg-num" text-anchor="middle">28</text>
+                <text x="504" y="54" class="svg-num" text-anchor="middle">32</text>
+                <text x="560" y="54" class="svg-num" text-anchor="middle">36</text>
+                <text x="616" y="54" class="svg-num" text-anchor="middle">40</text>
+                <text x="896" y="54" class="svg-num" text-anchor="middle">60</text>
+                <text x="924" y="54" class="svg-num" text-anchor="middle">62</text>
+                <text x="1008" y="54" class="svg-num" text-anchor="middle">68</text>
+                <text x="1064" y="54" class="svg-num" text-anchor="middle">72</text>
+                <!-- stat fields -->
+                <rect x="56" y="62" width="112" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="168" y="62" width="112" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="280" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="336" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="392" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="448" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="504" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="560" y="62" width="56" height="40" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="616" y="62" width="280" height="40" fill="#dfede5" stroke="#367f59"/>
+                <rect x="896" y="62" width="28" height="40" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="924" y="62" width="84" height="40" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="1008" y="62" width="56" height="40" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="112" y="87" class="svg-step" text-anchor="middle">ctime</text>
+                <text x="224" y="87" class="svg-step" text-anchor="middle">mtime</text>
+                <text x="308" y="87" class="svg-step" text-anchor="middle">dev</text>
+                <text x="364" y="87" class="svg-step" text-anchor="middle">ino</text>
+                <text x="420" y="87" class="svg-step" text-anchor="middle">mode</text>
+                <text x="476" y="87" class="svg-step" text-anchor="middle">uid</text>
+                <text x="532" y="87" class="svg-step" text-anchor="middle">gid</text>
+                <text x="588" y="87" class="svg-step" text-anchor="middle">size</text>
+                <text x="756" y="87" class="svg-step" text-anchor="middle">object id (20 bytes)</text>
+                <text x="966" y="87" class="svg-step" text-anchor="middle">README</text>
+                <text x="1036" y="87" class="svg-step" text-anchor="middle">pad</text>
+                <!-- values -->
+                <text x="112" y="122" class="svg-sub" text-anchor="middle">1792671528 s</text>
+                <text x="112" y="138" class="svg-sub" text-anchor="middle">920658538 ns</text>
+                <text x="224" y="122" class="svg-sub" text-anchor="middle">1792671528 s</text>
+                <text x="224" y="138" class="svg-sub" text-anchor="middle">920658538 ns</text>
+                <text x="308" y="122" class="svg-sub" text-anchor="middle">2128</text>
+                <text x="364" y="122" class="svg-sub" text-anchor="middle">2889566</text>
+                <text x="420" y="138" class="svg-sub" text-anchor="middle">00 00 81 a4</text>
+                <text x="476" y="122" class="svg-sub" text-anchor="middle">1000</text>
+                <text x="532" y="122" class="svg-sub" text-anchor="middle">1000</text>
+                <text x="588" y="122" class="svg-sub" text-anchor="middle">9</text>
+                <text x="756" y="122" class="svg-sub" text-anchor="middle">89931ee4751c9760ea2c…9012</text>
+                <text x="910" y="138" class="svg-sub" text-anchor="middle">00 06</text>
+                <text x="1036" y="122" class="svg-sub" text-anchor="middle">00×4</text>
+                <!-- zooms -->
+                <path d="M420 144 L420 166" stroke="#b8b8b1" stroke-width="1"/>
+                <rect x="270" y="166" width="300" height="44" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="284" y="185" class="svg-sub">mode 0x81a4 = type 1000 (regular file)</text>
+                <text x="284" y="201" class="svg-sub">           + permission bits 0644</text>
+                <path d="M910 144 L910 166" stroke="#b8b8b1" stroke-width="1"/>
+                <rect x="660" y="166" width="404" height="44" rx="3" fill="#ffffff" stroke="#d98226"/>
+                <text x="674" y="185" class="svg-sub">flags 0x0006: assume-valid 0 · extended 0</text>
+                <text x="674" y="201" class="svg-sub">             stage 00 · name length 6</text>
+                <text x="56" y="232" class="svg-note">blue = stat cache · green = what the entry names · orange = flags · purple = path · grey = NUL padding to a multiple of 8</text>
+
+                <!-- v4 lane -->
+                <text x="56" y="276" class="svg-lane">INDEX v4 · PATH = STRIP N BYTES OF THE PREVIOUS PATH, THEN A SUFFIX · NO PADDING</text>
+                <rect x="56" y="290" width="100" height="36" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="106" y="313" class="svg-sub" text-anchor="middle">62 bytes</text>
+                <rect x="156" y="290" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="172" y="313" class="svg-sub" text-anchor="middle">00</text>
+                <rect x="188" y="290" width="226" height="36" fill="#ece6f3" stroke="#765b98"/>
+                <text x="198" y="313" class="svg-sub">Documentation/git-add.adoc\0</text>
+
+                <rect x="440" y="290" width="100" height="36" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="490" y="313" class="svg-sub" text-anchor="middle">62 bytes</text>
+                <rect x="540" y="290" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="556" y="313" class="svg-sub" text-anchor="middle">07</text>
+                <rect x="572" y="290" width="82" height="36" fill="#ece6f3" stroke="#765b98"/>
+                <text x="582" y="313" class="svg-sub">m.adoc\0</text>
+
+                <rect x="680" y="290" width="100" height="36" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="730" y="313" class="svg-sub" text-anchor="middle">62 bytes</text>
+                <rect x="780" y="290" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="796" y="313" class="svg-sub" text-anchor="middle">06</text>
+                <rect x="812" y="290" width="104" height="36" fill="#ece6f3" stroke="#765b98"/>
+                <text x="822" y="313" class="svg-sub">pply.adoc\0</text>
+
+                <text x="440" y="346" class="svg-sub">drop 7 of "…git-add.adoc" → Documentation/git-am.adoc</text>
+                <text x="680" y="364" class="svg-sub">drop 6 of "…git-am.adoc" → Documentation/git-apply.adoc</text>
+
+                <!-- size bars -->
+                <text x="56" y="404" class="svg-lane">FILE SIZE, v2 VS v4</text>
+                <text x="56" y="428" class="svg-sub">those 3 entries</text>
+                <rect x="300" y="416" width="600" height="14" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="912" y="428" class="svg-sub">v2 312 B</text>
+                <rect x="300" y="434" width="509" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="821" y="446" class="svg-sub">v4 265 B</text>
+                <text x="56" y="470" class="svg-sub">git.git, 4,765 entries</text>
+                <rect x="300" y="458" width="600" height="14" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="912" y="470" class="svg-sub">v2 453,478 B</text>
+                <rect x="300" y="476" width="490" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="802" y="488" class="svg-sub">v4 370,478 B (−18%)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The index is a stat cache keyed by path: 40 of every entry's 62 fixed bytes describe the file on disk,
+              not its content. Version 4 gives up alignment for prefix compression. Bytes from <code>annot.py</code> in
+              <code>~/git-ref/lab/scratch/index/tools/</code>, run on the repository described in the text.
+            </p>
+          </figure>
+
+          <p>
+            The whole 317-byte file adds up: a 12-byte header, three entries of 72, 72 and 80 bytes
+            (<code>src/main.c</code> is a 10-character name and so gets 8 bytes of padding), a 61-byte
+            <code>TREE</code> extension, and a 20-byte SHA-1 over everything before it. The recorded nanoseconds are
+            real even though this build never compares them <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The default version is 3, and it is demoted to 2 on every write unless some entry needs the extended
+            flags (<code>read-cache.c</code>:1628, 2848-2850) <span class="src">from the code</span>. Version 4
+            prefix-compresses paths. The strip count uses the same +1-bias varint that Part 1 showed in
+            <code>OFS_DELTA</code> offsets. On git.git it saved 18%. On a 400,000-entry synthetic index it saved 24%
+            but read slower single-threaded, 127 against 106 ms <span class="recon">measured here</span>.
+          </p>
+          <h3>Why stat data</h3>
+          <p>
+            The stat words let <code>git status</code> say "unchanged" without reading a file.
+            <code>match_stat_data()</code> (<code>statinfo.c</code>:64-105) always compares mtime and size; ctime,
+            uid, gid and inode only under <code>core.trustctime</code> and <code>core.checkStat</code>; nanoseconds
+            only when built with <code>USE_NSEC</code>, which Linux builds lack <span class="src">from the code</span>.
+            One <code>lstat</code> and a compare per path. On git.git a default <code>status</code> made 4,764
+            <code>lstat</code> calls. With the fsmonitor daemon (new for Linux in v2.55.0) it made 0, and the median
+            fell from 28.7 to 10.2 ms with fsmonitor and the untracked cache, n = 31 <span class="recon">measured
+            here</span>, <code>matrix.sh</code>. A read-only command can still write: <code>status</code> rewrites
+            the index when something changed or an entry is racy, and only if the file on disk still has the hash
+            it read (<code>repo_update_index_if_able()</code>, <code>read-cache.c</code>:2748-2757)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>How the index becomes a tree</h3>
+          <p>
+            The <code>TREE</code> extension caches one tree id per directory, in preorder:
+            <code>path\0</code>, an entry count, a subtree count, the id. In the repository of Figure
+            1 the root node reads <code>'' 3 1</code> followed by <code>cf9d639a…</code>, which is
+            <code>HEAD^{tree}</code>. Every index change sets the count to −1 on each directory up to the root.
+            <code>update_one()</code> skips a valid node whose tree object exists (<code>cache-tree.c</code>:294-297):
+          </p>
+<pre><code>	if (0 &lt;= it-&gt;entry_count &amp;&amp;
+	    odb_has_object(the_repository-&gt;objects, &amp;it-&gt;oid,
+			   ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR))
+		return it-&gt;entry_count;</code></pre>
+          <p>
+            <code>git commit</code> then hands <code>cache_tree-&gt;oid</code> straight to
+            <code>commit_tree_extended()</code> (<code>builtin/commit.c</code>:1938) <span class="src">from the
+            code</span>. On git.git, <code>write-tree</code> with the extension stripped spent 48.5 ms rebuilding
+            trees; with it intact the region was never entered <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Extensions whose name starts A–Z are optional caches a reader may skip. Lowercase <code>link</code>
+            (split index) and <code>sdir</code> (sparse index) change the meaning of the entries, so an older reader
+            must refuse (<code>read-cache.c</code>:59-76). The trailing hash is checked only by
+            <code>git fsck</code>, since v2.13.0, because checking it on every read cost too much.
+          </p>
+          <h3>Three things that are wrong in v2.55.0</h3>
+          <p>
+            All three are still present at origin/seen <span class="src">from the code</span>. First,
+            <code>index.skipHash</code> plus <code>core.splitIndex</code> loses staged entries. Skip-hash writes a
+            null trailer, the shared index is named after it, and the reader treats a null base as "not split"
+            (<code>read-cache.c</code>:2369). Five files added, <code>ls-files</code> shows zero
+            <span class="recon">measured here</span>. Second, the <code>EOIE</code> extension can never validate in
+            a SHA-256 repository: <code>EOIE_SIZE</code> is <code>4 + GIT_SHA1_RAWSZ</code>
+            (<code>read-cache.c</code>:3543) while the writer emits a 32-byte hash, so threaded index loading
+            silently never runs there. Third, <code>Documentation/config/index.adoc</code> says
+            <code>index.threads</code> "Defaults to 'true'", but unset has meant one thread since v2.20.0
+            (<code>read-cache.c</code>:2257-2258). <a href="../merge-and-upkeep/">Part 3</a> lists reproductions.
+          </p>
+
+          <h2 id="racy-git"><span class="secnum">02</span>Racy git and the lock that never waits</h2>
+          <p class="lede">
+            A cache whose freshness test is a timestamp has a blind spot: anything that happens within one tick of
+            the clock. Git closes that hole twice. It also guards the index with the least patient lock in the
+            repository.
+          </p>
+          <p>
+            The blind spot is easy to state. <code>git add</code> records a file's mtime and size, and writes the
+            index in the same second. The file is then rewritten with different content of the same size, still in
+            that second. Its stat data matches the cache, so it looks unchanged. Petr Baudis (Pasky) reported this on
+            24 October 2005, and the fix, "Racy GIT" (<code>29e4d36357</code>), shipped in v1.0.0
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The first defence is a content check. An entry whose mtime is not older than the index file's own mtime
+            is "racily clean": its stat match proves nothing, so git hashes the file. The test is
+            <code>is_racy_stat()</code>, <code>read-cache.c</code>:355-367. Without <code>USE_NSEC</code> it
+            compares whole seconds:
+          </p>
+<pre><code>static int is_racy_stat(const struct index_state *istate,
+			const struct stat_data *sd)
+{
+	return (istate-&gt;timestamp.sec &amp;&amp;
+#ifdef USE_NSEC
+		 /* nanosecond timestamped files can also be racy! */
+		(istate-&gt;timestamp.sec &lt; sd-&gt;sd_mtime.sec ||
+		 (istate-&gt;timestamp.sec == sd-&gt;sd_mtime.sec &amp;&amp;
+		  istate-&gt;timestamp.nsec &lt;= sd-&gt;sd_mtime.nsec))
+#else
+		istate-&gt;timestamp.sec &lt;= sd-&gt;sd_mtime.sec
+#endif
+		);
+}</code></pre>
+          <p>
+            That check works only while the index stays as old as the entry. The next index write would give the
+            index a newer mtime and make the stale entry look trustworthy again. So the second defence runs on every
+            write. A racily clean entry whose content really differs is "smudged": its cached size is set to 0
+            (<code>read-cache.c</code>:2606, in <code>ce_smudge_racily_clean_entry()</code>). Size 0 will not match
+            a 6-byte file, so a plain stat compare catches it forever after <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-racy">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">Racy git on a one-second clock, and what happens without the smudge</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 360" role="img" aria-label="Two timelines in whole seconds. In the real run, a same-second same-size edit is caught by a content check, smudged to size 0 on the next index write, and still reported two seconds later. In the counterfactual, the index mtime is pushed forward without a rewrite, nothing is smudged, and the edit is reported clean.">
+                <text x="56" y="28" class="svg-lane">REAL RUN · GIT 2.55.0 · tools/racy.sh</text>
+                <line x1="100" y1="70" x2="1080" y2="70" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="120" y1="62" x2="120" y2="78" stroke="#b8b8b1"/>
+                <line x1="420" y1="62" x2="420" y2="78" stroke="#b8b8b1"/>
+                <line x1="720" y1="62" x2="720" y2="78" stroke="#b8b8b1"/>
+                <line x1="1020" y1="62" x2="1020" y2="78" stroke="#b8b8b1"/>
+                <text x="120" y="96" class="svg-sub" text-anchor="middle">T = 1792671606 s</text>
+                <text x="420" y="96" class="svg-sub" text-anchor="middle">T+1</text>
+                <text x="720" y="96" class="svg-sub" text-anchor="middle">T+2</text>
+                <text x="1020" y="96" class="svg-sub" text-anchor="middle">T+3</text>
+                <rect x="120" y="44" width="300" height="10" fill="#f7e3c8"/>
+                <circle cx="160" cy="70" r="9" fill="#ffffff" stroke="#3c6f97" stroke-width="1.5"/><text x="160" y="74" class="svg-num" text-anchor="middle">1</text>
+                <circle cx="220" cy="70" r="9" fill="#ffffff" stroke="#3c6f97" stroke-width="1.5"/><text x="220" y="74" class="svg-num" text-anchor="middle">2</text>
+                <circle cx="280" cy="70" r="9" fill="#ffffff" stroke="#367f59" stroke-width="1.5"/><text x="280" y="74" class="svg-num" text-anchor="middle">3</text>
+                <circle cx="340" cy="70" r="9" fill="#ffffff" stroke="#765b98" stroke-width="1.5"/><text x="340" y="74" class="svg-num" text-anchor="middle">4</text>
+                <circle cx="760" cy="70" r="9" fill="#ffffff" stroke="#3c6f97" stroke-width="1.5"/><text x="760" y="74" class="svg-num" text-anchor="middle">5</text>
+                <circle cx="820" cy="70" r="9" fill="#ffffff" stroke="#367f59" stroke-width="1.5"/><text x="820" y="74" class="svg-num" text-anchor="middle">6</text>
+                <text x="56" y="124" class="svg-sub">1  write "xyzzy\n"; update-index: entry mtime T, size 6</text>
+                <text x="56" y="144" class="svg-sub">2  rewrite as "frotz\n": same second, same size</text>
+                <text x="56" y="164" class="svg-sub">3  diff-files → M  (entry not older than index: hashed)</text>
+                <text x="590" y="124" class="svg-sub">4  index written again within T: cached size 6 → 0</text>
+                <text x="590" y="144" class="svg-sub">5  index written at T+2: its mtime moves on</text>
+                <text x="590" y="164" class="svg-sub">6  diff-files → M  (size 0 ≠ 6: plain stat catches it)</text>
+
+                <text x="56" y="214" class="svg-lane">COUNTERFACTUAL · INDEX MTIME MOVED WITHOUT A REWRITE</text>
+                <line x1="100" y1="256" x2="1080" y2="256" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="120" y1="248" x2="120" y2="264" stroke="#b8b8b1"/>
+                <line x1="420" y1="248" x2="420" y2="264" stroke="#b8b8b1"/>
+                <line x1="720" y1="248" x2="720" y2="264" stroke="#b8b8b1"/>
+                <line x1="1020" y1="248" x2="1020" y2="264" stroke="#b8b8b1"/>
+                <text x="120" y="282" class="svg-sub" text-anchor="middle">T</text>
+                <text x="720" y="282" class="svg-sub" text-anchor="middle">T+2</text>
+                <circle cx="160" cy="256" r="9" fill="#ffffff" stroke="#3c6f97" stroke-width="1.5"/><text x="160" y="260" class="svg-num" text-anchor="middle">1</text>
+                <circle cx="220" cy="256" r="9" fill="#ffffff" stroke="#3c6f97" stroke-width="1.5"/><text x="220" y="260" class="svg-num" text-anchor="middle">2</text>
+                <circle cx="280" cy="256" r="9" fill="#ffffff" stroke="#367f59" stroke-width="1.5"/><text x="280" y="260" class="svg-num" text-anchor="middle">3</text>
+                <circle cx="1020" cy="256" r="9" fill="#ffffff" stroke="#765b98" stroke-width="1.5"/><text x="1020" y="260" class="svg-num" text-anchor="middle">4</text>
+                <circle cx="1060" cy="256" r="9" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.5"/><text x="1060" y="260" class="svg-num" text-anchor="middle">5</text>
+                <text x="56" y="310" class="svg-sub">1–3  as above; diff-files → M</text>
+                <text x="590" y="310" class="svg-sub">4  touch -d @T+3 .git/index  (no write, so no smudge)</text>
+                <text x="590" y="330" class="svg-sub">5  diff-files → clean; :file is "xyzzy", file is "frotz"</text>
+                <text x="56" y="350" class="svg-note">orange band: the one-second window in which the stat cache cannot see a same-size edit</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              A timestamp cache cannot see edits within its own tick. Git content-checks entries as new as the index
+              and poisons them on rewrite; take away the rewrite and the edit becomes invisible. Both lanes measured
+              here with <code>racy.sh</code> and its <code>racy2</code> variant on ext4.
+            </p>
+          </figure>
+
+          <p>
+            The counterfactual in Figure 2 is the proof that the smudge matters. Moving the index's mtime
+            forward by hand, without letting git rewrite it, leaves the size at 6 and the edit falsely clean
+            <span class="recon">measured here</span>. The window is common in practice: right after cloning git.git,
+            119 of 4,765 entries were racily clean, and the first <code>status</code> rewrote the index to settle
+            them. Git also once tried a third defence. A 2006 commit made the writer sleep before finishing the index
+            (<code>b7e58b17b5</code>), and <code>0fc82cff12</code> removed it; both first appear in v1.4.3-rc1, so
+            the sleep never reached a release <span class="src">from the code</span>.
+          </p>
+          <h3>A lock with zero patience</h3>
+          <p>
+            Every index writer creates <code>index.lock</code> with <code>O_CREAT|O_EXCL</code>, writes the whole new
+            file into it, and renames it over <code>index</code>, so each write gets a new inode and readers see the
+            old file or the new one. The lock is taken once. <code>lockfile.h</code>:205-209:
+          </p>
+<pre><code>static inline int hold_lock_file_for_update(
+	struct lock_file *lk, const char *path, int flags)
+{
+	return hold_lock_file_for_update_timeout(lk, path, flags, 0);
+}</code></pre>
+          <p>
+            Timeout 0 means one attempt. A stale <code>index.lock</code> makes <code>git add</code> fail at once
+            <span class="recon">measured here</span>. The other locks are more patient: a loose ref retries for
+            100 ms (<code>core.filesRefLockTimeout</code>, <code>refs.c</code>:993-1004), <code>packed-refs.lock</code>
+            for 1000 ms (<code>refs/packed-backend.c</code>:1223), reftable's <code>tables.list.lock</code> for 100 ms
+            (<code>refs/reftable-backend.c</code>:404), and loose objects take no lock at all
+            <span class="src">from the code</span>. So "git retries locks for 100 ms" is wrong for the index.
+            A <code>core.indexLockTimeout</code> exists only on the seen branch (<code>fd1a1fc743</code>). Since
+            v2.54.0 <code>core.lockfilePid</code> writes the holder's pid beside the lock, as
+            <code>index~pid.lock</code>, so a failure can say whether that process is still alive. The practical
+            answer to two writers on one index is not to have one index: each worktree gets its own, which is why
+            <a href="../../git-worktrees/">parallel agents belong in separate worktrees</a>
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <h2 id="refs"><span class="secnum">03</span>Refs and what readers see</h2>
+          <p class="lede">
+            A ref is a name that points at an object, or, for a symbolic ref, at another name. Moving a branch is the
+            moment a commit becomes real. The files backend makes each single move atomic, but not a group of them,
+            and a reader can watch the group land one ref at a time.
+          </p>
+          <p>
+            On disk, in the default <code>files</code> backend, a loose ref is 40 hex digits and a newline: 41 bytes,
+            which on ext4 costs a full 4 KiB block. <code>HEAD</code> is usually a symref,
+            <code>ref: refs/heads/main\n</code>, 21 bytes <span class="recon">measured here</span>. Names pass a
+            256-entry character table plus rules: no leading dot, no <code>..</code>, no <code>@{</code>, no trailing
+            <code>.lock</code> (<code>refs.c</code>:69-324). The code sorts names into classes. Root refs are all-caps
+            names such as <code>HEAD</code>, <code>ORIG_HEAD</code> and <code>AUTO_MERGE</code>. Exactly two are
+            pseudorefs, <code>FETCH_HEAD</code> and <code>MERGE_HEAD</code>, which transactions refuse to write
+            (<code>refs.c</code>:888-901). Root refs and anything under <code>refs/worktree/</code>,
+            <code>refs/bisect/</code> or <code>refs/rewritten/</code> are per-worktree (881-886); the glossary still
+            lists only <code>HEAD</code> and <code>refs/bisect/</code> <span class="src">from the code</span>.
+          </p>
+          <p>
+            Storage sits behind <code>struct ref_storage_be</code> (<code>refs/refs-internal.h</code>:573), a table
+            of about 25 function pointers. Two backends can be chosen, <code>files</code> and <code>reftable</code>.
+            Inside <code>files</code> there is a second store, <code>packed-refs</code>: one sorted text file of
+            <code>&lt;hex&gt; &lt;name&gt;</code> lines, with a <code>^&lt;hex&gt;</code> line after an annotated tag
+            giving what it peels to. Above 32 KiB it is mmapped and binary-searched
+            (<code>refs/packed-backend.c</code>:523-640). Reads overlay loose refs on packed ones, and loose wins.
+            Loose refs are read first, so a concurrent <code>pack-refs</code>, which writes the packed copy and then
+            deletes the loose file, cannot make a ref vanish between the two reads <span class="src">from the
+            code</span>.
+          </p>
+          <h3>A transaction is many renames</h3>
+          <p>
+            Every ref update goes through a transaction: begin, queue updates, prepare, commit. In
+            <code>files</code>, prepare locks every ref by creating <code>&lt;ref&gt;.lock</code>, retrying for up to
+            100 ms. Under the locks it compares each ref's current value with the expected old value, then writes
+            the new value into the lockfile. A stale lock fails after 0.150 s of wall time
+            <span class="recon">measured here</span>. Moving a branch that <code>HEAD</code> points at also takes
+            <code>HEAD.lock</code>, to log the move in <code>HEAD</code>'s reflog. Commit then renames the lockfiles
+            over the refs, one at a time (<code>refs/files-backend.c</code>:3268-3421)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            There is no global lock, by choice. Before touching <code>packed-refs.lock</code>, prepare checks that no
+            new loose ref collides with a packed one, such as <code>a/b</code> against <code>a</code>. The comment at
+            <code>refs/files-backend.c</code>:3011-3022 says why the check is not done under a lock:
+          </p>
+<pre><code>	 * Verify that none of the loose reference that we're about to write
+	 * conflict with any existing packed references. Ideally, we'd do this
+	 * check after the packed-refs are locked so that the file cannot
+	 * change underneath our feet. But introducing such a lock now would
+	 * probably do more harm than good as users rely on there not being a
+	 * global lock with the "files" backend.
+	 ...
+	 * So instead, we accept the race for now.</code></pre>
+          <p>
+            Failure is all-or-nothing: if prepare cannot lock or verify every ref, nothing moves. A reader gets no
+            such promise. To see what it gets, I ran a 10,000-ref <code>update-ref --stdin</code> while a second
+            process looped <code>for-each-ref --points-at=&lt;new&gt;</code> and recorded each distinct count
+            (<code>refs-visibility.sh</code>). Figure 3 shows the result.
+          </p>
+
+          <figure class="figure wide" id="fig-visibility">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">What a polling reader saw during one 10,000-ref transaction, in each backend</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 440" role="img" aria-label="Files backend: the writer locks 10,000 refs and then renames them one at a time; the reader saw counts 0, 252, 838, 1758, 3254, 5762, 9514 and 10000. Reftable: the writer writes one table and renames tables.list.lock once; the reader saw only 0 and 10000. Bars compare create and delete times.">
+                <defs>
+                  <marker id="fig-visibility-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="56" y="26" class="svg-lane">FILES BACKEND · WRITER 2,982 MS · READER 140 SAMPLES</text>
+                <text x="56" y="62" class="svg-lane">writer</text>
+                <rect x="140" y="44" width="300" height="30" fill="#ece6f3" stroke="#765b98"/>
+                <text x="152" y="64" class="svg-sub">prepare: 10,000 .lock files, CAS</text>
+                <rect x="440" y="44" width="620" height="30" fill="#f7f7f5" stroke="#252525"/>
+                <text x="452" y="64" class="svg-sub">commit: rename x.lock → x, one ref at a time</text>
+                <text x="56" y="114" class="svg-lane">reader</text>
+                <line x1="140" y1="110" x2="1060" y2="110" stroke="#b8b8b1" stroke-width="1.5"/>
+                <circle cx="200" cy="110" r="4" fill="#3c6f97"/><circle cx="300" cy="110" r="4" fill="#3c6f97"/><circle cx="400" cy="110" r="4" fill="#3c6f97"/>
+                <text x="300" y="134" class="svg-sub" text-anchor="middle">0</text>
+                <circle cx="500" cy="110" r="4" fill="#ad4b43"/><text x="500" y="134" class="svg-sub" text-anchor="middle">252</text>
+                <circle cx="580" cy="110" r="4" fill="#ad4b43"/><text x="580" y="98" class="svg-sub" text-anchor="middle">838</text>
+                <circle cx="660" cy="110" r="4" fill="#ad4b43"/><text x="660" y="134" class="svg-sub" text-anchor="middle">1758</text>
+                <circle cx="760" cy="110" r="4" fill="#ad4b43"/><text x="760" y="98" class="svg-sub" text-anchor="middle">3254</text>
+                <circle cx="860" cy="110" r="4" fill="#ad4b43"/><text x="860" y="134" class="svg-sub" text-anchor="middle">5762</text>
+                <circle cx="970" cy="110" r="4" fill="#ad4b43"/><text x="970" y="98" class="svg-sub" text-anchor="middle">9514</text>
+                <circle cx="1050" cy="110" r="4" fill="#367f59"/><text x="1050" y="134" class="svg-sub" text-anchor="middle">10000</text>
+                <text x="140" y="160" class="svg-note">red: in-between states a reader can act on (7 in this run, 8 in a re-run; values differ per run)</text>
+
+                <text x="56" y="204" class="svg-lane">REFTABLE BACKEND · WRITER 272 MS · READER 55 SAMPLES</text>
+                <text x="56" y="240" class="svg-lane">writer</text>
+                <rect x="140" y="222" width="230" height="30" fill="#ece6f3" stroke="#765b98"/>
+                <text x="152" y="242" class="svg-sub">lock tables.list.lock</text>
+                <rect x="370" y="222" width="430" height="30" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="382" y="242" class="svg-sub">write &lt;name&gt;.temp.XXXXXX, rename to its final name</text>
+                <path d="M800 237 L842 237" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-visibility-ctl)"/>
+                <rect x="846" y="222" width="214" height="30" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="858" y="242" class="svg-sub">1 rename: new list live</text>
+                <text x="56" y="292" class="svg-lane">reader</text>
+                <line x1="140" y1="288" x2="1060" y2="288" stroke="#b8b8b1" stroke-width="1.5"/>
+                <circle cx="220" cy="288" r="4" fill="#3c6f97"/><circle cx="420" cy="288" r="4" fill="#3c6f97"/><circle cx="620" cy="288" r="4" fill="#3c6f97"/><circle cx="800" cy="288" r="4" fill="#3c6f97"/>
+                <text x="510" y="312" class="svg-sub" text-anchor="middle">0</text>
+                <circle cx="900" cy="288" r="4" fill="#367f59"/><circle cx="1000" cy="288" r="4" fill="#367f59"/>
+                <text x="950" y="312" class="svg-sub" text-anchor="middle">10000</text>
+
+                <text x="56" y="350" class="svg-lane">WRITE COST, SINGLE RUNS · refs-bench.sh</text>
+                <text x="56" y="378" class="svg-sub">create 10,000 refs</text>
+                <rect x="300" y="366" width="500" height="14" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="812" y="378" class="svg-sub">files 3,100 ms</text>
+                <rect x="300" y="384" width="27" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="339" y="396" class="svg-sub">reftable 167 ms</text>
+                <text x="56" y="420" class="svg-sub">delete 1,000 of 100,000</text>
+                <rect x="300" y="408" width="97" height="14" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="409" y="420" class="svg-sub">files 604 ms</text>
+                <rect x="300" y="426" width="4" height="10" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="316" y="436" class="svg-sub">reftable 20 ms</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <code>files</code> is atomic against failure, not against readers; reftable commits with one rename.
+              The counts are measured; where each sample sits on its lane is schematic, and the two lanes do not
+              share a time scale. Bars share one scale.
+            </p>
+          </figure>
+
+          <p>
+            Under <code>files</code> the reader saw 0, then 252, 838, 1,758, 3,254, 5,762 and 9,514 refs moved, then
+            10,000. A verifier's re-run saw eight in-between counts; under reftable both runs saw only 0 and 10,000
+            <span class="recon">measured here</span>. This is documented: <code>Documentation/BreakingChanges.adoc</code>
+            says that with <code>files</code>, "Git may see in-between states when it reads references while a
+            reference transaction is in the process of being committed to disk." Commands that must see a consistent
+            set of refs, such as a server advertising them during a large push, get no such guarantee
+            <span class="recon">reconstruction</span>.
+          </p>
+          <h3>Reflogs, and a regression already fixed</h3>
+          <p>
+            Each ref move also appends one line to <code>logs/&lt;ref&gt;</code>: old id, new id, committer, epoch,
+            timezone, a tab and the message. A first commit's line is 129 bytes. Appends use
+            <code>O_APPEND</code> and take no lock of their own. Branches, remote-tracking refs, notes and
+            <code>HEAD</code> get reflogs by default; tags do not <span class="src">from the code</span>.
+            Expiry has a known bug in v2.50.0 through v2.55.0. <code>reflog.h</code>:25-28 swaps the two defaults:
+          </p>
+<pre><code>#define REFLOG_EXPIRE_OPTIONS_INIT(now) { \
+	.default_expire_total = now - 30 * 24 * 3600, \
+	.default_expire_unreachable = now - 90 * 24 * 3600, \
+}</code></pre>
+          <p>
+            The documentation says 90 days for all entries and 30 for unreachable ones. With the swap, a
+            <code>gc</code> or the maintenance reflog task prunes reachable entries older than 30 days; I reproduced
+            the loss of 45- and 60-day entries <span class="recon">measured here</span>. It came in with
+            <code>8565827570</code> (v2.50.0) and was reported and fixed upstream by <code>60cf500551</code>
+            (24 September 2026), which is on master but in no tag yet. Until a release carries it, setting
+            <code>gc.reflogExpire</code> and <code>gc.reflogExpireUnreachable</code> explicitly restores the
+            documented behaviour, because the config parser overwrites both defaults (<code>reflog.c</code>:48-66)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="reftable"><span class="secnum">04</span>reftable: one rename per transaction</h2>
+          <p class="lede">
+            reftable stores refs the way git stores objects: in immutable files that are never edited, only replaced.
+            A transaction writes one new table and publishes it with one rename, so a reader sees all of it or none.
+          </p>
+          <p>
+            Shawn Pearce specified the format in 2017. Its stated objectives
+            (<code>Documentation/technical/reftable.adoc</code>:28-38) include "Near constant time lookup for any
+            single reference, even when the repository is cold", "Support atomic push with
+            <code>O(size_of_update)</code> operations", and combined reflog storage. Git imported the spec in
+            v2.28.0, the library in v2.35.0 and the backend in v2.45.0 <span class="src">from the code</span>.
+          </p>
+          <p>
+            A table is a 24-byte header (<code>REFT</code>, a version, a 3-byte block size of 4096 by default, and the
+            lowest and highest update index it covers), then blocks, then a footer with a CRC-32. Ref blocks hold
+            records sorted by name, each stored as "reuse N bytes of the previous name, then this suffix". Every 16th
+            record, and any record that reuses nothing, is a restart point: its offset goes in a table at the end of
+            the block, so a reader can binary-search the restarts and then scan at most 16 records
+            (<code>reftable/writer.c</code>:79-80). Log blocks hold reflog records and are zlib-compressed. Figure
+            4 decodes a whole table next to the <code>packed-refs</code> file for the same refs.
+          </p>
+
+          <figure class="figure wide" id="fig-reftable">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">The same four refs as <code>packed-refs</code> text and as a reftable</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 590" role="img" aria-label="Top: a 257-byte packed-refs file with a header ending in a space, one line per ref and a caret line for the peeled tag. Bottom: a 391-byte reftable: a 24-byte header, a ref block of four prefix-compressed records with a restart table, a compressed log block and a footer with a CRC.">
+                <text x="56" y="26" class="svg-lane">packed-refs · 257 BYTES · TEXT, SORTED, BINARY-SEARCHED</text>
+                <rect x="56" y="38" width="580" height="122" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="70" y="60" class="svg-sub"># pack-refs with: peeled fully-peeled sorted</text>
+                <rect x="362" y="49" width="20" height="14" fill="#f7e3c8" stroke="#d98226"/><text x="372" y="60" class="svg-num" text-anchor="middle">SP</text>
+                <text x="70" y="82" class="svg-sub">57ef6b409b72f867c799347c562551b1a76536d6 refs/heads/main</text>
+                <text x="70" y="104" class="svg-sub">57ef6b409b72f867c799347c562551b1a76536d6 refs/heads/topic</text>
+                <text x="70" y="126" class="svg-sub">c8c47bc1c7e563fab3a886eef1c0db8dba3575af refs/tags/v1</text>
+                <text x="70" y="148" class="svg-sub">^57ef6b409b72f867c799347c562551b1a76536d6</text>
+                <text x="656" y="60" class="svg-sub">header ends in a space (0x2c), then LF</text>
+                <text x="656" y="82" class="svg-sub">40 hex · SP · name · LF</text>
+                <text x="656" y="126" class="svg-sub">annotated tag object …</text>
+                <text x="656" y="148" class="svg-sub">… and the commit it peels to (0xd7)</text>
+
+                <text x="56" y="196" class="svg-lane">reftable · 391 BYTES · ONE TABLE AFTER AUTO-COMPACTION</text>
+                <text x="56" y="226" class="svg-sub">@0</text>
+                <rect x="120" y="210" width="110" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="175" y="226" class="svg-sub" text-anchor="middle">52 45 46 54</text>
+                <rect x="230" y="210" width="44" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="252" y="226" class="svg-sub" text-anchor="middle">01</text>
+                <rect x="274" y="210" width="86" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="317" y="226" class="svg-sub" text-anchor="middle">00 10 00</text>
+                <rect x="360" y="210" width="86" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="403" y="226" class="svg-sub" text-anchor="middle">00 … 01</text>
+                <rect x="446" y="210" width="86" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="489" y="226" class="svg-sub" text-anchor="middle">00 … 04</text>
+                <text x="175" y="250" class="svg-sub" text-anchor="middle">"REFT"</text>
+                <text x="252" y="250" class="svg-sub" text-anchor="middle">v1</text>
+                <text x="317" y="250" class="svg-sub" text-anchor="middle">4096</text>
+                <text x="403" y="250" class="svg-sub" text-anchor="middle">min 1</text>
+                <text x="489" y="250" class="svg-sub" text-anchor="middle">max 4</text>
+                <text x="552" y="226" class="svg-sub">header, 24 bytes</text>
+
+                <text x="56" y="280" class="svg-sub">@24  72 00 00 af  →  'r' ref block, 175 bytes counted from the start of the file</text>
+                <text x="148" y="304" class="svg-sub" text-anchor="middle">prefix</text>
+                <text x="204" y="304" class="svg-sub" text-anchor="middle">len·type</text>
+                <text x="302" y="304" class="svg-sub" text-anchor="middle">suffix</text>
+                <text x="392" y="304" class="svg-sub" text-anchor="middle">Δidx</text>
+                <text x="522" y="304" class="svg-sub" text-anchor="middle">value</text>
+
+                <text x="56" y="328" class="svg-sub">@28</text>
+                <rect x="120" y="312" width="56" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="148" y="328" class="svg-sub" text-anchor="middle">00</text>
+                <rect x="176" y="312" width="56" height="24" fill="#ece6f3" stroke="#765b98"/><text x="204" y="328" class="svg-sub" text-anchor="middle">23</text>
+                <rect x="232" y="312" width="140" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="302" y="328" class="svg-sub" text-anchor="middle">HEAD</text>
+                <rect x="372" y="312" width="40" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="392" y="328" class="svg-sub" text-anchor="middle">00</text>
+                <rect x="412" y="312" width="220" height="24" fill="#dfede5" stroke="#367f59"/><text x="522" y="328" class="svg-sub" text-anchor="middle">0f refs/heads/main</text>
+                <text x="648" y="328" class="svg-sub">restart · 23 = 4&lt;&lt;3|3: 4-byte suffix, symref</text>
+
+                <text x="56" y="356" class="svg-sub">@51</text>
+                <rect x="120" y="340" width="56" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="148" y="356" class="svg-sub" text-anchor="middle">00</text>
+                <rect x="176" y="340" width="56" height="24" fill="#ece6f3" stroke="#765b98"/><text x="204" y="356" class="svg-sub" text-anchor="middle">79</text>
+                <rect x="232" y="340" width="140" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="302" y="356" class="svg-sub" text-anchor="middle">refs/heads/main</text>
+                <rect x="372" y="340" width="40" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="392" y="356" class="svg-sub" text-anchor="middle">01</text>
+                <rect x="412" y="340" width="220" height="24" fill="#dfede5" stroke="#367f59"/><text x="522" y="356" class="svg-sub" text-anchor="middle">57 ef 6b 40 … 36 d6</text>
+                <text x="648" y="356" class="svg-sub">restart (prefix 0) · 79 = 15&lt;&lt;3|1: one object id</text>
+
+                <text x="56" y="384" class="svg-sub">@89</text>
+                <rect x="120" y="368" width="56" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="148" y="384" class="svg-sub" text-anchor="middle">0b</text>
+                <rect x="176" y="368" width="56" height="24" fill="#ece6f3" stroke="#765b98"/><text x="204" y="384" class="svg-sub" text-anchor="middle">29</text>
+                <rect x="232" y="368" width="140" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="302" y="384" class="svg-sub" text-anchor="middle">topic</text>
+                <rect x="372" y="368" width="40" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="392" y="384" class="svg-sub" text-anchor="middle">03</text>
+                <rect x="412" y="368" width="220" height="24" fill="#dfede5" stroke="#367f59"/><text x="522" y="384" class="svg-sub" text-anchor="middle">57 ef 6b 40 … 36 d6</text>
+                <text x="648" y="384" class="svg-sub">reuse 11 bytes, "refs/heads/" · 29 = 5&lt;&lt;3|1</text>
+
+                <text x="56" y="412" class="svg-sub">@117</text>
+                <rect x="120" y="396" width="56" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="148" y="412" class="svg-sub" text-anchor="middle">05</text>
+                <rect x="176" y="396" width="56" height="24" fill="#ece6f3" stroke="#765b98"/><text x="204" y="412" class="svg-sub" text-anchor="middle">3a</text>
+                <rect x="232" y="396" width="140" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="302" y="412" class="svg-sub" text-anchor="middle">tags/v1</text>
+                <rect x="372" y="396" width="40" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="392" y="412" class="svg-sub" text-anchor="middle">02</text>
+                <rect x="412" y="396" width="220" height="24" fill="#dfede5" stroke="#367f59"/><text x="522" y="412" class="svg-sub" text-anchor="middle">c8 c4 … + 57 ef …</text>
+                <text x="648" y="412" class="svg-sub">reuse "refs/" · 3a = 7&lt;&lt;3|2: id + peeled id</text>
+
+                <text x="56" y="444" class="svg-sub">@169 00 00 1c · 00 00 33 · 00 02  →  restart table: records at 28 and 51, count 2</text>
+                <text x="56" y="468" class="svg-sub">@175 67 · 00 01 2e · 78 da …  →  'g' log block: 302 bytes inflated, 144 on disk; 3 entries, none for the tag</text>
+                <text x="56" y="492" class="svg-sub">@323 footer, 68 bytes: header copy · log block at 175 · CRC-32 73 09 64 10</text>
+
+                <rect x="56" y="514" width="1008" height="60" rx="4" fill="#ffffff" stroke="#d98226"/>
+                <text x="72" y="538" class="svg-sub">varint in a 20-branch table: 80 31 → (0x00 + 1)&lt;&lt;7 | 0x31 = 177 = 22&lt;&lt;3|1  ·  plain LEB128 would write b1 01</text>
+                <text x="72" y="558" class="svg-sub">the same +1 bias as a pack's OFS_DELTA offset and the index v4 strip count · ~26 bytes per ref here vs ~62 in packed-refs</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Text lines against prefix-compressed binary blocks. The orange bytes are prefix lengths; the purple byte
+              packs the suffix length and the value type; reftable reuses the varint git already uses for pack
+              offsets. Dumps from <code>hexdump -C</code>, decoded with <code>refs-rtdump.py</code>.
+            </p>
+          </figure>
+
+          <h3>The stack and its one rename</h3>
+          <p>
+            Tables live in <code>.git/reftable/</code>, listed in <code>tables.list</code>. A writer
+            takes <code>tables.list.lock</code> (100 ms, <code>reftable.lockTimeout</code>), writes its table as
+            <code>&lt;name&gt;.temp.XXXXXX</code> and renames it to a name like
+            <code>0x000000000001-0x000000000004-ae42d254.ref</code>. Nobody reads that file yet. Then
+            <code>reftable/stack.c</code>:781-799 publishes it:
+          </p>
+<pre><code>	err = reftable_write_data(add-&gt;tables_list_lock.fd,
+				  table_list.buf, table_list.len);
+	reftable_buf_release(&amp;table_list);
+	if (err &lt; 0) {
+		err = REFTABLE_IO_ERROR;
+		goto done;
+	}
+
+	err = fsync(add-&gt;tables_list_lock.fd);
+	if (err &lt; 0) {
+		err = REFTABLE_IO_ERROR;
+		goto done;
+	}
+
+	err = flock_commit(&amp;add-&gt;tables_list_lock);</code></pre>
+          <p>
+            The rename inside <code>flock_commit()</code> is the commit point. The <code>fsync</code> is a macro
+            (<code>reftable/reftable-system.h</code>:16) for git's component-gated fsync, which by default does
+            nothing (<a href="#durability">§05</a>). Readers that find a table gone mid-open retry for about three seconds, and keep the list's
+            file descriptor open so a reused inode cannot fool them. After every commit the stack auto-compacts
+            toward a geometric sequence with factor 2; in my benchmarks it stayed at one to four tables
+            <span class="recon">measured here</span>. The atomicity is per stack. The main repository and each
+            linked worktree have their own stack, and a transaction that spans them commits one stack after another
+            (<code>refs/reftable-backend.c</code>:1012-1016) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two loose ends. The writer still emits an obj index, mapping object-id prefixes to ref blocks, which
+            served the 2017 goal of answering "does any ref point here?" quickly. Git never queries it:
+            <code>reftable_table_refs_for()</code> is called only from a unit test. And reftable still rejects
+            <code>a</code> beside <code>a/b</code>, though the format could hold both <span class="src">from the
+            code</span>. A reftable repository also keeps decoys for older tools: <code>.git/HEAD</code> reads
+            <code>ref: refs/heads/.invalid</code> and <code>refs/heads</code> is a regular file, not a directory
+            <span class="recon">measured here</span>. A small doc drift: <code>reftable.geometricFactor</code> is
+            documented up to 256, and the code dies above 255. The numbers favour it anyway: 26 bytes per ref against 62, 167 against 3,100 ms to create
+            10,000 refs, 20 against 604 ms to delete 1,000 of 100,000, with full listing at 100,000 refs about even
+            (96 against 90 ms) <span class="recon">measured here</span>, <code>refs-bench.sh</code>. <code>files</code>
+            stays the default unless git is built <code>WITH_BREAKING_CHANGES</code>, the Git 3.0 switch, which
+            <code>BreakingChanges.adoc</code> ties to JGit, libgit2 and Gitoxide supporting the format.
+          </p>
+
+          <h2 id="durability"><span class="secnum">05</span>Atomic, not durable</h2>
+          <p class="lede">
+            Every mutable file so far is published the same way: write a complete new file, then rename it over the
+            old one. A reader never sees a torn file. Whether the new file survives a power cut is a separate
+            question, and by default git answers it for packs only.
+          </p>
+          <p>
+            Durability is configured by <code>core.fsync</code>, a set of components. The default is
+            <code>write-or-die.h</code>:27-35:
+          </p>
+<pre><code>#define FSYNC_COMPONENTS_OBJECTS (FSYNC_COMPONENT_LOOSE_OBJECT | \
+				  FSYNC_COMPONENT_PACK)
+
+#define FSYNC_COMPONENTS_DERIVED_METADATA (FSYNC_COMPONENT_PACK_METADATA | \
+					   FSYNC_COMPONENT_COMMIT_GRAPH)
+
+#define FSYNC_COMPONENTS_DEFAULT ((FSYNC_COMPONENTS_OBJECTS | \
+				   FSYNC_COMPONENTS_DERIVED_METADATA) &amp; \
+				  ~FSYNC_COMPONENT_LOOSE_OBJECT)</code></pre>
+          <p>
+            Packs, pack indexes and bitmaps, and the commit-graph are synced. Loose objects are masked out. The index
+            and refs are not in the set at all <span class="src">from the code</span>. Counting trace2
+            hardware flushes: <code>git update-ref</code>, <code>git add</code> and <code>hash-object -w</code> each
+            made 0 by default; <code>core.fsync=reference</code> gave 1 under <code>files</code> and 2 under reftable,
+            and <code>core.fsync=index</code> gave 1. A whole traced <code>add</code> plus <code>commit</code> made no
+            <code>fsync</code> or <code>fdatasync</code> call <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Two details. <code>Documentation/config/core.adoc</code> says <code>committed</code> "is currently
+            equivalent to <code>objects</code>", but since <code>bc22d845c4</code> (v2.36.0) the code adds
+            <code>reference</code> (<code>write-or-die.h</code>:37-38); measured, <code>update-ref</code> flushes once
+            under <code>committed</code> and never under <code>objects</code>. And reflog appends have no fsync call at
+            all: the only one in <code>refs/files-backend.c</code> is at line 2016, for the loose-ref lockfile
+            <span class="src">from the code</span>. After a crash the rename can outlive the bytes it published, a
+            ref naming an object whose file was never flushed. Whether that happens depends on the filesystem's
+            ordering. Anyone who needs commits to survive should set <code>core.fsync=committed</code> or
+            <code>added</code> <span class="recon">reconstruction</span>. Figure 5 lists every structure
+            in the collection, with its lock, its patience and its commit point.
+          </p>
+
+          <figure class="figure wide" id="fig-locks">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">Locks and durability for every on-disk structure in git v2.55.0</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Structure</th><th>Lock</th><th>Waits</th><th>Commit point</th><th>Synced by default?</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Loose object</td><td>none; temp file</td><td>—</td><td><code>link()</code>; an existing copy wins</td><td class="hl-red" style="background: var(--red-soft)">No (0 flushes)</td></tr>
+                  <tr><td>Pack, <code>.idx</code>, <code>.rev</code>, bitmap</td><td>none; temp files</td><td>—</td><td>rename, <code>.idx</code> last</td><td class="hl-green" style="background: var(--green-soft)">Yes</td></tr>
+                  <tr><td>Pushed objects</td><td>none; quarantine dir</td><td>—</td><td>migrated after <code>pre-receive</code></td><td>as their type</td></tr>
+                  <tr><td>Multi-pack index</td><td>lockfile</td><td>0 ms</td><td>rename</td><td class="hl-green" style="background: var(--green-soft)">Yes</td></tr>
+                  <tr><td>Index</td><td><code>index.lock</code></td><td>0 ms</td><td>rename</td><td class="hl-red" style="background: var(--red-soft)">No (0; 1 with <code>index</code>)</td></tr>
+                  <tr><td>Loose ref</td><td><code>&lt;ref&gt;.lock</code></td><td>100 ms</td><td>one rename per ref</td><td class="hl-red" style="background: var(--red-soft)">No (0; 1 with <code>reference</code>)</td></tr>
+                  <tr><td><code>HEAD</code> in a commit</td><td><code>HEAD.lock</code>, log only</td><td>100 ms</td><td>unlinked; <code>HEAD</code> untouched</td><td class="hl-red" style="background: var(--red-soft)">No</td></tr>
+                  <tr><td><code>packed-refs</code></td><td><code>packed-refs.lock</code></td><td>1000 ms</td><td>rename of <code>packed-refs.new</code></td><td class="hl-red" style="background: var(--red-soft)">No</td></tr>
+                  <tr><td>Reflog (<code>files</code>)</td><td>none; <code>O_APPEND</code></td><td>—</td><td>append</td><td class="hl-red" style="background: var(--red-soft)">Never: no fsync call</td></tr>
+                  <tr><td>reftable stack</td><td><code>tables.list.lock</code></td><td>100 ms</td><td>one rename per stack</td><td class="hl-red" style="background: var(--red-soft)">No (0; 2 with <code>reference</code>)</td></tr>
+                  <tr><td><code>AUTO_MERGE</code></td><td>own lock; delete also takes <code>packed-refs.lock</code></td><td>100 / 1000 ms</td><td>rename or unlink</td><td class="hl-red" style="background: var(--red-soft)">No</td></tr>
+                  <tr><td><code>MERGE_HEAD</code>, <code>MERGE_MSG</code>, <code>COMMIT_EDITMSG</code></td><td>none</td><td>—</td><td>written in place</td><td class="hl-red" style="background: var(--red-soft)">No</td></tr>
+                  <tr><td>Commit-graph</td><td><code>commit-graph.lock</code></td><td>0 ms</td><td>rename</td><td class="hl-green" style="background: var(--green-soft)">Yes</td></tr>
+                  <tr><td>Maintenance</td><td><code>maintenance.lock</code></td><td>0 ms; <code>--auto</code> exits quietly</td><td>—</td><td>n/a</td></tr>
+                  <tr><td><code>gc</code></td><td><code>gc.pid.lock</code></td><td>0 ms, plus a 12-hour rule</td><td>rename</td><td>n/a</td></tr>
+                  <tr><td>Prune</td><td>none</td><td>—</td><td>deletes unreachable objects older than 2 weeks</td><td>n/a</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Four lock policies, not one: no lock for objects, 0 ms for the index and the derived files, 100 ms for a
+              ref, 1000 ms for <code>packed-refs</code>. Every commit point is a rename or a link; only pack data and
+              the commit-graph are synced unless <code>core.fsync</code> says otherwise. Flush counts are trace2
+              <code>fsync/hardware-flush</code>, measured here; the rest is read from the code.
+            </p>
+          </figure>
+
+          <h2 id="wire"><span class="secnum">06</span>The wire: pkt-lines and protocol v2</h2>
+          <p class="lede">
+            Moving state between repositories means agreeing on refs, then shipping a pack. Every byte of that
+            conversation, in every transport, is framed the same way, and protocol v2 changed the conversation far
+            more than the framing.
+          </p>
+          <p>
+            The frame is the pkt-line: four hex digits giving a length that counts the four digits themselves, then
+            the payload. <code>000eversion 2\n</code> is 14 bytes, 4 plus 10. The maximum is 65,520 bytes in total
+            (<code>LARGE_PACKET_MAX</code>, <code>pkt-line.h</code>:233). Lengths that cannot hold a payload are
+            reused as markers, in <code>pkt-line.c</code>:434-451:
+          </p>
+<pre><code>	} else if (!len) {
+		packet_trace("0000", 4, 0);
+		*pktlen = 0;
+		return PACKET_READ_FLUSH;
+	} else if (len == 1) {
+		packet_trace("0001", 4, 0);
+		*pktlen = 0;
+		return PACKET_READ_DELIM;
+	} else if (len == 2) {
+		packet_trace("0002", 4, 0);
+		*pktlen = 0;
+		return PACKET_READ_RESPONSE_END;
+	} else if (len &lt; 4) {</code></pre>
+          <p>
+            <code>0000</code> ends a message, <code>0001</code> separates sections within one, <code>0002</code> ends
+            a response over stateless HTTP, and <code>0003</code> is an error. When a pack and progress share one
+            stream, each pkt-line carries a band byte after its length: 1 for pack data, 2 for progress (printed as
+            <code>remote: …</code>), 3 for a fatal error. New in v2.55.0, control characters in remote sideband text are
+            masked, with ANSI colour still allowed by default (<code>sideband.allowControlCharacters</code>)
+            <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-wire">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">pkt-line framing, and a clone in protocol v0 and v2</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 500" role="img" aria-label="Top: annotated pkt-lines: 000e version 2, the flush, delim and response-end markers, a band-1 packet carrying the start of a pack, and a 6-byte band-1 packet carrying the final byte. Bottom: a v0 clone where the server sends every ref first, beside a v2 clone where the client asks for refs by prefix.">
+                <defs>
+                  <marker id="fig-wire-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="56" y="26" class="svg-lane">PKT-LINES · BYTES FROM A v2 CLONE OVER file://</text>
+                <rect x="56" y="40" width="50" height="30" fill="#f7e3c8" stroke="#d98226"/><text x="81" y="59" class="svg-sub" text-anchor="middle">000e</text>
+                <rect x="106" y="40" width="100" height="30" fill="#ffffff" stroke="#b8b8b1"/><text x="156" y="59" class="svg-sub" text-anchor="middle">version 2\n</text>
+                <rect x="226" y="40" width="50" height="30" fill="#f7f7f5" stroke="#252525"/><text x="251" y="59" class="svg-sub" text-anchor="middle">0000</text>
+                <rect x="296" y="40" width="50" height="30" fill="#f7f7f5" stroke="#252525"/><text x="321" y="59" class="svg-sub" text-anchor="middle">0001</text>
+                <rect x="366" y="40" width="50" height="30" fill="#f7f7f5" stroke="#252525"/><text x="391" y="59" class="svg-sub" text-anchor="middle">0002</text>
+                <rect x="436" y="40" width="50" height="30" fill="#f7e3c8" stroke="#d98226"/><text x="461" y="59" class="svg-sub" text-anchor="middle">01e6</text>
+                <rect x="486" y="40" width="30" height="30" fill="#e0ebf2" stroke="#3c6f97"/><text x="501" y="59" class="svg-sub" text-anchor="middle">01</text>
+                <rect x="516" y="40" width="210" height="30" fill="#ffffff" stroke="#b8b8b1"/><text x="621" y="59" class="svg-sub" text-anchor="middle">PACK 00000002 00000007 …</text>
+                <rect x="746" y="40" width="50" height="30" fill="#f7e3c8" stroke="#d98226"/><text x="771" y="59" class="svg-sub" text-anchor="middle">0006</text>
+                <rect x="796" y="40" width="30" height="30" fill="#e0ebf2" stroke="#3c6f97"/><text x="811" y="59" class="svg-sub" text-anchor="middle">01</text>
+                <rect x="826" y="40" width="40" height="30" fill="#ffffff" stroke="#b8b8b1"/><text x="846" y="59" class="svg-sub" text-anchor="middle">58</text>
+                <text x="131" y="90" class="svg-sub" text-anchor="middle">14 = 4 + 10</text>
+                <text x="251" y="90" class="svg-sub" text-anchor="middle">flush</text>
+                <text x="321" y="90" class="svg-sub" text-anchor="middle">delim</text>
+                <text x="391" y="90" class="svg-sub" text-anchor="middle">resp-end</text>
+                <text x="581" y="90" class="svg-sub" text-anchor="middle">486 = 4 + band byte + 481 pack bytes</text>
+                <text x="806" y="90" class="svg-sub" text-anchor="middle">last byte, alone</text>
+                <text x="890" y="52" class="svg-sub">band 1 pack · 2 progress</text>
+                <text x="890" y="68" class="svg-sub">band 3 fatal error</text>
+
+                <!-- v0 panel -->
+                <text x="56" y="138" class="svg-lane">v0 CLONE · THE SERVER SPEAKS FIRST</text>
+                <text x="100" y="162" class="svg-step" text-anchor="middle">client</text>
+                <text x="480" y="162" class="svg-step" text-anchor="middle">upload-pack</text>
+                <line x1="100" y1="170" x2="100" y2="390" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <line x1="480" y1="170" x2="480" y2="390" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="290" y="200" class="svg-sub" text-anchor="middle">every ref; capabilities after a NUL</text>
+                <path d="M480 208 L104 208" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="290" y="240" class="svg-sub" text-anchor="middle">want + chosen capabilities, want …</text>
+                <path d="M100 248 L476 248" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="290" y="280" class="svg-sub" text-anchor="middle">0000 · done (a clone has no haves)</text>
+                <path d="M100 288 L476 288" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="290" y="320" class="svg-sub" text-anchor="middle">NAK, then PACK in band 1</text>
+                <path d="M480 328 L104 328" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+
+                <!-- v2 panel -->
+                <text x="580" y="138" class="svg-lane">v2 CLONE · THE CLIENT ASKS</text>
+                <text x="624" y="162" class="svg-step" text-anchor="middle">client</text>
+                <text x="1024" y="162" class="svg-step" text-anchor="middle">upload-pack</text>
+                <line x1="624" y1="170" x2="624" y2="390" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <line x1="1024" y1="170" x2="1024" y2="390" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="824" y="200" class="svg-sub" text-anchor="middle">capabilities only: ls-refs, fetch=…, 0000</text>
+                <path d="M1024 208 L628 208" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="824" y="240" class="svg-sub" text-anchor="middle">command=ls-refs · 0001 · ref-prefix refs/heads/ …</text>
+                <path d="M624 248 L1020 248" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="824" y="280" class="svg-sub" text-anchor="middle">only refs under a requested prefix</text>
+                <path d="M1024 288 L628 288" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="824" y="320" class="svg-sub" text-anchor="middle">command=fetch · 0001 · want … / done</text>
+                <path d="M624 328 L1020 328" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+                <text x="824" y="360" class="svg-sub" text-anchor="middle">packfile · PACK in band 1</text>
+                <path d="M1024 368 L628 368" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-wire-data)"/>
+
+                <rect x="56" y="414" width="1008" height="70" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="72" y="438" class="svg-sub">11,101 refs, measured: full advertisement 704,410 B in v0 and 702,972 B in v2 (ls-refs with no prefix)</text>
+                <text x="72" y="458" class="svg-sub">up-to-date fetch origin main --no-tags: 202 B in v2 (ref-prefix) vs 704,410 B in v0</text>
+                <text x="72" y="476" class="svg-sub">plain fetch origin main also asks for refs/tags/ to follow tags: 72,892 B back</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              v2's saving is ref filtering, not framing, and tag following gives much of it back. Top bytes from a
+              <code>tee</code> wrapper around <code>git-upload-pack</code>; the measurements from
+              <code>transport-lsrefs.sh</code>, three repetitions.
+            </p>
+          </figure>
+
+          <h3>Asking for v2</h3>
+          <p>
+            A client asks for v2 unless <code>protocol.version</code> says otherwise (<code>protocol.c</code>:46); the
+            comment in <code>protocol.h</code>:32-37 still says the unconfigured default is v0, stale since v2.29.0.
+            The server takes the highest <code>version=N</code> it finds in <code>GIT_PROTOCOL</code> and falls back to
+            v0. Each transport smuggles that variable its own way <span class="src">from the code</span>. git://
+            appends <code>version=2</code> after a second NUL in its first packet (<code>connect.c</code>:1263-1267).
+            ssh passes <code>-o SendEnv=GIT_PROTOCOL</code>, which works only with OpenSSH and only if the server's
+            sshd accepts the variable. file:// sets the environment variable directly, and HTTP sends a
+            <code>Git-Protocol: version=2</code> header. An old server ignores all of these and speaks v0, which is
+            why the scheme could ship without a flag day <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            v2 became the default in v2.26.0 (<code>684ceae32d</code>), was reverted in v2.27.0
+            (<code>11c7f2a30b</code>) after fetches of the kernel gave up negotiating too early, sat behind
+            <code>feature.experimental</code> in v2.28.0, and has been the default since v2.29.0
+            (<code>eb049759fb</code>). The fix that made the second attempt stick is in <a href="#negotiation-push">§07</a>.
+          </p>
+          <h3>Where v2 saves bytes</h3>
+          <p>
+            In v0 the server writes every ref before reading anything, with its capabilities hidden after a NUL on the
+            first line. In v2 it sends a short capability list and waits. The client then sends commands. Each is a
+            capability block, a <code>0001</code> delimiter, arguments and a flush. A clone sends
+            <code>ref-prefix refs/heads/</code>, <code>ref-prefix refs/tags/</code> and <code>ref-prefix HEAD</code>,
+            and the server hands the prefixes straight to the ref backend's prefix iterator (<code>ls-refs.c</code>:202-211)
+            <span class="src">from the code</span>. The spec calls <code>ref-prefix</code> "purely for optimization".
+            Here is the clone's <code>ls-refs</code> request as it crossed the pipe, one pkt-line per row
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>0014 command=ls-refs\n
+001a agent=git/2.55.0-Linux        no LF: written with packet_write_fmt("agent=%s")
+0016 object-format=sha1            no LF either; receivers must accept both
+0001                               delim: capabilities end, arguments begin
+0009 peel\n
+000c symrefs\n
+000b unborn\n
+001b ref-prefix refs/heads/\n
+001a ref-prefix refs/tags/\n
+0014 ref-prefix HEAD\n
+0000                               flush: end of command</code></pre>
+          <p>
+            The server had advertised <code>agent</code>, <code>ls-refs=unborn</code>, <code>fetch=shallow
+            wait-for-done</code>, <code>server-option</code> and <code>object-format=sha1</code>. Optional features such
+            as <code>filter</code> appear only when the server's config turns them on. Its first reply line was
+            <code>0050</code>: 80 bytes holding <code>HEAD</code>'s id and <code>symref-target:refs/heads/main</code>.
+          </p>
+          <p>
+            It is the whole optimization. In a repository with 11,101 refs the full listing is about 704 KB in either
+            version. An up-to-date <code>git fetch origin main --no-tags</code> exchanged 202 bytes in v2 against
+            704,410 in v0 <span class="recon">measured here</span>. Most fetches do not look like that. Plain
+            <code>git fetch origin main</code> also asks for <code>refs/tags/</code> to follow tags, and received
+            72,892 bytes. <code>git ls-remote origin main</code> sends no prefix at all, because its patterns are tail
+            matches done on the client, and got the full 702,972 bytes.
+          </p>
+          <p>
+            Over HTTP, v2 is <code>stateless-connect</code>. <code>GET info/refs</code> with the
+            <code>Git-Protocol</code> header returns only capabilities, 144 bytes against v0's 560 for the small
+            test repository. Every command is then one POST: 181 bytes up and 313 down for <code>ls-refs</code>, 323 up and
+            1,140 down for the fetch. The server holds no state between POSTs. The remote helper injects a
+            <code>0002</code> after each response, and <code>fetch-pack</code> checks for it, so a truncated HTTP body
+            is an error rather than a short answer. The byte counts are <span class="recon">measured here</span>;
+            the reason for the marker is my <span class="recon">reconstruction</span>.
+          </p>
+
+          <h2 id="negotiation-push"><span class="secnum">07</span>Negotiation and push</h2>
+          <p class="lede">
+            A fetch has to work out which commits the two sides share before the server can build a pack of only what
+            is missing. A push skips that and sends objects into a quarantine, where they stay until a hook accepts
+            them.
+          </p>
+          <p>
+            The v2 <code>fetch</code> command is stateless. Each round the client sends its wants, every have the
+            server has already acknowledged, and a fresh batch of haves (<code>send_fetch_request()</code>,
+            <code>fetch-pack.c</code>:1411-1489). Batches start at 16 and double up to 16,384, then grow by 10%; over a
+            v0 pipe they double to 32 and then add 32 each round (<code>next_flush()</code>, 277-291)
+            <span class="src">from the code</span>. The server answers with <code>upload-pack.c</code>:1686-1708:
+          </p>
+<pre><code>static int send_acks(struct upload_pack_data *data, struct object_array *acks)
+{
+	int i;
+
+	packet_writer_write(&amp;data-&gt;writer, "acknowledgments\n");
+
+	/* Send Acks */
+	if (!acks-&gt;nr)
+		packet_writer_write(&amp;data-&gt;writer, "NAK\n");
+
+	for (i = 0; i &lt; acks-&gt;nr; i++) {
+		packet_writer_write(&amp;data-&gt;writer, "ACK %s\n",
+				    oid_to_hex(&amp;acks-&gt;objects[i].item-&gt;oid));
+	}
+
+	if (!data-&gt;wait_for_done &amp;&amp; ok_to_give_up(data)) {
+		/* Send Ready */
+		packet_writer_write(&amp;data-&gt;writer, "ready\n");
+		return 1;
+	}
+
+	return 0;
+}</code></pre>
+          <p>
+            Every have the server owns is marked, with its parents, as something the client has.
+            <code>ok_to_give_up()</code> is true once every want reaches such a commit. Then the server says
+            <code>ready</code>, a <code>0001</code>, and the pack follows in the same response; otherwise it sends a
+            flush and waits for another round. The client stops sending haves after <code>MAX_IN_VAIN</code>, 256,
+            without a new ACK. Since <code>4fa3f00abb</code> (v2.27.0) that count starts only after the first ACK
+            (<code>fetch-pack.c</code>:1476). That was the fix that let v2 become the default again
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Which haves to send is the negotiator's choice. <code>consecutive</code>, the default, walks the client's
+            history newest first and sends every commit not known to be common. <code>skipping</code> sends a commit,
+            then skips gaps that grow as <code>ttl*3/2+1</code>. <code>noop</code> sends nothing. Figure
+            7 shows what each cost on this machine.
+          </p>
+
+          <figure class="figure wide" id="fig-negotiation">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">Which commits each negotiator offers, and what it cost at N = 5,000</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 410" role="img" aria-label="Left: a client history with shared base commits and N local commits; consecutive offers every local commit, skipping offers commits at growing gaps and can jump past the common commit, noop offers none. Right: measured haves and objects for six runs on a log scale.">
+                <text x="56" y="26" class="svg-lane">CLIENT HISTORY · NEWEST ON THE RIGHT</text>
+                <line x1="70" y1="70" x2="500" y2="70" stroke="#b8b8b1" stroke-width="1.5"/>
+                <circle cx="70" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="100" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="130" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="160" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="190" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="220" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <circle cx="250" cy="70" r="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <circle cx="280" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="310" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="340" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="370" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="400" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="430" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="460" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="490" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="145" y="98" class="svg-sub" text-anchor="middle">shared base</text>
+                <text x="250" y="50" class="svg-sub" text-anchor="middle">common</text>
+                <text x="385" y="98" class="svg-sub" text-anchor="middle">N commits the server lacks</text>
+
+                <text x="56" y="140" class="svg-lane">consecutive</text>
+                <circle cx="250" cy="136" r="4" fill="#d98226"/><circle cx="280" cy="136" r="4" fill="#d98226"/><circle cx="310" cy="136" r="4" fill="#d98226"/><circle cx="340" cy="136" r="4" fill="#d98226"/><circle cx="370" cy="136" r="4" fill="#d98226"/><circle cx="400" cy="136" r="4" fill="#d98226"/><circle cx="430" cy="136" r="4" fill="#d98226"/><circle cx="460" cy="136" r="4" fill="#d98226"/><circle cx="490" cy="136" r="4" fill="#d98226"/>
+                <text x="56" y="180" class="svg-lane">skipping</text>
+                <circle cx="490" cy="176" r="4" fill="#d98226"/><circle cx="460" cy="176" r="4" fill="#d98226"/><circle cx="400" cy="176" r="4" fill="#d98226"/><circle cx="310" cy="176" r="4" fill="#d98226"/>
+                <circle cx="160" cy="176" r="4" fill="#ad4b43"/>
+                <text x="168" y="198" class="svg-sub">overshoot past "common"</text>
+                <text x="56" y="226" class="svg-lane">noop</text>
+                <text x="250" y="226" class="svg-sub">no haves: the whole history comes back</text>
+
+                <text x="56" y="272" class="svg-note">one round: wants + all ACKed haves + a new batch (16, 32 … 16,384, then +10%)</text>
+                <text x="56" y="294" class="svg-note">server: ACK each have it owns; "ready" once every want reaches one</text>
+                <text x="56" y="316" class="svg-note">client: done after 256 haves with no new ACK, counted from the first ACK</text>
+
+                <text x="580" y="26" class="svg-lane">MEASURED · N = 5,000 · LOG SCALE</text>
+                <line x1="740" y1="38" x2="740" y2="372" stroke="#deded9"/>
+                <line x1="810" y1="38" x2="810" y2="372" stroke="#deded9"/>
+                <line x1="880" y1="38" x2="880" y2="372" stroke="#deded9"/>
+                <line x1="950" y1="38" x2="950" y2="372" stroke="#deded9"/>
+                <line x1="1020" y1="38" x2="1020" y2="372" stroke="#deded9"/>
+                <text x="740" y="390" class="svg-sub" text-anchor="middle">1</text>
+                <text x="810" y="390" class="svg-sub" text-anchor="middle">10</text>
+                <text x="880" y="390" class="svg-sub" text-anchor="middle">100</text>
+                <text x="950" y="390" class="svg-sub" text-anchor="middle">1k</text>
+                <text x="1020" y="390" class="svg-sub" text-anchor="middle">10k</text>
+
+                <text x="580" y="58" class="svg-step">A consecutive v2</text><text x="580" y="74" class="svg-sub">9 rounds</text>
+                <rect x="740" y="48" width="270" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="1016" y="58" class="svg-sub">7,000</text>
+                <rect x="740" y="62" width="33" height="10" fill="#dfede5" stroke="#367f59"/><text x="779" y="72" class="svg-sub">3</text>
+
+                <text x="580" y="112" class="svg-step">A consecutive v0</text><text x="580" y="128" class="svg-sub">159 rounds</text>
+                <rect x="740" y="102" width="260" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="1006" y="112" class="svg-sub">5,056</text>
+                <rect x="740" y="116" width="33" height="10" fill="#dfede5" stroke="#367f59"/><text x="779" y="126" class="svg-sub">3</text>
+
+                <text x="580" y="166" class="svg-step">A skipping v2</text><text x="580" y="182" class="svg-sub">1 round</text>
+                <rect x="740" y="156" width="84" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="830" y="166" class="svg-sub">16</text>
+                <rect x="740" y="170" width="33" height="10" fill="#dfede5" stroke="#367f59"/><text x="779" y="180" class="svg-sub">3</text>
+
+                <text x="580" y="220" class="svg-step">A noop v2</text><text x="580" y="236" class="svg-sub">1 round</text>
+                <text x="746" y="220" class="svg-sub">0 haves</text>
+                <rect x="740" y="224" width="265" height="10" fill="#f3dfdc" stroke="#ad4b43"/><text x="1011" y="234" class="svg-sub">6,003</text>
+
+                <text x="580" y="274" class="svg-step">C consecutive v2</text><text x="580" y="290" class="svg-sub">9 rounds</text>
+                <rect x="740" y="264" width="264" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="1010" y="274" class="svg-sub">6,000</text>
+                <rect x="740" y="278" width="243" height="10" fill="#dfede5" stroke="#367f59"/><text x="989" y="288" class="svg-sub">3,004</text>
+
+                <text x="580" y="328" class="svg-step">C skipping v2</text><text x="580" y="344" class="svg-sub">2 rounds</text>
+                <rect x="740" y="318" width="90" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="836" y="328" class="svg-sub">19</text>
+                <rect x="740" y="332" width="265" height="10" fill="#f3dfdc" stroke="#ad4b43"/><text x="1011" y="342" class="svg-sub">6,001</text>
+                <text x="580" y="404" class="svg-note">blue haves sent · green objects received · red more than needed</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Exact negotiation can cost thousands of haves; the fast negotiator can overshoot to a near-full clone
+              when the common commit is not one of the client's tips. Scenario A: the common commit is a
+              remote-tracking tip. Scenario C: it is not. From <code>transport-negotiation.sh</code> and
+              <code>-c.sh</code>, deterministic, with auto-maintenance off.
+            </p>
+          </figure>
+
+          <p>
+            In scenario A, <code>consecutive</code> sent all 5,000 unshared commits and, because its last doubled
+            batch ran 2,000 commits into shared history, 7,000 haves in 9 rounds; v0's slower growth needed 159
+            rounds. <code>skipping</code> got the exact 3 objects with 16 haves, because the remote-tracking tip is
+            in its first batch. In scenario C it skipped past the common commit and received 6,001 objects where
+            3,004 were needed <span class="recon">measured here</span>.
+          </p>
+          <h3>How the pack is made and sent</h3>
+          <p>
+            <code>upload-pack</code> does not build packs. It spawns <code>pack-objects --revs --stdout</code>, feeds
+            it the wants, <code>--not</code>, and the common haves, and relays its output in band 1, with empty band-1
+            packets as keepalives. It holds back the last byte. The comment in <code>upload-pack.c</code>:225-234
+            says why: "unpack-objects would happily accept a valid packdata with trailing garbage". If
+            <code>pack-objects</code> dies, the client gets a pack missing its final byte, a truncated pack. In
+            the captured clone that byte travelled alone as <code>0006 01 58</code> <span class="recon">measured
+            here</span>.
+          </p>
+          <p>
+            Two documented surprises sit here. A v2 <code>want</code> only checks that the object exists, so a
+            dangling commit or the tip of a ref hidden with <code>uploadpack.hideRefs</code> can be fetched by id;
+            v0 refuses with "Server does not allow request for unadvertised object". <code>gitprotocol-v2.adoc</code>
+            says wants "are not limited to advertised objects", but the <code>uploadpack.allow*SHA1InWant</code> pages
+            do not say they apply only to v0. And from v2.19.0, a server with <code>uploadpack.allowRefInWant</code>
+            sent <code>wanted-refs</code> before <code>shallow-info</code>, the reverse of what the client reads, so
+            <code>git clone --depth 1</code> died with "expected 'packfile', received 'shallow-info'". That was fixed
+            upstream by <code>191740edaa</code> (16 September 2026), on master and in no tag yet.
+          </p>
+          <h3>Push is still v0</h3>
+          <p>
+            Every push speaks protocol v0, over every transport. <code>connect.c</code>:1410-1417:
+          </p>
+<pre><code>	/*
+	 * NEEDSWORK: If we are trying to use protocol v2 and we are planning
+	 * to perform any operation that doesn't involve upload-pack (i.e., a
+	 * fetch, ls-remote, etc), then fallback to v0 since we don't know how
+	 * to do anything else (like push or remote archive) via v2.
+	 */
+	if (version == protocol_v2 &amp;&amp; service != GIT_CONNECT_UPLOAD_PACK)
+		version = protocol_v0;</code></pre>
+          <p>
+            <code>remote-curl.c</code>:494-501 does the same for HTTP, and <code>receive-pack</code> ignores a v2
+            request (<code>builtin/receive-pack.c</code>:2662-2668) <span class="src">from the code</span>. The client
+            sends one <code>old new ref</code> line per update, its capabilities after a NUL on the first, a flush,
+            any push options, a flush, and then the pack, raw and unframed. A captured <code>push --atomic -o
+            ci.skip</code> began <code>00ca</code> + 40 zeros (a create) and ended with <code>000bci.skip</code>,
+            <code>0000</code> and <code>PACK</code> <span class="recon">measured here</span>. Figure
+            8 follows the pack through the server.
+          </p>
+
+          <figure class="figure wide" id="fig-push">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">What <code>receive-pack</code> does with a push, in order</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 330" role="img" aria-label="A client sends commands, push options and a raw pack. The server unpacks into a quarantine directory, checks connectivity, runs pre-receive, migrates objects, runs update hooks and the ref transaction, sends report-status inside band 1, then runs post-receive. If pre-receive rejects, the quarantine is deleted.">
+                <defs>
+                  <marker id="fig-push-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-push-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-push-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ad4b43"/></marker>
+                </defs>
+                <text x="56" y="26" class="svg-lane">CLIENT · send-pack</text>
+                <rect x="56" y="38" width="420" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="70" y="60" class="svg-sub">00ca &lt;old&gt; &lt;new&gt; refs/heads/topic\0caps · 0000</text>
+                <text x="70" y="80" class="svg-sub">000bci.skip · 0000 · PACK … (raw, unframed)</text>
+                <rect x="760" y="44" width="304" height="40" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="776" y="68" class="svg-sub">push still speaks v0 (NEEDSWORK)</text>
+                <path d="M120 96 L120 140" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-push-data)"/>
+
+                <text x="140" y="128" class="svg-lane">SERVER · receive-pack</text>
+                <rect x="56" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="64" y="164" class="svg-step">1 unpack</text>
+                <text x="64" y="184" class="svg-sub">&lt;100: loose</text>
+                <text x="64" y="200" class="svg-sub">else index-pack</text>
+                <text x="64" y="216" class="svg-sub">into quarantine</text>
+                <rect x="202" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="210" y="164" class="svg-step">2 connectivity</text>
+                <text x="210" y="184" class="svg-sub">rev-list --objects</text>
+                <text x="210" y="200" class="svg-sub">--not --all</text>
+                <text x="210" y="216" class="svg-sub">closure only</text>
+                <rect x="348" y="144" width="136" height="80" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="356" y="164" class="svg-step">3 pre-receive</text>
+                <text x="356" y="184" class="svg-sub">sees quarantine</text>
+                <text x="356" y="200" class="svg-sub">GIT_QUARANTINE_</text>
+                <text x="356" y="216" class="svg-sub">PATH, push opts</text>
+                <rect x="494" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="502" y="164" class="svg-step">4 migrate</text>
+                <text x="502" y="184" class="svg-sub">loose, then</text>
+                <text x="502" y="200" class="svg-sub">.keep .pack</text>
+                <text x="502" y="216" class="svg-sub">.rev .idx, rest</text>
+                <rect x="640" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="648" y="164" class="svg-step">5 refs</text>
+                <text x="648" y="184" class="svg-sub">update hooks</text>
+                <text x="648" y="200" class="svg-sub">ref transaction</text>
+                <text x="648" y="216" class="svg-sub">atomic or batched</text>
+                <rect x="786" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="794" y="164" class="svg-step">6 report</text>
+                <text x="794" y="184" class="svg-sub">unpack ok</text>
+                <text x="794" y="200" class="svg-sub">ok refs/heads/…</text>
+                <text x="794" y="216" class="svg-sub">inside band 1</text>
+                <rect x="932" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="940" y="164" class="svg-step">7 post-receive</text>
+                <text x="940" y="184" class="svg-sub">output on band 2</text>
+                <text x="940" y="200" class="svg-sub">then maintenance</text>
+                <text x="940" y="216" class="svg-sub">run --auto</text>
+                <path d="M192 184 L200 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M338 184 L346 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M484 184 L492 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M630 184 L638 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M776 184 L784 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M922 184 L930 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <rect x="56" y="232" width="428" height="10" fill="#ece6f3"/>
+                <text x="56" y="260" class="svg-sub">objects live in objects/tmp_objdir-incoming-XXXXXX</text>
+                <path d="M416 224 L416 284" stroke="#ad4b43" stroke-width="1.6" marker-end="url(#fig-push-red)"/>
+                <rect x="348" y="288" width="430" height="34" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="362" y="310" class="svg-sub">hook says no → quarantine deleted; objects/ untouched</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Pushed objects live in quarantine until <code>pre-receive</code> accepts them; a rejected push never
+              touches <code>objects/</code>. Steps from <code>builtin/receive-pack.c</code>; the bytes and child
+              processes captured here with <code>GIT_TRACE</code> and a <code>tee</code> wrapper.
+            </p>
+          </figure>
+
+          <p>
+            The server unpacks into <code>objects/tmp_objdir-incoming-XXXXXX</code>, exploding fewer than 100 objects
+            (<code>transfer.unpackLimit</code>) and otherwise keeping the pack with <code>index-pack --fix-thin
+            --keep</code>. Child processes see the quarantine as <code>GIT_OBJECT_DIRECTORY</code> with the real store
+            as an alternate. The connectivity check proves every new ref leads only to objects the repository now
+            has; it does not prove they are well formed. Only after <code>pre-receive</code> accepts does
+            <code>builtin/receive-pack.c</code>:2105-2109 move them into place:
+          </p>
+<pre><code>	/*
+	 * Now we'll start writing out refs, which means the objects need
+	 * to be in their final positions so that other processes can see them.
+	 */
+	if (tmp_objdir_migrate(tmp_objdir) &lt; 0) {</code></pre>
+          <p>
+            <code>--atomic</code> pushes use one ref transaction; others, since v2.51.0, a batched one that lets single
+            refs fail. The report is pkt-lines nested inside band-1 pkt-lines: <code>002f 01</code> wrapping
+            <code>000eunpack ok\n</code>, <code>0018ok refs/heads/topic\n</code> and <code>0000</code>
+            <span class="recon">measured here</span>. Merging what arrives is
+            <a href="../merge-and-upkeep/">Part 3</a>'s subject.
+          </p>
+
+          <h2 id="sources"><span class="secnum">08</span>Sources</h2>
+          <ul>
+            <li><a href="https://github.com/git/git/tree/v2.55.0">git/git at <code>v2.55.0</code></a> (<code>e9019fcafe</code>, 29 June 2026). Code read: <code>read-cache.c</code>, <code>statinfo.c</code>, <code>cache-tree.c</code>, <code>lockfile.h</code>, <code>refs.c</code>, <code>refs/files-backend.c</code>, <code>refs/packed-backend.c</code>, <code>refs/reftable-backend.c</code>, <code>reftable/</code>, <code>reflog.c</code>, <code>reflog.h</code>, <code>write-or-die.h</code>, <code>pkt-line.c</code>, <code>sideband.c</code>, <code>protocol.c</code>, <code>connect.c</code>, <code>remote-curl.c</code>, <code>ls-refs.c</code>, <code>fetch-pack.c</code>, <code>upload-pack.c</code>, <code>builtin/receive-pack.c</code>, <code>tmp-objdir.c</code>.</li>
+            <li>Manual and technical pages at the same commit: <code>gitformat-index</code>, <code>racy-git</code>, <code>reftable</code>, <code>BreakingChanges</code>, <code>config/core</code>, <code>gitprotocol-v2</code>, <code>config/uploadpack</code>.</li>
+            <li>Fixes after the tag, on origin/master as fetched 21 October 2026: <code>60cf500551</code> (reflog expiry defaults) and <code>191740edaa</code> (ref-in-want with shallow).</li>
+            <li>The lab, outside this repository at <code>~/git-ref/lab/</code>: <code>refs-visibility.sh</code>, <code>refs-bench.sh</code>, <code>refs-rtdump.py</code>, <code>transport-lsrefs.sh</code>, <code>transport-negotiation.sh</code> and <code>-c.sh</code>, <code>transport-httpd.py</code>, and the index tools in <code>scratch/index/tools/</code>. Raw output is in <code>results/</code>.</li>
+          </ul>
+          <p class="footnote">
+            <strong>Provenance.</strong> Every path, line number and excerpt was read from the pinned checkout.
+            Byte dumps and numbers marked "measured here" came from the lab scripts above, run with
+            <code>git version 2.55.0</code> on a 2-vCPU Linux box, warm cache, with auto-maintenance off for the
+            transport runs. Ref write timings are single runs; index timings ran at a load average of 3 to 7 and are
+            indicative; byte and object counts are deterministic. The flush counts come from trace2 on that box, not
+            from a power-cut test. Explanations marked "reconstruction" are mine. I did not verify: how a default
+            sshd treats <code>GIT_PROTOCOL</code>; whether major hosts enable <code>allowRefInWant</code> or similar
+            options; that the build lacks <code>USE_NSEC</code> (inferred from behaviour); ref lookups on a cold
+            cache; or a reftable-backend trace of one commit. The HTTP byte counts used a local
+            <code>http-backend</code>, not a network. Where each reader sample sits in Figure 3 is
+            schematic.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Git, taken apart</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../commit-and-objects/">Part 1: The commit and its objects</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../merge-and-upkeep/">Part 3: Combining, keeping, and how it got here</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../../git-worktrees/">One repository, many agents</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

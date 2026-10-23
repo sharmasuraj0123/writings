@@ -1,0 +1,234 @@
+          <h2 id="one-commit"><span class="secnum">{{S}}</span>One commit, every write</h2>
+          <p class="lede">
+            Git is an append-only, content-addressed object store surrounded by a handful of small mutable
+            files. Each of those files is either a pointer or a cache, and each has its own consistency story.
+            Objects never change, so writing one needs no lock. The mutable files are published by writing a
+            complete new copy and renaming it over the old one. Everything that makes git fast is derived data
+            that can be rebuilt from the objects. This collection reads git v2.55.0 along those lines. Part 1
+            covers the store: one traced commit, then the objects it writes and the packs, indexes and bitmaps
+            that hold them.
+          </p>
+          <p>
+            The lab repository holds two files, <code>README</code> (<code>hello\n</code>) and
+            <code>src/main.c</code>, with author and committer dates pinned so every object id below is
+            reproducible. The machine has no <code>strace</code>, so an <code>LD_PRELOAD</code> shim
+            (<code>fstrace.c</code>) logged every open, rename, link, unlink, mkdir and exec with a microsecond
+            offset <span class="recon">measured here</span>. Before doing anything, every git process walks up
+            from the current directory and asks <code>is_git_directory()</code> three questions: is there a valid
+            <code>HEAD</code>, an <code>objects/</code> directory and a <code>refs/</code> directory
+            (<code>setup.c</code>:414-452) <span class="src">from the code</span>. It then reads
+            <code>.git/config</code> three times <span class="recon">measured here</span>.
+          </p>
+
+          <h3>git add: lock first, then hash</h3>
+          <p>
+            <code>git add README src/main.c</code> takes <code>index.lock</code> <em>before</em> it reads the
+            index (<code>builtin/add.c</code>:454, 495). The lock is a tempfile opened
+            <code>O_RDWR|O_CREAT|O_EXCL</code>, the same create-exclusively-then-rename protocol Linus wrote into
+            <code>update-cache.c</code> on 7 April 2005 <span class="src">from the code</span>. For each file, git
+            hashes <code>"blob &lt;size&gt;\0"</code> plus the content, calls <code>access()</code> on the final
+            path to see whether the object already exists, and creates <code>tmp_obj_XXXXXX</code>, mode 0444, in
+            the two-hex-digit fan-out directory. On a fresh repository that open fails with
+            <code>ENOENT</code>, so git makes the directory and retries. It deflates at zlib level 1, then
+            <code>link()</code>s the temp file to its final name and <code>unlink()</code>s the temp
+            <span class="recon">measured here</span>. The 21-byte file for <code>hello\n</code> is exactly
+            <code>zlib.compress(b"blob 6\x00hello\n", 1)</code>. Its name, <code>ce013625…</code>, is the SHA-1
+            of the <em>uncompressed</em> bytes. §02 takes that apart.
+          </p>
+          <p>
+            Then the 184-byte index is written into the lock, the lock is <code>stat</code>ed to record its
+            mtime for the <a href="../state-and-wire/#racy-git">racy-git check</a> (Part 2), and the lock is renamed over <code>index</code>. The whole
+            <code>add</code> is 92 intercepted calls, 15 of which change <code>.git/</code>; the median wall time
+            over 21 fresh repositories is 2.3 ms <span class="recon">measured here</span>.
+          </p>
+
+          <h3>git commit: trees before hooks</h3>
+          <p>
+            A plain <code>git commit -m</code> with no paths takes the COMMIT_AS_IS branch,
+            <code>builtin/commit.c</code>:482-494 <span class="src">from the code</span>:
+          </p>
+<pre><code>	if (!only &amp;&amp; !pathspec.nr) {
+		repo_hold_locked_index(the_repository, &amp;index_lock,
+				       LOCK_DIE_ON_ERROR);
+		refresh_cache_or_die(refresh_flags);
+		if (the_repository-&gt;index-&gt;cache_changed
+		    || !cache_tree_fully_valid(the_repository-&gt;index-&gt;cache_tree))
+			cache_tree_update(the_repository-&gt;index, WRITE_TREE_SILENT);
+		if (write_locked_index(the_repository-&gt;index, &amp;index_lock,
+				       COMMIT_LOCK | SKIP_IF_UNCHANGED))
+			die(_("unable to write new index file"));
+		commit_style = COMMIT_AS_IS;
+		ret = repo_get_index_file(the_repository);
+		goto out;</code></pre>
+          <p>
+            <code>cache_tree_update()</code> writes the <code>src</code> tree (51 bytes on disk) and the root
+            tree (80 bytes), and the index is rewritten with a 53-byte TREE extension, all before git even looks
+            for a <code>pre-commit</code> hook. A rejecting <code>pre-commit</code> therefore leaves both trees
+            and the new index on disk; the verification pass reproduced that <span class="recon">measured here</span>.
+            Hooks are found by <code>access(X_OK)</code> on exact names (<code>hook.c</code>:26-36), so the
+            shipped <code>*.sample</code> files never run <span class="src">from the code</span>. The commit
+            object (122 bytes on disk) follows.
+          </p>
+          <p>
+            The commit becomes visible through one ref transaction on <code>HEAD</code>
+            (<code>sequencer.c</code>:1282-1290). The files backend splits it in two: a log-only update of
+            <code>HEAD</code>, whose <code>HEAD.lock</code> is created and released empty, and a real update of
+            <code>refs/heads/main</code>, whose lock receives 41 bytes, 40 hex digits and a newline
+            (<code>refs/files-backend.c</code>:2537-2551) <span class="src">from the code</span>. Both reflogs are
+            appended with <code>O_APPEND</code>, 160 bytes each. Then
+            <code>rename(main.lock, main)</code>. <strong>That rename is the instant the commit exists.</strong>
+            Before it, a reader sees the old branch; after it, the new one. Figure {{fig-commit-trace}} shows
+            every write in order.
+          </p>
+
+          <figure class="figure wide" id="fig-commit-trace">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One <code>git add</code> and one <code>git commit</code>, every write in order</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 697" role="img" aria-label="Every write of git add and git commit in a two-file repository, in time order, in six lanes: objects, index, refs, logs, hooks and the maintenance child. Lock lifetimes are orange bars; the rename of refs/heads/main.lock is the moment the commit becomes visible.">
+                <text x="20" y="30" class="svg-lane">TIME</text>
+                <text x="128" y="30" class="svg-lane">OBJECTS/</text>
+                <line x1="120" y1="40" x2="120" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="284" y="30" class="svg-lane">INDEX</text>
+                <line x1="276" y1="40" x2="276" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="440" y="30" class="svg-lane">REFS/</text>
+                <line x1="432" y1="40" x2="432" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="596" y="30" class="svg-lane">LOGS/</text>
+                <line x1="588" y1="40" x2="588" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="752" y="30" class="svg-lane">HOOKS</text>
+                <line x1="744" y1="40" x2="744" y2="641" stroke="#deded9" stroke-width="1"/>
+                <text x="908" y="30" class="svg-lane">CHILD PROCESS</text>
+                <line x1="900" y1="40" x2="900" y2="641" stroke="#deded9" stroke-width="1"/>
+                <rect x="14" y="56" width="1052" height="20" rx="3" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="22" y="70" class="svg-sub" style="fill:#252525">$ git add README src/main.c</text>
+                <rect x="14" y="185" width="1052" height="20" rx="3" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="22" y="199" class="svg-sub" style="fill:#252525">$ git commit -q -m 'first commit'</text>
+                <rect x="280" y="79" width="4" height="90" rx="1" fill="#d98226"/>
+                <rect x="280" y="208" width="4" height="71" rx="1" fill="#d98226"/>
+                <rect x="436" y="341" width="4" height="128" rx="1" fill="#d98226"/>
+                <rect x="442" y="360" width="4" height="90" rx="1" fill="#d98226"/>
+                <rect x="436" y="493" width="4" height="52" rx="1" fill="#d98226"/>
+                <rect x="442" y="512" width="4" height="33" rx="1" fill="#d98226"/>
+                <rect x="904" y="569" width="4" height="52" rx="1" fill="#d98226"/>
+                <rect x="914" y="550" width="2" height="71" fill="#b8b8b1"/>
+                <text x="20" y="90" class="svg-sub">+1.875 ms</text>
+                <text x="298" y="90" class="svg-sub" style="fill:#252525">index.lock O_EXCL</text>
+                <text x="20" y="109" class="svg-sub">+3.114 ms</text>
+                <text x="142" y="109" class="svg-sub" style="fill:#252525">mkdir ce/, tmp_obj_*</text>
+                <text x="20" y="128" class="svg-sub">+3.306 ms</text>
+                <text x="142" y="128" class="svg-sub" style="fill:#252525">link ce/0136… 21 B</text>
+                <text x="20" y="147" class="svg-sub">+3.786 ms</text>
+                <text x="142" y="147" class="svg-sub" style="fill:#252525">link 78/f2de… 45 B</text>
+                <text x="20" y="166" class="svg-sub">+3.965 ms</text>
+                <text x="298" y="166" class="svg-sub" style="fill:#252525">rename: index 184 B</text>
+                <text x="20" y="219" class="svg-sub">+1.853 ms</text>
+                <text x="298" y="219" class="svg-sub" style="fill:#252525">index.lock O_EXCL</text>
+                <text x="20" y="238" class="svg-sub">+2.544 ms</text>
+                <text x="142" y="238" class="svg-sub" style="fill:#252525">src tree, 51 B</text>
+                <text x="20" y="257" class="svg-sub">+2.813 ms</text>
+                <text x="142" y="257" class="svg-sub" style="fill:#252525">root tree, 80 B</text>
+                <text x="20" y="276" class="svg-sub">+3.111 ms</text>
+                <text x="298" y="276" class="svg-sub" style="fill:#252525">rename: 245 B + TREE</text>
+                <text x="20" y="295" class="svg-sub">+3.153 ms</text>
+                <text x="766" y="295" class="svg-sub" style="fill:#252525">pre-commit probed</text>
+                <text x="20" y="314" class="svg-sub">+3.809 ms</text>
+                <text x="142" y="314" class="svg-sub" style="fill:#252525">commit, 122 B</text>
+                <text x="20" y="333" class="svg-sub">+3.971 ms</text>
+                <text x="766" y="333" class="svg-sub" style="fill:#252525">ref-tx: preparing</text>
+                <text x="20" y="352" class="svg-sub">+4.039 ms</text>
+                <text x="454" y="352" class="svg-sub" style="fill:#252525">HEAD.lock, empty</text>
+                <text x="20" y="371" class="svg-sub">+4.112 ms</text>
+                <text x="454" y="371" class="svg-sub" style="fill:#252525">main.lock ← 41 B</text>
+                <text x="20" y="390" class="svg-sub">+4.168 ms</text>
+                <text x="766" y="390" class="svg-sub" style="fill:#252525">ref-tx: prepared</text>
+                <text x="20" y="409" class="svg-sub">+4.254 ms</text>
+                <text x="610" y="409" class="svg-sub" style="fill:#252525">logs/HEAD +160 B</text>
+                <text x="20" y="428" class="svg-sub">+4.371 ms</text>
+                <text x="610" y="428" class="svg-sub" style="fill:#252525">…/heads/main +160 B</text>
+                <text x="20" y="447" class="svg-sub">+4.399 ms</text>
+                <rect x="448" y="434" width="132" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.6"/>
+                <text x="454" y="447" class="svg-sub" style="fill:#ad4b43;font-weight:700">rename main.lock</text>
+                <text x="596" y="447" class="svg-note" style="fill:#ad4b43">← the commit exists from here</text>
+                <text x="20" y="466" class="svg-sub">+4.437 ms</text>
+                <text x="454" y="466" class="svg-sub" style="fill:#252525">unlink HEAD.lock</text>
+                <text x="20" y="485" class="svg-sub">+4.447 ms</text>
+                <text x="766" y="485" class="svg-sub" style="fill:#252525">ref-tx: committed</text>
+                <text x="20" y="504" class="svg-sub">+4.550 ms</text>
+                <text x="454" y="504" class="svg-sub" style="fill:#252525">AUTO_MERGE.lock</text>
+                <text x="20" y="523" class="svg-sub">+4.597 ms</text>
+                <text x="454" y="523" class="svg-sub" style="fill:#252525">packed-refs.lock</text>
+                <text x="20" y="542" class="svg-sub">+4.668 ms</text>
+                <text x="454" y="542" class="svg-sub" style="fill:#252525">both unlinked</text>
+                <text x="20" y="561" class="svg-sub">+5.314 ms</text>
+                <text x="922" y="561" class="svg-sub" style="fill:#252525">spawn maintenance</text>
+                <text x="20" y="580" class="svg-sub">+8.561 ms</text>
+                <text x="922" y="580" class="svg-sub" style="fill:#252525">lock, opendir 17/</text>
+                <text x="20" y="599" class="svg-sub">+9.891 ms</text>
+                <text x="766" y="599" class="svg-sub" style="fill:#252525">post-commit probed</text>
+                <text x="20" y="618" class="svg-sub">+10.113 ms</text>
+                <text x="922" y="618" class="svg-sub" style="fill:#252525">unlink (detached)</text>
+                <rect x="14" y="655" width="1052" height="34" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <rect x="26" y="668" width="14" height="8" rx="1" fill="#d98226"/>
+                <text x="48" y="676" class="svg-sub">lock file held (created O_EXCL, then renamed or unlinked)</text>
+                <text x="560" y="676" class="svg-sub" style="fill:#252525;font-weight:700">fsync / fdatasync calls: 0</text>
+                <text x="790" y="676" class="svg-sub">add: 92 calls · commit: 286</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              A commit is five loose files, two index rewrites and six short-lived lock files. It becomes real at
+              one rename (red), and nothing is fsynced. Offsets are microseconds from process start in one traced
+              run (run 2 of 3; the call order matched across runs); read-only probes are omitted. Orange bars are
+              lock lifetimes <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>The cleanup costs as much as the commit</h3>
+          <p>
+            Every commit then deletes <code>AUTO_MERGE</code> unconditionally (<code>sequencer.c</code>:2988-2989).
+            Since v2.44.0 that is a ref deletion, and a deletion in the files backend opens a
+            <code>packed-refs</code> transaction. So a clean commit in a repository with neither file still
+            creates and removes <code>AUTO_MERGE.lock</code> and <code>packed-refs.lock</code>
+            <span class="src">from the code</span>. A stale <code>packed-refs.lock</code> left by a crashed
+            process makes every commit wait about one second and print an error, though the commit still
+            succeeds <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Finally <code>git maintenance run --auto</code> runs as a child. It takes
+            <code>objects/maintenance.lock</code>, estimates the loose objects by reading only
+            <code>objects/17/</code>, finds nothing to do and exits. On this tiny repository that child is about
+            half the wall time: 8.4 ms median per commit by default against 3.9 ms with
+            <code>maintenance.auto=false</code> (N=21 each; a re-run gave 7.8 against 3.8)
+            <span class="recon">measured here</span>. In total, the root commit is 286 intercepted calls, 46 of
+            which change <code>.git/</code>, across six lock files. There is no <code>fsync</code> or
+            <code>fdatasync</code> anywhere in the trace <span class="recon">measured here</span>, because the
+            default <code>core.fsync</code> set leaves out loose objects, the index and refs
+            (<code>write-or-die.h</code>:27-35) <span class="src">from the code</span>.
+          </p>
+
+          <h3>The second commit, and the plumbing underneath</h3>
+          <p>
+            Changing <code>README</code> and committing again writes one blob, one tree and one commit. The
+            <code>src</code> subtree is not re-hashed: its cache-tree node is still valid and its object exists,
+            so <code>update_one()</code> returns early (<code>cache-tree.c</code>:294-297)
+            <span class="src">from the code</span>. Replaying both commits with plumbing (<code>hash-object
+            -w</code>, <code>update-index</code>, <code>write-tree</code>, <code>commit-tree</code>,
+            <code>update-ref</code>) produced all eight loose files and both reflogs byte for byte
+            <span class="recon">measured here</span>. The porcelain adds no hidden state.
+          </p>
+
+          <h3>Where each part picks up</h3>
+          <p>
+            Every structure in Figure {{fig-commit-trace}} has a section. The objects lane is this part: §02
+            names an object, §03 finds one, §04 to §06 pack, index and count them.
+            <a href="../state-and-wire/">Part 2</a> takes the mutable lanes: <a href="../state-and-wire/#index">the
+            index file</a> and its stat cache, <a href="../state-and-wire/#refs">refs and reflogs</a>, why every
+            publish is <a href="../state-and-wire/#durability">atomic but not durable</a>, and how objects and refs
+            move over <a href="../state-and-wire/#wire">the wire</a>. <a href="../merge-and-upkeep/">Part 3</a>
+            covers merging, <a href="../merge-and-upkeep/#maintenance">the maintenance child</a>, and the history of
+            the design, and ends with <a href="../merge-and-upkeep/#findings">the register</a> of bugs and
+            documentation drift found along the way. The
+            companion field guide <a href="../../git-worktrees/">One repository, many agents</a> covers the
+            worktree split.
+          </p>

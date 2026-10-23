@@ -1,0 +1,122 @@
+          <h2 id="lifecycle"><span class="secnum">{{S}}</span>Remove, prune, lock, repair</h2>
+          <p class="lede">
+            A worktree exists in two places, its directory and its admin entry, and they can drift
+            apart. Agents create and abandon worktrees all the time, so the cleanup rules matter.
+            The main one: <code>git worktree prune</code> deletes stale entries immediately, while
+            <code>git gc</code> waits three months.
+          </p>
+
+          <h3>remove</h3>
+          <p>
+            <code>git worktree remove &lt;path&gt;</code> deletes the directory and the admin entry
+            together. First it runs <code>git status --porcelain --ignore-submodules=none</code>
+            inside the worktree and refuses if that prints anything: "contains modified or untracked
+            files, use --force to delete it" (<code>builtin/worktree.c</code>:1340-1356)
+            <span class="src">from the code</span>. Ignored files don't appear in
+            <code>--porcelain</code> output. So an agent's <code>node_modules/</code>,
+            <code>target/</code> or <code>.venv/</code> is deleted without a warning, while one stray
+            untracked scratch file blocks removal. <span class="recon">reconstruction</span> from the
+            status flags. A locked worktree needs <code>remove -f -f</code> (1407-1409).
+          </p>
+
+          <h3>prune, and the two clocks</h3>
+          <p>
+            If the directory is deleted by hand, as <code>/tmp</code> cleanup or a container restart
+            would do, the admin entry stays behind and <code>git worktree list</code> marks it
+            <code>prunable</code>. <code>should_prune_worktree</code> (<code>worktree.c</code>:929-1018)
+            decides. Figure {{fig-prune}} shows its checks in order.
+          </p>
+
+          <figure class="figure" id="fig-prune">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title"><code>should_prune_worktree</code>, in order</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 250" role="img" aria-label="Five checks left to right. Admin entry not a directory: prune. A locked file exists: keep. The gitdir file is missing, unreadable or empty: prune. The worktree's .git exists: keep. Otherwise prune only if the index is missing or older than the expiry.">
+                <defs>
+                  <marker id="prn-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <g>
+                  <rect x="20" y="40" width="170" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="34" y="62" class="svg-num">1</text>
+                  <text x="50" y="62" class="svg-step">admin entry is</text>
+                  <text x="50" y="80" class="svg-step">a directory?</text>
+                  <text x="34" y="96" class="svg-sub">no → prune</text>
+                </g>
+                <g>
+                  <rect x="215" y="40" width="170" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="229" y="62" class="svg-num">2</text>
+                  <text x="245" y="62" class="svg-step">locked file</text>
+                  <text x="245" y="80" class="svg-step">exists?</text>
+                  <text x="229" y="96" class="svg-sub">yes → keep</text>
+                </g>
+                <g>
+                  <rect x="410" y="40" width="170" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="424" y="62" class="svg-num">3</text>
+                  <text x="440" y="62" class="svg-step">gitdir file</text>
+                  <text x="440" y="80" class="svg-step">readable, non-empty?</text>
+                  <text x="424" y="96" class="svg-sub">no → prune</text>
+                </g>
+                <g>
+                  <rect x="605" y="40" width="170" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="619" y="62" class="svg-num">4</text>
+                  <text x="635" y="62" class="svg-step">the worktree's</text>
+                  <text x="635" y="80" class="svg-step">.git still exists?</text>
+                  <text x="619" y="96" class="svg-sub">yes → keep</text>
+                </g>
+                <g>
+                  <rect x="800" y="40" width="180" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="814" y="62" class="svg-num">5</text>
+                  <text x="830" y="62" class="svg-step">index missing or</text>
+                  <text x="830" y="80" class="svg-step">mtime ≤ expire?</text>
+                  <text x="814" y="96" class="svg-sub">yes → prune, else keep</text>
+                </g>
+                <line x1="190" y1="72" x2="211" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#prn-ctl)"/>
+                <line x1="385" y1="72" x2="406" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#prn-ctl)"/>
+                <line x1="580" y1="72" x2="601" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#prn-ctl)"/>
+                <line x1="775" y1="72" x2="796" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#prn-ctl)"/>
+
+                <text x="20" y="146" class="svg-lane">WHO SETS "EXPIRE" IN CHECK 5</text>
+                <rect x="20" y="160" width="470" height="70" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="36" y="184" class="svg-step">git worktree prune</text>
+                <text x="36" y="204" class="svg-sub">expire = TIME_MAX  (builtin/worktree.c:259)</text>
+                <text x="36" y="221" class="svg-sub">every missing worktree is pruned now</text>
+                <rect x="510" y="160" width="470" height="70" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="526" y="184" class="svg-step">git gc  (and gc --auto)</text>
+                <text x="526" y="204" class="svg-sub">gc.worktreePruneExpire = 3.months.ago  (builtin/gc.c:162)</text>
+                <text x="526" y="221" class="svg-sub">a missing worktree survives 3 months</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              A lock wins over everything after check 1. Check 5 only runs when the directory is gone.
+              It is a grace period measured from the last time the worktree's index was written, and
+              who runs prune decides how long that grace period is.
+            </p>
+          </figure>
+
+          <p>
+            The lab ran it <span class="recon">measured here</span>. After <code>rm -rf ../wt4</code>,
+            <code>git worktree list</code> showed
+            <code>/home/coder/git-ref/lab/work/wt4 b2213c1c3e [agent-4] prunable</code>. A plain
+            <code>git worktree prune -n -v</code> answered "Removing worktrees/wt4: gitdir file points
+            to non-existent location", the same as with <code>--expire now</code>, even though
+            <code>wt4</code>'s index had been written seconds earlier. That fits the source: the
+            subcommand's default expiry is <code>TIME_MAX</code>, so every timestamp passes check 5.
+          </p>
+          <p>
+            Two consequences for agents. First, an orphaned worktree keeps its branch claimed
+            (Rule 1) and its index's blobs alive (Rule 2) until something prunes it, so a crashed
+            agent's branch can't be checked out elsewhere for up to three months. Second, if the
+            directory lives on a mount that comes and goes, run <code>git worktree lock --reason
+            "…"</code> so that check 2 protects it.
+          </p>
+
+          <h3>move and repair</h3>
+          <p>
+            <code>git worktree move</code> moves a linked worktree and rewrites both links.
+            If you moved things by hand, <code>git worktree repair</code> fixes the links from
+            whichever side you run it on (<code>Documentation/git-worktree.adoc</code>, "prune" and
+            "repair") <span class="src">from the docs</span>. Relative links (§03) avoid most of this
+            when the repository and its worktrees move together.
+          </p>

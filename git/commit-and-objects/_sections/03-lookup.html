@@ -1,0 +1,174 @@
+          <h2 id="lookup"><span class="secnum">{{S}}</span>Finding an object</h2>
+          <p class="lede">
+            A name says nothing about where an object lives. It might be a loose file, an entry in one of several
+            packs, an object in an alternate repository, or nowhere yet in a partial clone. Git answers with one
+            ordered chain of places to look, and the first hit wins.
+          </p>
+          <p>
+            The entry point is <code>odb_read_object_info_extended()</code>, which calls
+            <code>do_oid_object_info_extended()</code> (<code>odb.c</code>:550-617, 699-714)
+            <span class="src">from the code</span>. An id in the repository's <em>compat</em> hash is first mapped
+            to the storage hash. Replace refs are applied, the null id is rejected, and the in-memory source is
+            asked. That source holds one object: the empty tree, for either hash. The empty blob is not virtual
+            <span class="recon">measured here</span>. One nuance: the in-memory source is probed
+            with the original id, not the replaced one. Then come the real sources, <code>odb.c</code>:563-573:
+          </p>
+<pre><code>	if (!odb_source_read_object_info(odb-&gt;inmemory_objects, oid, oi, flags))
+		return 0;
+
+	odb_prepare_alternates(odb);
+
+	while (1) {
+		struct odb_source *source;
+
+		for (source = odb-&gt;sources; source; source = source-&gt;next)
+			if (!odb_source_read_object_info(source, real, oi, flags))
+				return 0;</code></pre>
+          <p>
+            The list holds the primary <code>.git/objects</code> first, then each alternate in order. Within a
+            "files" source the pack store answers before the loose store (<code>odb/source-files.c</code>:51-62),
+            and within the pack store the multi-pack-index answers before the individual packs, which are tried in
+            most-recently-used order (<code>packfile.c</code>:2149-2170) <span class="src">from the code</span>.
+            Before answering, <code>fill_pack_entry()</code> checks that the pack can still be opened, because a
+            concurrent repack may have deleted it. Figure {{fig-lookup}} draws the whole chain.
+          </p>
+
+          <figure class="figure wide" id="fig-lookup">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Where git v2.55 looks for an object, in order</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 430" role="img" aria-label="Flowchart of object lookup in git 2.55: compat mapping, replace refs, null id check, the in-memory source, then each object source in order (primary then alternates), each trying the multi-pack-index, then packs in most-recently-used order, then loose objects; then a second read that rescans packs only, submodule sources, one promisor fetch, and failure. A sidebar shows how a packed delta is read.">
+                <defs><marker id="lk-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker><marker id="lk-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker></defs>
+                <text x="30" y="26" class="svg-lane">odb_read_object_info_extended() · FIRST HIT RETURNS</text>
+                <rect x="30" y="44" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="40" y="64" class="svg-num">1</text>
+                <text x="56" y="64" class="svg-step">compat map</text>
+                <text x="56" y="82" class="svg-sub">sha256 ↔ sha1 id</text>
+                <rect x="222" y="44" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="232" y="64" class="svg-num">2</text>
+                <text x="248" y="64" class="svg-step">replace refs</text>
+                <text x="248" y="82" class="svg-sub">oid → real</text>
+                <rect x="414" y="44" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="424" y="64" class="svg-num">3</text>
+                <text x="440" y="64" class="svg-step">null id?</text>
+                <text x="440" y="82" class="svg-sub">reject</text>
+                <rect x="606" y="44" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="616" y="64" class="svg-num">4</text>
+                <text x="632" y="64" class="svg-step">in-memory</text>
+                <text x="632" y="82" class="svg-sub">empty tree only</text>
+                <line x1="202" y1="70" x2="218" y2="70" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="394" y1="70" x2="410" y2="70" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="586" y1="70" x2="602" y2="70" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="30" y="130" width="746" height="160" rx="4" fill="#ffffff" stroke="#252525" stroke-width="1.2"/>
+                <text x="40" y="150" class="svg-num">5</text>
+                <text x="56" y="150" class="svg-step">each source in list order</text>
+                <text x="250" y="150" class="svg-sub">for (source = odb-&gt;sources; …) · odb.c:563-573</text>
+                <rect x="46" y="166" width="346" height="110" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="56" y="186" class="svg-step">primary: .git/objects</text>
+                <text x="236" y="186" class="svg-sub">local wins by order</text>
+                <rect x="56" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="106" y="226" text-anchor="middle" class="svg-step">MIDX</text>
+                <text x="106" y="244" text-anchor="middle" class="svg-sub">fanout lookup</text>
+                <line x1="156" y1="231" x2="166" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="168" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="218" y="226" text-anchor="middle" class="svg-step">packs</text>
+                <text x="218" y="244" text-anchor="middle" class="svg-sub">MRU order</text>
+                <line x1="268" y1="231" x2="278" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="280" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="330" y="226" text-anchor="middle" class="svg-step">loose</text>
+                <text x="330" y="244" text-anchor="middle" class="svg-sub">xx/ files</text>
+                <rect x="414" y="166" width="346" height="110" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="424" y="186" class="svg-step">alternates</text>
+                <text x="604" y="186" class="svg-sub">info/alternates</text>
+                <rect x="424" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="474" y="226" text-anchor="middle" class="svg-step">MIDX</text>
+                <text x="474" y="244" text-anchor="middle" class="svg-sub">fanout lookup</text>
+                <line x1="524" y1="231" x2="534" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="536" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="586" y="226" text-anchor="middle" class="svg-step">packs</text>
+                <text x="586" y="244" text-anchor="middle" class="svg-sub">MRU order</text>
+                <line x1="636" y1="231" x2="646" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="648" y="204" width="100" height="54" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="698" y="226" text-anchor="middle" class="svg-step">loose</text>
+                <text x="698" y="244" text-anchor="middle" class="svg-sub">xx/ files</text>
+                <line x1="398" y1="231" x2="410" y2="231" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="691" y1="98" x2="691" y2="126" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="30" y="330" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="40" y="350" class="svg-num">6</text>
+                <text x="56" y="350" class="svg-step">second read</text>
+                <text x="56" y="368" class="svg-sub">packs rescanned</text>
+                <rect x="222" y="330" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="232" y="350" class="svg-num">7</text>
+                <text x="248" y="350" class="svg-step">submodule sources</text>
+                <text x="248" y="368" class="svg-sub">registered, retry</text>
+                <rect x="414" y="330" width="170" height="52" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="424" y="350" class="svg-num">8</text>
+                <text x="440" y="350" class="svg-step">promisor fetch</text>
+                <text x="440" y="368" class="svg-sub">once, then retry</text>
+                <rect x="606" y="330" width="170" height="52" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="616" y="350" class="svg-num">9</text>
+                <text x="632" y="350" class="svg-step">missing</text>
+                <text x="632" y="368" class="svg-sub">die if corrupt</text>
+                <line x1="115" y1="292" x2="115" y2="326" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="202" y1="356" x2="218" y2="356" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="394" y1="356" x2="410" y2="356" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="586" y1="356" x2="602" y2="356" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <text x="30" y="410" class="svg-note">Step 6 runs unless the caller passed OBJECT_INFO_QUICK; a pack written since the first pass is found here.</text>
+                <line x1="792" y1="40" x2="792" y2="400" stroke="#deded9"/>
+                <text x="806" y="26" class="svg-lane">READING A PACKED DELTA</text>
+                <rect x="806" y="50" width="150" height="40" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="818" y="75" class="svg-step">delta (depth 2)</text>
+                <line x1="846" y1="92" x2="846" y2="116" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <rect x="806" y="120" width="150" height="40" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="818" y="145" class="svg-step">delta (depth 1)</text>
+                <line x1="846" y1="162" x2="846" y2="186" stroke="#252525" stroke-width="2" marker-end="url(#lk-ctl)"/>
+                <line x1="916" y1="118" x2="916" y2="94" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#lk-data)"/>
+                <rect x="806" y="190" width="150" height="40" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="818" y="215" class="svg-step">base: inflate</text>
+                <line x1="916" y1="188" x2="916" y2="164" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#lk-data)"/>
+                <text x="806" y="254" class="svg-sub">down: walk the chain</text>
+                <text x="806" y="270" class="svg-sub">up: apply each delta</text>
+                <rect x="806" y="284" width="250" height="54" rx="3" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="816" y="304" class="svg-step">delta_base_cache, 96 MiB</text>
+                <text x="816" y="324" class="svg-sub">LRU of inflated bases</text>
+                <text x="806" y="362" class="svg-sub">without the cache, log -p</text>
+                <text x="806" y="378" class="svg-sub">took 1.60-1.70 s, not 0.74-0.91 s</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Packs before loose, local before alternates. In 2.55 the "local first" rule comes from the order of
+              the source list, not from the pack sorter. Black arrows are control flow; blue boxes are object
+              sources; the dashed purple box is a cache. Read from <code>odb.c</code>, <code>packfile.c</code> and
+              <code>odb/</code> <span class="src">from the code</span>; the <code>log -p</code> timings are two
+              alternating runs on git.git <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <p>
+            If every source misses, git tries once more with <code>OBJECT_INFO_SECOND_READ</code>, unless the caller
+            asked for a quick answer. The pack directories are rescanned and loose objects are skipped
+            (<code>packfile.c</code>:2201-2202; <code>odb/source-loose.c</code>:213-217). That catches a pack a
+            concurrent fetch or repack published after the first pass <span class="recon">reconstruction</span>. Then registered submodule sources are added
+            and the chain retried. Finally, in a partial clone, one <code>promisor_remote_get_direct()</code> fetches
+            the object from the server, unless the caller passed <code>SKIP_FETCH_OBJECT</code>
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two details contradict common belief. Git does not check loose objects first; for object info, packs
+            come first in every source. And the comparator <code>sort_pack()</code> still contains a branch that
+            puts local packs before alternate packs, but in 2.55 that branch is dead: each source now owns its own
+            pack store, so a store never mixes local and alternate packs <span class="src">from the code</span>.
+            Local-first comes from the source order alone. The exception is the streaming path for small blobs: the pack stream
+            refuses small objects, so loose is tried next, and a corrupt loose copy prints <code>inflate: data stream error</code> before git falls back to
+            the pack and outputs the right content <span class="recon">measured here</span>.
+          </p>
+          <p>
+            This structure is new. The "files" source arrived in v2.54.0 (<code>cb506a8a69</code>), the loose-object
+            source struct in v2.53.0 (<code>ece43d9dc7</code>) with its pluggable read callback in v2.55.0
+            (<code>584338ed92</code>), and the in-memory source in v2.55.0 (<code>822d403651</code>)
+            <span class="src">from the code</span>. Each source is a <code>struct odb_source</code> with its own
+            callbacks, which leaves room for object stores that are not directories of files.
+            <span class="recon">reconstruction</span>
+          </p>

@@ -1,0 +1,152 @@
+          <h2 id="add"><span class="secnum">{{S}}</span>What git worktree add writes</h2>
+          <p class="lede">
+            <code>git worktree add ../wt1 agent-1</code> copies no history. It writes three small
+            pointer files, creates a <code>HEAD</code>, and runs <code>git reset --hard</code> in the
+            new directory. Everything happens in <code>add_worktree</code>,
+            <code>builtin/worktree.c</code>:461-633 <span class="src">from the code</span>.
+          </p>
+
+          <h3>The steps, in order</h3>
+          <ol>
+            <li>
+              <strong>Check the target.</strong> <code>check_candidate_path</code> refuses a path that
+              is already a registered worktree, unless <code>--force</code> is given (479).
+            </li>
+            <li>
+              <strong>Check the branch.</strong> If the argument names an existing branch,
+              <code>die_if_checked_out</code> refuses it when another worktree already has it (484-489).
+              §04 covers this rule.
+            </li>
+            <li>
+              <strong>Name the admin directory.</strong> The name is the target path's basename,
+              sanitised into a valid ref component. <code>mkdir .git/worktrees/&lt;name&gt;</code> runs
+              in a loop: on <code>EEXIST</code> it appends a counter, so a second <code>wt1</code>
+              becomes <code>wt11</code>, then <code>wt12</code> (494-515).
+            </li>
+            <li>
+              <strong>Lock it.</strong> Before anything else, git writes
+              <code>worktrees/&lt;name&gt;/locked</code> containing "initializing", so a concurrent
+              <code>prune</code> cannot delete a half-built worktree (524-532). It also registers an
+              <code>atexit</code> handler that removes the junk if the process dies.
+            </li>
+            <li>
+              <strong>Write the links.</strong> <code>write_worktree_linking_files</code> writes the new
+              checkout's <code>.git</code> <em>file</em> and the admin directory's <code>gitdir</code>
+              file, each pointing at the other (542; <code>worktree.c</code>:1092-1120). Then it writes
+              <code>commondir</code> containing <code>../..</code> (544-545).
+            </li>
+            <li>
+              <strong>Create <code>HEAD</code>.</strong> In the new worktree's own ref store,
+              <code>HEAD</code> becomes a symref to the branch, or a detached commit id with
+              <code>--detach</code> (550-568).
+            </li>
+            <li>
+              <strong>Copy per-worktree settings.</strong> If the current worktree uses sparse checkout,
+              its patterns are copied. If <code>extensions.worktreeConfig</code> is on, its
+              <code>config.worktree</code> is copied (570-583).
+            </li>
+            <li>
+              <strong>Populate files.</strong> <code>checkout_worktree</code> runs
+              <code>git reset --hard --no-recurse-submodules</code> with <code>GIT_DIR</code> and
+              <code>GIT_WORK_TREE</code> set to the new paths (400-410, 592-594). This writes the
+              index and the files.
+            </li>
+            <li>
+              <strong>Unlock, then hook.</strong> The <code>locked</code> file is removed unless
+              <code>--lock</code> was given, and <code>post-checkout</code> runs in the new
+              directory. A failing hook does not delete the worktree (600-623).
+            </li>
+          </ol>
+
+          <h3>The three pointer files</h3>
+          <p>
+            Here is what that left on disk in the lab hub <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ cat wt1/.git
+gitdir: /home/coder/git-ref/lab/work/hub/.git/worktrees/wt1
+$ ls hub/.git/worktrees/wt1
+COMMIT_EDITMSG  FETCH_HEAD  HEAD  ORIG_HEAD  commondir  gitdir  index  logs  refs
+$ cat hub/.git/worktrees/wt1/commondir
+../..
+$ cat hub/.git/worktrees/wt1/gitdir
+/home/coder/git-ref/lab/work/wt1/.git
+$ cat hub/.git/worktrees/wt1/HEAD
+ref: refs/heads/agent-1</code></pre>
+          <p>
+            Any git command run inside <code>wt1</code> finds the repository in two hops. Setup reads
+            the <code>.git</code> file and requires the <code>gitdir: </code> prefix
+            (<code>setup.c</code>:999). That gives the admin directory, which holds
+            <code>HEAD</code> and <code>index</code>. <code>get_common_dir_noenv</code> then reads
+            <code>commondir</code> and, because <code>../..</code> is relative, resolves it against
+            the admin directory, which lands on <code>hub/.git</code> (<code>setup.c</code>:323-350)
+            <span class="src">from the code</span>. The <code>gitdir</code> file points the other
+            way. Git does not need it to run commands in the worktree. It needs it to know where
+            the worktree is: <code>worktree list</code>, <code>prune</code> and the one-branch check
+            all read it.
+          </p>
+
+          <figure class="figure" id="fig-links">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">How a worktree finds its repository, and how the repository finds the worktree</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 300" role="img" aria-label="The worktree's .git file points to the admin directory; the admin directory's commondir points up to the shared .git; the admin directory's gitdir file points back to the worktree's .git file.">
+                <defs>
+                  <marker id="lnk-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="lnk-st" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <!-- worktree -->
+                <rect x="30" y="60" width="260" height="170" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="46" y="84" class="svg-lane">WORKTREE  ../wt1/</text>
+                <rect x="46" y="100" width="228" height="52" rx="3" fill="#ffffff" stroke="#367f59"/>
+                <text x="60" y="122" class="svg-step">.git  (a file)</text>
+                <text x="60" y="140" class="svg-sub">gitdir: hub/.git/worktrees/wt1</text>
+                <text x="46" y="180" class="svg-sub">README.md  Makefile  src/ …</text>
+                <text x="46" y="200" class="svg-sub">4,765 files from reset --hard</text>
+
+                <!-- admin dir -->
+                <rect x="370" y="60" width="270" height="200" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="386" y="84" class="svg-lane">ADMIN DIR  .git/worktrees/wt1/</text>
+                <rect x="386" y="100" width="238" height="30" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="398" y="120" class="svg-sub">HEAD → refs/heads/agent-1</text>
+                <rect x="386" y="136" width="238" height="30" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="398" y="156" class="svg-sub">index · logs/ · refs/worktree</text>
+                <rect x="386" y="172" width="238" height="30" rx="3" fill="#ffffff" stroke="#252525"/>
+                <text x="398" y="192" class="svg-sub">commondir  ../..</text>
+                <rect x="386" y="208" width="238" height="30" rx="3" fill="#ffffff" stroke="#765b98"/>
+                <text x="398" y="228" class="svg-sub">gitdir  …/wt1/.git</text>
+
+                <!-- common dir -->
+                <rect x="720" y="60" width="250" height="200" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="84" class="svg-lane">COMMON DIR  hub/.git/</text>
+                <text x="736" y="114" class="svg-step">objects/  (320 MiB pack)</text>
+                <text x="736" y="140" class="svg-step">refs/heads/agent-1 …</text>
+                <text x="736" y="166" class="svg-step">config · hooks/</text>
+                <text x="736" y="192" class="svg-step">worktrees/</text>
+
+                <!-- edges -->
+                <path d="M274 126 L382 115" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#lnk-ctl)"/>
+                <text x="328" y="104" text-anchor="middle" class="svg-num">1</text>
+                <path d="M624 187 L716 140" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#lnk-ctl)"/>
+                <text x="676" y="150" text-anchor="middle" class="svg-num">2</text>
+                <path d="M386 223 C 335 223, 330 146, 279 140" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#lnk-st)"/>
+                <text x="386" y="282" class="svg-note">back-pointer: read by list, prune, the one-branch check</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Hops 1 and 2 (black) are how a command inside the worktree finds its <code>HEAD</code>,
+              its index and the shared objects. The dashed back-pointer is how the repository knows
+              the worktree exists and whether it is still there.
+            </p>
+          </figure>
+
+          <p>
+            Paths are absolute by default. When <code>worktree.useRelativePaths</code> is true, or
+            <code>--relative-paths</code> is passed, both links are written relative to each other.
+            The first such write sets <code>extensions.relativeWorktrees</code>, which older gits
+            refuse to open (<code>worktree.c</code>:1106-1116;
+            <code>Documentation/config/worktree.adoc</code>) <span class="src">from the code</span>.
+            Relative links let you move the repository and its worktrees together, for example
+            between a container and its host.
+          </p>

@@ -1,0 +1,158 @@
+          <h2 id="reftable"><span class="secnum">{{S}}</span>reftable: one rename per transaction</h2>
+          <p class="lede">
+            reftable stores refs the way git stores objects: in immutable files that are never edited, only replaced.
+            A transaction writes one new table and publishes it with one rename, so a reader sees all of it or none.
+          </p>
+          <p>
+            Shawn Pearce specified the format in 2017. Its stated objectives
+            (<code>Documentation/technical/reftable.adoc</code>:28-38) include "Near constant time lookup for any
+            single reference, even when the repository is cold", "Support atomic push with
+            <code>O(size_of_update)</code> operations", and combined reflog storage. Git imported the spec in
+            v2.28.0, the library in v2.35.0 and the backend in v2.45.0 <span class="src">from the code</span>.
+          </p>
+          <p>
+            A table is a 24-byte header (<code>REFT</code>, a version, a 3-byte block size of 4096 by default, and the
+            lowest and highest update index it covers), then blocks, then a footer with a CRC-32. Ref blocks hold
+            records sorted by name, each stored as "reuse N bytes of the previous name, then this suffix". Every 16th
+            record, and any record that reuses nothing, is a restart point: its offset goes in a table at the end of
+            the block, so a reader can binary-search the restarts and then scan at most 16 records
+            (<code>reftable/writer.c</code>:79-80). Log blocks hold reflog records and are zlib-compressed. Figure
+            {{fig-reftable}} decodes a whole table next to the <code>packed-refs</code> file for the same refs.
+          </p>
+
+          <figure class="figure wide" id="fig-reftable">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The same four refs as <code>packed-refs</code> text and as a reftable</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 590" role="img" aria-label="Top: a 257-byte packed-refs file with a header ending in a space, one line per ref and a caret line for the peeled tag. Bottom: a 391-byte reftable: a 24-byte header, a ref block of four prefix-compressed records with a restart table, a compressed log block and a footer with a CRC.">
+                <text x="56" y="26" class="svg-lane">packed-refs · 257 BYTES · TEXT, SORTED, BINARY-SEARCHED</text>
+                <rect x="56" y="38" width="580" height="122" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="70" y="60" class="svg-sub"># pack-refs with: peeled fully-peeled sorted</text>
+                <rect x="362" y="49" width="20" height="14" fill="#f7e3c8" stroke="#d98226"/><text x="372" y="60" class="svg-num" text-anchor="middle">SP</text>
+                <text x="70" y="82" class="svg-sub">57ef6b409b72f867c799347c562551b1a76536d6 refs/heads/main</text>
+                <text x="70" y="104" class="svg-sub">57ef6b409b72f867c799347c562551b1a76536d6 refs/heads/topic</text>
+                <text x="70" y="126" class="svg-sub">c8c47bc1c7e563fab3a886eef1c0db8dba3575af refs/tags/v1</text>
+                <text x="70" y="148" class="svg-sub">^57ef6b409b72f867c799347c562551b1a76536d6</text>
+                <text x="656" y="60" class="svg-sub">header ends in a space (0x2c), then LF</text>
+                <text x="656" y="82" class="svg-sub">40 hex · SP · name · LF</text>
+                <text x="656" y="126" class="svg-sub">annotated tag object …</text>
+                <text x="656" y="148" class="svg-sub">… and the commit it peels to (0xd7)</text>
+
+                <text x="56" y="196" class="svg-lane">reftable · 391 BYTES · ONE TABLE AFTER AUTO-COMPACTION</text>
+                <text x="56" y="226" class="svg-sub">@0</text>
+                <rect x="120" y="210" width="110" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="175" y="226" class="svg-sub" text-anchor="middle">52 45 46 54</text>
+                <rect x="230" y="210" width="44" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="252" y="226" class="svg-sub" text-anchor="middle">01</text>
+                <rect x="274" y="210" width="86" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="317" y="226" class="svg-sub" text-anchor="middle">00 10 00</text>
+                <rect x="360" y="210" width="86" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="403" y="226" class="svg-sub" text-anchor="middle">00 … 01</text>
+                <rect x="446" y="210" width="86" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="489" y="226" class="svg-sub" text-anchor="middle">00 … 04</text>
+                <text x="175" y="250" class="svg-sub" text-anchor="middle">"REFT"</text>
+                <text x="252" y="250" class="svg-sub" text-anchor="middle">v1</text>
+                <text x="317" y="250" class="svg-sub" text-anchor="middle">4096</text>
+                <text x="403" y="250" class="svg-sub" text-anchor="middle">min 1</text>
+                <text x="489" y="250" class="svg-sub" text-anchor="middle">max 4</text>
+                <text x="552" y="226" class="svg-sub">header, 24 bytes</text>
+
+                <text x="56" y="280" class="svg-sub">@24  72 00 00 af  →  'r' ref block, 175 bytes counted from the start of the file</text>
+                <text x="148" y="304" class="svg-sub" text-anchor="middle">prefix</text>
+                <text x="204" y="304" class="svg-sub" text-anchor="middle">len·type</text>
+                <text x="302" y="304" class="svg-sub" text-anchor="middle">suffix</text>
+                <text x="392" y="304" class="svg-sub" text-anchor="middle">Δidx</text>
+                <text x="522" y="304" class="svg-sub" text-anchor="middle">value</text>
+
+                <text x="56" y="328" class="svg-sub">@28</text>
+                <rect x="120" y="312" width="56" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="148" y="328" class="svg-sub" text-anchor="middle">00</text>
+                <rect x="176" y="312" width="56" height="24" fill="#ece6f3" stroke="#765b98"/><text x="204" y="328" class="svg-sub" text-anchor="middle">23</text>
+                <rect x="232" y="312" width="140" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="302" y="328" class="svg-sub" text-anchor="middle">HEAD</text>
+                <rect x="372" y="312" width="40" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="392" y="328" class="svg-sub" text-anchor="middle">00</text>
+                <rect x="412" y="312" width="220" height="24" fill="#dfede5" stroke="#367f59"/><text x="522" y="328" class="svg-sub" text-anchor="middle">0f refs/heads/main</text>
+                <text x="648" y="328" class="svg-sub">restart · 23 = 4&lt;&lt;3|3: 4-byte suffix, symref</text>
+
+                <text x="56" y="356" class="svg-sub">@51</text>
+                <rect x="120" y="340" width="56" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="148" y="356" class="svg-sub" text-anchor="middle">00</text>
+                <rect x="176" y="340" width="56" height="24" fill="#ece6f3" stroke="#765b98"/><text x="204" y="356" class="svg-sub" text-anchor="middle">79</text>
+                <rect x="232" y="340" width="140" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="302" y="356" class="svg-sub" text-anchor="middle">refs/heads/main</text>
+                <rect x="372" y="340" width="40" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="392" y="356" class="svg-sub" text-anchor="middle">01</text>
+                <rect x="412" y="340" width="220" height="24" fill="#dfede5" stroke="#367f59"/><text x="522" y="356" class="svg-sub" text-anchor="middle">57 ef 6b 40 … 36 d6</text>
+                <text x="648" y="356" class="svg-sub">restart (prefix 0) · 79 = 15&lt;&lt;3|1: one object id</text>
+
+                <text x="56" y="384" class="svg-sub">@89</text>
+                <rect x="120" y="368" width="56" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="148" y="384" class="svg-sub" text-anchor="middle">0b</text>
+                <rect x="176" y="368" width="56" height="24" fill="#ece6f3" stroke="#765b98"/><text x="204" y="384" class="svg-sub" text-anchor="middle">29</text>
+                <rect x="232" y="368" width="140" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="302" y="384" class="svg-sub" text-anchor="middle">topic</text>
+                <rect x="372" y="368" width="40" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="392" y="384" class="svg-sub" text-anchor="middle">03</text>
+                <rect x="412" y="368" width="220" height="24" fill="#dfede5" stroke="#367f59"/><text x="522" y="384" class="svg-sub" text-anchor="middle">57 ef 6b 40 … 36 d6</text>
+                <text x="648" y="384" class="svg-sub">reuse 11 bytes, "refs/heads/" · 29 = 5&lt;&lt;3|1</text>
+
+                <text x="56" y="412" class="svg-sub">@117</text>
+                <rect x="120" y="396" width="56" height="24" fill="#f7e3c8" stroke="#d98226"/><text x="148" y="412" class="svg-sub" text-anchor="middle">05</text>
+                <rect x="176" y="396" width="56" height="24" fill="#ece6f3" stroke="#765b98"/><text x="204" y="412" class="svg-sub" text-anchor="middle">3a</text>
+                <rect x="232" y="396" width="140" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="302" y="412" class="svg-sub" text-anchor="middle">tags/v1</text>
+                <rect x="372" y="396" width="40" height="24" fill="#ffffff" stroke="#b8b8b1"/><text x="392" y="412" class="svg-sub" text-anchor="middle">02</text>
+                <rect x="412" y="396" width="220" height="24" fill="#dfede5" stroke="#367f59"/><text x="522" y="412" class="svg-sub" text-anchor="middle">c8 c4 … + 57 ef …</text>
+                <text x="648" y="412" class="svg-sub">reuse "refs/" · 3a = 7&lt;&lt;3|2: id + peeled id</text>
+
+                <text x="56" y="444" class="svg-sub">@169 00 00 1c · 00 00 33 · 00 02  →  restart table: records at 28 and 51, count 2</text>
+                <text x="56" y="468" class="svg-sub">@175 67 · 00 01 2e · 78 da …  →  'g' log block: 302 bytes inflated, 144 on disk; 3 entries, none for the tag</text>
+                <text x="56" y="492" class="svg-sub">@323 footer, 68 bytes: header copy · log block at 175 · CRC-32 73 09 64 10</text>
+
+                <rect x="56" y="514" width="1008" height="60" rx="4" fill="#ffffff" stroke="#d98226"/>
+                <text x="72" y="538" class="svg-sub">varint in a 20-branch table: 80 31 → (0x00 + 1)&lt;&lt;7 | 0x31 = 177 = 22&lt;&lt;3|1  ·  plain LEB128 would write b1 01</text>
+                <text x="72" y="558" class="svg-sub">the same +1 bias as a pack's OFS_DELTA offset and the index v4 strip count · ~26 bytes per ref here vs ~62 in packed-refs</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Text lines against prefix-compressed binary blocks. The orange bytes are prefix lengths; the purple byte
+              packs the suffix length and the value type; reftable reuses the varint git already uses for pack
+              offsets. Dumps from <code>hexdump -C</code>, decoded with <code>refs-rtdump.py</code>.
+            </p>
+          </figure>
+
+          <h3>The stack and its one rename</h3>
+          <p>
+            Tables live in <code>.git/reftable/</code>, listed in <code>tables.list</code>. A writer
+            takes <code>tables.list.lock</code> (100 ms, <code>reftable.lockTimeout</code>), writes its table as
+            <code>&lt;name&gt;.temp.XXXXXX</code> and renames it to a name like
+            <code>0x000000000001-0x000000000004-ae42d254.ref</code>. Nobody reads that file yet. Then
+            <code>reftable/stack.c</code>:781-799 publishes it:
+          </p>
+<pre><code>	err = reftable_write_data(add-&gt;tables_list_lock.fd,
+				  table_list.buf, table_list.len);
+	reftable_buf_release(&amp;table_list);
+	if (err &lt; 0) {
+		err = REFTABLE_IO_ERROR;
+		goto done;
+	}
+
+	err = fsync(add-&gt;tables_list_lock.fd);
+	if (err &lt; 0) {
+		err = REFTABLE_IO_ERROR;
+		goto done;
+	}
+
+	err = flock_commit(&amp;add-&gt;tables_list_lock);</code></pre>
+          <p>
+            The rename inside <code>flock_commit()</code> is the commit point. The <code>fsync</code> is a macro
+            (<code>reftable/reftable-system.h</code>:16) for git's component-gated fsync, which by default does
+            nothing (<a href="#durability">§05</a>). Readers that find a table gone mid-open retry for about three seconds, and keep the list's
+            file descriptor open so a reused inode cannot fool them. After every commit the stack auto-compacts
+            toward a geometric sequence with factor 2; in my benchmarks it stayed at one to four tables
+            <span class="recon">measured here</span>. The atomicity is per stack. The main repository and each
+            linked worktree have their own stack, and a transaction that spans them commits one stack after another
+            (<code>refs/reftable-backend.c</code>:1012-1016) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two loose ends. The writer still emits an obj index, mapping object-id prefixes to ref blocks, which
+            served the 2017 goal of answering "does any ref point here?" quickly. Git never queries it:
+            <code>reftable_table_refs_for()</code> is called only from a unit test. And reftable still rejects
+            <code>a</code> beside <code>a/b</code>, though the format could hold both <span class="src">from the
+            code</span>. A reftable repository also keeps decoys for older tools: <code>.git/HEAD</code> reads
+            <code>ref: refs/heads/.invalid</code> and <code>refs/heads</code> is a regular file, not a directory
+            <span class="recon">measured here</span>. A small doc drift: <code>reftable.geometricFactor</code> is
+            documented up to 256, and the code dies above 255. The numbers favour it anyway: 26 bytes per ref against 62, 167 against 3,100 ms to create
+            10,000 refs, 20 against 604 ms to delete 1,000 of 100,000, with full listing at 100,000 refs about even
+            (96 against 90 ms) <span class="recon">measured here</span>, <code>refs-bench.sh</code>. <code>files</code>
+            stays the default unless git is built <code>WITH_BREAKING_CHANGES</code>, the Git 3.0 switch, which
+            <code>BreakingChanges.adoc</code> ties to JGit, libgit2 and Gitoxide supporting the format.
+          </p>

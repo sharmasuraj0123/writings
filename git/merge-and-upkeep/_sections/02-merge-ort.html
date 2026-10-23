@@ -1,0 +1,166 @@
+          <h2 id="merge-ort"><span class="secnum">{{S}}</span>merge-ort: one map, three phases</h2>
+          <p>
+            Since v2.34.0 the default merge strategy is <code>ort</code>, Elijah Newren's rewrite
+            (<code>6a5fb96672</code>). The old <code>recursive</code> strategy is gone: commit
+            <code>ad45b327c0</code> moved its shared helpers into <code>merge-ort.c</code> and deleted
+            <code>merge-recursive.[ch]</code>, 4,212 lines, in v2.50.0. <code>-s recursive</code> is now a
+            synonym for ort <span class="src">from the code</span>.
+          </p>
+          <p>
+            ort keeps one map. <code>opt-&gt;priv-&gt;paths</code> is a <code>strmap</code> from every relevant
+            path to a <code>merged_info</code> or, if the path still needs work, a <code>conflict_info</code>.
+            Path strings are interned, so later phases compare pointers instead of strings
+            (<code>merge-ort.c:318-528</code>). The merge itself is three phases and an optional restart, in
+            <code>merge-ort.c:5250-5275</code>:
+          </p>
+          <pre><code>redo:
+	trace2_region_enter("merge", "collect_merge_info", opt-&gt;repo);
+	if (collect_merge_info(opt, merge_base, side1, side2) != 0) {
+	…
+	trace2_region_enter("merge", "renames", opt-&gt;repo);
+	result-&gt;clean = detect_and_process_renames(opt);
+	trace2_region_leave("merge", "renames", opt-&gt;repo);
+	if (opt-&gt;priv-&gt;renames.redo_after_renames == 2) {
+		trace2_region_enter("merge", "reset_maps", opt-&gt;repo);
+		clear_or_reinit_internal_opts(opt-&gt;priv, 1);
+		trace2_region_leave("merge", "reset_maps", opt-&gt;repo);
+		goto redo;
+	}</code></pre>
+          <p>
+            <code>collect_merge_info()</code> walks the base and both sides' trees together. Its callback
+            builds a 3-bit <code>match_mask</code>. If all three versions of a subtree have the same id, the
+            subtree is resolved without opening it. That is why a merge touching three files in a large
+            repository costs little: unchanged directories are compared by hash and skipped
+            (<code>merge-ort.c:1253-1453</code>). Rename detection comes next, then
+            <code>process_entries()</code>, which visits paths children first, merges file contents and
+            writes the result trees bottom-up <span class="src">from the code</span>. Figure {{fig-ort}} lays
+            out the phases and what each one writes.
+          </p>
+
+          <figure class="figure wide" id="fig-ort">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">merge-ort's phases, what each writes, and the merge-base walk that feeds it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 530" role="img" aria-label="Four phases left to right: collect_merge_info reads only; detect_and_process_renames and process_entries write merged blobs and trees to the object store; merge_switch_to_result writes the index, worktree and AUTO_MERGE. merge-tree and replay exit before the last phase. An inset shows a criss-cross history where M1 and S1 are both merge bases.">
+                <defs>
+                  <marker id="ort-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="ort-par" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b8b8b1"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">ONE ORT MERGE</text>
+                <!-- redo arc -->
+                <path d="M410,60 L410,46 L140,46 L140,58" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <text x="275" y="40" text-anchor="middle" class="svg-note">restart once if renames ask for it</text>
+                <!-- phase boxes -->
+                <rect x="20" y="62" width="240" height="98" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="84" class="svg-step">collect_merge_info</text>
+                <text x="32" y="106" class="svg-sub">walks base, side1, side2 at once</text>
+                <text x="32" y="124" class="svg-sub">3 sides equal: resolved, skipped</text>
+                <text x="32" y="142" class="svg-sub">every other path → strmap</text>
+                <rect x="290" y="62" width="240" height="98" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="302" y="84" class="svg-step">detect_and_process_renames</text>
+                <text x="302" y="106" class="svg-sub">exact → basename → N×M matrix</text>
+                <text x="302" y="124" class="svg-sub">reused across picks by replay</text>
+                <text x="302" y="142" class="svg-sub">may send ort back to collect</text>
+                <rect x="560" y="62" width="240" height="98" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="572" y="84" class="svg-step">process_entries</text>
+                <text x="572" y="106" class="svg-sub">children before parents</text>
+                <text x="572" y="124" class="svg-sub">xdiff content merge per path</text>
+                <text x="572" y="142" class="svg-sub">writes merged blobs, then trees</text>
+                <rect x="830" y="62" width="240" height="98" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="842" y="84" class="svg-step">merge_switch_to_result</text>
+                <text x="842" y="106" class="svg-sub">two-way checkout to the result</text>
+                <text x="842" y="124" class="svg-sub">conflicts: stages 1/2/3, 1 sort</text>
+                <text x="842" y="142" class="svg-sub">AUTO_MERGE → result tree</text>
+                <line x1="262" y1="111" x2="286" y2="111" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <line x1="532" y1="111" x2="556" y2="111" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <line x1="802" y1="111" x2="826" y2="111" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <!-- writes -->
+                <text x="140" y="204" text-anchor="middle" class="svg-note">reads trees, writes nothing</text>
+                <rect x="290" y="180" width="510" height="40" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="545" y="205" text-anchor="middle" class="svg-sub">object store: merged blobs (markers included) and trees</text>
+                <rect x="830" y="180" width="240" height="40" rx="4" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="950" y="205" text-anchor="middle" class="svg-sub">index · worktree · AUTO_MERGE</text>
+                <!-- exit -->
+                <path d="M815,111 L815,256 L804,256" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <rect x="540" y="240" width="260" height="32" rx="16" fill="#ffffff" stroke="#252525"/>
+                <text x="670" y="261" text-anchor="middle" class="svg-sub">merge-tree, replay: return tree id</text>
+                <text x="670" y="294" text-anchor="middle" class="svg-note">merge-tree --quiet: the outer merge writes no objects</text>
+                <line x1="20" y1="316" x2="1070" y2="316" stroke="#deded9"/>
+                <!-- inset -->
+                <text x="20" y="342" class="svg-lane">INSET: A CRISS-CROSS PAINTED BY paint_down_to_common()</text>
+                <line x1="324" y1="385" x2="266" y2="385" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="234" y1="385" x2="166" y2="385" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="238" y1="395" x2="163" y2="476" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="324" y1="485" x2="266" y2="485" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="234" y1="485" x2="166" y2="485" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="238" y1="475" x2="163" y2="394" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="137" y1="391" x2="75" y2="427" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="137" y1="479" x2="75" y2="443" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <circle cx="60" cy="435" r="15" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="60" y="439" text-anchor="middle" class="svg-step">O</text>
+                <circle cx="150" cy="385" r="15" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+                <text x="150" y="389" text-anchor="middle" class="svg-step">M1</text>
+                <circle cx="150" cy="485" r="15" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+                <text x="150" y="489" text-anchor="middle" class="svg-step">S1</text>
+                <circle cx="250" cy="385" r="15" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="250" y="389" text-anchor="middle" class="svg-step">+</text>
+                <circle cx="250" cy="485" r="15" fill="#dfede5" stroke="#367f59"/>
+                <text x="250" y="489" text-anchor="middle" class="svg-step">+</text>
+                <circle cx="340" cy="385" r="15" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="340" y="389" text-anchor="middle" class="svg-step">M2</text>
+                <circle cx="340" cy="485" r="15" fill="#dfede5" stroke="#367f59"/>
+                <text x="340" y="489" text-anchor="middle" class="svg-step">S2</text>
+                <text x="250" y="362" text-anchor="middle" class="svg-sub">merge S1</text>
+                <text x="250" y="518" text-anchor="middle" class="svg-sub">merge M1</text>
+                <text x="370" y="389" class="svg-sub">main</text>
+                <text x="370" y="489" class="svg-sub">side</text>
+                <!-- legend -->
+                <rect x="440" y="366" width="14" height="14" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="462" y="378" class="svg-sub">PARENT1 only (from main)</text>
+                <rect x="440" y="392" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="462" y="404" class="svg-sub">PARENT2 only (from side)</text>
+                <rect x="440" y="418" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="462" y="430" class="svg-sub">both flags → RESULT</text>
+                <rect x="440" y="444" width="14" height="14" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="462" y="456" class="svg-sub">behind a RESULT → STALE</text>
+                <!-- notes -->
+                <text x="700" y="378" class="svg-sub">merge-base --all → 71876a4 (M1), e539273 (S1)</text>
+                <text x="700" y="402" class="svg-sub">merge-base, v2.55 early exit → 71876a4</text>
+                <text x="700" y="426" class="svg-sub">ort merges M1 and S1 into a virtual base</text>
+                <text x="700" y="456" class="svg-step">git.git bc5204569f: 54 merge bases</text>
+                <text x="700" y="478" class="svg-sub">--all: 21 ms with commit-graph</text>
+                <text x="700" y="498" class="svg-sub">--all: 1,142 ms without</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              "In memory" means the index and worktree are untouched. The object store is not: the rename and
+              content phases write blobs and trees as they go. The inset is the dossier's walkthrough W6
+              (<code>walk-c-d-e.sh</code>); the timings are medians of 5 from <code>mb-time.sh</code>.
+            </p>
+          </figure>
+
+          <p>
+            "In memory" needs care. <code>git merge-tree --write-tree</code> and <code>git replay</code> never
+            touch the index or the worktree. They still write objects. On a freshly gc'd clone, a conflicted
+            <code>merge-tree</code> left 2 new loose objects, and <code>--quiet</code> (v2.50.0) left 0
+            <span class="recon">measured here</span>. The two are the merged blob, conflict markers included,
+            and the tree that holds it; inner merges of a criss-cross record objects even under
+            <code>--quiet</code> <span class="src">from the code</span>. Only <code>merge_switch_to_result()</code> touches
+            the checkout. It runs a two-way checkout, appends the stage 1, 2 and 3 entries of conflicted paths
+            and sorts the index once (<code>merge-ort.c:4594-4967</code>).
+          </p>
+          <p>
+            It also points <code>AUTO_MERGE</code> at the result tree, and it does so on clean merges too.
+            <code>Documentation/revisions.adoc:75-78</code> says the ref records the tree "when a merge
+            operation resulted in conflicts". A clean <code>git merge --no-commit</code> writes it anyway
+            (<code>merge-ort.c:4924-4955</code>). This is finding C15 in the register.
+          </p>
+          <p>
+            Several bases are merged pairwise into a virtual commit first. Its diff3 label is "merged common
+            ancestors", and when the bases themselves conflict, the virtual base carries 9-character markers
+            labelled "Temporary merge branch 1" and "2" <span class="src">from the code</span>. The 54-base
+            merge above ran the collect, renames and process cycle 55 times in 0.53 s
+            <span class="recon">measured here</span>.
+          </p>

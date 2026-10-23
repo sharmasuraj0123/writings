@@ -1,0 +1,2463 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Git v2.55.0 taken apart, part 3: merge bases and generation numbers, merge-ort, rename detection, conflict styles and rerere, auto-maintenance and geometric repack, prune's grace period, the commit-graph and Bloom filters, history to Git 3.0, and a findings register with reproductions."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/git/merge-and-upkeep/" />
+    <meta property="og:title" content="Combining, keeping, and how it got here" />
+    <meta property="og:description" content="Part 3 of a three-part teardown of git v2.55.0: how merge-ort combines histories and what 'in memory' really writes, why rename detection rarely goes quadratic, why your commits now trigger geometric maintenance instead of gc, how prune stays safe with a clock instead of a lock, what the commit-graph and Bloom filters buy on git.git, and a register of three fixed bugs, latent ones and 29 doc drifts, each with a reproduction." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/git/merge-and-upkeep/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Combining, keeping, and how it got here" />
+    <meta name="twitter:description" content="Git v2.55.0, part 3: merging, maintenance, the commit-graph and Bloom filters, history to Git 3.0, and a findings register with reproductions." />
+    <title>Combining, keeping, and how it got here — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · Where two histories meet</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#merge-bases">01 · Where two histories meet</a>
+        <a class="toc-parent" href="#merge-ort">02 · merge-ort: one map, three phases</a>
+        <a class="toc-parent" href="#renames-conflicts">03 · Renames, line diffs and conflicts</a>
+        <a class="toc-parent" href="#maintenance">04 · Who tidies up: gc --auto and maintenance</a>
+        <a class="toc-parent" href="#prune">05 · Deleting by the clock</a>
+        <a class="toc-parent" href="#commit-graph">06 · The commit-graph and Bloom filters</a>
+        <a class="toc-parent" href="#history">07 · From e83c5163 to Git 3.0</a>
+        <a class="toc-parent" href="#findings">08 · The findings register</a>
+        <a class="toc-parent" href="#sources">09 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#merge-bases">01 · Merge bases</a>
+        <a href="#merge-ort">02 · merge-ort</a>
+        <a href="#renames-conflicts">03 · Renames and conflicts</a>
+        <a href="#maintenance">04 · gc and maintenance</a>
+        <a href="#prune">05 · Prune's clock</a>
+        <a href="#commit-graph">06 · Commit-graph + Bloom</a>
+        <a href="#history">07 · 2005 to Git 3.0</a>
+        <a href="#findings">08 · Findings register</a>
+        <a href="#sources">09 · Sources</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Languages & Tools</p>
+        <h1>Combining, keeping, and how it got here<span class="status-pill">Teardown</span></h1>
+        <p class="dek">
+          Part 3 of Git, taken apart. How git combines two histories: merge bases painted with generation numbers, merge-ort's one map and three phases, staged rename detection, conflict styles and rerere. How it keeps a repository fast without locking deletion: auto-maintenance, geometric repacks, prune's two-week clock, the commit-graph and Bloom filters. How a 1,244-line commit from 2005 became v2.55.0, what Git 3.0 will change, and the full register of bugs, documentation drift and gotchas found while reading.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 23 October 2026 · Subject: <code>git@e9019fca</code> (v2.55.0) · Part 3 of 3 · Read from the source and the manual; measured on this machine</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#merge-bases">Where two histories meet</a></li>
+          <li><a href="#merge-ort">merge-ort: one map, three phases</a></li>
+          <li><a href="#renames-conflicts">Renames, line diffs and conflicts</a></li>
+          <li><a href="#maintenance">Who tidies up: gc --auto and maintenance</a></li>
+          <li><a href="#prune">Deleting by the clock</a></li>
+          <li><a href="#commit-graph">The commit-graph and Bloom filters</a></li>
+          <li><a href="#history">From e83c5163 to Git 3.0</a></li>
+          <li><a href="#findings">The findings register</a></li>
+          <li><a href="#sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from git at <code>e9019fca</code>
+              (tag <code>v2.55.0</code>, 29 June 2026), cited as a path and line number from the repository root;
+              the manual pages are cited under <code>Documentation/</code>. <span class="recon">measured here</span>
+              marks a number or behaviour observed with <code>git version 2.55.0</code> on a Linux box with a
+              2-vCPU cgroup quota (git's <code>sysconf</code> still sees 8 CPUs), mostly on a clone of git.git itself;
+              the scripts live in <code>~/git-ref/lab/</code>. Timings are medians of three to five runs, and
+              differences under about 30% are noise. <span class="recon">reconstruction</span> marks a judgement I
+              drew from those sources rather than read in one place.
+            </p>
+            <p>
+              This is Part 3 of 3 of <a href="../">Git, taken apart</a>. <a href="../commit-and-objects/">Part 1</a>
+              covers the commit and its objects, packs and bitmaps; <a href="../state-and-wire/">Part 2</a> covers the
+              index, refs, durability and the wire protocol. This part assumes both and does not re-explain their formats.
+            </p>
+          </div>
+
+          <h2 id="merge-bases"><span class="secnum">01</span>Where two histories meet</h2>
+          <p class="lede">
+            <a href="../commit-and-objects/">Part 1</a> showed that git's history is an append-only store of
+            objects named by their hashes. <a href="../state-and-wire/">Part 2</a> showed the small mutable
+            files around it: the index and the refs, each published by a rename. This part covers the two
+            jobs that run on top of both. Merging combines two lines of history, and it only ever adds
+            objects. Upkeep keeps the store fast, and it does that by rebuilding derived data and by
+            deleting with a clock instead of a lock. The collection's thesis holds here too: everything
+            that makes git fast can be thrown away and rebuilt from the objects.
+          </p>
+          <p>
+            A merge starts by finding the merge base: the newest commit both sides share. That commit is
+            the "before" for a three-way merge. Git finds it in <code>paint_down_to_common()</code> in
+            <code>commit-reach.c</code>. It walks a priority queue backwards from both tips. Commits reached
+            from the first tip get the flag <code>PARENT1</code>; commits reached from the second get
+            <code>PARENT2</code>. A commit that ends up with both flags is a common ancestor. It is marked
+            <code>RESULT</code>, and its parents are marked <code>STALE</code>, because anything older than
+            a common ancestor cannot be the best one. The four flags are object flag bits 16 to 19
+            <span class="src">from the code</span>.
+          </p>
+          <p>The core of the loop is <code>commit-reach.c:144-160</code>:</p>
+          <pre><code>		flags = commit-&gt;object.flags &amp; (PARENT1 | PARENT2 | STALE);
+		if (flags == (PARENT1 | PARENT2)) {
+			if (!(commit-&gt;object.flags &amp; RESULT)) {
+				commit-&gt;object.flags |= RESULT;
+				tail = commit_list_append(commit, tail);
+				/*
+				 * The queue is generation-ordered; no
+				 * remaining common ancestor can be a
+				 * descendant of this one.
+				 */
+				if (!(mb_flags &amp; MERGE_BASE_FIND_ALL) &amp;&amp;
+				    generation &lt; GENERATION_NUMBER_INFINITY)
+					break;
+			}
+			/* Mark parents of a found merge stale */
+			flags |= STALE;
+		}</code></pre>
+          <p>
+            The <code>break</code> is new in v2.55.0. Commit <code>93e5b1680e</code> lets plain
+            <code>git merge-base</code> stop at the first common ancestor when the queue is ordered by
+            generation number. Its message reports 5,229 ms falling to 24 ms. The same release made the
+            loop's "is anything left to do" check O(1) (<code>a186b7797a</code>), about 27× faster inside
+            this function on a 3.7-million-commit monorepo, per its message <span class="src">from the code</span>.
+            Merges never take the shortcut. They pass <code>MERGE_BASE_FIND_ALL</code>, because a merge
+            needs every base.
+          </p>
+          <p>
+            Generation numbers come from the commit-graph file (<a href="#commit-graph">section 06</a>). They
+            are what make this walk cheap. On git.git, the merge behind <code>bc5204569f</code> ("Git
+            2.43-rc0") has 54 merge bases. <code>git merge-base --all</code> on its two parents took 21 ms
+            with a commit-graph and 1,142 ms without, median of 5 runs with
+            <code>lab/scratch/merge/tools/mb-time.sh</code>. The single-base form took 11 ms
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Several bases is the "criss-cross" case: each side has already merged the other once. It is
+            not rare. In a 1-in-6 sample of git.git's two-parent merges, 125 of 3,498 (3.6%) had more than
+            one base <span class="recon">measured here</span>. The next section shows what merge-ort does
+            with more than one base.
+          </p>
+
+          <h2 id="merge-ort"><span class="secnum">02</span>merge-ort: one map, three phases</h2>
+          <p>
+            Since v2.34.0 the default merge strategy is <code>ort</code>, Elijah Newren's rewrite
+            (<code>6a5fb96672</code>). The old <code>recursive</code> strategy is gone: commit
+            <code>ad45b327c0</code> moved its shared helpers into <code>merge-ort.c</code> and deleted
+            <code>merge-recursive.[ch]</code>, 4,212 lines, in v2.50.0. <code>-s recursive</code> is now a
+            synonym for ort <span class="src">from the code</span>.
+          </p>
+          <p>
+            ort keeps one map. <code>opt-&gt;priv-&gt;paths</code> is a <code>strmap</code> from every relevant
+            path to a <code>merged_info</code> or, if the path still needs work, a <code>conflict_info</code>.
+            Path strings are interned, so later phases compare pointers instead of strings
+            (<code>merge-ort.c:318-528</code>). The merge itself is three phases and an optional restart, in
+            <code>merge-ort.c:5250-5275</code>:
+          </p>
+          <pre><code>redo:
+	trace2_region_enter("merge", "collect_merge_info", opt-&gt;repo);
+	if (collect_merge_info(opt, merge_base, side1, side2) != 0) {
+	…
+	trace2_region_enter("merge", "renames", opt-&gt;repo);
+	result-&gt;clean = detect_and_process_renames(opt);
+	trace2_region_leave("merge", "renames", opt-&gt;repo);
+	if (opt-&gt;priv-&gt;renames.redo_after_renames == 2) {
+		trace2_region_enter("merge", "reset_maps", opt-&gt;repo);
+		clear_or_reinit_internal_opts(opt-&gt;priv, 1);
+		trace2_region_leave("merge", "reset_maps", opt-&gt;repo);
+		goto redo;
+	}</code></pre>
+          <p>
+            <code>collect_merge_info()</code> walks the base and both sides' trees together. Its callback
+            builds a 3-bit <code>match_mask</code>. If all three versions of a subtree have the same id, the
+            subtree is resolved without opening it. That is why a merge touching three files in a large
+            repository costs little: unchanged directories are compared by hash and skipped
+            (<code>merge-ort.c:1253-1453</code>). Rename detection comes next, then
+            <code>process_entries()</code>, which visits paths children first, merges file contents and
+            writes the result trees bottom-up <span class="src">from the code</span>. Figure 1 lays
+            out the phases and what each one writes.
+          </p>
+
+          <figure class="figure wide" id="fig-ort">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">merge-ort's phases, what each writes, and the merge-base walk that feeds it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 530" role="img" aria-label="Four phases left to right: collect_merge_info reads only; detect_and_process_renames and process_entries write merged blobs and trees to the object store; merge_switch_to_result writes the index, worktree and AUTO_MERGE. merge-tree and replay exit before the last phase. An inset shows a criss-cross history where M1 and S1 are both merge bases.">
+                <defs>
+                  <marker id="ort-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="ort-par" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b8b8b1"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">ONE ORT MERGE</text>
+                <!-- redo arc -->
+                <path d="M410,60 L410,46 L140,46 L140,58" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <text x="275" y="40" text-anchor="middle" class="svg-note">restart once if renames ask for it</text>
+                <!-- phase boxes -->
+                <rect x="20" y="62" width="240" height="98" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="84" class="svg-step">collect_merge_info</text>
+                <text x="32" y="106" class="svg-sub">walks base, side1, side2 at once</text>
+                <text x="32" y="124" class="svg-sub">3 sides equal: resolved, skipped</text>
+                <text x="32" y="142" class="svg-sub">every other path → strmap</text>
+                <rect x="290" y="62" width="240" height="98" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="302" y="84" class="svg-step">detect_and_process_renames</text>
+                <text x="302" y="106" class="svg-sub">exact → basename → N×M matrix</text>
+                <text x="302" y="124" class="svg-sub">reused across picks by replay</text>
+                <text x="302" y="142" class="svg-sub">may send ort back to collect</text>
+                <rect x="560" y="62" width="240" height="98" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="572" y="84" class="svg-step">process_entries</text>
+                <text x="572" y="106" class="svg-sub">children before parents</text>
+                <text x="572" y="124" class="svg-sub">xdiff content merge per path</text>
+                <text x="572" y="142" class="svg-sub">writes merged blobs, then trees</text>
+                <rect x="830" y="62" width="240" height="98" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="842" y="84" class="svg-step">merge_switch_to_result</text>
+                <text x="842" y="106" class="svg-sub">two-way checkout to the result</text>
+                <text x="842" y="124" class="svg-sub">conflicts: stages 1/2/3, 1 sort</text>
+                <text x="842" y="142" class="svg-sub">AUTO_MERGE → result tree</text>
+                <line x1="262" y1="111" x2="286" y2="111" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <line x1="532" y1="111" x2="556" y2="111" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <line x1="802" y1="111" x2="826" y2="111" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <!-- writes -->
+                <text x="140" y="204" text-anchor="middle" class="svg-note">reads trees, writes nothing</text>
+                <rect x="290" y="180" width="510" height="40" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="545" y="205" text-anchor="middle" class="svg-sub">object store: merged blobs (markers included) and trees</text>
+                <rect x="830" y="180" width="240" height="40" rx="4" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="950" y="205" text-anchor="middle" class="svg-sub">index · worktree · AUTO_MERGE</text>
+                <!-- exit -->
+                <path d="M815,111 L815,256 L804,256" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ort-ctl)"/>
+                <rect x="540" y="240" width="260" height="32" rx="16" fill="#ffffff" stroke="#252525"/>
+                <text x="670" y="261" text-anchor="middle" class="svg-sub">merge-tree, replay: return tree id</text>
+                <text x="670" y="294" text-anchor="middle" class="svg-note">merge-tree --quiet: the outer merge writes no objects</text>
+                <line x1="20" y1="316" x2="1070" y2="316" stroke="#deded9"/>
+                <!-- inset -->
+                <text x="20" y="342" class="svg-lane">INSET: A CRISS-CROSS PAINTED BY paint_down_to_common()</text>
+                <line x1="324" y1="385" x2="266" y2="385" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="234" y1="385" x2="166" y2="385" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="238" y1="395" x2="163" y2="476" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="324" y1="485" x2="266" y2="485" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="234" y1="485" x2="166" y2="485" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="238" y1="475" x2="163" y2="394" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="137" y1="391" x2="75" y2="427" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <line x1="137" y1="479" x2="75" y2="443" stroke="#b8b8b1" stroke-width="1.2" marker-end="url(#ort-par)"/>
+                <circle cx="60" cy="435" r="15" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="60" y="439" text-anchor="middle" class="svg-step">O</text>
+                <circle cx="150" cy="385" r="15" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+                <text x="150" y="389" text-anchor="middle" class="svg-step">M1</text>
+                <circle cx="150" cy="485" r="15" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+                <text x="150" y="489" text-anchor="middle" class="svg-step">S1</text>
+                <circle cx="250" cy="385" r="15" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="250" y="389" text-anchor="middle" class="svg-step">+</text>
+                <circle cx="250" cy="485" r="15" fill="#dfede5" stroke="#367f59"/>
+                <text x="250" y="489" text-anchor="middle" class="svg-step">+</text>
+                <circle cx="340" cy="385" r="15" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="340" y="389" text-anchor="middle" class="svg-step">M2</text>
+                <circle cx="340" cy="485" r="15" fill="#dfede5" stroke="#367f59"/>
+                <text x="340" y="489" text-anchor="middle" class="svg-step">S2</text>
+                <text x="250" y="362" text-anchor="middle" class="svg-sub">merge S1</text>
+                <text x="250" y="518" text-anchor="middle" class="svg-sub">merge M1</text>
+                <text x="370" y="389" class="svg-sub">main</text>
+                <text x="370" y="489" class="svg-sub">side</text>
+                <!-- legend -->
+                <rect x="440" y="366" width="14" height="14" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="462" y="378" class="svg-sub">PARENT1 only (from main)</text>
+                <rect x="440" y="392" width="14" height="14" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="462" y="404" class="svg-sub">PARENT2 only (from side)</text>
+                <rect x="440" y="418" width="14" height="14" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="462" y="430" class="svg-sub">both flags → RESULT</text>
+                <rect x="440" y="444" width="14" height="14" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="462" y="456" class="svg-sub">behind a RESULT → STALE</text>
+                <!-- notes -->
+                <text x="700" y="378" class="svg-sub">merge-base --all → 71876a4 (M1), e539273 (S1)</text>
+                <text x="700" y="402" class="svg-sub">merge-base, v2.55 early exit → 71876a4</text>
+                <text x="700" y="426" class="svg-sub">ort merges M1 and S1 into a virtual base</text>
+                <text x="700" y="456" class="svg-step">git.git bc5204569f: 54 merge bases</text>
+                <text x="700" y="478" class="svg-sub">--all: 21 ms with commit-graph</text>
+                <text x="700" y="498" class="svg-sub">--all: 1,142 ms without</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              "In memory" means the index and worktree are untouched. The object store is not: the rename and
+              content phases write blobs and trees as they go. The inset is the dossier's walkthrough W6
+              (<code>walk-c-d-e.sh</code>); the timings are medians of 5 from <code>mb-time.sh</code>.
+            </p>
+          </figure>
+
+          <p>
+            "In memory" needs care. <code>git merge-tree --write-tree</code> and <code>git replay</code> never
+            touch the index or the worktree. They still write objects. On a freshly gc'd clone, a conflicted
+            <code>merge-tree</code> left 2 new loose objects, and <code>--quiet</code> (v2.50.0) left 0
+            <span class="recon">measured here</span>. The two are the merged blob, conflict markers included,
+            and the tree that holds it; inner merges of a criss-cross record objects even under
+            <code>--quiet</code> <span class="src">from the code</span>. Only <code>merge_switch_to_result()</code> touches
+            the checkout. It runs a two-way checkout, appends the stage 1, 2 and 3 entries of conflicted paths
+            and sorts the index once (<code>merge-ort.c:4594-4967</code>).
+          </p>
+          <p>
+            It also points <code>AUTO_MERGE</code> at the result tree, and it does so on clean merges too.
+            <code>Documentation/revisions.adoc:75-78</code> says the ref records the tree "when a merge
+            operation resulted in conflicts". A clean <code>git merge --no-commit</code> writes it anyway
+            (<code>merge-ort.c:4924-4955</code>). This is finding C15 in the register.
+          </p>
+          <p>
+            Several bases are merged pairwise into a virtual commit first. Its diff3 label is "merged common
+            ancestors", and when the bases themselves conflict, the virtual base carries 9-character markers
+            labelled "Temporary merge branch 1" and "2" <span class="src">from the code</span>. The 54-base
+            merge above ran the collect, renames and process cycle 55 times in 0.53 s
+            <span class="recon">measured here</span>.
+          </p>
+
+          <h2 id="renames-conflicts"><span class="secnum">03</span>Renames, line diffs and conflicts</h2>
+          <p>
+            Git stores no renames. The first README called that a design choice: rename information is
+            "implicit in the trees involved" (<a href="#history">section 07</a>). So every merge and every
+            <code>diff -M</code> has to guess. <code>diffcore_rename_extended()</code> guesses in three stages,
+            cheapest first, and each stage removes pairs before the next one runs (Figure 2).
+          </p>
+          <p>
+            Stage one pairs deleted and added paths whose blob ids are equal. Stage two pairs paths whose
+            basename appears exactly once on each side, if their contents are similar enough. The bar is set
+            in <code>diffcore-rename.c:1495-1504</code>:
+          </p>
+          <pre><code>		/* Determine minimum score to match basenames */
+		double factor = 0.5;
+		char *basename_factor = getenv("GIT_BASENAME_FACTOR");
+		int min_basename_score;
+
+		if (basename_factor)
+			factor = strtol(basename_factor, NULL, 10)/100.0;
+		assert(factor >= 0.0 &amp;&amp; factor &lt;= 1.0);
+		min_basename_score = minimum_score +
+			(int)(factor * (MAX_SCORE - minimum_score));</code></pre>
+          <p>
+            At the default 50% threshold that is 75%. The environment variable is undocumented
+            <span class="src">from the code</span>. Only what is left reaches stage three: a matrix that
+            scores every remaining source against every remaining destination. Each file is cut into chunks
+            (a line, or 64 bytes), the chunks are hashed modulo 107927, and the score is the bytes copied
+            times 60000 over the larger size. The rename limit is checked just before the matrix, and it bounds
+            the matrix's <em>area</em>: sources × destinations against the limit squared. The limit is 1000
+            for diffs (<code>diff.c:58</code>) and 7000 for merges (<code>merge-ort.c:3442-3443</code>).
+          </p>
+
+          <figure class="figure wide" id="fig-renames">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">The rename funnel, with measured cost at each exit</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 360" role="img" aria-label="Unmatched paths flow through exact matching, unique-basename matching, a limit check on the matrix area, then the N by M similarity matrix. Measured times rise from 12 ms for exact moves to 10,984 ms for 3,200 inexact renames. An inset shows a 92% score computed from 144 copied bytes out of 156.">
+                <defs>
+                  <marker id="ren-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="ren-dat" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">diffcore_rename_extended(): CHEAPEST STAGE FIRST</text>
+                <rect x="20" y="44" width="170" height="80" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="68" class="svg-step">unmatched paths</text>
+                <text x="32" y="90" class="svg-sub">deleted = sources</text>
+                <text x="32" y="108" class="svg-sub">added = destinations</text>
+                <rect x="226" y="44" width="190" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="238" y="68" class="svg-step">1 · exact</text>
+                <text x="238" y="90" class="svg-sub">same blob id (oidhash)</text>
+                <text x="238" y="108" class="svg-sub">earliest path wins</text>
+                <rect x="452" y="44" width="200" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="464" y="68" class="svg-step">2 · unique basename</text>
+                <text x="464" y="90" class="svg-sub">one of each name</text>
+                <text x="464" y="108" class="svg-sub">score ≥ 75% at -M50%</text>
+                <polygon points="730,44 778,84 730,124 682,84" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="730" y="88" text-anchor="middle" class="svg-step">limit²</text>
+                <rect x="808" y="44" width="262" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="820" y="68" class="svg-step">3 · N×M similarity matrix</text>
+                <text x="820" y="90" class="svg-sub">chunk hashes, 4 best per dst</text>
+                <text x="820" y="108" class="svg-sub">copied × 60000 / max size</text>
+                <line x1="192" y1="84" x2="222" y2="84" stroke="#252525" stroke-width="2" marker-end="url(#ren-ctl)"/>
+                <line x1="418" y1="84" x2="448" y2="84" stroke="#252525" stroke-width="2" marker-end="url(#ren-ctl)"/>
+                <line x1="654" y1="84" x2="680" y2="84" stroke="#252525" stroke-width="2" marker-end="url(#ren-ctl)"/>
+                <line x1="780" y1="84" x2="804" y2="84" stroke="#252525" stroke-width="2" marker-end="url(#ren-ctl)"/>
+                <!-- exits -->
+                <line x1="321" y1="126" x2="321" y2="148" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#ren-dat)"/>
+                <rect x="236" y="150" width="170" height="46" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="321" y="169" text-anchor="middle" class="svg-sub">found: 12 ms (N=800)</text>
+                <text x="321" y="187" text-anchor="middle" class="svg-sub">18 ms (N=3,200)</text>
+                <line x1="552" y1="126" x2="552" y2="148" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#ren-dat)"/>
+                <rect x="462" y="150" width="180" height="46" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="552" y="169" text-anchor="middle" class="svg-sub">found: 209 / 290 /</text>
+                <text x="552" y="187" text-anchor="middle" class="svg-sub">683 ms</text>
+                <line x1="730" y1="126" x2="730" y2="148" stroke="#ad4b43" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <rect x="664" y="150" width="132" height="46" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="730" y="169" text-anchor="middle" class="svg-sub">over: skip</text>
+                <text x="730" y="187" text-anchor="middle" class="svg-sub">0 renames</text>
+                <line x1="939" y1="126" x2="939" y2="148" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#ren-dat)"/>
+                <rect x="822" y="150" width="234" height="46" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="939" y="169" text-anchor="middle" class="svg-sub">found: 488 / 1,903 /</text>
+                <text x="939" y="187" text-anchor="middle" class="svg-sub">10,984 ms</text>
+                <text x="105" y="168" text-anchor="middle" class="svg-note">N = 800 / 1,600 / 3,200</text>
+                <text x="105" y="186" text-anchor="middle" class="svg-note">files moved and edited</text>
+                <text x="545" y="222" text-anchor="middle" class="svg-note">limit: 1000 for diffs (diff.c:58), 7000 for merges (merge-ort.c:3442-3443); diff -M at N=1,600 found 0 inexact renames</text>
+                <line x1="20" y1="240" x2="1070" y2="240" stroke="#deded9"/>
+                <!-- inset -->
+                <text x="20" y="264" class="svg-lane">INSET: ONE SCORE (old.txt → new.txt)</text>
+                <text x="20" y="295" class="svg-sub">old.txt 151 B</text>
+                <rect x="130" y="282" width="453" height="18" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="130" y="282" width="432" height="18" fill="#dfede5" stroke="#367f59"/>
+                <text x="20" y="327" class="svg-sub">new.txt 156 B</text>
+                <rect x="130" y="314" width="468" height="18" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="130" y="314" width="432" height="18" fill="#dfede5" stroke="#367f59"/>
+                <text x="346" y="346" text-anchor="middle" class="svg-note">144 bytes in matching chunks</text>
+                <text x="640" y="292" class="svg-sub">src_copied = 144</text>
+                <text x="640" y="312" class="svg-sub">144 × 60000 / max(151, 156) = 55384</text>
+                <text x="640" y="332" class="svg-step">→ 92%, printed as R092</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Most renames never reach the quadratic stage, and the rename limit is an area checked last.
+              Timings: <code>git diff -M -l0</code> on synthetic 40-line files, median of 3, from
+              <code>rename-scale.sh</code>; the red exit is the same N=1,600 run with the default limit.
+            </p>
+          </figure>
+
+          <p>
+            The scaling is what the funnel predicts. Moving 3,200 edited files under new names took
+            10,984 ms. Keeping their basenames took 683 ms; unedited moves took 18 ms
+            <span class="recon">measured here</span>. One documented surprise sits in the option parser:
+            <code>-M5</code> means 50%, because the digits are read as a decimal fraction
+            (<code>diff.c:6344-6377</code>; <code>Documentation/diff-options.adoc:585-589</code>).
+          </p>
+          <p>
+            Once paths are paired, file contents go to <code>xdl_merge()</code>. One-sided changes are
+            taken, identical changes accepted, and overlaps become conflicts. Git asks for the
+            <code>ZEALOUS</code> level, which shrinks a conflict by moving lines both sides share outside
+            the markers. The <code>diff3</code> and <code>zdiff3</code> styles are capped at
+            <code>EAGER</code>, because diff3 output "does not make sense for anything more aggressive";
+            zdiff3 then trims identical lines at the edges (<code>xdiff/xmerge.c:534-541, 655-663</code>).
+            ort diffs with histogram, chosen in v2.31.0 because, in its author's words, "I really don't like
+            silent mismerges". Plain <code>git diff</code> still defaults to Myers with cost cut-offs. On the
+            whole v2.30.0..v2.55.0 diff it took 2,286 ms and printed the most lines; histogram took 1,820 ms
+            and patience 1,547 ms. The excess came from <code>po/*.po</code> translation files
+            <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-conflicts">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">One conflict in three styles, and the rerere id each one produces</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 340" role="img" aria-label="Three columns show the same conflict in merge, diff3 and zdiff3 style. In merge and zdiff3 the shared line Y side sits outside the markers; in diff3 it stays inside. rerere strips labels, sorts the sides and hashes them: merge and zdiff3 give id 9c7007f3, diff3 gives a8ade8ef.">
+                <defs>
+                  <marker id="cfl-dat" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="cfl-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ad4b43"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">merge (default)</text>
+                <text x="250" y="22" class="svg-lane">diff3</text>
+                <text x="480" y="22" class="svg-lane">zdiff3</text>
+                <rect x="20" y="32" width="210" height="244" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="250" y="32" width="210" height="244" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="480" y="32" width="210" height="244" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <!-- merge column -->
+                <rect x="28" y="93" width="194" height="16" fill="#e0ebf2"/>
+                <rect x="28" y="127" width="194" height="16" fill="#dfede5"/>
+                <rect x="28" y="161" width="194" height="16" fill="#f7e3c8"/>
+                <text x="34" y="54" class="svg-sub">a</text>
+                <text x="34" y="71" class="svg-sub">b</text>
+                <text x="34" y="88" class="svg-sub">&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</text>
+                <text x="34" y="105" class="svg-sub">X main</text>
+                <text x="34" y="122" class="svg-sub">=======</text>
+                <text x="34" y="139" class="svg-sub">X side</text>
+                <text x="34" y="156" class="svg-sub">&gt;&gt;&gt;&gt;&gt;&gt;&gt; side</text>
+                <text x="34" y="173" class="svg-sub">Y side</text>
+                <text x="34" y="190" class="svg-sub">d</text>
+                <text x="34" y="207" class="svg-sub">e</text>
+                <!-- diff3 column -->
+                <rect x="258" y="93" width="194" height="33" fill="#e0ebf2"/>
+                <rect x="258" y="144" width="194" height="16" fill="#ffffff"/>
+                <rect x="258" y="178" width="194" height="33" fill="#dfede5"/>
+                <rect x="258" y="110" width="194" height="16" fill="#f3dfdc"/>
+                <rect x="258" y="195" width="194" height="16" fill="#f3dfdc"/>
+                <text x="264" y="54" class="svg-sub">a</text>
+                <text x="264" y="71" class="svg-sub">b</text>
+                <text x="264" y="88" class="svg-sub">&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</text>
+                <text x="264" y="105" class="svg-sub">X main</text>
+                <text x="264" y="122" class="svg-sub">Y side</text>
+                <text x="264" y="139" class="svg-sub">||||||| f66523a</text>
+                <text x="264" y="156" class="svg-sub">c</text>
+                <text x="264" y="173" class="svg-sub">=======</text>
+                <text x="264" y="190" class="svg-sub">X side</text>
+                <text x="264" y="207" class="svg-sub">Y side</text>
+                <text x="264" y="224" class="svg-sub">&gt;&gt;&gt;&gt;&gt;&gt;&gt; side</text>
+                <text x="264" y="241" class="svg-sub">d</text>
+                <text x="264" y="258" class="svg-sub">e</text>
+                <!-- zdiff3 column -->
+                <rect x="488" y="93" width="194" height="16" fill="#e0ebf2"/>
+                <rect x="488" y="127" width="194" height="16" fill="#ffffff"/>
+                <rect x="488" y="161" width="194" height="16" fill="#dfede5"/>
+                <rect x="488" y="195" width="194" height="16" fill="#f7e3c8"/>
+                <text x="494" y="54" class="svg-sub">a</text>
+                <text x="494" y="71" class="svg-sub">b</text>
+                <text x="494" y="88" class="svg-sub">&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</text>
+                <text x="494" y="105" class="svg-sub">X main</text>
+                <text x="494" y="122" class="svg-sub">||||||| f66523a</text>
+                <text x="494" y="139" class="svg-sub">c</text>
+                <text x="494" y="156" class="svg-sub">=======</text>
+                <text x="494" y="173" class="svg-sub">X side</text>
+                <text x="494" y="190" class="svg-sub">&gt;&gt;&gt;&gt;&gt;&gt;&gt; side</text>
+                <text x="494" y="207" class="svg-sub">Y side</text>
+                <text x="494" y="224" class="svg-sub">d</text>
+                <text x="494" y="241" class="svg-sub">e</text>
+                <!-- notes under columns -->
+                <text x="125" y="298" text-anchor="middle" class="svg-note">ZEALOUS: shared line moved out</text>
+                <text x="355" y="298" text-anchor="middle" class="svg-note">capped at EAGER: it stays in</text>
+                <text x="585" y="298" text-anchor="middle" class="svg-note">EAGER, then edges trimmed</text>
+                <!-- rerere -->
+                <text x="740" y="22" class="svg-lane">rerere</text>
+                <rect x="740" y="32" width="330" height="58" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="752" y="54" class="svg-step">normalise the conflict</text>
+                <text x="752" y="76" class="svg-sub">drop labels and base, sort sides</text>
+                <rect x="740" y="108" width="330" height="58" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="752" y="130" class="svg-step">id = sha1(side \0 side \0)</text>
+                <text x="752" y="152" class="svg-sub">"X main\n\0X side\n\0"</text>
+                <rect x="740" y="184" width="330" height="58" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="752" y="206" class="svg-step">9c7007f3… (merge and zdiff3)</text>
+                <text x="752" y="228" class="svg-sub">rr-cache/&lt;id&gt;/preimage, postimage</text>
+                <rect x="740" y="258" width="330" height="58" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="752" y="280" class="svg-step">a8ade8ef… (diff3)</text>
+                <text x="752" y="302" class="svg-sub">"Y side" is in both sides: no match</text>
+                <line x1="905" y1="92" x2="905" y2="104" stroke="#252525" stroke-width="2"/>
+                <line x1="905" y1="168" x2="905" y2="180" stroke="#252525" stroke-width="2"/>
+                <line x1="692" y1="100" x2="736" y2="62" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#cfl-dat)"/>
+                <line x1="462" y1="250" x2="736" y2="290" stroke="#ad4b43" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#cfl-red)"/>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              rerere's id is the hash of the conflict's two sides, and diff3 changes the sides. Blue: ours;
+              green: theirs; orange: the shared line outside the markers; red: the shared line inside them.
+              Output of the dossier's walkthroughs W2 and W8 (<code>walk-a-b.sh</code>).
+            </p>
+          </figure>
+
+          <p>
+            That id matters for <code>git rerere</code>, which replays recorded resolutions. It names a
+            conflict by hashing its two sides, labels and base removed, sorted. In the reproduction, merge and
+            zdiff3 styles gave the same id; diff3 gave a different one, because the shared line stayed inside
+            its sides. <code>Documentation/technical/rerere.adoc:9-19</code> promises normalisation across
+            styles, which holds for zdiff3 only (finding C16) <span class="recon">measured here</span>.
+          </p>
+          <p>
+            One cache goes unused. ort can reuse renames found for the previous pick of a rebase, but the
+            sequencer zeroes its result for each pick (<code>sequencer.c:781</code>) and
+            <code>merge_switch_to_result()</code> frees the cache. <code>git replay</code> keeps one result
+            and benefits: on an 8-commit topic over 800 renamed files it ran rename detection once (995 ms),
+            where <code>git rebase</code> ran it 8 times (2,981 ms) <span class="recon">measured here</span>.
+            That is finding B4.
+          </p>
+
+          <h2 id="maintenance"><span class="secnum">04</span>Who tidies up: gc --auto and maintenance</h2>
+          <p>
+            Every write in <a href="../commit-and-objects/#one-commit">Part 1</a> adds a loose object, and every fetch adds
+            a pack. Left alone, lookups slow down as both pile up. Git has always tidied as a side effect of
+            ordinary commands. What changed recently is which command does it.
+          </p>
+          <p>
+            The old answer is <code>git gc --auto</code>. Its first test is a guess at the number of loose
+            objects, in <code>builtin/gc.c:470-482</code>:
+          </p>
+          <pre><code>	/*
+	 * This is weird, but stems from legacy behaviour: the GC auto
+	 * threshold was always essentially interpreted as if it was rounded up
+	 * to the next multiple 256 of, so we retain this behaviour for now.
+	 */
+	int auto_threshold = DIV_ROUND_UP(limit, 256) * 256;
+	…
+	return loose_count &gt; auto_threshold;</code></pre>
+          <p>
+            The count comes from one directory. <code>odb/source-loose.c:539</code> opens
+            <code>objects/17</code>, counts the names in it, and line 560 returns <code>count * 256</code>.
+            With <code>gc.auto</code> at 6700 the threshold is 6912, so gc fires at 28 objects in that one
+            shard. A synthetic repository with 27 there did nothing; one more object triggered a repack
+            <span class="recon">measured here</span>. More than 50 packs selects an all-into-one repack, by
+            default with <code>--cruft</code>. A non-empty <code>gc.log</code> younger than a day blocks
+            every later detached auto-gc, because the next run "is likely to fail in the same way"
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            But porcelain no longer calls <code>gc --auto</code>. <code>commit</code>, <code>fetch</code>,
+            <code>merge</code>, <code>rebase</code>, <code>am</code> and <code>receive-pack</code> spawn
+            <code>git maintenance run --auto</code>, gated by <code>maintenance.auto</code>, which falls back
+            to <code>gc.auto &gt; 0</code> (<code>run-command.c:1956-1993</code>). Since v2.54.0
+            (<code>452b12c2e0</code>) an unscheduled run uses the <code>geometric</code> strategy, because gc's
+            all-into-one repack "is wasteful in small- and medium-sized repositories, in large repos it may even
+            be prohibitively expensive". Figure 4 shows both paths.
+          </p>
+
+          <figure class="figure wide" id="fig-maint">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">Two ways into a repack: the maintenance path porcelain takes, and legacy gc --auto</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 470" role="img" aria-label="Left: porcelain commands start git maintenance run --auto, which uses the geometric strategy; its geometric-repack task either rolls up the smallest packs or, when every pack would roll up, does an all-into-one cruft repack; the commit-graph task needs 100 new commits. Right: legacy gc --auto checks gc.log, the pack count and objects/17 times 256 against 6912. An inset lights shard 17 of 256.">
+                <defs>
+                  <marker id="mnt-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">SINCE v2.54: WHAT YOUR COMMIT RUNS</text>
+                <rect x="20" y="38" width="380" height="34" rx="17" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="210" y="60" text-anchor="middle" class="svg-sub">commit · fetch · merge · rebase · am · receive-pack</text>
+                <line x1="210" y1="74" x2="210" y2="94" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="20" y="96" width="380" height="50" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="32" y="117" class="svg-step">maintenance.auto?</text>
+                <text x="32" y="136" class="svg-sub">unset: falls back to gc.auto &gt; 0</text>
+                <line x1="210" y1="148" x2="210" y2="166" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="20" y="168" width="380" height="50" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="32" y="189" class="svg-step">git maintenance run --auto</text>
+                <text x="32" y="208" class="svg-sub">objects/maintenance.lock; busy → exit 0</text>
+                <line x1="210" y1="220" x2="210" y2="238" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="20" y="240" width="380" height="50" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="32" y="261" class="svg-step">strategy: geometric</text>
+                <text x="32" y="280" class="svg-sub">default for unscheduled runs since v2.54.0</text>
+                <line x1="110" y1="292" x2="110" y2="312" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="310" y1="292" x2="310" y2="312" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="20" y="314" width="186" height="68" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="32" y="335" class="svg-step">geometric-repack</text>
+                <text x="32" y="355" class="svg-sub">≥ 2 packs would merge,</text>
+                <text x="32" y="372" class="svg-sub">or 17/ holds ≥ 2 objects</text>
+                <rect x="220" y="314" width="180" height="68" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="232" y="335" class="svg-step">commit-graph</text>
+                <text x="232" y="355" class="svg-sub">≥ 100 new commits</text>
+                <text x="232" y="372" class="svg-sub">write --split</text>
+                <path d="M113,384 L113,402 L418,402" fill="none" stroke="#252525" stroke-width="2"/>
+                <line x1="418" y1="334" x2="418" y2="422" stroke="#252525" stroke-width="2"/>
+                <line x1="417" y1="334" x2="432" y2="334" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="417" y1="422" x2="432" y2="422" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="436" y="300" width="210" height="68" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="448" y="321" class="svg-step">roll up the small packs</text>
+                <text x="448" y="340" class="svg-sub">--geometric=2, no walk</text>
+                <text x="448" y="356" class="svg-sub">+ --write-midx</text>
+                <rect x="436" y="388" width="210" height="68" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="448" y="409" class="svg-step">every pack rolls up</text>
+                <text x="448" y="428" class="svg-sub">all-into-one --cruft</text>
+                <text x="448" y="444" class="svg-sub">+ --write-midx</text>
+                <!-- legacy column -->
+                <line x1="666" y1="14" x2="666" y2="456" stroke="#deded9"/>
+                <text x="686" y="24" class="svg-lane">LEGACY: git gc --auto</text>
+                <rect x="686" y="38" width="384" height="34" rx="17" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="878" y="60" text-anchor="middle" class="svg-sub">scripts, cron jobs; no porcelain caller</text>
+                <rect x="686" y="92" width="220" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="698" y="117" class="svg-sub">gc.log &lt; 1 day old?</text>
+                <rect x="686" y="150" width="220" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="698" y="175" class="svg-sub">more than 50 packs?</text>
+                <rect x="686" y="208" width="220" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="698" y="233" class="svg-sub">objects/17 × 256 &gt; 6912?</text>
+                <line x1="796" y1="74" x2="796" y2="90" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="796" y1="134" x2="796" y2="148" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="796" y1="192" x2="796" y2="206" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <text x="804" y="145" class="svg-sub">no</text>
+                <text x="804" y="203" class="svg-sub">no</text>
+                <line x1="908" y1="112" x2="926" y2="112" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="908" y1="170" x2="926" y2="170" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="908" y1="228" x2="926" y2="228" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <text x="930" y="116" class="svg-sub">yes: skip</text>
+                <text x="930" y="174" class="svg-sub">yes: all-into-one</text>
+                <text x="930" y="232" class="svg-sub">yes: repack -d -l</text>
+                <text x="796" y="268" text-anchor="middle" class="svg-sub">no: nothing to do</text>
+                <!-- inset -->
+                <text x="686" y="302" class="svg-lane">INSET: THE ONE SHARD gc COUNTS</text>
+                <g fill="#f7f7f5" stroke="#deded9" stroke-width="0.6">
+                  <rect x="686" y="314" width="128" height="128"/>
+                </g>
+                <path d="M686,322 H814 M686,330 H814 M686,338 H814 M686,346 H814 M686,354 H814 M686,362 H814 M686,370 H814 M686,378 H814 M686,386 H814 M686,394 H814 M686,402 H814 M686,410 H814 M686,418 H814 M686,426 H814 M686,434 H814 M694,314 V442 M702,314 V442 M710,314 V442 M718,314 V442 M726,314 V442 M734,314 V442 M742,314 V442 M750,314 V442 M758,314 V442 M766,314 V442 M774,314 V442 M782,314 V442 M790,314 V442 M798,314 V442 M806,314 V442" stroke="#deded9" stroke-width="0.6" fill="none"/>
+                <rect x="742" y="322" width="8" height="8" fill="#d98226"/>
+                <text x="830" y="334" class="svg-sub">objects/17 = 1 of 256</text>
+                <text x="830" y="360" class="svg-sub">27 × 256 = 6,912: not &gt;</text>
+                <text x="830" y="380" class="svg-sub">28 × 256 = 7,168: repack</text>
+                <text x="830" y="406" class="svg-note">gc.auto 6700, rounded up</text>
+                <text x="830" y="424" class="svg-note">to a multiple of 256</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Since 2.54, your commits trigger geometric maintenance, not gc, and gc's threshold still reads
+              one directory in 256. Thresholds from <code>builtin/gc.c</code>; the 27/28 boundary measured with
+              <code>lab/scratch/maintenance/mkblobs.py</code>.
+            </p>
+          </figure>
+
+          <p>
+            The geometric task weighs packs by object count. It finds the smallest packs that break a
+            factor-2 progression and rolls them into one with <code>pack-objects --stdin-packs</code>, which
+            copies objects without walking reachability. Only when every pack would roll up does it fall back
+            to gc's all-into-one <code>--cruft</code> repack (<code>builtin/gc.c:1570-1671</code>). The
+            difference shows. A repository with 700 reachable loose objects, 3 of them in <code>17/</code>, is
+            below gc's threshold. Yet a single <code>git commit</code> there ran a cruft repack and wrote a
+            multi-pack index, because with no packs at all, "every pack" rolls up
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The ten tasks run under <code>objects/maintenance.lock</code>, and a busy lock makes
+            <code>--auto</code> exit 0 silently. In v2.55 the lock passes to the detached child
+            (<code>6e95b07e5f</code>) <span class="src">from the code</span>. The trade-off is in the strategy's
+            own commit, <code>d9bccf2ec3</code>: "pruning of unreferenced objects is not going to happen
+            regularly anymore". The next section is about that pruning.
+          </p>
+
+          <h2 id="prune"><span class="secnum">05</span>Deleting by the clock</h2>
+          <p>
+            Adding objects needs no lock, because an object never changes
+            (<a href="../commit-and-objects/#objects">Part 1</a>). Deleting them is harder. <code>git prune</code>
+            cannot lock out every process that might be about to reference an object, so it uses time instead.
+            It deletes an unreachable loose object only if the file's mtime is older than <code>--expire</code>,
+            two weeks by default since v1.5.5 (<code>25ee9731c1</code>). Its roots are the index, every ref,
+            every worktree's <code>HEAD</code> and every reflog entry. Since v2.2.0 (<code>d3038d22f9</code>) it
+            also keeps anything reachable from a <em>recent</em> unreachable object, so a tree written a minute
+            ago keeps an old blob alive (<code>builtin/prune.c:84-109</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The clock only works if writers reset it. When a writer finds that an object it wants to write
+            already exists, it "freshens" it instead: <code>utime()</code> on the loose file, or on the whole
+            pack. <code>packfile.c:2172-2186</code>:
+          </p>
+          <pre><code>int packfile_store_freshen_object(struct packfile_store *store,
+				  const struct object_id *oid)
+{
+	struct pack_entry e;
+	if (!find_pack_entry(store, oid, &amp;e))
+		return 0;
+	if (e.p-&gt;is_cruft)
+		return 0;
+	if (e.p-&gt;freshened)
+		return 1;
+	if (utime(e.p-&gt;pack_name, NULL))
+		return 0;
+	e.p-&gt;freshened = 1;
+	return 1;
+}</code></pre>
+          <p>
+            A pack is touched once per process. A cruft pack is never touched, because its per-object mtimes
+            live in a <code>.mtimes</code> file; returning 0 makes the caller write the object loose again,
+            with a fresh mtime. Both paths showed up in the lab. Rewriting an old loose blob reset its mtime
+            and took it off <code>prune -n</code>'s list, and rewriting a cruft-packed blob produced a new
+            loose file <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The manual is candid about what is left. Users "who run commands concurrently have to live with
+            some risk of corruption (which seems to be low in practice)"
+            (<code>Documentation/git-gc.adoc:167-169</code>). And since gc and the maintenance reflog task both
+            expire reflogs, their roots were thinned by a v2.50.0 regression: the built-in defaults expire all
+            entries after 30 days and unreachable ones after 90, the reverse of the documentation
+            (<code>reflog.h:25-28</code>). It was reported and fixed upstream after the v2.55.0 tag by
+            <code>60cf500551</code>, which is on master but in no release yet (finding A1). Reflogs themselves
+            are covered in <a href="../state-and-wire/#refs">Part 2</a>, and worktree pruning in
+            <a href="../../git-worktrees/">One repository, many agents</a>.
+          </p>
+
+          <h2 id="commit-graph"><span class="secnum">06</span>The commit-graph and Bloom filters</h2>
+          <p>
+            Walking history means parsing commits: inflate each one, read its <code>parent</code> lines, look
+            each parent up. The commit-graph file (v2.18.0) stores the answers in fixed-width rows instead. It
+            is derived data, like a pack index: delete it and git falls back to parsing. Rows are in object-id
+            order, so a commit's row number is its position. Each 36-byte <code>CDAT</code> row holds the root
+            tree id, the positions of the first two parents (<code>0x70000000</code> means none; a set top bit
+            points into the <code>EDGE</code> list for octopus merges), and a 30-bit topological level packed
+            with a 34-bit commit date <span class="src">from the code</span>. Figure 5 decodes a
+            five-commit file.
+          </p>
+
+          <figure class="figure wide" id="fig-cgraph">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">Commit-graph rows from a five-commit repository, a skewed clock, and what generation numbers buy</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 440" role="img" aria-label="Five CDAT rows with tree, parent positions, level and date. M's second parent 0x80000000 points into EDGE, which lists C and D. Commit C's clock is 1000 seconds behind its parent, so GDA2 stores an offset of 1001. A bar chart shows log --graph -n 2000 on git.git taking 1.587 s without a graph, 0.241 s with generation v1 and 0.083 s with v2.">
+                <defs>
+                  <marker id="cg-dat" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="cg-eff" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">CDAT ROWS, 36 BYTES EACH, IN OID ORDER</text>
+                <text x="20" y="48" class="svg-sub">pos</text>
+                <text x="60" y="48" class="svg-sub">tree (20 B)</text>
+                <text x="196" y="48" class="svg-sub">parent1</text>
+                <text x="296" y="48" class="svg-sub">parent2</text>
+                <text x="396" y="48" class="svg-sub">level&lt;&lt;2|hi</text>
+                <text x="516" y="48" class="svg-sub">date lo</text>
+                <text x="636" y="48" class="svg-sub">decoded</text>
+                <line x1="20" y1="56" x2="1070" y2="56" stroke="#b8b8b1"/>
+                <rect x="56" y="62" width="130" height="122" fill="#e0ebf2"/>
+                <rect x="190" y="62" width="196" height="122" fill="#dfede5"/>
+                <rect x="390" y="62" width="236" height="122" fill="#f7e3c8"/>
+                <text x="20" y="80" class="svg-sub">0</text><text x="62" y="80" class="svg-sub">8c78d866…</text><text x="196" y="80" class="svg-sub">00000001</text><text x="296" y="80" class="svg-sub">70000000</text><text x="396" y="80" class="svg-sub">00000008</text><text x="516" y="80" class="svg-sub">6955b964</text><text x="636" y="80" class="svg-sub">B: parent A · level 2</text>
+                <text x="20" y="104" class="svg-sub">1</text><text x="62" y="104" class="svg-sub">08585692…</text><text x="196" y="104" class="svg-sub">70000000</text><text x="296" y="104" class="svg-sub">70000000</text><text x="396" y="104" class="svg-sub">00000004</text><text x="516" y="104" class="svg-sub">6955b900</text><text x="636" y="104" class="svg-sub">A: root · level 1 · T0</text>
+                <text x="20" y="128" class="svg-sub">2</text><text x="62" y="128" class="svg-sub">4b016810…</text><text x="196" y="128" class="svg-sub">00000001</text><text x="296" y="128" class="svg-sub">70000000</text><text x="396" y="128" class="svg-sub">00000008</text><text x="516" y="128" class="svg-sub">6955b518</text><text x="636" y="128" class="svg-sub">C: parent A · level 2 · T0 − 1000</text>
+                <text x="20" y="152" class="svg-sub">3</text><text x="62" y="152" class="svg-sub">6ca2b082…</text><text x="196" y="152" class="svg-sub">00000001</text><text x="296" y="152" class="svg-sub">70000000</text><text x="396" y="152" class="svg-sub">00000008</text><text x="516" y="152" class="svg-sub">6955b9c8</text><text x="636" y="152" class="svg-sub">D: parent A · level 2</text>
+                <text x="20" y="176" class="svg-sub">4</text><text x="62" y="176" class="svg-sub">090130c5…</text><text x="196" y="176" class="svg-sub">00000000</text><text x="296" y="176" class="svg-sub">80000000</text><text x="396" y="176" class="svg-sub">0000000c</text><text x="516" y="176" class="svg-sub">6955ba2c</text><text x="636" y="176" class="svg-sub">M: B + EDGE[0] · level 3</text>
+                <path d="M326,184 L326,212" fill="none" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#cg-dat)"/>
+                <rect x="196" y="214" width="430" height="30" rx="4" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="208" y="234" class="svg-sub">EDGE: 00000002 80000003 → C, then D (top bit: last)</text>
+                <line x1="20" y1="266" x2="1070" y2="266" stroke="#deded9"/>
+                <!-- clock skew -->
+                <text x="20" y="290" class="svg-lane">GDA2: A CORRECTED DATE FOR C</text>
+                <line x1="40" y1="350" x2="500" y2="350" stroke="#b8b8b1"/>
+                <circle cx="80" cy="350" r="7" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="80" y="376" text-anchor="middle" class="svg-sub">C's date</text>
+                <text x="80" y="394" text-anchor="middle" class="svg-sub">T0 − 1000</text>
+                <circle cx="330" cy="350" r="7" fill="#f7f7f5" stroke="#252525"/>
+                <text x="330" y="376" text-anchor="middle" class="svg-sub">A (parent)</text>
+                <text x="330" y="394" text-anchor="middle" class="svg-sub">T0</text>
+                <circle cx="420" cy="350" r="7" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="440" y="376" text-anchor="middle" class="svg-sub">C corrected</text>
+                <text x="440" y="394" text-anchor="middle" class="svg-sub">T0 + 1</text>
+                <path d="M86,340 Q250,296 414,340" fill="none" stroke="#765b98" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#cg-eff)"/>
+                <text x="250" y="312" text-anchor="middle" class="svg-sub">offset 1001 = 0x3e9</text>
+                <text x="270" y="424" text-anchor="middle" class="svg-note">v2 generation = max(date, 1 + parents'); v1 is the level alone</text>
+                <!-- bars -->
+                <line x1="540" y1="276" x2="540" y2="430" stroke="#deded9"/>
+                <text x="560" y="290" class="svg-lane">git.git: log --graph -n 2000</text>
+                <text x="560" y="328" class="svg-sub">no graph</text>
+                <rect x="680" y="314" width="340" height="20" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="692" y="328" class="svg-sub">1.587 s</text>
+                <text x="560" y="364" class="svg-sub">gen v1</text>
+                <rect x="680" y="350" width="52" height="20" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="742" y="364" class="svg-sub">0.241 s</text>
+                <text x="560" y="400" class="svg-sub">gen v2</text>
+                <rect x="680" y="386" width="18" height="20" fill="#dfede5" stroke="#367f59"/>
+                <text x="708" y="400" class="svg-sub">0.083 s</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Parents as positions and corrected dates turn whole-history walks into bounded searches. Rows
+              from the dossier's walkthrough W2 (T0 = 2026-01-01T00:00Z); timings are medians of 3 on
+              git.git's 82,547 commits from <code>lab/scratch/maintenance/bench.sh</code>.
+            </p>
+          </figure>
+
+          <p>
+            Generation numbers make the walk stop early: if gen(A) &lt; gen(B), A cannot reach B. Version 1
+            used the topological level. Version 2 uses the corrected date, max(date, 1 + the parents'), stored
+            as an offset in <code>GDA2</code> (<code>commit-graph.c:1630-1648</code>). The 2018 levels made
+            some merge-base walks worse, which is why v2 exists. On git.git, <code>rev-list --count</code> fell
+            from 1.38 to 0.11 s and <code>log --topo-order -n 10</code> from 1.59 to 0.018 s; plain
+            <code>log --oneline</code> gained nothing <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Path-limited history needs more. <code>git log -- path</code> must diff each commit's tree against
+            its first parent. A changed-path Bloom filter answers "did this commit touch the path?" first
+            (Figure 6). Each commit gets one filter, sized in bytes at 10 bits per changed path
+            plus each leading directory, probed with 7 hashes; over 512 paths it becomes one all-ones byte
+            (<code>bloom.c:483-547</code>).
+          </p>
+
+          <figure class="figure wide" id="fig-bloom">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">One Bloom filter, bit by bit, and what it saves on git.git</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 350" role="img" aria-label="The path a.txt is hashed twice with murmur3, giving seven bit positions in a 16-bit filter, which is stored as bytes a9 54. A query for d/e/f.txt tests the keys d/e/f.txt, d/e and d. Path-limited log on git.git takes 1.218 s without a graph, 1.064 s with one, and 0.087 s with Bloom filters.">
+                <defs>
+                  <marker id="blm-dat" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">COMMIT A CHANGED ONE PATH: n = 1 → 10 BITS → 2 BYTES</text>
+                <rect x="20" y="40" width="90" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="65" y="73" text-anchor="middle" class="svg-step">a.txt</text>
+                <rect x="140" y="40" width="250" height="56" rx="4" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="152" y="62" class="svg-step">two murmur3 hashes</text>
+                <text x="152" y="83" class="svg-sub">seeds 0x293ae76f, 0x7e646e2c</text>
+                <rect x="420" y="40" width="250" height="56" rx="4" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="432" y="62" class="svg-step">(h0 + i·h1) mod 16, i &lt; 7</text>
+                <text x="432" y="83" class="svg-sub">[0, 7, 14, 5, 12, 3, 10]</text>
+                <line x1="112" y1="68" x2="136" y2="68" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#blm-dat)"/>
+                <line x1="392" y1="68" x2="416" y2="68" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#blm-dat)"/>
+                <line x1="672" y1="68" x2="706" y2="68" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#blm-dat)"/>
+                <g stroke="#b8b8b1" stroke-width="1">
+                  <rect x="710" y="54" width="22" height="26" fill="#f7e3c8"/><rect x="732" y="54" width="22" height="26" fill="#ffffff"/><rect x="754" y="54" width="22" height="26" fill="#ffffff"/><rect x="776" y="54" width="22" height="26" fill="#f7e3c8"/>
+                  <rect x="798" y="54" width="22" height="26" fill="#ffffff"/><rect x="820" y="54" width="22" height="26" fill="#f7e3c8"/><rect x="842" y="54" width="22" height="26" fill="#ffffff"/><rect x="864" y="54" width="22" height="26" fill="#f7e3c8"/>
+                  <rect x="886" y="54" width="22" height="26" fill="#ffffff"/><rect x="908" y="54" width="22" height="26" fill="#ffffff"/><rect x="930" y="54" width="22" height="26" fill="#f7e3c8"/><rect x="952" y="54" width="22" height="26" fill="#ffffff"/>
+                  <rect x="974" y="54" width="22" height="26" fill="#f7e3c8"/><rect x="996" y="54" width="22" height="26" fill="#ffffff"/><rect x="1018" y="54" width="22" height="26" fill="#f7e3c8"/><rect x="1040" y="54" width="22" height="26" fill="#ffffff"/>
+                </g>
+                <text x="721" y="48" text-anchor="middle" class="svg-sub">0</text>
+                <text x="875" y="48" text-anchor="middle" class="svg-sub">7</text>
+                <text x="897" y="48" text-anchor="middle" class="svg-sub">8</text>
+                <text x="1051" y="48" text-anchor="middle" class="svg-sub">15</text>
+                <text x="798" y="100" text-anchor="middle" class="svg-sub">byte 0 = a9</text>
+                <text x="974" y="100" text-anchor="middle" class="svg-sub">byte 1 = 54</text>
+                <line x1="20" y1="122" x2="1070" y2="122" stroke="#deded9"/>
+                <!-- query -->
+                <text x="20" y="146" class="svg-lane">QUERY: git log -- d/e/f.txt</text>
+                <rect x="20" y="160" width="250" height="56" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="32" y="182" class="svg-step">keys for every prefix</text>
+                <text x="32" y="203" class="svg-sub">d/e/f.txt · d/e · d</text>
+                <rect x="300" y="160" width="370" height="56" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="312" y="182" class="svg-step">any bit unset: definitely not</text>
+                <text x="312" y="203" class="svg-sub">skip this commit's tree diff</text>
+                <line x1="272" y1="188" x2="296" y2="188" stroke="#252525" stroke-width="2"/>
+                <rect x="700" y="160" width="370" height="56" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-dasharray="5 4"/>
+                <text x="712" y="182" class="svg-step">doc drift: C10, C11</text>
+                <text x="712" y="203" class="svg-sub">"64-bit words" are bytes; seed ends in c</text>
+                <line x1="20" y1="236" x2="1070" y2="236" stroke="#deded9"/>
+                <!-- bars -->
+                <text x="20" y="260" class="svg-lane">git.git: log -- compat/fsmonitor/fsm-listen-darwin.c</text>
+                <text x="20" y="290" class="svg-sub">no graph</text>
+                <rect x="160" y="276" width="400" height="20" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="172" y="290" class="svg-sub">1.218 s</text>
+                <text x="20" y="316" class="svg-sub">graph only</text>
+                <rect x="160" y="302" width="349" height="20" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="172" y="316" class="svg-sub">1.064 s</text>
+                <text x="20" y="342" class="svg-sub">graph + Bloom</text>
+                <rect x="160" y="328" width="29" height="20" fill="#dfede5" stroke="#367f59"/>
+                <text x="199" y="342" class="svg-sub">0.087 s</text>
+                <text x="640" y="290" class="svg-sub">filter verdicts on that query:</text>
+                <text x="640" y="314" class="svg-step">23,627 definitely not · 36 maybe</text>
+                <text x="640" y="338" class="svg-sub">3 of the 36 were false positives</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              One small filter per commit lets <code>git log -- path</code> skip 23,627 of 23,663 tree diffs on
+              git.git. Bytes recomputed by <code>lab/scratch/maintenance/bloom.py</code> match the file;
+              timings are medians of 3 from <code>bench.sh</code>; verdicts from trace2's
+              <code>bloom/statistics</code>.
+            </p>
+          </figure>
+
+          <p>
+            Filters cost a write 8× slower (16.0 s against 2.0 s) and a file 16% bigger. The format document
+            gets two details wrong: it sizes filters in 64-bit words, and it prints the second seed as
+            <code>0x7e646e2</code>, which does not reproduce git's bytes (findings C10, C11). Git still writes
+            murmur3 v1 by default, which mishandles bytes ≥ 0x80 on signed-char platforms, and
+            <code>git gc</code> ignores <code>commitGraph.changedPaths</code> by documented design (D11, D2)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Maintenance writes the graph as a chain of layers, merging layers when the new one is at least half
+            the size of the one below. A v2.52.0 refactor (<code>199d452758</code>) broke the chain's shared
+            level cache at <code>commit-graph.c:2607-2608</code>:
+          </p>
+          <pre><code>	for (struct commit_graph *chain = g; chain; chain = chain-&gt;base_graph)
+		g-&gt;topo_levels = &amp;topo_levels;</code></pre>
+          <p>
+            It assigns <code>g-&gt;</code> where <code>chain-&gt;</code> was meant, so lower layers recompute
+            levels: 0.10 s instead of 0.016 s to add one commit on git.git, with correct output
+            <span class="recon">measured here</span>. <code>8ea36f63d8</code> fixed it after the tag; it is on
+            master, untagged (finding A3). Scalar, for its part, pins <code>commitGraph.generationVersion=1</code>
+            and <code>gc.auto=0</code> (<code>scalar.c:142, 152</code>).
+          </p>
+
+          <h2 id="history"><span class="secnum">07</span>From e83c5163 to Git 3.0</h2>
+          <p>
+            Git's first commit, <code>e83c5163</code>, is dated 7 April 2005. It is 11 files and 1,244 lines
+            that build seven programs, from <code>update-cache</code> to <code>cat-file</code>, linked against
+            OpenSSL. Its README calls git "the stupid content tracker" and names the two ideas this collection
+            has followed: a content-addressable object database and a "current directory cache", today's
+            index. It already rules out rename tracking, and it puts trust outside git: "the trust has to
+            come from outside", by signing one top-level hash <span class="src">from the code</span>.
+          </p>
+          <p>
+            The object in git.git today is not the one Linus wrote. Its dates are epoch seconds with a
+            timezone, which the original <code>ctime()</code> code could not produce. Early history was
+            rewritten by <code>convert-cache</code> after the format changed <span class="recon">measured here</span>.
+            And the format changed fast. Within a fortnight came recursive trees (9 April), the rename of
+            <code>.dircache</code> to <code>.git</code> (11 April, "That's clearly moronic"), a network-byte-order
+            index (15 April), hashing before compression and the index's trailing checksum (20 April), and tag
+            objects (25 April). Figure 7 sets the two designs side by side.
+          </p>
+
+          <figure class="figure wide" id="fig-history">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">The first commit against v2.55.0, the layers added since, and the Git 3.0 plan</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 560" role="img" aria-label="A two-column comparison of eight design choices in April 2005 and in v2.55.0, a list of code that survives from the first commit, a timeline of milestones from packs in 2005 to Rust in 2026, growth bars for C, shell and Rust lines, and a box listing the four Git 3.0 changes.">
+                <text x="20" y="22" class="svg-lane">e83c5163 · 7 APRIL 2005</text>
+                <text x="470" y="22" class="svg-lane">v2.55.0 · 29 JUNE 2026</text>
+                <line x1="20" y1="32" x2="1070" y2="32" stroke="#b8b8b1"/>
+                <rect x="20" y="36" width="430" height="200" fill="#f7f7f5"/>
+                <rect x="460" y="36" width="610" height="200" fill="#e0ebf2"/>
+                <text x="30" y="56" class="svg-sub">name = SHA-1 of the compressed bytes</text>
+                <text x="470" y="56" class="svg-sub">hash "&lt;type&gt; &lt;size&gt;\0" + data, then deflate (20 Apr 2005)</text>
+                <text x="30" y="80" class="svg-sub">one flat tree with full paths</text>
+                <text x="470" y="80" class="svg-sub">recursive trees (9 Apr 2005)</text>
+                <text x="30" y="104" class="svg-sub">dates as ctime() strings</text>
+                <text x="470" y="104" class="svg-sub">epoch seconds + timezone</text>
+                <text x="30" y="128" class="svg-sub">index: native byte order, SHA-1 in header</text>
+                <text x="470" y="128" class="svg-sub">network order (15 Apr), trailing checksum (20 Apr)</text>
+                <text x="30" y="152" class="svg-sub">init-db makes all 256 fan-out dirs</text>
+                <text x="470" y="152" class="svg-sub">fan-out dirs created on first write</text>
+                <text x="30" y="176" class="svg-sub">.dircache/</text>
+                <text x="470" y="176" class="svg-sub">.git/ (11 Apr 2005)</text>
+                <text x="30" y="200" class="svg-sub">no refs at all</text>
+                <text x="470" y="200" class="svg-sub">files or reftable backend (Part 2)</text>
+                <text x="30" y="224" class="svg-sub">trust: sign one top-level hash, outside git</text>
+                <text x="470" y="224" class="svg-sub">signed tags; gpgsig headers with GPG or SSH keys</text>
+                <text x="20" y="262" class="svg-lane">STILL THERE</text>
+                <text x="130" y="262" class="svg-sub">parent-order comment in write_commit_tree() · alloc_nr() · the DB_ENVIRONMENT name · index.lock: O_EXCL, then rename</text>
+                <line x1="20" y1="278" x2="1070" y2="278" stroke="#deded9"/>
+                <!-- ribbon: x = 40 + (year - 2005) * 48 -->
+                <text x="20" y="300" class="svg-lane">LAYERS, NOT REPLACEMENTS</text>
+                <line x1="40" y1="360" x2="1060" y2="360" stroke="#252525" stroke-width="2"/>
+                <text x="40" y="384" text-anchor="middle" class="svg-num">2005</text>
+                <text x="280" y="384" text-anchor="middle" class="svg-num">2010</text>
+                <text x="520" y="384" text-anchor="middle" class="svg-num">2015</text>
+                <text x="760" y="384" text-anchor="middle" class="svg-num">2020</text>
+                <text x="1048" y="384" text-anchor="middle" class="svg-num">2026</text>
+                <g fill="#d98226">
+                  <circle cx="65" cy="360" r="4"/><circle cx="125" cy="360" r="4"/><circle cx="146" cy="360" r="4"/>
+                  <circle cx="275" cy="360" r="4"/><circle cx="487" cy="360" r="4"/><circle cx="616" cy="360" r="4"/>
+                  <circle cx="667" cy="360" r="4"/><circle cx="798" cy="360" r="4"/><circle cx="846" cy="360" r="4"/>
+                  <circle cx="991" cy="360" r="4"/><circle cx="1047" cy="360" r="4"/>
+                </g>
+                <text x="65" y="326" text-anchor="middle" class="svg-sub">packs</text>
+                <text x="65" y="342" text-anchor="middle" class="svg-sub">v0.99</text>
+                <text x="146" y="326" text-anchor="middle" class="svg-sub">staging UI</text>
+                <text x="146" y="342" text-anchor="middle" class="svg-sub">v1.5.0</text>
+                <text x="125" y="404" text-anchor="middle" class="svg-sub">OFS_DELTA,</text>
+                <text x="125" y="420" text-anchor="middle" class="svg-sub">packed-refs</text>
+                <text x="275" y="326" text-anchor="middle" class="svg-sub">smart HTTP</text>
+                <text x="275" y="342" text-anchor="middle" class="svg-sub">v1.6.6</text>
+                <text x="487" y="326" text-anchor="middle" class="svg-sub">bitmaps</text>
+                <text x="487" y="342" text-anchor="middle" class="svg-sub">v2.0.0</text>
+                <text x="616" y="326" text-anchor="middle" class="svg-sub">sha1dc</text>
+                <text x="616" y="342" text-anchor="middle" class="svg-sub">v2.13.0</text>
+                <text x="667" y="404" text-anchor="middle" class="svg-sub">protocol v2,</text>
+                <text x="667" y="420" text-anchor="middle" class="svg-sub">commit-graph</text>
+                <text x="798" y="326" text-anchor="middle" class="svg-sub">SHA-256 repos</text>
+                <text x="798" y="342" text-anchor="middle" class="svg-sub">v2.29.0</text>
+                <text x="846" y="404" text-anchor="middle" class="svg-sub">ort default</text>
+                <text x="846" y="420" text-anchor="middle" class="svg-sub">v2.34.0</text>
+                <text x="991" y="326" text-anchor="middle" class="svg-sub">reftable</text>
+                <text x="991" y="342" text-anchor="middle" class="svg-sub">v2.45.0</text>
+                <text x="1016" y="404" text-anchor="middle" class="svg-sub">geometric, Rust</text>
+                <text x="1016" y="420" text-anchor="middle" class="svg-sub">v2.54, v2.55</text>
+                <line x1="20" y1="438" x2="1070" y2="438" stroke="#deded9"/>
+                <!-- growth -->
+                <text x="20" y="460" class="svg-lane">LINES, v1.0.0 → v2.55.0</text>
+                <text x="20" y="486" class="svg-sub">C</text>
+                <rect x="80" y="474" width="31" height="16" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="80" y="474" width="400" height="16" fill="none" stroke="#3c6f97"/>
+                <rect x="80" y="474" width="31" height="16" fill="#e0ebf2"/>
+                <text x="490" y="486" class="svg-sub">34,041 → 436,044</text>
+                <text x="20" y="512" class="svg-sub">shell</text>
+                <rect x="80" y="500" width="310" height="16" fill="none" stroke="#3c6f97"/>
+                <rect x="80" y="500" width="11" height="16" fill="#e0ebf2"/>
+                <text x="400" y="512" class="svg-sub">12,072 → 337,602</text>
+                <text x="20" y="538" class="svg-sub">Rust</text>
+                <rect x="80" y="526" width="2" height="16" fill="#3c6f97"/>
+                <text x="92" y="538" class="svg-sub">0 → 1,813</text>
+                <!-- git 3.0 -->
+                <rect x="700" y="452" width="370" height="96" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="712" y="474" class="svg-step">Git 3.0 (no release date)</text>
+                <text x="712" y="496" class="svg-sub">sha256 · reftable · main · Rust required</text>
+                <text x="712" y="516" class="svg-sub">"no plan to deprecate" sha1</text>
+                <text x="712" y="536" class="svg-sub">last 2.x release becomes an LTS</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The model was fixed in a fortnight; twenty-one years added layers, not replacements. Ribbon
+              positions are each feature's first release tag; line counts from <code>lab/scratch/history/growth.sh</code>
+              (<code>git grep -c ''</code> per tag); the Git 3.0 box quotes
+              <code>Documentation/BreakingChanges.adoc</code>.
+            </p>
+          </figure>
+
+          <p>
+            After v0.99 (10 July 2005) the object and index model kept its shape. Everything since is a layer.
+            Packs arrived 11 weeks after the first commit. Junio C Hamano has tagged every release since
+            v0.99.2. Then came offset deltas and <code>packed-refs</code>, the v1.5.0 staging-area interface,
+            smart HTTP, bitmaps, collision-detecting SHA-1, protocol v2 and the commit-graph in the same
+            release, SHA-256 repositories, ort, reftable and geometric maintenance. Each is derived data or an
+            alternative encoding. None replaced the object model, and some, like
+            <code>Z_BEST_SPEED</code> for loose objects since v1.5.3, are only tuning
+            <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            Some code is older than the format. <code>write_commit_tree()</code> still carries Linus's comment
+            that "the same exact tree merged with a different order of parents will be a _different_ changeset",
+            and <code>alloc_nr()</code> is byte-identical to 2005 <span class="src">from the code</span>. C grew
+            from 34,041 lines at v1.0.0 to 436,044 at v2.55.0, shell (mostly the test suite) from 12,072 to
+            337,602. 2,335 people have authored commits. Since mid-2024 Patrick Steinhardt has written 27% of
+            non-merge commits, more than three times Junio's count, much of it the refs, object-database and Rust work
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Rust is one 1,571-line crate, <code>gitcore</code>, built by default since v2.55.0 and opted out with
+            <code>NO_RUST</code>; <code>Documentation/BreakingChanges.adoc:201-203</code> still says to opt in
+            with <code>WITH_RUST=YesPlease</code>, a knob that does not exist (C20). The same document lists
+            Git 3.0: SHA-256 and reftable as defaults for new repositories, <code>main</code> as the default
+            branch, Rust required. It says there is "no plan to deprecate" the SHA-1 format and "no planned release date"
+            for 3.0 <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="findings"><span class="secnum">08</span>The findings register</h2>
+          <p>
+            Reading v2.55.0 line by line against its manual turns up mismatches. Figure 8 lists
+            all of them, in four groups. Group A is three real bugs in v2.55.0 that upstream has already fixed
+            after the tag: the fixes are on <code>master</code>, <code>next</code> and <code>seen</code> but in
+            no release yet. None of them was found here; each was reported or fixed upstream, and the register
+            records the introducing commit, the fix and a reproduction. Group B is five latent bugs or gaps still
+            present at <code>origin/seen</code> as fetched on 21 October 2026. Group C is 29 places where the
+            documentation and the code disagree; the code wins. Group D is behaviour that is documented, or
+            deliberate, but surprises people.
+          </p>
+          <p>
+            The reproductions for A1, A2, B1, B2, B3 and D1 were re-run for this post with
+            <code>git version 2.55.0</code>, and each printed what the register says <span class="recon">measured here</span>. The others come
+            from the dossier's lab runs and the verification passes behind it.
+          </p>
+          <p>
+            Upstream keeps moving, and a few changes since the tag touch rows below. On <code>master</code>:
+            <code>USE_NSEC</code> became the runtime setting <code>core.useNanosec</code>
+            (<code>3a21fe8cf9</code>, D24), reftable's reflog timezones were fixed (<code>e14e2b6cf2</code>), and
+            <code>init.defaultRefFormat</code> was renamed <code>init.defaultRefStorageFormat</code>
+            (<code>53d995c53f</code>). Only on <code>seen</code>, <code>core.indexLockTimeout</code>
+            (<code>fd1a1fc743</code>) would let the index lock wait (D19). None is in a release yet.
+          </p>
+
+          <figure class="figure wide" id="fig-register">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">Findings register for git v2.55.0: fixed after the tag, latent, doc drift, gotchas</p>
+            </div>
+            <div class="figure-body">
+              <details open>
+                <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">A · REAL BUGS IN v2.55.0, FIXED UPSTREAM AFTER THE TAG (3)</summary>
+                <table style="font-size: 13px">
+                  <thead><tr><th>#</th><th>Finding</th><th>Code</th><th>Introduced → fixed</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr><td>A1</td><td>Reflog expiry defaults swapped: every entry expires after 30 days, unreachable ones after 90, the reverse of the docs. Hits <code>reflog expire</code>, <code>gc</code> and the maintenance reflog task.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">reflog.h:25-28; docs config/gc.adoc:115-122, git-reflog.adoc:114-124</td><td>8565827570 (v2.50.0) → 60cf500551, 2026-09-24</td><td class="hl-green" style="background: var(--green-soft)">fixed on master, untagged</td></tr>
+                    <tr><td>A2</td><td><code>uploadpack.allowRefInWant</code> plus <code>clone --depth</code> dies: the server sends wanted-refs before shallow-info.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:1815-1816; fetch-pack.c:1851-1856; gitprotocol-v2.adoc:391-393</td><td>516e2b76bd, 733020517a (v2.19.0) → 191740edaa, 2026-09-16</td><td class="hl-green" style="background: var(--green-soft)">fixed on master, untagged</td></tr>
+                    <tr><td>A3</td><td>A split commit-graph write recomputes lower layers' levels: 0.10 s instead of 0.016 s per one-commit layer. Output is correct.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-graph.c:2606-2608; reader 919-920</td><td>199d452758 (v2.52.0) → 8ea36f63d8, 2026-07-09</td><td class="hl-green" style="background: var(--green-soft)">fixed on master, untagged</td></tr>
+                  </tbody>
+                </table>
+              </details>
+              <details style="margin: 6px 0 22px">
+                <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for A</summary>
+                <pre><code># A1: no config; reflog.h defaults
+git init -q -b main rl &amp;&amp; cd rl; now=$(date +%s); d(){ echo "@$((now - $1*86400)) +0000"; }
+for a in 100 60 45 20 1; do echo $a&gt;f; git add f
+  GIT_COMMITTER_DATE="$(d $a)" GIT_AUTHOR_DATE="$(d $a)" git commit -qm c$a; done
+echo u&gt;h; git add h; GIT_COMMITTER_DATE="$(d 35)" GIT_AUTHOR_DATE="$(d 35)" git commit -qm u35
+GIT_COMMITTER_DATE="$(d 1)" git reset -q --hard HEAD~1
+git reflog expire --all --verbose   # prunes c100, c60, c45, u35; keeps c20, c1, the reset
+
+# A2: needs a repository srv with at least one commit
+git -C srv config uploadpack.allowRefInWant true
+git -c protocol.version=2 clone -q --depth 1 file://$PWD/srv rw1
+# fatal: expected 'packfile', received 'shallow-info'
+
+# A3: ~/git-ref/lab/scratch/maintenance/topo.sh and topo2.sh
+# two-layer chain, then one commit with: commit-graph write --split=no-merge --stdin-commits</code></pre>
+              </details>
+
+              <details open>
+                <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">B · LATENT BUGS AND GAPS, UNFIXED AT origin/seen (5)</summary>
+                <table style="font-size: 13px">
+                  <thead><tr><th>#</th><th>Finding</th><th>Code</th><th>History</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr><td>B1</td><td><code>index.skipHash</code> with <code>core.splitIndex</code> silently drops every staged entry: the shared index is named after a null hash, and a null base means "not split".</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">read-cache.c:3268, 2369</td><td>skipHash since ee1f0c242e (v2.40.0); tests for the pair disabled in 7cce609e08 (v2.55.0); first bad commit not bisected</td><td class="hl-red" style="background: var(--red-soft)">unfixed; Scalar turns skipHash on</td></tr>
+                    <tr><td>B2</td><td>The end-of-index-entries extension can never validate in a SHA-256 repository, so threaded index loading is dead there.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">read-cache.c:3543 (size uses GIT_SHA1_RAWSZ), 3567, 3632-3644</td><td>EOIE/IEOT v2.20.0; SHA-256 repos v2.29.0; the writer change not traced</td><td class="hl-red" style="background: var(--red-soft)">unfixed</td></tr>
+                    <tr><td>B3</td><td><code>feature.experimental</code> and <code>feature.manyFiles</code> never enable path-walk packing: line 78 resets the cascaded value when the key is unset.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">repo-settings.c:57, 63, 78; builtin/pack-objects.c:5188-5197</td><td>4f7f571204 (v2.51.0)</td><td class="hl-red" style="background: var(--red-soft)">unfixed</td></tr>
+                    <tr><td>B4</td><td>Rebase and cherry-pick never reuse ort's cached renames; <code>git replay</code> does (1 rename pass against 8).</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">sequencer.c:781, 784-791; merge-ort.c:4966-4980, 5145-5157</td><td>since the ort rename cache; the design doc says it is dropped only when a rebase stops</td><td class="hl-red" style="background: var(--red-soft)">unfixed; a missed optimisation</td></tr>
+                    <tr><td>B5</td><td>The commit-graph writer's edge guard (0x7fffffff) is looser than the documented cap (0x70000000 = "no parent").</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-graph.c:2676; gitformat-commit-graph.adoc:32-35</td><td>—</td><td class="hl-red" style="background: var(--red-soft)">latent, theoretical</td></tr>
+                  </tbody>
+                </table>
+              </details>
+              <details style="margin: 6px 0 22px">
+                <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for B</summary>
+                <pre><code># B1
+git init -q sk; git -C sk config index.skipHash true; git -C sk config core.splitIndex true
+for i in 1 2 3 4 5; do echo $i &gt; sk/f$i; done; git -C sk add f1 f2 f3 f4 f5
+git -C sk ls-files | wc -l    # 0
+git -C sk status --short      # ?? f1 … ?? f5
+
+# B2: the reader probes 64 bytes before EOF; EOIE sits 76 before it
+git init -q --object-format=sha256 s &amp;&amp; echo a &gt; s/a &amp;&amp; git -C s -c index.threads=true add a
+python3 -c "d=open('s/.git/index','rb').read(); print(len(d), d.rfind(b'EOIE'), d[-64:-60])"
+# 168 92 b'\xe3\xb0\xc4B'
+
+# B3: count path-walk regions (run inside any repository)
+for c in "" "-c feature.experimental=true" "-c feature.manyFiles=true" "-c pack.usePathWalk=true"; do
+  echo HEAD | GIT_TRACE2_EVENT=$PWD/t2.json git $c pack-objects --revs --stdout &gt;/dev/null
+  grep -c '"label":"path-walk"' t2.json; rm t2.json; done
+# 0 0 0 2
+
+# B4: ~/git-ref/lab/scratch/merge/tools/rename-cache.sh (N=800, K=8, M=400)
+# replay: 1 diffcore_rename call; rebase: 8</code></pre>
+              </details>
+
+              <details open>
+                <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">C · DOCUMENTATION DRIFT: DOC AND CODE DISAGREE, THE CODE WINS (29)</summary>
+                <table style="font-size: 13px">
+                  <thead><tr><th>#</th><th>What the doc says, and what the code does</th><th>Doc</th><th>Code</th><th>Since</th></tr></thead>
+                  <tbody>
+                    <tr><td>C1</td><td><code>core.fsync=committed</code> "equivalent to objects"; the code adds refs. The described default is wrong too.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/core.adoc:678-681</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">write-or-die.h:33-38</td><td>v2.36.0 (bc22d845c4)</td></tr>
+                    <tr><td>C2</td><td><code>index.threads</code> "defaults to true"; unset means 1 thread.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/index.adoc:26-27</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config.c:2547; read-cache.c:2257-2258</td><td>v2.20.0 (2a9dedef2e)</td></tr>
+                    <tr><td>C3</td><td>MIDX version "defaults to 2"; v1 is written.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-pack.adoc:377-379</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">midx-write.c:1279-1282</td><td>v2.54.0 revert (a12382f994)</td></tr>
+                    <tr><td>C4</td><td>Pseudo-pack order "descending by pack ID"; the code sorts ascending, and the doc contradicts itself at :538-539.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-pack.adoc:530-531</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">midx-write.c:644-657</td><td>—</td></tr>
+                    <tr><td>C5</td><td>BTMP "encodes three pieces of information", then lists two; disk holds two u32 per pack.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-pack.adoc:575-577</td><td>measured BTMP</td><td>—</td></tr>
+                    <tr><td>C6</td><td>Bitmap type indexes "after the hash cache"; they start at offset 32 and the hash cache is last. "20-byte checksum" is 32 bytes in SHA-256.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/bitmap-format.adoc:95-97</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pack-bitmap-write.c:1365-1441</td><td>—</td></tr>
+                    <tr><td>C7</td><td>A <code>DIR_BITS</code> name hash from a 2006 IRC log that the code never implemented.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/pack-heuristics.adoc:151-153</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pack-objects.h:204-222</td><td>2006</td></tr>
+                    <tr><td>C8</td><td>idx v3 signature spelled with a digit zero; the code's is a letter O.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/hash-function-transition.adoc:219</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pack.h:41</td><td>copied forward on seen</td></tr>
+                    <tr><td>C9</td><td><code>gitformat-loose(5)</code> documents <code>map-*.map</code> files; 2.55 writes a text <code>loose-object-idx</code>.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-loose.adoc:12-13</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">loose.c:15, 80, 140, 182</td><td>v2.54.0</td></tr>
+                    <tr><td>C10</td><td>Bloom filter size in "64-bit words"; the code uses bytes.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-commit-graph.adoc:157-159</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">bloom.h:30-32, 47</td><td>—</td></tr>
+                    <tr><td>C11</td><td>Second Bloom seed printed as 0x7e646e2; the code's is 0x7e646e2c.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-commit-graph.adoc:149</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">bloom.c:228-229</td><td>—</td></tr>
+                    <tr><td>C12</td><td><code>reftable.geometricFactor</code> "maximum factor of 256"; the code dies above 255.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/reftable.adoc:47-48</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs/reftable-backend.c:353-354</td><td>—</td></tr>
+                    <tr><td>C13</td><td>Glossary: per-worktree refs are HEAD and refs/bisect/; the code adds refs/worktree/, refs/rewritten/ and root refs.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">glossary-content.adoc:494-498</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs.c:881-886</td><td>—</td></tr>
+                    <tr><td>C14</td><td>Glossary: root refs use only upper case and underscores; <code>is_root_ref()</code> also accepts a hyphen.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">glossary-content.adoc:565-585</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs.c:908</td><td>minor</td></tr>
+                    <tr><td>C15</td><td><code>AUTO_MERGE</code> written when a merge "resulted in conflicts"; it is written after clean merges too.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">revisions.adoc:75-78</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">merge-ort.c:4924-4955</td><td>v2.32.0 (5291828df8)</td></tr>
+                    <tr><td>C16</td><td>rerere normalises across conflict styles; diff3 changes the conflict id, zdiff3 does not.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/rerere.adoc:9-19</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">xdiff/xmerge.c:534-541; rerere.c:367-466</td><td>—</td></tr>
+                    <tr><td>C17</td><td><code>allowTipSHA1InWant</code> and friends describe refusals that apply only to protocol v0/v1; v2 serves any object by id.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/uploadpack.adoc:6-23</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:1472-1505</td><td>v2.18.0</td></tr>
+                    <tr><td>C18</td><td>Comment says the unconfigured client default is v0; the code returns v2.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">protocol.h:32-38</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">protocol.c:46</td><td>v2.29.0 (eb049759fb)</td></tr>
+                    <tr><td>C19</td><td>bundle-uri comment "Convert all refs/heads/"; every refs/&lt;x&gt; maps to refs/bundles/&lt;x&gt;, as the design doc says.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">bundle-uri.c:432-433 (comment)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">bundle-uri.c:432-456</td><td>comment only</td></tr>
+                    <tr><td>C20</td><td>Opt in to Rust with <code>WITH_RUST=YesPlease</code>; no such knob. Rust is on unless <code>NO_RUST</code>.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">BreakingChanges.adoc:201-203</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">Makefile:497-499, 1595-1597</td><td>2.52-era text</td></tr>
+                    <tr><td>C21</td><td><code>feature.adoc</code> promises path-walk under experimental (never delivered, B3) and omits it from manyFiles, which sets it.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/feature.adoc:24-26, 34-47</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">repo-settings.c:57, 63, 78</td><td>v2.51.0</td></tr>
+                    <tr><td>C22</td><td>Comment names the PID file <code>foo-pid.lock</code>; code and docs use <code>foo~pid.lock</code>.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">lockfile.c:90-107 (comment)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">lockfile.h:136</td><td>v2.54.0 (dbdcab6b89)</td></tr>
+                    <tr><td>C23</td><td>Comment: the shared index gets a zero timestamp; the code copies the live one.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">split-index.c:109-110 (comment)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">split-index.c:110</td><td>stale comment</td></tr>
+                    <tr><td>C24</td><td>Split commit-graph merge rule "less than"; the code uses &lt;=.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/commit-graph.adoc:272-296</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-graph.c:2280-2324</td><td>minor</td></tr>
+                    <tr><td>C25</td><td>MIDX header byte for base files "always zero" is written and never read; chains use a BASE chunk.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitformat-pack.adoc:391-392</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">midx-write.c:36-51</td><td>minor</td></tr>
+                    <tr><td>C26</td><td>ort "defaults to histogram" while diffs use <code>diff.algorithm</code>: incomplete, since porcelain merges honour <code>diff.algorithm</code> and plumbing does not.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">merge-strategies.adoc:96-102</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">merge-ort.c:5473-5481, 5513-5523</td><td>v2.50.0 (2e806d8464)</td></tr>
+                    <tr><td>C27</td><td><code>need_to_gc()</code> comment says too many packs runs <code>repack -A -d -l</code>; with cruft packs it is <code>--cruft</code>.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:664-715 (comment)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:628-648</td><td>stale comment</td></tr>
+                    <tr><td>C28</td><td>The v2 grammar spells "acknowledgements"; the header and the code say "acknowledgments".</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">gitprotocol-v2.adoc:391-394</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:1690</td><td>cosmetic</td></tr>
+                    <tr><td>C29</td><td>reftable's 2017 problem statement calls packed-refs lookup a linear scan; the code binary-searches the mapped file.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">technical/reftable.adoc:10-13</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs/packed-backend.c:590-640</td><td>historical</td></tr>
+                  </tbody>
+                </table>
+                <p style="font-size: 13px; color: var(--ink-faint); margin: 10px 0 22px">Every C item is unfixed at origin/seen. Doc paths are under <code>Documentation/</code>. To reproduce one, read the two locations side by side; C1, C3 to C6, C9 to C11 and C15 were also confirmed by measuring what git writes.</p>
+              </details>
+
+              <details open>
+                <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">D · DOCUMENTED OR DELIBERATE, BUT SURPRISING (26)</summary>
+                <table style="font-size: 13px">
+                  <thead><tr><th>#</th><th>Behaviour</th><th>Code</th><th>Status</th></tr></thead>
+                  <tbody>
+                    <tr><td>D1</td><td><code>-M5</code> means 50% and <code>-M05</code> means 5%: the digits are a decimal fraction.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">diff.c:6344-6377</td><td class="hl-purple" style="background: var(--purple-soft)">documented</td></tr>
+                    <tr><td>D2</td><td><code>git gc</code> ignores <code>commitGraph.changedPaths</code>; only <code>commit-graph write</code> reads it.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/commit-graph.c:207-220; builtin/gc.c:1056-1059</td><td class="hl-purple" style="background: var(--purple-soft)">documented scope</td></tr>
+                    <tr><td>D3</td><td>Protocol v2 serves any existing object by id, including dangling commits and hidden refs' tips.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:1472-1505</td><td class="hl-purple" style="background: var(--purple-soft)">in the protocol spec</td></tr>
+                    <tr><td>D4</td><td>Push still speaks protocol v0 over every transport.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">connect.c:1411-1417</td><td class="hl-purple" style="background: var(--purple-soft)">NEEDSWORK, open</td></tr>
+                    <tr><td>D5</td><td><code>pre-commit</code> runs after the trees and the index are written; a rejecting hook leaves them on disk.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/commit.c:482-494</td><td class="hl-purple" style="background: var(--purple-soft)">reproduced</td></tr>
+                    <tr><td>D6</td><td>Auto-maintenance roughly doubles a tiny commit: 8.4 ms against 3.9 ms.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/commit.c:1964-1967</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D7</td><td>Every commit takes and drops <code>AUTO_MERGE.lock</code> and <code>packed-refs.lock</code>; a stale <code>packed-refs.lock</code> costs each commit about 1 s.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">sequencer.c:2988-2989</td><td class="hl-purple" style="background: var(--purple-soft)">open at seen</td></tr>
+                    <tr><td>D8</td><td>Files backend readers see intermediate states of a multi-ref transaction; reftable readers see none.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">refs/files-backend.c:3293-3331</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D9</td><td><code>gc --auto</code> counts <code>objects/17/</code> only, and porcelain no longer calls it.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:470-482; odb/source-loose.c:535-560</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D10</td><td>A non-empty <code>gc.log</code> blocks detached auto-gc for a day.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:791-832</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D11</td><td>Bloom filters still default to murmur3 v1, which mishandles high bytes on signed-char platforms.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-graph.c:2626</td><td class="hl-purple" style="background: var(--purple-soft)">open at seen</td></tr>
+                    <tr><td>D12</td><td>Only <code>git fsck</code> verifies the index checksum.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">read-cache.c:1701-1730</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D13</td><td>By default nothing on the commit path is fsynced; reflog appends have no fsync call.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">write-or-die.h:33-35; refs/files-backend.c:2016</td><td class="hl-purple" style="background: var(--purple-soft)">configurable</td></tr>
+                    <tr><td>D14</td><td>Plain <code>git merge-base</code> may stop at the first base; merges use all.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">commit-reach.c:149-156</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D15</td><td>The rename limit bounds sources × destinations, after the cheap stages: 7000 for merges, 1000 for diffs.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">diffcore-rename.c:1086-1128</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D16</td><td>Default Myers is heuristic, and on git.git history slower and wordier than patience and histogram.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">xdiff/xdiffi.c:30-49, 351-355</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D17</td><td>"In-memory" merges write blobs and trees; only <code>merge-tree --quiet</code> avoids it, outer merge only.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">merge-ort.c:2200-2271, 3829-3869</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D18</td><td>reftable: git never queries the object index it writes; D/F conflicts still enforced; cross-worktree transactions commit stack by stack.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">reftable/table.c:614-634; refs/reftable-backend.c:1371-1375</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D19</td><td>The index lock never waits; ref locks retry for 100 ms, <code>packed-refs</code> for 1000 ms.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">lockfile.h:205-209; refs.c:997-998</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D20</td><td><code>online_cpus()</code> ignores cgroup quotas: git saw 8 CPUs on a 2-CPU quota.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">thread-utils.c:21-61</td><td class="hl-purple" style="background: var(--purple-soft)">unchanged</td></tr>
+                    <tr><td>D21</td><td>After <code>fetch --unshallow</code>, following an old tag took a second connection and two rounds.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">upload-pack.c:561-571</td><td class="hl-purple" style="background: var(--purple-soft)">measured; intent unknown</td></tr>
+                    <tr><td>D22</td><td>The <code>skipping</code> negotiator can over-fetch when the common commit is not a tip: 6,001 objects against 3,004.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">negotiator/skipping.c:130-212</td><td class="hl-purple" style="background: var(--purple-soft)">by design</td></tr>
+                    <tr><td>D23</td><td>Geometric maintenance rarely prunes unreachable objects.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builtin/gc.c:1570-1617</td><td class="hl-purple" style="background: var(--purple-soft)">documented trade-off</td></tr>
+                    <tr><td>D24</td><td><code>USE_NSEC</code> is off on Linux: nanoseconds are recorded but not compared.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">statinfo.c:64-105; Makefile:200-211</td><td class="hl-purple" style="background: var(--purple-soft)">runtime switch on master</td></tr>
+                    <tr><td>D25</td><td>A bitmap count of <code>A ^B</code> can be smaller, and exact, than the plain walk's.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pack-bitmap.c:2103-2257</td><td class="hl-purple" style="background: var(--purple-soft)">measured</td></tr>
+                    <tr><td>D26</td><td>Protocol v2 is not cheaper on tiny repositories; its win is <code>ref-prefix</code> at scale.</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ls-refs.c:194-211</td><td class="hl-purple" style="background: var(--purple-soft)">measured</td></tr>
+                  </tbody>
+                </table>
+              </details>
+              <details style="margin: 6px 0 0">
+                <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for D</summary>
+                <pre><code>D1   git diff -M5 --name-status A B; git diff -M05 --name-status A B
+     # on a weakly similar rename: D/A under -M5, R0nn under -M05
+D2   git -c commitGraph.changedPaths=true gc     # no BIDX/BDAT chunks
+     git commit-graph write --reachable --changed-paths   # adds them
+D3   git -c protocol.version=2 fetch file://$PWD/srv &lt;dangling-oid&gt;   # fetched
+     git -c protocol.version=0 fetch file://$PWD/srv &lt;dangling-oid&gt;   # refused
+D4   GIT_TRACE=1 git -c protocol.version=2 push file://$PWD/srv main   # no GIT_PROTOCOL
+D5   a pre-commit hook that exits 1: index 184 → 245 B, loose objects 2 → 4, kept
+D6   ~/git-ref/lab/scratch/history/tools/time-commit.sh, with and without maintenance.auto=false
+D7   touch .git/packed-refs.lock; git commit --allow-empty -m x   # ~1 s, error, succeeds
+D8   ~/git-ref/lab/refs-visibility.sh
+D9   ~/git-ref/lab/scratch/maintenance/mkblobs.py: 27 vs 28 objects in objects/17
+D10  leave a non-empty .git/gc.log; git gc --auto does nothing for a day
+D11  git commit-graph write --reachable --changed-paths   # BDAT header (1, 7, 10)
+D12  flip the last byte of .git/index: git ls-files exits 0, git fsck exits 128
+D13  GIT_TRACE2_PERF=… git commit …   # fsync/hardware-flush counters stay 0
+D14  git merge-base --all A B (2 bases) vs git merge-base A B (1) on a criss-cross
+D15  ~/git-ref/lab/scratch/merge/tools/rename-scale.sh
+D16  ~/git-ref/lab/scratch/merge/tools/diff-algos.sh
+D17  git merge-tree --write-tree A B (2 loose objects) vs --quiet (0), on a gc'd clone
+D18  in a reftable repo: git update-ref refs/heads/topic/x HEAD  # refused, topic exists
+D19  touch .git/index.lock; git add x        # fails at once
+D20  getconf _NPROCESSORS_ONLN vs nproc and /sys/fs/cgroup/cpu.max
+D21  transport walkthrough W5: clone --depth 1, fetch --unshallow, fetch a tag
+D22  ~/git-ref/lab/transport-negotiation-c.sh (N=5000)
+D23  git show d9bccf2ec3   # the strategy's own commit message
+D24  same-second edit after git add: the entry is smudged, not compared by ns
+D25  git rev-list --count --objects v2.55.0 ^v2.54.0, with and without bitmaps
+D26  ~/git-ref/lab/transport-lsrefs.sh</code></pre>
+              </details>
+            </div>
+            <p class="figure-caption">
+              Three real bugs fixed upstream after 2.55, five latent ones still open, and a long tail of
+              documentation that drifted from the code. Status is as of <code>origin/seen</code> fetched
+              2026-10-21; green means fixed on master but in no tag, red means unfixed.
+            </p>
+          </figure>
+
+          <p>
+            Read by subsystem, the register follows the collection's thesis. Git is an append-only store of
+            objects surrounded by a few small mutable files, and each file is either a pointer or a cache with
+            its own consistency story. Objects need no lock, and no finding touches how an object is named or stored.
+            Mutable files publish by rename, and two of the fixed bugs sit at that edge: reflog expiry, which
+            decides what a pointer's history protects, and the shallow-clone section order on the wire. The
+            rest cluster around derived data: the index as a cache (B1, B2, C2), the commit-graph and its
+            filters (A3, B5, C10, C11, D2, D11), packs and their indexes (C3 to C7)
+            <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            That is where git's surprises live: where one consistency story meets another. A cache whose
+            freshness test is a timestamp. A ref backend atomic per ref, not per transaction. A deletion that
+            relies on a two-week clock and on writers touching mtimes. Publishing that is atomic but, by default,
+            not durable. Merging and upkeep add no new kind of state. They add objects, rebuild what can be
+            rebuilt, and wait for the clock before throwing anything away.
+          </p>
+
+          <h2 id="sources"><span class="secnum">09</span>Sources</h2>
+          <ul>
+            <li><a href="https://github.com/git/git/tree/v2.55.0">git/git at <code>v2.55.0</code></a>
+              (<code>e9019fcafe0040228b8631c30f97ae1adb61bcdc</code>, 29 June 2026). Code read:
+              <code>commit-reach.c</code>, <code>merge-ort.c</code>, <code>diffcore-rename.c</code>,
+              <code>diffcore-delta.c</code>, <code>xdiff/</code>, <code>rerere.c</code>, <code>sequencer.c</code>,
+              <code>builtin/gc.c</code>, <code>run-command.c</code>, <code>odb/source-loose.c</code>,
+              <code>builtin/prune.c</code>, <code>packfile.c</code>, <code>commit-graph.c</code>, <code>bloom.c</code>,
+              <code>repo-settings.c</code>, <code>scalar.c</code>, and the first commit <code>e83c5163</code>.</li>
+            <li>The manual at the same commit, chiefly <code>Documentation/git-gc.adoc</code>,
+              <code>revisions.adoc</code>, <code>diff-options.adoc</code>, <code>gitformat-commit-graph.adoc</code>,
+              <code>technical/rerere.adoc</code> and <code>BreakingChanges.adoc</code>; release notes under
+              <code>Documentation/RelNotes/</code>.</li>
+            <li>Upstream <code>master</code>, <code>next</code> and <code>seen</code> as fetched on 21 October
+              2026, for the status of each finding only.</li>
+            <li>The lab at <code>~/git-ref/lab/</code>: <code>scratch/merge/tools/</code> (merge bases, rename
+              scaling, diff algorithms, the rename cache, walkthroughs), <code>scratch/maintenance/</code>
+              (<code>bench.sh</code>, <code>bloom.py</code>, <code>mkblobs.py</code>, <code>topo.sh</code>),
+              <code>scratch/history/</code> (<code>growth.sh</code>, <code>time-commit.sh</code>).</li>
+            <li>The other parts: <a href="../commit-and-objects/">The commit and its objects</a> and
+              <a href="../state-and-wire/">Mutable state and the wire</a>; the companion
+              <a href="../../git-worktrees/">One repository, many agents</a>.</li>
+          </ul>
+          <p class="footnote">
+            <strong>Provenance.</strong> Every path, line number, constant and quoted excerpt was read from the
+            pinned checkout, and commit ids and dates from its history. Numbers marked "measured here" come from
+            the lab scripts above, run with <code>git version 2.55.0</code> under a 2-vCPU cgroup quota, mostly on
+            a <code>--shared</code> clone of git.git; host noise is visible, so treat timing differences under
+            about 30% as noise. The register's A1, A2, B1, B2, B3 and D1 reproductions were re-run on 23 October
+            2026. The readings of the register by subsystem, and of history as layers, are mine. Not verified:
+            the mailing-list threads behind any finding (lore.kernel.org was unreachable); the commit that first
+            made B1 reachable and the one that made the EOIE writer emit full-size hashes; why generation v1 is
+            3× slower for <code>--graph</code>, which was not profiled; whether the path-walk override in B3 was
+            meant to keep path-walk opt-in; and how often geometric maintenance reaches its cruft roll-up in a
+            busy repository.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Git, taken apart</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../commit-and-objects/">Part 1: The commit and its objects</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../state-and-wire/">Part 2: Mutable state and the wire</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../../git-worktrees/">One repository, many agents</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

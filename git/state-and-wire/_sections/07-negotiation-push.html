@@ -1,0 +1,272 @@
+          <h2 id="negotiation-push"><span class="secnum">{{S}}</span>Negotiation and push</h2>
+          <p class="lede">
+            A fetch has to work out which commits the two sides share before the server can build a pack of only what
+            is missing. A push skips that and sends objects into a quarantine, where they stay until a hook accepts
+            them.
+          </p>
+          <p>
+            The v2 <code>fetch</code> command is stateless. Each round the client sends its wants, every have the
+            server has already acknowledged, and a fresh batch of haves (<code>send_fetch_request()</code>,
+            <code>fetch-pack.c</code>:1411-1489). Batches start at 16 and double up to 16,384, then grow by 10%; over a
+            v0 pipe they double to 32 and then add 32 each round (<code>next_flush()</code>, 277-291)
+            <span class="src">from the code</span>. The server answers with <code>upload-pack.c</code>:1686-1708:
+          </p>
+<pre><code>static int send_acks(struct upload_pack_data *data, struct object_array *acks)
+{
+	int i;
+
+	packet_writer_write(&amp;data-&gt;writer, "acknowledgments\n");
+
+	/* Send Acks */
+	if (!acks-&gt;nr)
+		packet_writer_write(&amp;data-&gt;writer, "NAK\n");
+
+	for (i = 0; i &lt; acks-&gt;nr; i++) {
+		packet_writer_write(&amp;data-&gt;writer, "ACK %s\n",
+				    oid_to_hex(&amp;acks-&gt;objects[i].item-&gt;oid));
+	}
+
+	if (!data-&gt;wait_for_done &amp;&amp; ok_to_give_up(data)) {
+		/* Send Ready */
+		packet_writer_write(&amp;data-&gt;writer, "ready\n");
+		return 1;
+	}
+
+	return 0;
+}</code></pre>
+          <p>
+            Every have the server owns is marked, with its parents, as something the client has.
+            <code>ok_to_give_up()</code> is true once every want reaches such a commit. Then the server says
+            <code>ready</code>, a <code>0001</code>, and the pack follows in the same response; otherwise it sends a
+            flush and waits for another round. The client stops sending haves after <code>MAX_IN_VAIN</code>, 256,
+            without a new ACK. Since <code>4fa3f00abb</code> (v2.27.0) that count starts only after the first ACK
+            (<code>fetch-pack.c</code>:1476). That was the fix that let v2 become the default again
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Which haves to send is the negotiator's choice. <code>consecutive</code>, the default, walks the client's
+            history newest first and sends every commit not known to be common. <code>skipping</code> sends a commit,
+            then skips gaps that grow as <code>ttl*3/2+1</code>. <code>noop</code> sends nothing. Figure
+            {{fig-negotiation}} shows what each cost on this machine.
+          </p>
+
+          <figure class="figure wide" id="fig-negotiation">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Which commits each negotiator offers, and what it cost at N = 5,000</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 410" role="img" aria-label="Left: a client history with shared base commits and N local commits; consecutive offers every local commit, skipping offers commits at growing gaps and can jump past the common commit, noop offers none. Right: measured haves and objects for six runs on a log scale.">
+                <text x="56" y="26" class="svg-lane">CLIENT HISTORY · NEWEST ON THE RIGHT</text>
+                <line x1="70" y1="70" x2="500" y2="70" stroke="#b8b8b1" stroke-width="1.5"/>
+                <circle cx="70" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="100" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="130" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="160" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="190" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/><circle cx="220" cy="70" r="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <circle cx="250" cy="70" r="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <circle cx="280" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="310" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="340" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="370" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="400" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="430" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="460" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/><circle cx="490" cy="70" r="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="145" y="98" class="svg-sub" text-anchor="middle">shared base</text>
+                <text x="250" y="50" class="svg-sub" text-anchor="middle">common</text>
+                <text x="385" y="98" class="svg-sub" text-anchor="middle">N commits the server lacks</text>
+
+                <text x="56" y="140" class="svg-lane">consecutive</text>
+                <circle cx="250" cy="136" r="4" fill="#d98226"/><circle cx="280" cy="136" r="4" fill="#d98226"/><circle cx="310" cy="136" r="4" fill="#d98226"/><circle cx="340" cy="136" r="4" fill="#d98226"/><circle cx="370" cy="136" r="4" fill="#d98226"/><circle cx="400" cy="136" r="4" fill="#d98226"/><circle cx="430" cy="136" r="4" fill="#d98226"/><circle cx="460" cy="136" r="4" fill="#d98226"/><circle cx="490" cy="136" r="4" fill="#d98226"/>
+                <text x="56" y="180" class="svg-lane">skipping</text>
+                <circle cx="490" cy="176" r="4" fill="#d98226"/><circle cx="460" cy="176" r="4" fill="#d98226"/><circle cx="400" cy="176" r="4" fill="#d98226"/><circle cx="310" cy="176" r="4" fill="#d98226"/>
+                <circle cx="160" cy="176" r="4" fill="#ad4b43"/>
+                <text x="168" y="198" class="svg-sub">overshoot past "common"</text>
+                <text x="56" y="226" class="svg-lane">noop</text>
+                <text x="250" y="226" class="svg-sub">no haves: the whole history comes back</text>
+
+                <text x="56" y="272" class="svg-note">one round: wants + all ACKed haves + a new batch (16, 32 … 16,384, then +10%)</text>
+                <text x="56" y="294" class="svg-note">server: ACK each have it owns; "ready" once every want reaches one</text>
+                <text x="56" y="316" class="svg-note">client: done after 256 haves with no new ACK, counted from the first ACK</text>
+
+                <text x="580" y="26" class="svg-lane">MEASURED · N = 5,000 · LOG SCALE</text>
+                <line x1="740" y1="38" x2="740" y2="372" stroke="#deded9"/>
+                <line x1="810" y1="38" x2="810" y2="372" stroke="#deded9"/>
+                <line x1="880" y1="38" x2="880" y2="372" stroke="#deded9"/>
+                <line x1="950" y1="38" x2="950" y2="372" stroke="#deded9"/>
+                <line x1="1020" y1="38" x2="1020" y2="372" stroke="#deded9"/>
+                <text x="740" y="390" class="svg-sub" text-anchor="middle">1</text>
+                <text x="810" y="390" class="svg-sub" text-anchor="middle">10</text>
+                <text x="880" y="390" class="svg-sub" text-anchor="middle">100</text>
+                <text x="950" y="390" class="svg-sub" text-anchor="middle">1k</text>
+                <text x="1020" y="390" class="svg-sub" text-anchor="middle">10k</text>
+
+                <text x="580" y="58" class="svg-step">A consecutive v2</text><text x="580" y="74" class="svg-sub">9 rounds</text>
+                <rect x="740" y="48" width="270" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="1016" y="58" class="svg-sub">7,000</text>
+                <rect x="740" y="62" width="33" height="10" fill="#dfede5" stroke="#367f59"/><text x="779" y="72" class="svg-sub">3</text>
+
+                <text x="580" y="112" class="svg-step">A consecutive v0</text><text x="580" y="128" class="svg-sub">159 rounds</text>
+                <rect x="740" y="102" width="260" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="1006" y="112" class="svg-sub">5,056</text>
+                <rect x="740" y="116" width="33" height="10" fill="#dfede5" stroke="#367f59"/><text x="779" y="126" class="svg-sub">3</text>
+
+                <text x="580" y="166" class="svg-step">A skipping v2</text><text x="580" y="182" class="svg-sub">1 round</text>
+                <rect x="740" y="156" width="84" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="830" y="166" class="svg-sub">16</text>
+                <rect x="740" y="170" width="33" height="10" fill="#dfede5" stroke="#367f59"/><text x="779" y="180" class="svg-sub">3</text>
+
+                <text x="580" y="220" class="svg-step">A noop v2</text><text x="580" y="236" class="svg-sub">1 round</text>
+                <text x="746" y="220" class="svg-sub">0 haves</text>
+                <rect x="740" y="224" width="265" height="10" fill="#f3dfdc" stroke="#ad4b43"/><text x="1011" y="234" class="svg-sub">6,003</text>
+
+                <text x="580" y="274" class="svg-step">C consecutive v2</text><text x="580" y="290" class="svg-sub">9 rounds</text>
+                <rect x="740" y="264" width="264" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="1010" y="274" class="svg-sub">6,000</text>
+                <rect x="740" y="278" width="243" height="10" fill="#dfede5" stroke="#367f59"/><text x="989" y="288" class="svg-sub">3,004</text>
+
+                <text x="580" y="328" class="svg-step">C skipping v2</text><text x="580" y="344" class="svg-sub">2 rounds</text>
+                <rect x="740" y="318" width="90" height="10" fill="#e0ebf2" stroke="#3c6f97"/><text x="836" y="328" class="svg-sub">19</text>
+                <rect x="740" y="332" width="265" height="10" fill="#f3dfdc" stroke="#ad4b43"/><text x="1011" y="342" class="svg-sub">6,001</text>
+                <text x="580" y="404" class="svg-note">blue haves sent · green objects received · red more than needed</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Exact negotiation can cost thousands of haves; the fast negotiator can overshoot to a near-full clone
+              when the common commit is not one of the client's tips. Scenario A: the common commit is a
+              remote-tracking tip. Scenario C: it is not. From <code>transport-negotiation.sh</code> and
+              <code>-c.sh</code>, deterministic, with auto-maintenance off.
+            </p>
+          </figure>
+
+          <p>
+            In scenario A, <code>consecutive</code> sent all 5,000 unshared commits and, because its last doubled
+            batch ran 2,000 commits into shared history, 7,000 haves in 9 rounds; v0's slower growth needed 159
+            rounds. <code>skipping</code> got the exact 3 objects with 16 haves, because the remote-tracking tip is
+            in its first batch. In scenario C it skipped past the common commit and received 6,001 objects where
+            3,004 were needed <span class="recon">measured here</span>.
+          </p>
+          <h3>How the pack is made and sent</h3>
+          <p>
+            <code>upload-pack</code> does not build packs. It spawns <code>pack-objects --revs --stdout</code>, feeds
+            it the wants, <code>--not</code>, and the common haves, and relays its output in band 1, with empty band-1
+            packets as keepalives. It holds back the last byte. The comment in <code>upload-pack.c</code>:225-234
+            says why: "unpack-objects would happily accept a valid packdata with trailing garbage". If
+            <code>pack-objects</code> dies, the client gets a pack missing its final byte, a truncated pack. In
+            the captured clone that byte travelled alone as <code>0006 01 58</code> <span class="recon">measured
+            here</span>.
+          </p>
+          <p>
+            Two documented surprises sit here. A v2 <code>want</code> only checks that the object exists, so a
+            dangling commit or the tip of a ref hidden with <code>uploadpack.hideRefs</code> can be fetched by id;
+            v0 refuses with "Server does not allow request for unadvertised object". <code>gitprotocol-v2.adoc</code>
+            says wants "are not limited to advertised objects", but the <code>uploadpack.allow*SHA1InWant</code> pages
+            do not say they apply only to v0. And from v2.19.0, a server with <code>uploadpack.allowRefInWant</code>
+            sent <code>wanted-refs</code> before <code>shallow-info</code>, the reverse of what the client reads, so
+            <code>git clone --depth 1</code> died with "expected 'packfile', received 'shallow-info'". That was fixed
+            upstream by <code>191740edaa</code> (16 September 2026), on master and in no tag yet.
+          </p>
+          <h3>Push is still v0</h3>
+          <p>
+            Every push speaks protocol v0, over every transport. <code>connect.c</code>:1410-1417:
+          </p>
+<pre><code>	/*
+	 * NEEDSWORK: If we are trying to use protocol v2 and we are planning
+	 * to perform any operation that doesn't involve upload-pack (i.e., a
+	 * fetch, ls-remote, etc), then fallback to v0 since we don't know how
+	 * to do anything else (like push or remote archive) via v2.
+	 */
+	if (version == protocol_v2 &amp;&amp; service != GIT_CONNECT_UPLOAD_PACK)
+		version = protocol_v0;</code></pre>
+          <p>
+            <code>remote-curl.c</code>:494-501 does the same for HTTP, and <code>receive-pack</code> ignores a v2
+            request (<code>builtin/receive-pack.c</code>:2662-2668) <span class="src">from the code</span>. The client
+            sends one <code>old new ref</code> line per update, its capabilities after a NUL on the first, a flush,
+            any push options, a flush, and then the pack, raw and unframed. A captured <code>push --atomic -o
+            ci.skip</code> began <code>00ca</code> + 40 zeros (a create) and ended with <code>000bci.skip</code>,
+            <code>0000</code> and <code>PACK</code> <span class="recon">measured here</span>. Figure
+            {{fig-push}} follows the pack through the server.
+          </p>
+
+          <figure class="figure wide" id="fig-push">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What <code>receive-pack</code> does with a push, in order</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 330" role="img" aria-label="A client sends commands, push options and a raw pack. The server unpacks into a quarantine directory, checks connectivity, runs pre-receive, migrates objects, runs update hooks and the ref transaction, sends report-status inside band 1, then runs post-receive. If pre-receive rejects, the quarantine is deleted.">
+                <defs>
+                  <marker id="fig-push-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-push-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-push-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ad4b43"/></marker>
+                </defs>
+                <text x="56" y="26" class="svg-lane">CLIENT · send-pack</text>
+                <rect x="56" y="38" width="420" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="70" y="60" class="svg-sub">00ca &lt;old&gt; &lt;new&gt; refs/heads/topic\0caps · 0000</text>
+                <text x="70" y="80" class="svg-sub">000bci.skip · 0000 · PACK … (raw, unframed)</text>
+                <rect x="760" y="44" width="304" height="40" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="776" y="68" class="svg-sub">push still speaks v0 (NEEDSWORK)</text>
+                <path d="M120 96 L120 140" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-push-data)"/>
+
+                <text x="140" y="128" class="svg-lane">SERVER · receive-pack</text>
+                <rect x="56" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="64" y="164" class="svg-step">1 unpack</text>
+                <text x="64" y="184" class="svg-sub">&lt;100: loose</text>
+                <text x="64" y="200" class="svg-sub">else index-pack</text>
+                <text x="64" y="216" class="svg-sub">into quarantine</text>
+                <rect x="202" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="210" y="164" class="svg-step">2 connectivity</text>
+                <text x="210" y="184" class="svg-sub">rev-list --objects</text>
+                <text x="210" y="200" class="svg-sub">--not --all</text>
+                <text x="210" y="216" class="svg-sub">closure only</text>
+                <rect x="348" y="144" width="136" height="80" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="356" y="164" class="svg-step">3 pre-receive</text>
+                <text x="356" y="184" class="svg-sub">sees quarantine</text>
+                <text x="356" y="200" class="svg-sub">GIT_QUARANTINE_</text>
+                <text x="356" y="216" class="svg-sub">PATH, push opts</text>
+                <rect x="494" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="502" y="164" class="svg-step">4 migrate</text>
+                <text x="502" y="184" class="svg-sub">loose, then</text>
+                <text x="502" y="200" class="svg-sub">.keep .pack</text>
+                <text x="502" y="216" class="svg-sub">.rev .idx, rest</text>
+                <rect x="640" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="648" y="164" class="svg-step">5 refs</text>
+                <text x="648" y="184" class="svg-sub">update hooks</text>
+                <text x="648" y="200" class="svg-sub">ref transaction</text>
+                <text x="648" y="216" class="svg-sub">atomic or batched</text>
+                <rect x="786" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="794" y="164" class="svg-step">6 report</text>
+                <text x="794" y="184" class="svg-sub">unpack ok</text>
+                <text x="794" y="200" class="svg-sub">ok refs/heads/…</text>
+                <text x="794" y="216" class="svg-sub">inside band 1</text>
+                <rect x="932" y="144" width="136" height="80" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="940" y="164" class="svg-step">7 post-receive</text>
+                <text x="940" y="184" class="svg-sub">output on band 2</text>
+                <text x="940" y="200" class="svg-sub">then maintenance</text>
+                <text x="940" y="216" class="svg-sub">run --auto</text>
+                <path d="M192 184 L200 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M338 184 L346 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M484 184 L492 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M630 184 L638 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M776 184 L784 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <path d="M922 184 L930 184" stroke="#252525" stroke-width="2" marker-end="url(#fig-push-ctl)"/>
+                <rect x="56" y="232" width="428" height="10" fill="#ece6f3"/>
+                <text x="56" y="260" class="svg-sub">objects live in objects/tmp_objdir-incoming-XXXXXX</text>
+                <path d="M416 224 L416 284" stroke="#ad4b43" stroke-width="1.6" marker-end="url(#fig-push-red)"/>
+                <rect x="348" y="288" width="430" height="34" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="362" y="310" class="svg-sub">hook says no → quarantine deleted; objects/ untouched</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Pushed objects live in quarantine until <code>pre-receive</code> accepts them; a rejected push never
+              touches <code>objects/</code>. Steps from <code>builtin/receive-pack.c</code>; the bytes and child
+              processes captured here with <code>GIT_TRACE</code> and a <code>tee</code> wrapper.
+            </p>
+          </figure>
+
+          <p>
+            The server unpacks into <code>objects/tmp_objdir-incoming-XXXXXX</code>, exploding fewer than 100 objects
+            (<code>transfer.unpackLimit</code>) and otherwise keeping the pack with <code>index-pack --fix-thin
+            --keep</code>. Child processes see the quarantine as <code>GIT_OBJECT_DIRECTORY</code> with the real store
+            as an alternate. The connectivity check proves every new ref leads only to objects the repository now
+            has; it does not prove they are well formed. Only after <code>pre-receive</code> accepts does
+            <code>builtin/receive-pack.c</code>:2105-2109 move them into place:
+          </p>
+<pre><code>	/*
+	 * Now we'll start writing out refs, which means the objects need
+	 * to be in their final positions so that other processes can see them.
+	 */
+	if (tmp_objdir_migrate(tmp_objdir) &lt; 0) {</code></pre>
+          <p>
+            <code>--atomic</code> pushes use one ref transaction; others, since v2.51.0, a batched one that lets single
+            refs fail. The report is pkt-lines nested inside band-1 pkt-lines: <code>002f 01</code> wrapping
+            <code>000eunpack ok\n</code>, <code>0018ok refs/heads/topic\n</code> and <code>0000</code>
+            <span class="recon">measured here</span>. Merging what arrives is
+            <a href="../merge-and-upkeep/">Part 3</a>'s subject.
+          </p>

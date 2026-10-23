@@ -1,0 +1,2220 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="How git worktrees work, read from the git 2.55 source: what is shared, what is private, the one-branch rule, prune, sparse checkout, partial clone, and measured costs for running many agents on one repo."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/git-worktrees/" />
+    <meta property="og:title" content="One repository, many agents" />
+    <meta property="og:description" content="Git worktrees read from git v2.55.0: the shared/private split in path.c, what git worktree add writes, why a branch can be checked out once, how gc protects every worktree's index, when prune deletes, and what a second checkout costs measured six ways. Plus concurrency probes: 400 commits and 120 fetches from parallel worktrees, zero lock failures." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/git-worktrees/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="One repository, many agents" />
+    <meta name="twitter:description" content="Git worktrees from the source and a lab: what is shared, what is private, and what a second checkout costs for parallel agents." />
+    <title>One repository, many agents — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · One checkout is single-occupancy</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#one-checkout">01 · One checkout is single-occupancy</a>
+        <a class="toc-parent" href="#shared-private">02 · What is shared and what is private</a>
+        <a class="toc-parent" href="#add">03 · What git worktree add writes</a>
+        <a class="toc-parent" href="#rules">04 · The rules that keep worktrees apart</a>
+        <a class="toc-parent" href="#concurrency">05 · Trying to make agents collide</a>
+        <a class="toc-parent" href="#lifecycle">06 · Remove, prune, lock, repair</a>
+        <a class="toc-parent" href="#less">07 · Fewer files, fewer objects</a>
+        <a class="toc-parent" href="#costs">08 · What a second checkout costs</a>
+        <a class="toc-parent" href="#recipe">09 · A recipe for N agents</a>
+        <a class="toc-parent" href="#deeper">10 · What this guide skipped</a>
+        <a class="toc-parent" href="#sources">11 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#one-checkout">01 · Single-occupancy</a>
+        <a href="#shared-private">02 · Shared vs private</a>
+        <a href="#add">03 · worktree add</a>
+        <a href="#rules">04 · The rules</a>
+        <a href="#concurrency">05 · Concurrency probes</a>
+        <a href="#lifecycle">06 · Lifecycle</a>
+        <a href="#less">07 · Sparse + partial</a>
+        <a href="#costs">08 · Measured costs</a>
+        <a href="#recipe">09 · Recipe for N agents</a>
+        <a href="#deeper">10 · Going deeper</a>
+        <a href="#sources">11 · Sources</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Languages & Tools</p>
+        <h1>One repository, many agents<span class="status-pill">Field guide</span></h1>
+        <p class="dek">
+          A git checkout is single-occupancy: one HEAD, one index, one set of files. Worktrees split those three off and share everything else, which is why they are the cheap way to run several agents on one repository. This guide reads git worktrees from git@v2.55.0, measures them against five other ways to get a second checkout, and tries to make concurrent agents collide.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 21 October 2026 · Subject: <code>git@e9019fca</code> (v2.55.0) · Read from the source and the manual; measured on this machine</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#one-checkout">One checkout is single-occupancy</a></li>
+          <li><a href="#shared-private">What is shared and what is private</a></li>
+          <li><a href="#add">What git worktree add writes</a></li>
+          <li><a href="#rules">The rules that keep worktrees apart</a></li>
+          <li><a href="#concurrency">Trying to make agents collide</a></li>
+          <li><a href="#lifecycle">Remove, prune, lock, repair</a></li>
+          <li><a href="#less">Fewer files, fewer objects</a></li>
+          <li><a href="#costs">What a second checkout costs</a></li>
+          <li><a href="#recipe">A recipe for N agents</a></li>
+          <li><a href="#deeper">What this guide skipped</a></li>
+          <li><a href="#sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from git at <code>e9019fca</code>
+              (tag <code>v2.55.0</code>, 29 June 2026), cited as a path and line number from the repository root;
+              the manual pages are cited under <code>Documentation/</code>. <span class="recon">measured here</span>
+              marks a number or behaviour observed with <code>git version 2.55.0</code> on a 2-vCPU Linux box, on a
+              clone of git.git itself (4,765 tracked files, a 320 MiB pack). Timings are medians of three runs;
+              differences under about 20% are noise. <span class="recon">reconstruction</span> marks a judgement I
+              drew from those sources rather than read in one place.
+            </p>
+          </div>
+
+          <h2 id="one-checkout"><span class="secnum">01</span>One checkout is single-occupancy</h2>
+          <p class="lede">
+            A git repository has two parts. The history (objects and refs) can be shared by any number of
+            readers. The checkout can't: it has one <code>HEAD</code> saying which commit you are on, one
+            index saying what the next commit will contain, and one set of files on disk. Two agents
+            working in one checkout share all three, and each one undoes the other's work.
+          </p>
+          <p>
+            The failure is mundane. Agent A runs <code>git switch fix-login</code> while agent B is
+            halfway through editing <code>src/auth.ts</code> on <code>main</code>. B's edits now sit on
+            A's branch. Or A stages a file and B runs <code>git commit -a</code>, so A's half-finished
+            change ships in B's commit. Neither agent made a mistake. They shared the three things git
+            assumes only one writer touches.
+          </p>
+          <p>
+            Before 2015 there were two fixes. You could clone the repository again and pay for a second
+            copy of the history. Or you could serialise the agents. <code>git worktree</code> is the third
+            option. <code>builtin/worktree.c</code> first appears in commit <code>df0b6cfbda</code>
+            (29 June 2015), and the first tag that contains it is <code>v2.5.0</code>
+            <span class="src">from the code</span>. It splits a repository into a <em>common directory</em> that
+            every checkout shares and a small <em>per-worktree directory</em> that holds each checkout's
+            own <code>HEAD</code>, index and private refs. Figure 1 shows the
+            difference.
+          </p>
+
+          <figure class="figure wide" id="fig-occupancy">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">One checkout shared by two agents, against three worktrees sharing one history</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 330" role="img" aria-label="Left: two agents both write to one HEAD, one index and one set of files above a single .git. Right: one shared object and ref store with three worktrees, each with its own HEAD, index and files, one agent each.">
+                <defs>
+                  <marker id="occ-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="occ-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ad4b43"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">ONE CHECKOUT, TWO WRITERS</text>
+                <text x="470" y="24" class="svg-lane">WORKTREES: ONE HISTORY, THREE CHECKOUTS</text>
+                <line x1="445" y1="14" x2="445" y2="316" stroke="#deded9" stroke-width="1"/>
+
+                <!-- left: agents -->
+                <rect x="60" y="44" width="110" height="34" rx="17" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="115" y="66" text-anchor="middle" class="svg-step">agent A</text>
+                <rect x="250" y="44" width="110" height="34" rx="17" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="305" y="66" text-anchor="middle" class="svg-step">agent B</text>
+                <!-- left: the single-occupancy trio -->
+                <rect x="40" y="120" width="360" height="96" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="56" y="140" class="svg-sub">THE CHECKOUT (one of each)</text>
+                <rect x="56" y="152" width="100" height="48" rx="3" fill="#ffffff" stroke="#ad4b43"/>
+                <text x="106" y="174" text-anchor="middle" class="svg-step">HEAD</text>
+                <text x="106" y="190" text-anchor="middle" class="svg-sub">which commit</text>
+                <rect x="170" y="152" width="100" height="48" rx="3" fill="#ffffff" stroke="#ad4b43"/>
+                <text x="220" y="174" text-anchor="middle" class="svg-step">index</text>
+                <text x="220" y="190" text-anchor="middle" class="svg-sub">next commit</text>
+                <rect x="284" y="152" width="100" height="48" rx="3" fill="#ffffff" stroke="#ad4b43"/>
+                <text x="334" y="174" text-anchor="middle" class="svg-step">files</text>
+                <text x="334" y="190" text-anchor="middle" class="svg-sub">what you edit</text>
+                <line x1="115" y1="80" x2="190" y2="148" stroke="#ad4b43" stroke-width="2" marker-end="url(#occ-red)"/>
+                <line x1="305" y1="80" x2="250" y2="148" stroke="#ad4b43" stroke-width="2" marker-end="url(#occ-red)"/>
+                <text x="220" y="104" text-anchor="middle" class="svg-note">both write here</text>
+                <!-- left: history -->
+                <rect x="40" y="244" width="360" height="56" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="220" y="268" text-anchor="middle" class="svg-step">.git — objects, refs, config</text>
+                <text x="220" y="286" text-anchor="middle" class="svg-sub">shareable by any number of readers</text>
+                <line x1="220" y1="218" x2="220" y2="242" stroke="#3c6f97" stroke-width="1"/>
+
+                <!-- right: three worktrees -->
+                <g>
+                  <rect x="470" y="44" width="110" height="34" rx="17" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="525" y="66" text-anchor="middle" class="svg-step">agent A</text>
+                  <rect x="470" y="104" width="180" height="112" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                  <text x="482" y="124" class="svg-sub">../wt-a  (fix-login)</text>
+                  <text x="482" y="150" class="svg-step">HEAD</text>
+                  <text x="482" y="174" class="svg-step">index</text>
+                  <text x="482" y="198" class="svg-step">files</text>
+                  <line x1="525" y1="80" x2="525" y2="100" stroke="#252525" stroke-width="2" marker-end="url(#occ-ctl)"/>
+                </g>
+                <g>
+                  <rect x="670" y="44" width="110" height="34" rx="17" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="725" y="66" text-anchor="middle" class="svg-step">agent B</text>
+                  <rect x="670" y="104" width="180" height="112" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                  <text x="682" y="124" class="svg-sub">../wt-b  (main)</text>
+                  <text x="682" y="150" class="svg-step">HEAD</text>
+                  <text x="682" y="174" class="svg-step">index</text>
+                  <text x="682" y="198" class="svg-step">files</text>
+                  <line x1="725" y1="80" x2="725" y2="100" stroke="#252525" stroke-width="2" marker-end="url(#occ-ctl)"/>
+                </g>
+                <g>
+                  <rect x="870" y="44" width="110" height="34" rx="17" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="925" y="66" text-anchor="middle" class="svg-step">agent C</text>
+                  <rect x="870" y="104" width="180" height="112" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                  <text x="882" y="124" class="svg-sub">../wt-c  (docs)</text>
+                  <text x="882" y="150" class="svg-step">HEAD</text>
+                  <text x="882" y="174" class="svg-step">index</text>
+                  <text x="882" y="198" class="svg-step">files</text>
+                  <line x1="925" y1="80" x2="925" y2="100" stroke="#252525" stroke-width="2" marker-end="url(#occ-ctl)"/>
+                </g>
+                <rect x="470" y="244" width="580" height="56" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="760" y="268" text-anchor="middle" class="svg-step">common dir — objects, refs/heads, config, hooks, stash</text>
+                <text x="760" y="286" text-anchor="middle" class="svg-sub">one copy; every worktree reads and writes it</text>
+                <line x1="560" y1="218" x2="560" y2="242" stroke="#3c6f97" stroke-width="1"/>
+                <line x1="760" y1="218" x2="760" y2="242" stroke="#3c6f97" stroke-width="1"/>
+                <line x1="960" y1="218" x2="960" y2="242" stroke="#3c6f97" stroke-width="1"/>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Green boxes are private to one worktree. The blue store is shared. In one checkout (left),
+              the red trio has two writers. With worktrees (right), each agent gets its own trio and the
+              history underneath is still stored once.
+            </p>
+          </figure>
+
+          <p>
+            This guide covers how that split works and what it costs. I read the mechanism from git's
+            source at <code>v2.55.0</code>, timed it against five other ways to get a second checkout,
+            and ran several worktrees at once to see where they collide. The short answer: for
+            parallel agents, the real dangers are the things worktrees still share, not lock
+            contention. §04 and §05 list them.
+          </p>
+
+          <h2 id="shared-private"><span class="secnum">02</span>What is shared and what is private</h2>
+          <p class="lede">
+            A linked worktree has two directories behind it: its own small admin directory under
+            <code>.git/worktrees/&lt;name&gt;/</code>, and the main repository's <code>.git</code>, which
+            git calls the common directory. Every path git resolves inside <code>.git</code> goes to
+            one of the two, and a short hard-coded table decides which.
+          </p>
+          <p>
+            The table is <code>common_list</code> in <code>path.c</code>:98-124
+            <span class="src">from the code</span>. Each row has three flags: whether the path is
+            ignored by garbage reporting, whether it is a directory, and whether it belongs to the
+            common directory (the struct is at <code>path.c</code>:89-96). Lines 98-123, verbatim:
+          </p>
+<pre><code>static struct common_dir common_list[] = {
+	{ 0, 1, 1, "branches" },
+	{ 0, 1, 1, "common" },
+	{ 0, 1, 1, "hooks" },
+	{ 0, 1, 1, "info" },
+	{ 0, 0, 0, "info/sparse-checkout" },
+	{ 1, 1, 1, "logs" },
+	{ 1, 0, 0, "logs/HEAD" },
+	{ 0, 1, 0, "logs/refs/bisect" },
+	{ 0, 1, 0, "logs/refs/rewritten" },
+	{ 0, 1, 0, "logs/refs/worktree" },
+	{ 0, 1, 1, "lost-found" },
+	{ 0, 1, 1, "objects" },
+	{ 0, 1, 1, "refs" },
+	{ 0, 1, 0, "refs/bisect" },
+	{ 0, 1, 0, "refs/rewritten" },
+	{ 0, 1, 0, "refs/worktree" },
+	{ 0, 1, 1, "remotes" },
+	{ 0, 1, 1, "worktrees" },
+	{ 0, 1, 1, "rr-cache" },
+	{ 0, 1, 1, "svn" },
+	{ 0, 0, 1, "config" },
+	{ 1, 0, 1, "gc.pid" },
+	{ 0, 0, 1, "packed-refs" },
+	{ 0, 0, 1, "shallow" },
+	{ 0, 0, 0, NULL }</code></pre>
+          <p>
+            Read the third column. A path is shared when it, or the nearest listed directory above
+            it, has a 1 there. <code>objects</code>, <code>refs</code>, <code>config</code>,
+            <code>hooks</code>, <code>packed-refs</code> and <code>rr-cache</code> are shared.
+            Inside the shared <code>refs</code> directory, three subtrees are carved back out as
+            private: <code>refs/bisect</code>, <code>refs/rewritten</code> and
+            <code>refs/worktree</code>. So is <code>info/sparse-checkout</code>, which lets each
+            worktree have its own sparse patterns (§07). Anything not in the table at all, such as
+            <code>HEAD</code>, <code>index</code>, <code>ORIG_HEAD</code>, <code>MERGE_HEAD</code>
+            and the <code>rebase-merge/</code> state directory, defaults to private.
+            <span class="recon">reconstruction</span> of the lookup from the trie code that follows
+            the table.
+          </p>
+          <p>
+            The ref store makes the same split by name. <code>refs.c</code>:881-886
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>int is_per_worktree_ref(const char *refname)
+{
+	return starts_with(refname, "refs/worktree/") ||
+	       starts_with(refname, "refs/bisect/") ||
+	       starts_with(refname, "refs/rewritten/");
+}</code></pre>
+          <p>
+            Root refs count as per-worktree too. <code>is_current_worktree_ref</code>
+            (<code>refs.c</code>:941-943) accepts any all-caps name such as <code>HEAD</code>,
+            <code>ORIG_HEAD</code> or <code>AUTO_MERGE</code>. Everything else, notably every
+            <code>refs/heads/*</code> branch, every tag, every remote-tracking ref and
+            <code>refs/stash</code>, is shared. A worktree can still read another worktree's private
+            refs by spelling them <code>worktrees/&lt;name&gt;/refs/worktree/...</code> or
+            <code>main-worktree/HEAD</code> (<code>parse_worktree_ref</code>, 945-991)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            I checked this on a hub with four worktrees <span class="recon">measured here</span>.
+            A ref written in <code>wt1</code> as <code>refs/worktree/mark</code> was invisible to
+            <code>for-each-ref</code> in <code>wt2</code>. In <code>wt2</code>,
+            <code>git rev-parse worktrees/wt1/refs/worktree/mark</code> resolved it to
+            <code>e9019fcafe</code>. A branch written in <code>wt1</code> showed up in
+            <code>wt2</code> immediately.
+          </p>
+
+          <figure class="figure" id="fig-split">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">Where each part of <code>.git</code> lives when there are worktrees</p>
+            </div>
+            <div class="figure-body">
+              <div class="stack">
+                <div class="stack-row"><div class="stack-cell head">Shared — common dir</div><div class="stack-cell hl-blue" style="background: var(--blue-soft)"><code>objects/</code> · <code>refs/heads</code>, <code>refs/tags</code>, <code>refs/remotes</code>, <code>refs/stash</code> · <code>packed-refs</code> · <code>config</code> · <code>hooks/</code> · <code>info/</code> · <code>rr-cache/</code> · <code>shallow</code> · <code>worktrees/</code></div></div>
+                <div class="stack-row"><div class="stack-cell head">Private — per worktree</div><div class="stack-cell hl-green" style="background: var(--green-soft)"><code>HEAD</code> · <code>index</code> · <code>logs/HEAD</code> · <code>ORIG_HEAD</code>, <code>MERGE_HEAD</code>, <code>FETCH_HEAD</code>, <code>AUTO_MERGE</code> · <code>refs/worktree/*</code>, <code>refs/bisect/*</code>, <code>refs/rewritten/*</code> · <code>info/sparse-checkout</code> · rebase/merge/bisect state</div></div>
+                <div class="stack-row"><div class="stack-cell head">Private only if asked</div><div class="stack-cell hl-purple" style="background: var(--purple-soft)"><code>config.worktree</code>, read only when <code>extensions.worktreeConfig</code> is true (§04)</div></div>
+              </div>
+            </div>
+            <p class="figure-caption">
+              Branches, tags, the stash and config are shared. Everything that says where you are or
+              what you are in the middle of is private. The purple row is opt-in.
+            </p>
+          </figure>
+
+          <h2 id="add"><span class="secnum">03</span>What git worktree add writes</h2>
+          <p class="lede">
+            <code>git worktree add ../wt1 agent-1</code> copies no history. It writes three small
+            pointer files, creates a <code>HEAD</code>, and runs <code>git reset --hard</code> in the
+            new directory. Everything happens in <code>add_worktree</code>,
+            <code>builtin/worktree.c</code>:461-633 <span class="src">from the code</span>.
+          </p>
+
+          <h3>The steps, in order</h3>
+          <ol>
+            <li>
+              <strong>Check the target.</strong> <code>check_candidate_path</code> refuses a path that
+              is already a registered worktree, unless <code>--force</code> is given (479).
+            </li>
+            <li>
+              <strong>Check the branch.</strong> If the argument names an existing branch,
+              <code>die_if_checked_out</code> refuses it when another worktree already has it (484-489).
+              §04 covers this rule.
+            </li>
+            <li>
+              <strong>Name the admin directory.</strong> The name is the target path's basename,
+              sanitised into a valid ref component. <code>mkdir .git/worktrees/&lt;name&gt;</code> runs
+              in a loop: on <code>EEXIST</code> it appends a counter, so a second <code>wt1</code>
+              becomes <code>wt11</code>, then <code>wt12</code> (494-515).
+            </li>
+            <li>
+              <strong>Lock it.</strong> Before anything else, git writes
+              <code>worktrees/&lt;name&gt;/locked</code> containing "initializing", so a concurrent
+              <code>prune</code> cannot delete a half-built worktree (524-532). It also registers an
+              <code>atexit</code> handler that removes the junk if the process dies.
+            </li>
+            <li>
+              <strong>Write the links.</strong> <code>write_worktree_linking_files</code> writes the new
+              checkout's <code>.git</code> <em>file</em> and the admin directory's <code>gitdir</code>
+              file, each pointing at the other (542; <code>worktree.c</code>:1092-1120). Then it writes
+              <code>commondir</code> containing <code>../..</code> (544-545).
+            </li>
+            <li>
+              <strong>Create <code>HEAD</code>.</strong> In the new worktree's own ref store,
+              <code>HEAD</code> becomes a symref to the branch, or a detached commit id with
+              <code>--detach</code> (550-568).
+            </li>
+            <li>
+              <strong>Copy per-worktree settings.</strong> If the current worktree uses sparse checkout,
+              its patterns are copied. If <code>extensions.worktreeConfig</code> is on, its
+              <code>config.worktree</code> is copied (570-583).
+            </li>
+            <li>
+              <strong>Populate files.</strong> <code>checkout_worktree</code> runs
+              <code>git reset --hard --no-recurse-submodules</code> with <code>GIT_DIR</code> and
+              <code>GIT_WORK_TREE</code> set to the new paths (400-410, 592-594). This writes the
+              index and the files.
+            </li>
+            <li>
+              <strong>Unlock, then hook.</strong> The <code>locked</code> file is removed unless
+              <code>--lock</code> was given, and <code>post-checkout</code> runs in the new
+              directory. A failing hook does not delete the worktree (600-623).
+            </li>
+          </ol>
+
+          <h3>The three pointer files</h3>
+          <p>
+            Here is what that left on disk in the lab hub <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ cat wt1/.git
+gitdir: /home/coder/git-ref/lab/work/hub/.git/worktrees/wt1
+$ ls hub/.git/worktrees/wt1
+COMMIT_EDITMSG  FETCH_HEAD  HEAD  ORIG_HEAD  commondir  gitdir  index  logs  refs
+$ cat hub/.git/worktrees/wt1/commondir
+../..
+$ cat hub/.git/worktrees/wt1/gitdir
+/home/coder/git-ref/lab/work/wt1/.git
+$ cat hub/.git/worktrees/wt1/HEAD
+ref: refs/heads/agent-1</code></pre>
+          <p>
+            Any git command run inside <code>wt1</code> finds the repository in two hops. Setup reads
+            the <code>.git</code> file and requires the <code>gitdir: </code> prefix
+            (<code>setup.c</code>:999). That gives the admin directory, which holds
+            <code>HEAD</code> and <code>index</code>. <code>get_common_dir_noenv</code> then reads
+            <code>commondir</code> and, because <code>../..</code> is relative, resolves it against
+            the admin directory, which lands on <code>hub/.git</code> (<code>setup.c</code>:323-350)
+            <span class="src">from the code</span>. The <code>gitdir</code> file points the other
+            way. Git does not need it to run commands in the worktree. It needs it to know where
+            the worktree is: <code>worktree list</code>, <code>prune</code> and the one-branch check
+            all read it.
+          </p>
+
+          <figure class="figure" id="fig-links">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">How a worktree finds its repository, and how the repository finds the worktree</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 300" role="img" aria-label="The worktree's .git file points to the admin directory; the admin directory's commondir points up to the shared .git; the admin directory's gitdir file points back to the worktree's .git file.">
+                <defs>
+                  <marker id="lnk-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="lnk-st" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <!-- worktree -->
+                <rect x="30" y="60" width="260" height="170" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="46" y="84" class="svg-lane">WORKTREE  ../wt1/</text>
+                <rect x="46" y="100" width="228" height="52" rx="3" fill="#ffffff" stroke="#367f59"/>
+                <text x="60" y="122" class="svg-step">.git  (a file)</text>
+                <text x="60" y="140" class="svg-sub">gitdir: hub/.git/worktrees/wt1</text>
+                <text x="46" y="180" class="svg-sub">README.md  Makefile  src/ …</text>
+                <text x="46" y="200" class="svg-sub">4,765 files from reset --hard</text>
+
+                <!-- admin dir -->
+                <rect x="370" y="60" width="270" height="200" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="386" y="84" class="svg-lane">ADMIN DIR  .git/worktrees/wt1/</text>
+                <rect x="386" y="100" width="238" height="30" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="398" y="120" class="svg-sub">HEAD → refs/heads/agent-1</text>
+                <rect x="386" y="136" width="238" height="30" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="398" y="156" class="svg-sub">index · logs/ · refs/worktree</text>
+                <rect x="386" y="172" width="238" height="30" rx="3" fill="#ffffff" stroke="#252525"/>
+                <text x="398" y="192" class="svg-sub">commondir  ../..</text>
+                <rect x="386" y="208" width="238" height="30" rx="3" fill="#ffffff" stroke="#765b98"/>
+                <text x="398" y="228" class="svg-sub">gitdir  …/wt1/.git</text>
+
+                <!-- common dir -->
+                <rect x="720" y="60" width="250" height="200" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="84" class="svg-lane">COMMON DIR  hub/.git/</text>
+                <text x="736" y="114" class="svg-step">objects/  (320 MiB pack)</text>
+                <text x="736" y="140" class="svg-step">refs/heads/agent-1 …</text>
+                <text x="736" y="166" class="svg-step">config · hooks/</text>
+                <text x="736" y="192" class="svg-step">worktrees/</text>
+
+                <!-- edges -->
+                <path d="M274 126 L382 115" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#lnk-ctl)"/>
+                <text x="328" y="104" text-anchor="middle" class="svg-num">1</text>
+                <path d="M624 187 L716 140" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#lnk-ctl)"/>
+                <text x="676" y="150" text-anchor="middle" class="svg-num">2</text>
+                <path d="M386 223 C 335 223, 330 146, 279 140" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#lnk-st)"/>
+                <text x="386" y="282" class="svg-note">back-pointer: read by list, prune, the one-branch check</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Hops 1 and 2 (black) are how a command inside the worktree finds its <code>HEAD</code>,
+              its index and the shared objects. The dashed back-pointer is how the repository knows
+              the worktree exists and whether it is still there.
+            </p>
+          </figure>
+
+          <p>
+            Paths are absolute by default. When <code>worktree.useRelativePaths</code> is true, or
+            <code>--relative-paths</code> is passed, both links are written relative to each other.
+            The first such write sets <code>extensions.relativeWorktrees</code>, which older gits
+            refuse to open (<code>worktree.c</code>:1106-1116;
+            <code>Documentation/config/worktree.adoc</code>) <span class="src">from the code</span>.
+            Relative links let you move the repository and its worktrees together, for example
+            between a container and its host.
+          </p>
+
+          <h2 id="rules"><span class="secnum">04</span>The rules that keep worktrees apart</h2>
+          <p class="lede">
+            Git enforces two rules for you. A branch can be checked out in at most one worktree, and
+            garbage collection treats every worktree's <code>HEAD</code> and index as live. Everything
+            else in the shared column of Figure 2 is unguarded, and that is where parallel
+            agents step on each other.
+          </p>
+
+          <h3>Rule 1: one branch, one worktree</h3>
+          <p>
+            <code>die_if_checked_out</code> walks every worktree and dies if any has the branch
+            (<code>branch.c</code>:847-863). Its callers are <code>git worktree add</code>
+            (<code>builtin/worktree.c</code>:488), <code>git switch</code> and <code>git checkout</code>
+            (<code>builtin/checkout.c</code>:1652, which <code>--ignore-other-worktrees</code> skips) and
+            <code>git rebase</code> (<code>builtin/rebase.c</code>:1704). The check that matters is
+            <code>is_shared_symref</code>, <code>worktree.c</code>:504-519
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	if (wt-&gt;is_bare)
+		return 0;
+
+	if (wt-&gt;is_detached &amp;&amp; !strcmp(symref, "HEAD")) {
+		if (is_worktree_being_rebased(wt, target))
+			return 1;
+		if (is_worktree_being_bisected(wt, target))
+			return 1;
+	}
+
+	refs = get_worktree_ref_store(wt);
+	symref_target = refs_resolve_ref_unsafe(refs, symref, 0,
+						NULL, &amp;flags);
+	if ((flags &amp; REF_ISSYMREF) &amp;&amp;
+	    symref_target &amp;&amp; !strcmp(symref_target, target))
+		return 1;</code></pre>
+          <p>
+            The detached case is the subtle part. During a rebase, <code>HEAD</code> is detached, yet
+            the branch is still claimed: the rebase will move it when it finishes. A second worktree
+            that checked it out in the meantime would have its branch moved underneath it. The
+            reason for the rule is simple. A branch is a shared ref. Two indexes building commits on
+            top of it would each advance it from a parent the other has already left behind.
+            <span class="recon">reconstruction</span>
+          </p>
+          <p>
+            The lab hit the rule both ways <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ git -C ../wt1 checkout agent-2
+fatal: 'agent-2' is already used by worktree at '/home/coder/git-ref/lab/work/wt2'
+$ git worktree add ../wtX agent-3
+fatal: 'agent-3' is already used by worktree at '/home/coder/git-ref/lab/work/wt3'</code></pre>
+          <p>
+            <code>--force</code> skips the check (<code>builtin/worktree.c</code>:487). For agents,
+            don't. Give each agent its own branch, or use <code>--detach</code> and create the branch
+            only when the work is ready.
+          </p>
+
+          <h3>Rule 2: gc sees every worktree</h3>
+          <p>
+            An agent's staged but uncommitted file is only a blob in the shared object store, and
+            nothing in <code>refs/</code> points to it. If gc only looked at refs, a
+            <code>git gc</code> started in any other worktree could delete it. It doesn't, because
+            reachability walks every worktree. <code>add_index_objects_to_pending</code> reads each
+            worktree's index file (<code>revision.c</code>:1829-1857), and
+            <code>other_head_refs</code> adds each worktree's <code>HEAD</code>
+            (<code>reachable.c</code>:314, 322) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The lab tested it <span class="recon">measured here</span>. I staged a new file in
+            <code>wt3</code>, never committed it, and ran <code>git gc --prune=now</code> from the
+            hub. Afterwards <code>git cat-file -t 974785ff</code> still answered <code>blob</code>.
+            Two limits remain. A file that was never staged isn't in the object store at all, so gc
+            has nothing to protect. And a worktree whose directory was deleted stops protecting
+            anything once it is pruned (§06).
+          </p>
+
+          <h3>What is shared and unguarded</h3>
+          <p>
+            Everything else in the common directory has no owner. Figure 4 lists what
+            the lab showed for each.
+          </p>
+
+          <figure class="figure wide" id="fig-ledger">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">Hazard ledger: what one agent's action does to the others</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead><tr><th>Shared thing</th><th>Probe (lab)</th><th>Observed</th><th>What to do</th></tr></thead>
+                <tbody>
+                  <tr><td><code>refs/heads/*</code></td><td>P1: check out a branch another worktree has</td><td class="hl-green" style="background: var(--green-soft)">refused: "already used by worktree"</td><td>one branch per agent</td></tr>
+                  <tr><td>objects</td><td>P5: <code>gc --prune=now</code> while a blob is staged only in <code>wt3</code></td><td class="hl-green" style="background: var(--green-soft)">blob kept</td><td>nothing; gc is worktree-aware</td></tr>
+                  <tr><td><code>refs/stash</code></td><td>P2: <code>stash</code> in <code>wt1</code>, <code>stash list</code> in <code>wt2</code></td><td class="hl-red" style="background: var(--red-soft)"><code>stash@{0}: WIP on agent-1</code> appears in wt2</td><td>no <code>stash pop</code> in agent scripts; commit to a WIP branch</td></tr>
+                  <tr><td><code>config</code></td><td>P4: <code>git config core.editor ed</code> in <code>wt1</code></td><td class="hl-red" style="background: var(--red-soft)">wt2 reads <code>ed</code></td><td><code>extensions.worktreeConfig</code> + <code>config --worktree</code></td></tr>
+                  <tr><td><code>hooks/</code></td><td>(by the table in §02)</td><td class="hl-orange" style="background: var(--orange-soft)">one hook set for all worktrees</td><td>hooks must not assume one checkout</td></tr>
+                  <tr><td>branch names</td><td>P3: <code>update-ref refs/heads/note-from-wt1</code></td><td class="hl-orange" style="background: var(--orange-soft)">visible in wt2 at once</td><td>namespace per agent: <code>agent/&lt;id&gt;/…</code></td></tr>
+                  <tr><td><code>refs/worktree/*</code></td><td>P3: <code>update-ref refs/worktree/mark</code></td><td class="hl-green" style="background: var(--green-soft)">invisible to wt2</td><td>use for an agent's private bookmarks</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Green: git keeps worktrees apart. Red: one agent's action shows up in another's
+              worktree. Orange: shared by design, so it needs a convention. All probes are in
+              <code>lab/hazards.sh</code>, run on git 2.55.0.
+            </p>
+          </figure>
+
+          <p>
+            Config is the one with a built-in fix. With <code>extensions.worktreeConfig</code> set
+            to true, <code>git config --worktree</code> writes to
+            <code>.git/worktrees/&lt;name&gt;/config.worktree</code>, and other worktrees don't read
+            it. In the lab, <code>wt1</code> then read <code>vi</code> and <code>wt2</code> still
+            read <code>ed</code> <span class="recon">measured here</span>. <code>git sparse-checkout
+            set</code> turns this extension on by itself, so that one worktree's sparse settings
+            don't leak into the others (<code>Documentation/git-sparse-checkout.adoc</code>:51-57)
+            <span class="src">from the docs</span>.
+          </p>
+
+          <h2 id="concurrency"><span class="secnum">05</span>Trying to make agents collide</h2>
+          <p class="lede">
+            I expected lock errors. Four worktrees committing as fast as they could, and six fetching
+            the same remote at once, produced none. The one race that did fail, two worktrees moving
+            the same branch, failed cleanly: exactly one winner, and an error message for the loser.
+          </p>
+
+          <div class="measured">
+            <div><div class="n">400</div><div class="k">commits from 4 worktrees in parallel, 20.0 s wall, 0 failures</div></div>
+            <div><div class="n">120</div><div class="k">concurrent fetches + 20 <code>pack-refs</code>, 0 stderr lines</div></div>
+            <div><div class="n">50 / 50</div><div class="k">same-ref races with exactly one winner</div></div>
+            <div><div class="n">0</div><div class="k">rounds where both writers succeeded</div></div>
+          </div>
+
+          <h3>Probe P6: commits on separate branches</h3>
+          <p>
+            Each of four worktrees made 100 commits on its own branch. A fifth process ran
+            <code>git pack-refs --all</code> 40 times in the hub at the same time. Every branch
+            ended with exactly 100 new commits, and no stderr lines were written
+            <span class="recon">measured here</span>. A commit takes two locks:
+            <code>index.lock</code> in its own admin directory, which no other worktree touches, and
+            the lock on its own branch ref. The only shared lock it can meet is
+            <code>packed-refs.lock</code>. Git retries that one for <code>core.packedRefsTimeout</code>,
+            1000 ms by default, and retries a single ref lock for
+            <code>core.filesRefLockTimeout</code>, 100 ms by default
+            (<code>Documentation/config/core.adoc</code>:580-590) <span class="src">from the docs</span>.
+            At this rate, the retries absorbed every collision. The hub uses the <code>files</code>
+            ref backend (<code>git rev-parse --show-ref-format</code>).
+          </p>
+
+          <h3>Probes P9 and P9b: fetches into the same remote-tracking refs</h3>
+          <p>
+            Here every worktree writes the same refs. A bare remote had 50 branches. Each round, I
+            moved all 50 to a new commit, then fetched from three worktrees at once. That ran 10
+            rounds. The stress version used six fetchers, 20 rounds and a <code>pack-refs</code> in
+            each round, for 120 fetches in total. Nothing failed and nothing was written to stderr
+            <span class="recon">measured here</span>. My reading is that concurrent fetches write the
+            same new value to each ref, so a fetch that loses a lock and retries finds the work
+            already done. <span class="recon">reconstruction</span>; I did not trace the fetch
+            transaction code.
+          </p>
+
+          <h3>Probe P10: two writers, one branch, different values</h3>
+          <p>
+            The real conflict is two agents moving one shared ref to <em>different</em> commits. The
+            one-branch rule stops the usual way this happens, but not an agent that runs
+            <code>update-ref</code>, <code>push</code> or <code>branch -f</code> on a branch it
+            doesn't have checked out. I raced <code>wt1</code> and <code>wt2</code>, each running
+            <code>update-ref refs/heads/shared-target &lt;mine&gt; &lt;base&gt;</code>, 50 times. A
+            won 34 rounds and B won 16. Both never succeeded. Every loser got the same message
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>fatal: update_ref failed for ref 'refs/heads/shared-target': cannot lock ref
+'refs/heads/shared-target': is at &lt;oid&gt; but expected &lt;oid&gt;</code></pre>
+          <p>
+            That is a compare-and-swap. The old value passed to <code>update-ref</code> is checked
+            while the lock is held, so the loser fails instead of silently overwriting the winner.
+            The catch is that commands that don't pass an old value, such as
+            <code>git branch -f</code>, <code>git update-ref</code> with one argument and
+            <code>git push --force</code>, have nothing to compare against. With those, the last
+            writer wins. <span class="recon">reconstruction</span>; I only measured the guarded form.
+          </p>
+          <p>
+            So the dangers for parallel agents are mostly semantic, not mechanical. The ones that
+            matter are a shared stash, shared config, shared branch names, and unguarded force
+            updates. §09 turns that into a recipe.
+          </p>
+
+          <h2 id="lifecycle"><span class="secnum">06</span>Remove, prune, lock, repair</h2>
+          <p class="lede">
+            A worktree exists in two places, its directory and its admin entry, and they can drift
+            apart. Agents create and abandon worktrees all the time, so the cleanup rules matter.
+            The main one: <code>git worktree prune</code> deletes stale entries immediately, while
+            <code>git gc</code> waits three months.
+          </p>
+
+          <h3>remove</h3>
+          <p>
+            <code>git worktree remove &lt;path&gt;</code> deletes the directory and the admin entry
+            together. First it runs <code>git status --porcelain --ignore-submodules=none</code>
+            inside the worktree and refuses if that prints anything: "contains modified or untracked
+            files, use --force to delete it" (<code>builtin/worktree.c</code>:1340-1356)
+            <span class="src">from the code</span>. Ignored files don't appear in
+            <code>--porcelain</code> output. So an agent's <code>node_modules/</code>,
+            <code>target/</code> or <code>.venv/</code> is deleted without a warning, while one stray
+            untracked scratch file blocks removal. <span class="recon">reconstruction</span> from the
+            status flags. A locked worktree needs <code>remove -f -f</code> (1407-1409).
+          </p>
+
+          <h3>prune, and the two clocks</h3>
+          <p>
+            If the directory is deleted by hand, as <code>/tmp</code> cleanup or a container restart
+            would do, the admin entry stays behind and <code>git worktree list</code> marks it
+            <code>prunable</code>. <code>should_prune_worktree</code> (<code>worktree.c</code>:929-1018)
+            decides. Figure 5 shows its checks in order.
+          </p>
+
+          <figure class="figure" id="fig-prune">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title"><code>should_prune_worktree</code>, in order</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 250" role="img" aria-label="Five checks left to right. Admin entry not a directory: prune. A locked file exists: keep. The gitdir file is missing, unreadable or empty: prune. The worktree's .git exists: keep. Otherwise prune only if the index is missing or older than the expiry.">
+                <defs>
+                  <marker id="prn-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <g>
+                  <rect x="20" y="40" width="170" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="34" y="62" class="svg-num">1</text>
+                  <text x="50" y="62" class="svg-step">admin entry is</text>
+                  <text x="50" y="80" class="svg-step">a directory?</text>
+                  <text x="34" y="96" class="svg-sub">no → prune</text>
+                </g>
+                <g>
+                  <rect x="215" y="40" width="170" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="229" y="62" class="svg-num">2</text>
+                  <text x="245" y="62" class="svg-step">locked file</text>
+                  <text x="245" y="80" class="svg-step">exists?</text>
+                  <text x="229" y="96" class="svg-sub">yes → keep</text>
+                </g>
+                <g>
+                  <rect x="410" y="40" width="170" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="424" y="62" class="svg-num">3</text>
+                  <text x="440" y="62" class="svg-step">gitdir file</text>
+                  <text x="440" y="80" class="svg-step">readable, non-empty?</text>
+                  <text x="424" y="96" class="svg-sub">no → prune</text>
+                </g>
+                <g>
+                  <rect x="605" y="40" width="170" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="619" y="62" class="svg-num">4</text>
+                  <text x="635" y="62" class="svg-step">the worktree's</text>
+                  <text x="635" y="80" class="svg-step">.git still exists?</text>
+                  <text x="619" y="96" class="svg-sub">yes → keep</text>
+                </g>
+                <g>
+                  <rect x="800" y="40" width="180" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="814" y="62" class="svg-num">5</text>
+                  <text x="830" y="62" class="svg-step">index missing or</text>
+                  <text x="830" y="80" class="svg-step">mtime ≤ expire?</text>
+                  <text x="814" y="96" class="svg-sub">yes → prune, else keep</text>
+                </g>
+                <line x1="190" y1="72" x2="211" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#prn-ctl)"/>
+                <line x1="385" y1="72" x2="406" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#prn-ctl)"/>
+                <line x1="580" y1="72" x2="601" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#prn-ctl)"/>
+                <line x1="775" y1="72" x2="796" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#prn-ctl)"/>
+
+                <text x="20" y="146" class="svg-lane">WHO SETS "EXPIRE" IN CHECK 5</text>
+                <rect x="20" y="160" width="470" height="70" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="36" y="184" class="svg-step">git worktree prune</text>
+                <text x="36" y="204" class="svg-sub">expire = TIME_MAX  (builtin/worktree.c:259)</text>
+                <text x="36" y="221" class="svg-sub">every missing worktree is pruned now</text>
+                <rect x="510" y="160" width="470" height="70" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="526" y="184" class="svg-step">git gc  (and gc --auto)</text>
+                <text x="526" y="204" class="svg-sub">gc.worktreePruneExpire = 3.months.ago  (builtin/gc.c:162)</text>
+                <text x="526" y="221" class="svg-sub">a missing worktree survives 3 months</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              A lock wins over everything after check 1. Check 5 only runs when the directory is gone.
+              It is a grace period measured from the last time the worktree's index was written, and
+              who runs prune decides how long that grace period is.
+            </p>
+          </figure>
+
+          <p>
+            The lab ran it <span class="recon">measured here</span>. After <code>rm -rf ../wt4</code>,
+            <code>git worktree list</code> showed
+            <code>/home/coder/git-ref/lab/work/wt4 b2213c1c3e [agent-4] prunable</code>. A plain
+            <code>git worktree prune -n -v</code> answered "Removing worktrees/wt4: gitdir file points
+            to non-existent location", the same as with <code>--expire now</code>, even though
+            <code>wt4</code>'s index had been written seconds earlier. That fits the source: the
+            subcommand's default expiry is <code>TIME_MAX</code>, so every timestamp passes check 5.
+          </p>
+          <p>
+            Two consequences for agents. First, an orphaned worktree keeps its branch claimed
+            (Rule 1) and its index's blobs alive (Rule 2) until something prunes it, so a crashed
+            agent's branch can't be checked out elsewhere for up to three months. Second, if the
+            directory lives on a mount that comes and goes, run <code>git worktree lock --reason
+            "…"</code> so that check 2 protects it.
+          </p>
+
+          <h3>move and repair</h3>
+          <p>
+            <code>git worktree move</code> moves a linked worktree and rewrites both links.
+            If you moved things by hand, <code>git worktree repair</code> fixes the links from
+            whichever side you run it on (<code>Documentation/git-worktree.adoc</code>, "prune" and
+            "repair") <span class="src">from the docs</span>. Relative links (§03) avoid most of this
+            when the repository and its worktrees move together.
+          </p>
+
+          <h2 id="less"><span class="secnum">07</span>Fewer files, fewer objects</h2>
+          <p class="lede">
+            A worktree avoids copying history, but it still checks out every file. Sparse checkout
+            reduces the files an agent gets. Partial clone reduces the objects the repository fetches
+            in the first place. They work at different layers and combine with worktrees.
+          </p>
+
+          <h3>Sparse checkout: fewer files per worktree</h3>
+          <p>
+            <code>git sparse-checkout set &lt;dir&gt;…</code> limits the working tree to the listed
+            directories. Cone mode, the default, takes directory names and always includes the files
+            at the top level (<code>Documentation/git-sparse-checkout.adoc</code>:25-26, 68)
+            <span class="src">from the docs</span>. Files outside the cone stay in the index with
+            the <em>skip-worktree</em> bit set, and git does not expect them on disk (233-242). The
+            patterns are stored in <code>info/sparse-checkout</code>, which §02 showed is private
+            to each worktree. Running <code>set</code> turns on <code>extensions.worktreeConfig</code>
+            so that the cone settings stay per-worktree as well (51-57).
+          </p>
+          <p>
+            For an agent assigned one area of a repository, this is the right default. In the lab,
+            a worktree limited to <code>Documentation/</code> held 1,503 of git's 4,765 tracked
+            files, used 16.6 MB instead of 58.8 MB, and took 304 ms instead of 1,026 ms to create
+            <span class="recon">measured here</span>. The order matters. Use
+            <code>worktree add --no-checkout</code>, then <code>sparse-checkout set</code>, then
+            <code>checkout</code>. Otherwise the full tree is written first and then deleted. And
+            when the current worktree is sparse, <code>add</code> copies its patterns into the new
+            one (<code>builtin/worktree.c</code>:574-575).
+          </p>
+<pre><code>git worktree add --no-checkout ../wt-docs -b agent/docs-7
+git -C ../wt-docs sparse-checkout set --cone Documentation
+git -C ../wt-docs checkout agent/docs-7</code></pre>
+
+          <h3>Partial clone: fewer objects in the store</h3>
+          <p>
+            <code>git clone --filter=blob:none</code> fetches every commit and tree but only the blobs
+            the checkout needs. The pack it receives is marked as a <em>promisor packfile</em> by a
+            sibling <code>&lt;name&gt;.promisor</code> file. Any object it refers to but doesn't
+            contain is treated as promised by the remote and fetched on demand when needed
+            (<code>Documentation/technical/partial-clone.adoc</code>:95-125)
+            <span class="src">from the docs</span>. A partial clone and its worktrees share one
+            promisor store, so a blob one agent fetched is there for the rest.
+          </p>
+          <p>
+            In the lab, a blobless clone of git.git was 128.8 MB of <code>.git</code> instead of
+            312.1 MB, and took 33.0 s instead of 61.9 s <span class="recon">measured here</span>.
+            Both were served over <code>file://</code> by a local <code>upload-pack</code> on the
+            same two cores. A real network would change the times but not which method wins. The
+            cost moves to later: <code>git log -p</code>, <code>blame</code> or a checkout of an
+            old commit fetches blobs as it goes, and each fetch needs the remote to be reachable.
+          </p>
+
+          <h3>Two kinds of clone that share objects</h3>
+          <p>
+            A clone from a local path hardlinks the object files rather than copying them. All
+            three object files in the lab's local clone had a link count above one, and its
+            <code>.git</code> took 712 KB of new disk space <span class="recon">measured here</span>.
+            <code>clone --shared</code> goes further. It copies nothing and writes the source's
+            object directory into <code>objects/info/alternates</code>. The manual calls this
+            "a possibly dangerous operation": if the source repository later drops a commit that
+            the clone still uses, maintenance in the source can delete it
+            (<code>Documentation/git-clone.adoc</code>:87-93) <span class="src">from the docs</span>.
+            Both kinds of clone are separate repositories with their own refs, config and stash, so
+            they avoid every red row in Figure 4. In exchange, the agents no longer
+            see each other's branches without a fetch.
+          </p>
+
+          <h2 id="costs"><span class="secnum">08</span>What a second checkout costs</h2>
+          <p class="lede">
+            I timed six ways to give an agent its own checkout of git.git at <code>v2.55.0</code>,
+            three runs each. Four of them finish in about a second and add about 60 MB, which is
+            the size of the checked-out files. The two that transfer a pack take 30 to 60 times
+            longer. A sparse worktree beats them all.
+          </p>
+
+          <figure class="figure wide" id="fig-costs">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">Time to create, and new disk used, for one more checkout of git.git</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 320" role="img" aria-label="Bar chart. Full clone over file: 61.9 seconds, 371 MB. Blobless partial clone: 33.0 seconds, 188 MB. Local clone with hardlinks: 0.83 seconds, about 60 MB. Clone --shared: 0.95 seconds, 60 MB. Worktree add: 1.03 seconds, 59 MB. Sparse worktree for Documentation: 0.30 seconds, 17 MB.">
+                <text x="20" y="28" class="svg-lane">METHOD</text>
+                <text x="300" y="28" class="svg-lane">TIME, MEDIAN OF 3 (LOG SCALE)</text>
+                <text x="720" y="28" class="svg-lane">NEW DISK (MB)</text>
+                <!-- time axis: x = 300 + 330*(log10(ms)-2)/3 -->
+                <line x1="300" y1="44" x2="300" y2="276" stroke="#b8b8b1"/>
+                <line x1="410" y1="44" x2="410" y2="276" stroke="#deded9" stroke-dasharray="2 3"/>
+                <line x1="520" y1="44" x2="520" y2="276" stroke="#deded9" stroke-dasharray="2 3"/>
+                <line x1="630" y1="44" x2="630" y2="276" stroke="#deded9" stroke-dasharray="2 3"/>
+                <text x="300" y="296" text-anchor="middle" class="svg-sub">0.1 s</text>
+                <text x="410" y="296" text-anchor="middle" class="svg-sub">1 s</text>
+                <text x="520" y="296" text-anchor="middle" class="svg-sub">10 s</text>
+                <text x="630" y="296" text-anchor="middle" class="svg-sub">100 s</text>
+                <!-- disk axis: x = 720 + 300*MB/400 -->
+                <line x1="720" y1="44" x2="720" y2="276" stroke="#b8b8b1"/>
+                <line x1="870" y1="44" x2="870" y2="276" stroke="#deded9" stroke-dasharray="2 3"/>
+                <line x1="1020" y1="44" x2="1020" y2="276" stroke="#deded9" stroke-dasharray="2 3"/>
+                <text x="720" y="296" text-anchor="middle" class="svg-sub">0</text>
+                <text x="870" y="296" text-anchor="middle" class="svg-sub">200</text>
+                <text x="1020" y="296" text-anchor="middle" class="svg-sub">400</text>
+
+                <!-- rows: y = 52 + 38*i -->
+                <text x="20" y="68" class="svg-step">clone --no-local (file://)</text>
+                <rect x="300" y="54" width="307" height="20" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="604" y="69" text-anchor="end" class="svg-sub">61.9 s</text>
+                <rect x="720" y="54" width="278" height="20" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="994" y="69" text-anchor="end" class="svg-sub">371</text>
+
+                <text x="20" y="106" class="svg-step">clone --filter=blob:none</text>
+                <rect x="300" y="92" width="277" height="20" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="574" y="107" text-anchor="end" class="svg-sub">33.0 s</text>
+                <rect x="720" y="92" width="141" height="20" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="866" y="107" class="svg-sub">188</text>
+
+                <text x="20" y="144" class="svg-step">clone (local path, hardlinks)</text>
+                <rect x="300" y="130" width="101" height="20" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="406" y="145" class="svg-sub">0.83 s</text>
+                <rect x="720" y="130" width="45" height="20" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="770" y="145" class="svg-sub">≈60</text>
+
+                <text x="20" y="182" class="svg-step">clone --shared (alternates)</text>
+                <rect x="300" y="168" width="108" height="20" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="413" y="183" class="svg-sub">0.95 s</text>
+                <rect x="720" y="168" width="45" height="20" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="770" y="183" class="svg-sub">60</text>
+
+                <text x="20" y="220" class="svg-step">worktree add</text>
+                <rect x="300" y="206" width="111" height="20" fill="#dfede5" stroke="#367f59"/>
+                <text x="416" y="221" class="svg-sub">1.03 s</text>
+                <rect x="720" y="206" width="44" height="20" fill="#dfede5" stroke="#367f59"/>
+                <text x="769" y="221" class="svg-sub">59</text>
+
+                <text x="20" y="258" class="svg-step">worktree add, sparse (Documentation/)</text>
+                <rect x="300" y="244" width="53" height="20" fill="#dfede5" stroke="#367f59"/>
+                <text x="358" y="259" class="svg-sub">0.30 s</text>
+                <rect x="720" y="244" width="13" height="20" fill="#dfede5" stroke="#367f59"/>
+                <text x="738" y="259" class="svg-sub">17</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Red and orange transfer a pack, so they pay for history. Blue are local clones that
+              share or hardlink the objects. Green are worktrees. Among the four fast methods, the
+              differences are within noise; checking out about 59 MB of files is the cost they
+              share. Data: <code>lab/results/costs.tsv</code>.
+            </p>
+          </figure>
+
+          <p>
+            How the numbers were taken: <code>lab/costs.sh</code> ran each method three times on a
+            2-vCPU box, against the pinned clone in <code>~/git-ref/src</code>, which has one
+            320 MiB pack <span class="recon">measured here</span>. "New disk" is <code>du -sk</code>
+            of the new directory plus, for worktrees, the 0.5 MB admin entry. The exception is the
+            hardlinked clone, where <code>du</code> run on the source and the clone together showed
+            712 KB of new <code>.git</code>. The individual runs, in ms: full clone 62,441 / 61,916 /
+            59,810; blobless 34,578 / 33,006 / 32,939; worktree 1,026 / 823 / 1,218; sparse
+            worktree 304 / 291 / 517.
+          </p>
+          <p>
+            Disk use is the more important number. Ten agents on ten full clones of this
+            repository would use about 3.7 GB, and ten worktrees about 0.6 GB. Ten sparse worktrees
+            limited to <code>Documentation/</code> would use about 0.17 GB. That is
+            <span class="recon">arithmetic</span> from the medians, not a measured run of ten. On
+            a box with 9 GB free, which is this one, that difference decides how many agents fit.
+          </p>
+
+          <h2 id="recipe"><span class="secnum">09</span>A recipe for N agents</h2>
+          <p class="lede">
+            Everything above comes down to a short procedure. A supervisor owns the hub repository.
+            Each agent gets a locked worktree on its own namespaced branch, with its own config, and
+            never uses the stash. When it finishes, the branch is pushed and the worktree removed.
+            Figure 7 shows the lifecycle.
+          </p>
+
+          <figure class="figure wide" id="fig-recipe">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">One agent's worktree from creation to removal, and what each step touches</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 250" role="img" aria-label="Five steps: create a locked worktree on a new branch; set per-worktree config; work and commit; push the branch with a lease; unlock and remove the worktree. Lanes show which steps touch the private admin entry and which touch the shared store.">
+                <defs>
+                  <marker id="rcp-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="rcp-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="20" y="52" class="svg-lane">SUPERVISOR</text>
+                <text x="20" y="128" class="svg-lane">AGENT</text>
+                <text x="20" y="208" class="svg-lane">SHARED STORE</text>
+                <line x1="120" y1="160" x2="1060" y2="160" stroke="#deded9"/>
+
+                <rect x="130" y="30" width="170" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="142" y="48" class="svg-num">1</text>
+                <text x="156" y="48" class="svg-step">worktree add --lock</text>
+                <text x="142" y="66" class="svg-sub">-b agent/7/fix-login</text>
+
+                <rect x="320" y="106" width="170" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="332" y="124" class="svg-num">2</text>
+                <text x="346" y="124" class="svg-step">config --worktree</text>
+                <text x="332" y="142" class="svg-sub">user.*, core.hooksPath</text>
+
+                <rect x="510" y="106" width="170" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="522" y="124" class="svg-num">3</text>
+                <text x="536" y="124" class="svg-step">edit, add, commit</text>
+                <text x="522" y="142" class="svg-sub">WIP commits, no stash</text>
+
+                <rect x="700" y="106" width="170" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="712" y="124" class="svg-num">4</text>
+                <text x="726" y="124" class="svg-step">push</text>
+                <text x="712" y="142" class="svg-sub">--force-with-lease</text>
+
+                <rect x="890" y="30" width="170" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="902" y="48" class="svg-num">5</text>
+                <text x="916" y="48" class="svg-step">unlock, remove</text>
+                <text x="902" y="66" class="svg-sub">prune on startup</text>
+
+                <path d="M300 52 C 315 52, 310 128, 318 128" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#rcp-ctl)"/>
+                <line x1="490" y1="128" x2="506" y2="128" stroke="#252525" stroke-width="2" marker-end="url(#rcp-ctl)"/>
+                <line x1="680" y1="128" x2="696" y2="128" stroke="#252525" stroke-width="2" marker-end="url(#rcp-ctl)"/>
+                <path d="M870 128 C 880 128, 878 52, 886 52" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#rcp-ctl)"/>
+
+                <rect x="130" y="186" width="930" height="40" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="146" y="211" class="svg-sub">objects · refs/heads/agent/7/* · refs/remotes · config (shared part) · hooks</text>
+                <line x1="215" y1="76" x2="215" y2="184" stroke="#3c6f97" stroke-width="1" marker-end="url(#rcp-data)"/>
+                <line x1="595" y1="152" x2="595" y2="184" stroke="#3c6f97" stroke-width="1" marker-end="url(#rcp-data)"/>
+                <line x1="785" y1="152" x2="785" y2="184" stroke="#3c6f97" stroke-width="1" marker-end="url(#rcp-data)"/>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Only steps 1, 3 and 4 write to the shared store (blue drops), and each writes only to
+              refs under the agent's own namespace. Step 2 is the only one that goes to the private
+              config. That is what keeps the red rows of Figure 4 from being reached.
+            </p>
+          </figure>
+
+          <h3>Once per hub</h3>
+<pre><code>git config extensions.worktreeConfig true      # lets step 2 stay private
+git worktree prune                             # clear entries left by crashed agents
+mkdir -p ../wt</code></pre>
+
+          <h3>Per agent</h3>
+<pre><code>id=7; b="agent/$id/fix-login"; wt="../wt/agent-$id"
+git fetch origin
+git worktree add --lock --reason "agent $id" -b "$b" "$wt" origin/main
+git -C "$wt" config --worktree user.name  "agent-$id"
+git -C "$wt" config --worktree user.email "agent-$id@example.invalid"
+
+# … the agent works in "$wt": edit, git add, git commit (never git stash) …
+
+git -C "$wt" push --force-with-lease -u origin "$b"
+git worktree unlock "$wt"
+git worktree remove "$wt"          # refuses if anything is uncommitted</code></pre>
+          <p>
+            I ran this in the lab hub, with a local bare remote standing in for
+            <code>origin</code> <span class="recon">measured here</span>. The agent's commit was
+            authored by <code>agent-7 &lt;agent-7@example.invalid&gt;</code>, while the hub's
+            <code>user.name</code> stayed <code>lab</code>. <code>worktree list</code> showed
+            <code>[agent/7/fix-login] locked</code>. Removing it before unlocking failed with
+            "cannot remove a locked working tree, lock reason: agent 7". After unlocking, an
+            untracked <code>tmp.txt</code> still blocked removal. Once that was deleted,
+            <code>remove</code> succeeded and the entry was gone.
+          </p>
+
+          <h3>The rules behind it</h3>
+          <ul>
+            <li>
+              <strong>One branch per agent, under a namespace.</strong> Branches are shared
+              (§02), so <code>agent/&lt;id&gt;/…</code> keeps one agent from reusing another's name, and
+              Rule 1 (§04) keeps two agents off one branch.
+            </li>
+            <li>
+              <strong>No stash.</strong> <code>refs/stash</code> is shared (P2). An agent that runs
+              <code>stash pop</code> can apply another agent's work. Commit WIP to the agent's
+              branch and squash it later.
+            </li>
+            <li>
+              <strong>Identity and hooks per worktree.</strong> With
+              <code>extensions.worktreeConfig</code>, <code>config --worktree</code> keeps author
+              names and <code>core.hooksPath</code> out of other agents' worktrees (P4).
+            </li>
+            <li>
+              <strong>Guarded updates only.</strong> Use <code>--force-with-lease</code>, or
+              <code>update-ref &lt;ref&gt; &lt;new&gt; &lt;old&gt;</code>, so a lost race fails
+              (P10) instead of overwriting the winner.
+            </li>
+            <li>
+              <strong>Lock while running, prune on startup.</strong> A lock protects a worktree from
+              prune. Startup prune clears what crashed agents left, which would otherwise hold their
+              branches for three months (§06).
+            </li>
+            <li>
+              <strong>Dependencies are not shared.</strong> <code>node_modules/</code>,
+              <code>target/</code> and virtualenvs are ignored files inside each worktree. Each agent
+              rebuilds them, and §08's numbers don't include them. A shared package cache (pnpm's
+              store, <code>CARGO_TARGET_DIR</code>, uv's cache) is how you share that cost; git
+              plays no part. <span class="recon">reconstruction</span>
+            </li>
+            <li>
+              <strong>Ports, databases and env files are not git's job.</strong> A worktree keeps
+              agents' checkouts apart and nothing more.
+            </li>
+          </ul>
+
+          <h2 id="deeper"><span class="secnum">10</span>What this guide skipped</h2>
+          <p class="lede">
+            This guide treated the common directory as a box: objects go in, refs point into it, and
+            gc keeps what is reachable. Every one of those boxes has its own machinery in git's
+            source, and most of the costs measured above come from inside them. These are the
+            topics for a follow-up that takes git itself apart. That follow-up is now
+            <a href="../git/">Git, taken apart</a>, a three-part collection read from the same pinned source.
+          </p>
+          <div class="tier-grid" style="grid-template-columns: repeat(3, minmax(0, 1fr))">
+            <div class="tier-card ep"><h4>Objects and hashing</h4><p class="sub">STORAGE</p><p>Blobs, trees, commits and tags as hashed bytes; loose objects; the SHA-1 to SHA-256 transition, from its design doc in <code>technical/</code>.</p></div>
+            <div class="tier-card ep"><h4>Packfiles</h4><p class="sub">STORAGE</p><p>Delta chains and how <code>pack-objects</code> chooses bases; <code>.idx</code>, <code>.rev</code>, bitmaps (<code>pack-bitmap.c</code>), multi-pack index (<code>midx.c</code>). The 320 MiB in §08 is all here.</p></div>
+            <div class="tier-card ep"><h4>The index</h4><p class="sub">STATE</p><p>The format and its extensions (<code>gitformat-index.adoc</code>, <code>read-cache.c</code>, 4,051 lines): cache-tree, the untracked cache, fsmonitor, and the sparse index that §07's cone mode enables (<code>sparse-index.c</code>).</p></div>
+            <div class="tier-card se"><h4>Refs and their backends</h4><p class="sub">STATE</p><p>Loose refs, <code>packed-refs</code> and ref transactions (the compare-and-swap of P10), then <code>reftable/</code>, the binary backend that replaces both.</p></div>
+            <div class="tier-card se"><h4>Transport</h4><p class="sub">NETWORK</p><p>Protocol v2 (<code>gitprotocol-v2.adoc</code>), have/want negotiation, server-side filters behind partial clone, and bundle URIs (<code>bundle-uri.c</code>).</p></div>
+            <div class="tier-card se"><h4>Merging</h4><p class="sub">ALGORITHMS</p><p><code>merge-ort.c</code> (5,598 lines): rename detection, the three-way tree merge, conflict representation in the index, and rerere's shared <code>rr-cache</code> from §02.</p></div>
+            <div class="tier-card pr"><h4>Maintenance</h4><p class="sub">UPKEEP</p><p><code>git maintenance</code>, the commit-graph (<code>commit-graph.c</code>), geometric repacking, cruft packs, and how <code>gc --auto</code> decides to run, which is what can delete a <code>--shared</code> clone's borrowed objects.</p></div>
+            <div class="tier-card pr"><h4>Git at scale</h4><p class="sub">PERFORMANCE</p><p><code>scalar.c</code>: the opinionated bundle of partial clone, sparse checkout, fsmonitor and background maintenance that large monorepos use.</p></div>
+            <div class="tier-card pr"><h4>Worktree edge cases</h4><p class="sub">THIS TOPIC, DEEPER</p><p>Submodules inside worktrees (why <code>move</code> refuses them), bare hubs, and how <code>repair</code> rebuilds broken links.</p></div>
+          </div>
+          <p>
+            The first four are the core of "how git stores things". Transport and merging are how
+            it moves and combines them. Maintenance and scale are what keep a repository with many
+            agents fast. <span class="recon">reconstruction</span>: this is my reading of which
+            parts of the tree matter most, not a structure git documents.
+          </p>
+
+          <h2 id="sources"><span class="secnum">11</span>Sources</h2>
+          <ul>
+            <li><a href="https://github.com/git/git/tree/v2.55.0">git/git at <code>v2.55.0</code></a> (<code>e9019fcafe0040228b8631c30f97ae1adb61bcdc</code>, 29 June 2026). Code read: <code>builtin/worktree.c</code>, <code>worktree.c</code>, <code>path.c</code>, <code>refs.c</code>, <code>branch.c</code>, <code>setup.c</code>, <code>revision.c</code>, <code>reachable.c</code>, <code>builtin/gc.c</code>, <code>builtin/checkout.c</code>.</li>
+            <li><code>Documentation/git-worktree.adoc</code>, <code>git-sparse-checkout.adoc</code>, <code>git-clone.adoc</code>, <code>config/worktree.adoc</code>, <code>config/core.adoc</code>, <code>config/gc.adoc</code>, <code>config/extensions.adoc</code> and <code>technical/partial-clone.adoc</code>, all at the same commit.</li>
+            <li>Commit <code>df0b6cfbda</code> (29 June 2015), which first adds <code>builtin/worktree.c</code>, and <code>Documentation/RelNotes/2.48.0.adoc</code>:56-58 on relative worktree links.</li>
+            <li>The lab, outside this repository at <code>~/git-ref/lab/</code>: <code>costs.sh</code> (§08), <code>hazards.sh</code> (P0–P8), <code>p9-fetch.sh</code> and <code>p9b-fetch-stress.sh</code> (P9), <code>p10-cas.sh</code> (P10). Raw output is in <code>results/</code>.</li>
+          </ul>
+          <p class="footnote">
+            <strong>Provenance.</strong> Every file path, line number and quoted excerpt was read from
+            the pinned checkout. Every number and error message marked "measured here" came from the
+            lab scripts above, run once (three times for timings) with <code>git version 2.55.0</code>
+            on a 2-vCPU Linux box with an ext4 home directory, on a clone of git.git itself. The
+            explanations marked "reconstruction" are mine. These include how <code>common_list</code>
+            is resolved for unlisted paths, why concurrent fetches don't fail, and what unguarded
+            ref updates do. I did not trace the fetch transaction code or test the reftable backend,
+            Windows, network filesystems, submodules in worktrees, or more than six concurrent
+            worktrees. The partial-clone timings used a local <code>file://</code> server, not a
+            network. The ten-agent disk figures in §08 are arithmetic, not a measured run.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Writings</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../git/">Git, taken apart</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../gh-cli/">Anatomy of GitHub CLI</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../nextjs-routing/">Next.js routing, taken apart</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

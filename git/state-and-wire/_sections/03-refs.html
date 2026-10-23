@@ -1,0 +1,156 @@
+          <h2 id="refs"><span class="secnum">{{S}}</span>Refs and what readers see</h2>
+          <p class="lede">
+            A ref is a name that points at an object, or, for a symbolic ref, at another name. Moving a branch is the
+            moment a commit becomes real. The files backend makes each single move atomic, but not a group of them,
+            and a reader can watch the group land one ref at a time.
+          </p>
+          <p>
+            On disk, in the default <code>files</code> backend, a loose ref is 40 hex digits and a newline: 41 bytes,
+            which on ext4 costs a full 4 KiB block. <code>HEAD</code> is usually a symref,
+            <code>ref: refs/heads/main\n</code>, 21 bytes <span class="recon">measured here</span>. Names pass a
+            256-entry character table plus rules: no leading dot, no <code>..</code>, no <code>@{</code>, no trailing
+            <code>.lock</code> (<code>refs.c</code>:69-324). The code sorts names into classes. Root refs are all-caps
+            names such as <code>HEAD</code>, <code>ORIG_HEAD</code> and <code>AUTO_MERGE</code>. Exactly two are
+            pseudorefs, <code>FETCH_HEAD</code> and <code>MERGE_HEAD</code>, which transactions refuse to write
+            (<code>refs.c</code>:888-901). Root refs and anything under <code>refs/worktree/</code>,
+            <code>refs/bisect/</code> or <code>refs/rewritten/</code> are per-worktree (881-886); the glossary still
+            lists only <code>HEAD</code> and <code>refs/bisect/</code> <span class="src">from the code</span>.
+          </p>
+          <p>
+            Storage sits behind <code>struct ref_storage_be</code> (<code>refs/refs-internal.h</code>:573), a table
+            of about 25 function pointers. Two backends can be chosen, <code>files</code> and <code>reftable</code>.
+            Inside <code>files</code> there is a second store, <code>packed-refs</code>: one sorted text file of
+            <code>&lt;hex&gt; &lt;name&gt;</code> lines, with a <code>^&lt;hex&gt;</code> line after an annotated tag
+            giving what it peels to. Above 32 KiB it is mmapped and binary-searched
+            (<code>refs/packed-backend.c</code>:523-640). Reads overlay loose refs on packed ones, and loose wins.
+            Loose refs are read first, so a concurrent <code>pack-refs</code>, which writes the packed copy and then
+            deletes the loose file, cannot make a ref vanish between the two reads <span class="src">from the
+            code</span>.
+          </p>
+          <h3>A transaction is many renames</h3>
+          <p>
+            Every ref update goes through a transaction: begin, queue updates, prepare, commit. In
+            <code>files</code>, prepare locks every ref by creating <code>&lt;ref&gt;.lock</code>, retrying for up to
+            100 ms. Under the locks it compares each ref's current value with the expected old value, then writes
+            the new value into the lockfile. A stale lock fails after 0.150 s of wall time
+            <span class="recon">measured here</span>. Moving a branch that <code>HEAD</code> points at also takes
+            <code>HEAD.lock</code>, to log the move in <code>HEAD</code>'s reflog. Commit then renames the lockfiles
+            over the refs, one at a time (<code>refs/files-backend.c</code>:3268-3421)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            There is no global lock, by choice. Before touching <code>packed-refs.lock</code>, prepare checks that no
+            new loose ref collides with a packed one, such as <code>a/b</code> against <code>a</code>. The comment at
+            <code>refs/files-backend.c</code>:3011-3022 says why the check is not done under a lock:
+          </p>
+<pre><code>	 * Verify that none of the loose reference that we're about to write
+	 * conflict with any existing packed references. Ideally, we'd do this
+	 * check after the packed-refs are locked so that the file cannot
+	 * change underneath our feet. But introducing such a lock now would
+	 * probably do more harm than good as users rely on there not being a
+	 * global lock with the "files" backend.
+	 ...
+	 * So instead, we accept the race for now.</code></pre>
+          <p>
+            Failure is all-or-nothing: if prepare cannot lock or verify every ref, nothing moves. A reader gets no
+            such promise. To see what it gets, I ran a 10,000-ref <code>update-ref --stdin</code> while a second
+            process looped <code>for-each-ref --points-at=&lt;new&gt;</code> and recorded each distinct count
+            (<code>refs-visibility.sh</code>). Figure {{fig-visibility}} shows the result.
+          </p>
+
+          <figure class="figure wide" id="fig-visibility">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What a polling reader saw during one 10,000-ref transaction, in each backend</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 440" role="img" aria-label="Files backend: the writer locks 10,000 refs and then renames them one at a time; the reader saw counts 0, 252, 838, 1758, 3254, 5762, 9514 and 10000. Reftable: the writer writes one table and renames tables.list.lock once; the reader saw only 0 and 10000. Bars compare create and delete times.">
+                <defs>
+                  <marker id="fig-visibility-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="56" y="26" class="svg-lane">FILES BACKEND · WRITER 2,982 MS · READER 140 SAMPLES</text>
+                <text x="56" y="62" class="svg-lane">writer</text>
+                <rect x="140" y="44" width="300" height="30" fill="#ece6f3" stroke="#765b98"/>
+                <text x="152" y="64" class="svg-sub">prepare: 10,000 .lock files, CAS</text>
+                <rect x="440" y="44" width="620" height="30" fill="#f7f7f5" stroke="#252525"/>
+                <text x="452" y="64" class="svg-sub">commit: rename x.lock → x, one ref at a time</text>
+                <text x="56" y="114" class="svg-lane">reader</text>
+                <line x1="140" y1="110" x2="1060" y2="110" stroke="#b8b8b1" stroke-width="1.5"/>
+                <circle cx="200" cy="110" r="4" fill="#3c6f97"/><circle cx="300" cy="110" r="4" fill="#3c6f97"/><circle cx="400" cy="110" r="4" fill="#3c6f97"/>
+                <text x="300" y="134" class="svg-sub" text-anchor="middle">0</text>
+                <circle cx="500" cy="110" r="4" fill="#ad4b43"/><text x="500" y="134" class="svg-sub" text-anchor="middle">252</text>
+                <circle cx="580" cy="110" r="4" fill="#ad4b43"/><text x="580" y="98" class="svg-sub" text-anchor="middle">838</text>
+                <circle cx="660" cy="110" r="4" fill="#ad4b43"/><text x="660" y="134" class="svg-sub" text-anchor="middle">1758</text>
+                <circle cx="760" cy="110" r="4" fill="#ad4b43"/><text x="760" y="98" class="svg-sub" text-anchor="middle">3254</text>
+                <circle cx="860" cy="110" r="4" fill="#ad4b43"/><text x="860" y="134" class="svg-sub" text-anchor="middle">5762</text>
+                <circle cx="970" cy="110" r="4" fill="#ad4b43"/><text x="970" y="98" class="svg-sub" text-anchor="middle">9514</text>
+                <circle cx="1050" cy="110" r="4" fill="#367f59"/><text x="1050" y="134" class="svg-sub" text-anchor="middle">10000</text>
+                <text x="140" y="160" class="svg-note">red: in-between states a reader can act on (7 in this run, 8 in a re-run; values differ per run)</text>
+
+                <text x="56" y="204" class="svg-lane">REFTABLE BACKEND · WRITER 272 MS · READER 55 SAMPLES</text>
+                <text x="56" y="240" class="svg-lane">writer</text>
+                <rect x="140" y="222" width="230" height="30" fill="#ece6f3" stroke="#765b98"/>
+                <text x="152" y="242" class="svg-sub">lock tables.list.lock</text>
+                <rect x="370" y="222" width="430" height="30" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="382" y="242" class="svg-sub">write &lt;name&gt;.temp.XXXXXX, rename to its final name</text>
+                <path d="M800 237 L842 237" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-visibility-ctl)"/>
+                <rect x="846" y="222" width="214" height="30" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="858" y="242" class="svg-sub">1 rename: new list live</text>
+                <text x="56" y="292" class="svg-lane">reader</text>
+                <line x1="140" y1="288" x2="1060" y2="288" stroke="#b8b8b1" stroke-width="1.5"/>
+                <circle cx="220" cy="288" r="4" fill="#3c6f97"/><circle cx="420" cy="288" r="4" fill="#3c6f97"/><circle cx="620" cy="288" r="4" fill="#3c6f97"/><circle cx="800" cy="288" r="4" fill="#3c6f97"/>
+                <text x="510" y="312" class="svg-sub" text-anchor="middle">0</text>
+                <circle cx="900" cy="288" r="4" fill="#367f59"/><circle cx="1000" cy="288" r="4" fill="#367f59"/>
+                <text x="950" y="312" class="svg-sub" text-anchor="middle">10000</text>
+
+                <text x="56" y="350" class="svg-lane">WRITE COST, SINGLE RUNS · refs-bench.sh</text>
+                <text x="56" y="378" class="svg-sub">create 10,000 refs</text>
+                <rect x="300" y="366" width="500" height="14" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="812" y="378" class="svg-sub">files 3,100 ms</text>
+                <rect x="300" y="384" width="27" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="339" y="396" class="svg-sub">reftable 167 ms</text>
+                <text x="56" y="420" class="svg-sub">delete 1,000 of 100,000</text>
+                <rect x="300" y="408" width="97" height="14" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="409" y="420" class="svg-sub">files 604 ms</text>
+                <rect x="300" y="426" width="4" height="10" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="316" y="436" class="svg-sub">reftable 20 ms</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              <code>files</code> is atomic against failure, not against readers; reftable commits with one rename.
+              The counts are measured; where each sample sits on its lane is schematic, and the two lanes do not
+              share a time scale. Bars share one scale.
+            </p>
+          </figure>
+
+          <p>
+            Under <code>files</code> the reader saw 0, then 252, 838, 1,758, 3,254, 5,762 and 9,514 refs moved, then
+            10,000. A verifier's re-run saw eight in-between counts; under reftable both runs saw only 0 and 10,000
+            <span class="recon">measured here</span>. This is documented: <code>Documentation/BreakingChanges.adoc</code>
+            says that with <code>files</code>, "Git may see in-between states when it reads references while a
+            reference transaction is in the process of being committed to disk." Commands that must see a consistent
+            set of refs, such as a server advertising them during a large push, get no such guarantee
+            <span class="recon">reconstruction</span>.
+          </p>
+          <h3>Reflogs, and a regression already fixed</h3>
+          <p>
+            Each ref move also appends one line to <code>logs/&lt;ref&gt;</code>: old id, new id, committer, epoch,
+            timezone, a tab and the message. A first commit's line is 129 bytes. Appends use
+            <code>O_APPEND</code> and take no lock of their own. Branches, remote-tracking refs, notes and
+            <code>HEAD</code> get reflogs by default; tags do not <span class="src">from the code</span>.
+            Expiry has a known bug in v2.50.0 through v2.55.0. <code>reflog.h</code>:25-28 swaps the two defaults:
+          </p>
+<pre><code>#define REFLOG_EXPIRE_OPTIONS_INIT(now) { \
+	.default_expire_total = now - 30 * 24 * 3600, \
+	.default_expire_unreachable = now - 90 * 24 * 3600, \
+}</code></pre>
+          <p>
+            The documentation says 90 days for all entries and 30 for unreachable ones. With the swap, a
+            <code>gc</code> or the maintenance reflog task prunes reachable entries older than 30 days; I reproduced
+            the loss of 45- and 60-day entries <span class="recon">measured here</span>. It came in with
+            <code>8565827570</code> (v2.50.0) and was reported and fixed upstream by <code>60cf500551</code>
+            (24 September 2026), which is on master but in no tag yet. Until a release carries it, setting
+            <code>gc.reflogExpire</code> and <code>gc.reflogExpireUnreachable</code> explicitly restores the
+            documented behaviour, because the config parser overwrites both defaults (<code>reflog.c</code>:48-66)
+            <span class="src">from the code</span>.
+          </p>

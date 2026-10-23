@@ -1,0 +1,49 @@
+          <h2 id="prune"><span class="secnum">{{S}}</span>Deleting by the clock</h2>
+          <p>
+            Adding objects needs no lock, because an object never changes
+            (<a href="../commit-and-objects/#objects">Part 1</a>). Deleting them is harder. <code>git prune</code>
+            cannot lock out every process that might be about to reference an object, so it uses time instead.
+            It deletes an unreachable loose object only if the file's mtime is older than <code>--expire</code>,
+            two weeks by default since v1.5.5 (<code>25ee9731c1</code>). Its roots are the index, every ref,
+            every worktree's <code>HEAD</code> and every reflog entry. Since v2.2.0 (<code>d3038d22f9</code>) it
+            also keeps anything reachable from a <em>recent</em> unreachable object, so a tree written a minute
+            ago keeps an old blob alive (<code>builtin/prune.c:84-109</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The clock only works if writers reset it. When a writer finds that an object it wants to write
+            already exists, it "freshens" it instead: <code>utime()</code> on the loose file, or on the whole
+            pack. <code>packfile.c:2172-2186</code>:
+          </p>
+          <pre><code>int packfile_store_freshen_object(struct packfile_store *store,
+				  const struct object_id *oid)
+{
+	struct pack_entry e;
+	if (!find_pack_entry(store, oid, &amp;e))
+		return 0;
+	if (e.p-&gt;is_cruft)
+		return 0;
+	if (e.p-&gt;freshened)
+		return 1;
+	if (utime(e.p-&gt;pack_name, NULL))
+		return 0;
+	e.p-&gt;freshened = 1;
+	return 1;
+}</code></pre>
+          <p>
+            A pack is touched once per process. A cruft pack is never touched, because its per-object mtimes
+            live in a <code>.mtimes</code> file; returning 0 makes the caller write the object loose again,
+            with a fresh mtime. Both paths showed up in the lab. Rewriting an old loose blob reset its mtime
+            and took it off <code>prune -n</code>'s list, and rewriting a cruft-packed blob produced a new
+            loose file <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The manual is candid about what is left. Users "who run commands concurrently have to live with
+            some risk of corruption (which seems to be low in practice)"
+            (<code>Documentation/git-gc.adoc:167-169</code>). And since gc and the maintenance reflog task both
+            expire reflogs, their roots were thinned by a v2.50.0 regression: the built-in defaults expire all
+            entries after 30 days and unreachable ones after 90, the reverse of the documentation
+            (<code>reflog.h:25-28</code>). It was reported and fixed upstream after the v2.55.0 tag by
+            <code>60cf500551</code>, which is on master but in no release yet (finding A1). Reflogs themselves
+            are covered in <a href="../state-and-wire/#refs">Part 2</a>, and worktree pruning in
+            <a href="../../git-worktrees/">One repository, many agents</a>.
+          </p>

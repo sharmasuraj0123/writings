@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Git, taken apart: a three-part teardown of git internals read from git v2.55.0 — objects, packs, the index, refs, the wire, merging, maintenance and history, with measurements and a findings register."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/git/" />
+    <meta property="og:title" content="Git, taken apart — XO Research" />
+    <meta property="og:description" content="Git internals in three parts, read from the v2.55.0 source and measured: the commit and its objects, mutable state and the wire, and how histories are combined, kept fast and got here." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://quirq.ai/git/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <title>Git, taken apart — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --blue: #3c6f97;
+        --purple: #765b98;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .page {
+        max-width: var(--text);
+        margin: 0 auto;
+        padding: 72px 22px 96px;
+      }
+
+      .kicker {
+        margin: 0 0 14px;
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--orange);
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-family: var(--serif);
+        font-size: clamp(34px, 6vw, 46px);
+        font-weight: 500;
+        line-height: 1.12;
+        letter-spacing: -0.012em;
+      }
+
+      .lede {
+        margin: 0 0 8px;
+        max-width: 56ch;
+        color: var(--ink-soft);
+        font-size: 18px;
+      }
+
+      .section {
+        margin-top: 58px;
+      }
+
+      .section > h2 {
+        margin: 0 0 6px;
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        font-weight: 600;
+        color: var(--ink-faint);
+      }
+
+      .section > .rule {
+        height: 1px;
+        margin-bottom: 4px;
+        background: var(--line);
+      }
+
+      .log {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+
+      .log li {
+        padding: 26px 0 28px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .meta {
+        display: flex;
+        gap: 14px;
+        margin: 0 0 6px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        color: var(--ink-faint);
+      }
+
+      .meta .dot {
+        color: var(--line-dark);
+      }
+
+      .log h3 {
+        margin: 0 0 8px;
+        font-family: var(--serif);
+        font-size: 25px;
+        font-weight: 500;
+        line-height: 1.22;
+        letter-spacing: -0.008em;
+      }
+
+      .log h3 a {
+        text-decoration: none;
+      }
+
+      .log h3 a:hover {
+        text-decoration: underline;
+        text-decoration-color: var(--orange);
+      }
+
+      .log p {
+        margin: 0;
+        max-width: 60ch;
+        color: var(--ink-soft);
+      }
+
+      .state {
+        padding: 34px 0;
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--ink-faint);
+      }
+
+      .state.error {
+        color: var(--orange);
+      }
+
+      footer {
+        margin-top: 70px;
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+        font-family: var(--mono);
+        font-size: 12.5px;
+        color: var(--ink-faint);
+      }
+
+      footer code {
+        padding: 0.08em 0.34em;
+        border-radius: 3px;
+        background: #eeeeeb;
+        font-size: 0.95em;
+      }
+
+      .collection-note {
+        margin: 14px 0 0;
+        max-width: 60ch;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+      .pill {
+        display: inline-block;
+        margin-left: 8px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+        background: var(--paper-soft);
+        vertical-align: 3px;
+      }
+      .pill.soon { background: var(--paper-warm); color: #a8641a; border-color: #f7e3c8; }
+      .back {
+        margin: 0 0 26px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+      .back a { color: var(--ink-faint); text-decoration: none; }
+      .back a:hover { color: var(--ink); text-decoration: underline; }
+      .map { margin: 34px 0 0; }
+      .map svg { width: 100%; height: auto; display: block; }
+      .map .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .map .svg-step { font: 500 13px var(--sans); fill: var(--ink); }
+      .map .svg-sub { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .map .svg-num { font: 700 11px var(--mono); fill: var(--orange); }
+      .map figcaption { margin-top: 8px; font-size: 14px; color: var(--ink-faint); }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <p class="back"><a href="../">← Writings</a></p>
+      <p class="kicker">XO Labs · Research collection</p>
+      <h1>Git, taken apart</h1>
+      <p class="lede">
+        Git is an append-only store of content-addressed objects, surrounded by a
+        handful of small mutable files: the index, the refs, a few caches. Each of
+        those files has its own lock, its own commit point and its own consistency
+        story. This collection reads all of it from the git v2.55.0 source, measures
+        it on a real repository, and keeps a register of where the code and the
+        documentation disagree.
+      </p>
+      <p class="collection-note">
+        Three parts, read in order or alone. Every claim cites a file and line at
+        <code>git@e9019fca</code> (v2.55.0, 29 June 2026) or a measurement run on a
+        2-vCPU Linux box with git 2.55.0. Each part is one self-contained HTML file.
+      </p>
+
+      <figure class="map" aria-labelledby="map-cap">
+        <svg viewBox="0 0 704 250" role="img" aria-label="One git commit at the centre, with three parts around it: Part 1 covers objects, packs, indexes and bitmaps; Part 2 covers the index file, refs, reftable, durability and the wire protocol; Part 3 covers merging, maintenance, the commit-graph and history.">
+          <rect x="262" y="96" width="180" height="56" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+          <text x="352" y="120" text-anchor="middle" class="svg-step">git add + git commit</text>
+          <text x="352" y="138" text-anchor="middle" class="svg-sub">5 objects · 1 rename</text>
+          <a href="commit-and-objects/">
+            <rect x="12" y="20" width="210" height="96" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+            <text x="26" y="42" class="svg-num">PART 1</text>
+            <text x="26" y="62" class="svg-step">The commit and its objects</text>
+            <text x="26" y="82" class="svg-sub">objects · lookup · packs</text>
+            <text x="26" y="100" class="svg-sub">deltas · .idx · bitmaps</text>
+          </a>
+          <a href="state-and-wire/">
+            <rect x="482" y="20" width="210" height="96" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+            <text x="496" y="42" class="svg-num">PART 2</text>
+            <text x="496" y="62" class="svg-step">Mutable state and the wire</text>
+            <text x="496" y="82" class="svg-sub">index · racy git · refs</text>
+            <text x="496" y="100" class="svg-sub">reftable · fsync · protocol</text>
+          </a>
+          <a href="merge-and-upkeep/">
+            <rect x="247" y="176" width="210" height="64" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+            <text x="261" y="196" class="svg-num">PART 3</text>
+            <text x="261" y="214" class="svg-step">Combining, keeping, history</text>
+            <text x="261" y="231" class="svg-sub">merge-ort · gc · commit-graph</text>
+          </a>
+          <line x1="222" y1="80" x2="260" y2="110" stroke="#252525" stroke-width="2"/>
+          <line x1="482" y1="80" x2="444" y2="110" stroke="#252525" stroke-width="2"/>
+          <line x1="352" y1="152" x2="352" y2="174" stroke="#252525" stroke-width="2"/>
+        </svg>
+        <figcaption id="map-cap">Each part starts from the same traced commit and follows a different set of files outward.</figcaption>
+      </figure>
+
+      <div id="log-root">
+        <section class="section">
+          <h2>The collection</h2>
+          <div class="rule"></div>
+          <ul class="log">
+            <li>
+              <p class="meta"><span>Part 1</span><span class="dot">·</span><span>23 October 2026</span><span class="dot">·</span><span>25 min read</span></p>
+              <h3><a href="commit-and-objects/">The commit and its objects</a></h3>
+              <p>A git commit is five small zlib files, two rewrites of the index, six lock files and one rename. This first part of a three-part teardown traces one git add and one git commit through git v2.55.0, call by call, then follows the objects they write: how an object is named, where git looks for it, how packs store it as a backwards byte delta, and how fanout tables and bitmaps make finding and counting objects cheap.</p>
+            </li>
+            <li>
+              <p class="meta"><span>Part 2</span><span class="dot">·</span><span>23 October 2026</span><span class="dot">·</span><span>26 min read</span></p>
+              <h3><a href="state-and-wire/">Mutable state and the wire</a></h3>
+              <p>Git's objects never change, so they need no lock. Everything around them does change: the index, the refs, the reflogs, and the conversation between two repositories. This part reads those small mutable files and the wire protocol from git v2.55.0: the index as a stat cache that becomes a tree, racy git, what a reader sees while refs move, reftable's one-rename commit, why every publish is atomic but nothing is fsynced by default, pkt-lines and protocol v2, negotiation, and the push quarantine.</p>
+            </li>
+            <li>
+              <p class="meta"><span>Part 3</span><span class="dot">·</span><span>23 October 2026</span><span class="dot">·</span><span>29 min read</span></p>
+              <h3><a href="merge-and-upkeep/">Combining, keeping, and how it got here</a></h3>
+              <p>How git combines two histories: merge bases painted with generation numbers, merge-ort's one map and three phases, staged rename detection, conflict styles and rerere. How it keeps a repository fast without locking deletion: auto-maintenance, geometric repacks, prune's two-week clock, the commit-graph and Bloom filters. How a 1,244-line commit from 2005 became v2.55.0, what Git 3.0 will change, and the full register of bugs, documentation drift and gotchas found while reading.</p>
+            </li>
+          </ul>
+        </section>
+
+        <section class="section">
+          <h2>Companion</h2>
+          <div class="rule"></div>
+          <ul class="log">
+            <li>
+              <p class="meta"><span>21 October 2026</span><span class="dot">·</span><span>23 min read</span></p>
+              <h3><a href="../git-worktrees/">One repository, many agents</a></h3>
+              <p>A field guide to git worktrees: what a linked worktree shares with the repository and what it keeps private, the one-branch rule, prune, sparse checkout and partial clone, measured costs, and a tested recipe for running many agents on one repository.</p>
+            </li>
+          </ul>
+        </section>
+      </div>
+
+      <footer>
+        Parts live under <code>git/&lt;slug&gt;/index.html</code> and are indexed in
+        the root <code>posts.json</code> with the <code>git/</code> prefix in their slug.
+        The research behind them (eight dossiers, two verification passes, the lab
+        scripts) is kept outside this repository.
+      </footer>
+    </main>
+  </body>
+</html>

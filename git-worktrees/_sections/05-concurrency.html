@@ -1,0 +1,67 @@
+          <h2 id="concurrency"><span class="secnum">{{S}}</span>Trying to make agents collide</h2>
+          <p class="lede">
+            I expected lock errors. Four worktrees committing as fast as they could, and six fetching
+            the same remote at once, produced none. The one race that did fail, two worktrees moving
+            the same branch, failed cleanly: exactly one winner, and an error message for the loser.
+          </p>
+
+          <div class="measured">
+            <div><div class="n">400</div><div class="k">commits from 4 worktrees in parallel, 20.0 s wall, 0 failures</div></div>
+            <div><div class="n">120</div><div class="k">concurrent fetches + 20 <code>pack-refs</code>, 0 stderr lines</div></div>
+            <div><div class="n">50 / 50</div><div class="k">same-ref races with exactly one winner</div></div>
+            <div><div class="n">0</div><div class="k">rounds where both writers succeeded</div></div>
+          </div>
+
+          <h3>Probe P6: commits on separate branches</h3>
+          <p>
+            Each of four worktrees made 100 commits on its own branch. A fifth process ran
+            <code>git pack-refs --all</code> 40 times in the hub at the same time. Every branch
+            ended with exactly 100 new commits, and no stderr lines were written
+            <span class="recon">measured here</span>. A commit takes two locks:
+            <code>index.lock</code> in its own admin directory, which no other worktree touches, and
+            the lock on its own branch ref. The only shared lock it can meet is
+            <code>packed-refs.lock</code>. Git retries that one for <code>core.packedRefsTimeout</code>,
+            1000 ms by default, and retries a single ref lock for
+            <code>core.filesRefLockTimeout</code>, 100 ms by default
+            (<code>Documentation/config/core.adoc</code>:580-590) <span class="src">from the docs</span>.
+            At this rate, the retries absorbed every collision. The hub uses the <code>files</code>
+            ref backend (<code>git rev-parse --show-ref-format</code>).
+          </p>
+
+          <h3>Probes P9 and P9b: fetches into the same remote-tracking refs</h3>
+          <p>
+            Here every worktree writes the same refs. A bare remote had 50 branches. Each round, I
+            moved all 50 to a new commit, then fetched from three worktrees at once. That ran 10
+            rounds. The stress version used six fetchers, 20 rounds and a <code>pack-refs</code> in
+            each round, for 120 fetches in total. Nothing failed and nothing was written to stderr
+            <span class="recon">measured here</span>. My reading is that concurrent fetches write the
+            same new value to each ref, so a fetch that loses a lock and retries finds the work
+            already done. <span class="recon">reconstruction</span>; I did not trace the fetch
+            transaction code.
+          </p>
+
+          <h3>Probe P10: two writers, one branch, different values</h3>
+          <p>
+            The real conflict is two agents moving one shared ref to <em>different</em> commits. The
+            one-branch rule stops the usual way this happens, but not an agent that runs
+            <code>update-ref</code>, <code>push</code> or <code>branch -f</code> on a branch it
+            doesn't have checked out. I raced <code>wt1</code> and <code>wt2</code>, each running
+            <code>update-ref refs/heads/shared-target &lt;mine&gt; &lt;base&gt;</code>, 50 times. A
+            won 34 rounds and B won 16. Both never succeeded. Every loser got the same message
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>fatal: update_ref failed for ref 'refs/heads/shared-target': cannot lock ref
+'refs/heads/shared-target': is at &lt;oid&gt; but expected &lt;oid&gt;</code></pre>
+          <p>
+            That is a compare-and-swap. The old value passed to <code>update-ref</code> is checked
+            while the lock is held, so the loser fails instead of silently overwriting the winner.
+            The catch is that commands that don't pass an old value, such as
+            <code>git branch -f</code>, <code>git update-ref</code> with one argument and
+            <code>git push --force</code>, have nothing to compare against. With those, the last
+            writer wins. <span class="recon">reconstruction</span>; I only measured the guarded form.
+          </p>
+          <p>
+            So the dangers for parallel agents are mostly semantic, not mechanical. The ones that
+            matter are a shared stash, shared config, shared branch names, and unguarded force
+            updates. §09 turns that into a recipe.
+          </p>

@@ -1,0 +1,146 @@
+          <h2 id="maintenance"><span class="secnum">{{S}}</span>Who tidies up: gc --auto and maintenance</h2>
+          <p>
+            Every write in <a href="../commit-and-objects/#one-commit">Part 1</a> adds a loose object, and every fetch adds
+            a pack. Left alone, lookups slow down as both pile up. Git has always tidied as a side effect of
+            ordinary commands. What changed recently is which command does it.
+          </p>
+          <p>
+            The old answer is <code>git gc --auto</code>. Its first test is a guess at the number of loose
+            objects, in <code>builtin/gc.c:470-482</code>:
+          </p>
+          <pre><code>	/*
+	 * This is weird, but stems from legacy behaviour: the GC auto
+	 * threshold was always essentially interpreted as if it was rounded up
+	 * to the next multiple 256 of, so we retain this behaviour for now.
+	 */
+	int auto_threshold = DIV_ROUND_UP(limit, 256) * 256;
+	…
+	return loose_count &gt; auto_threshold;</code></pre>
+          <p>
+            The count comes from one directory. <code>odb/source-loose.c:539</code> opens
+            <code>objects/17</code>, counts the names in it, and line 560 returns <code>count * 256</code>.
+            With <code>gc.auto</code> at 6700 the threshold is 6912, so gc fires at 28 objects in that one
+            shard. A synthetic repository with 27 there did nothing; one more object triggered a repack
+            <span class="recon">measured here</span>. More than 50 packs selects an all-into-one repack, by
+            default with <code>--cruft</code>. A non-empty <code>gc.log</code> younger than a day blocks
+            every later detached auto-gc, because the next run "is likely to fail in the same way"
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            But porcelain no longer calls <code>gc --auto</code>. <code>commit</code>, <code>fetch</code>,
+            <code>merge</code>, <code>rebase</code>, <code>am</code> and <code>receive-pack</code> spawn
+            <code>git maintenance run --auto</code>, gated by <code>maintenance.auto</code>, which falls back
+            to <code>gc.auto &gt; 0</code> (<code>run-command.c:1956-1993</code>). Since v2.54.0
+            (<code>452b12c2e0</code>) an unscheduled run uses the <code>geometric</code> strategy, because gc's
+            all-into-one repack "is wasteful in small- and medium-sized repositories, in large repos it may even
+            be prohibitively expensive". Figure {{fig-maint}} shows both paths.
+          </p>
+
+          <figure class="figure wide" id="fig-maint">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Two ways into a repack: the maintenance path porcelain takes, and legacy gc --auto</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1090 470" role="img" aria-label="Left: porcelain commands start git maintenance run --auto, which uses the geometric strategy; its geometric-repack task either rolls up the smallest packs or, when every pack would roll up, does an all-into-one cruft repack; the commit-graph task needs 100 new commits. Right: legacy gc --auto checks gc.log, the pack count and objects/17 times 256 against 6912. An inset lights shard 17 of 256.">
+                <defs>
+                  <marker id="mnt-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">SINCE v2.54: WHAT YOUR COMMIT RUNS</text>
+                <rect x="20" y="38" width="380" height="34" rx="17" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="210" y="60" text-anchor="middle" class="svg-sub">commit · fetch · merge · rebase · am · receive-pack</text>
+                <line x1="210" y1="74" x2="210" y2="94" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="20" y="96" width="380" height="50" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="32" y="117" class="svg-step">maintenance.auto?</text>
+                <text x="32" y="136" class="svg-sub">unset: falls back to gc.auto &gt; 0</text>
+                <line x1="210" y1="148" x2="210" y2="166" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="20" y="168" width="380" height="50" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="32" y="189" class="svg-step">git maintenance run --auto</text>
+                <text x="32" y="208" class="svg-sub">objects/maintenance.lock; busy → exit 0</text>
+                <line x1="210" y1="220" x2="210" y2="238" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="20" y="240" width="380" height="50" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="32" y="261" class="svg-step">strategy: geometric</text>
+                <text x="32" y="280" class="svg-sub">default for unscheduled runs since v2.54.0</text>
+                <line x1="110" y1="292" x2="110" y2="312" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="310" y1="292" x2="310" y2="312" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="20" y="314" width="186" height="68" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="32" y="335" class="svg-step">geometric-repack</text>
+                <text x="32" y="355" class="svg-sub">≥ 2 packs would merge,</text>
+                <text x="32" y="372" class="svg-sub">or 17/ holds ≥ 2 objects</text>
+                <rect x="220" y="314" width="180" height="68" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="232" y="335" class="svg-step">commit-graph</text>
+                <text x="232" y="355" class="svg-sub">≥ 100 new commits</text>
+                <text x="232" y="372" class="svg-sub">write --split</text>
+                <path d="M113,384 L113,402 L418,402" fill="none" stroke="#252525" stroke-width="2"/>
+                <line x1="418" y1="334" x2="418" y2="422" stroke="#252525" stroke-width="2"/>
+                <line x1="417" y1="334" x2="432" y2="334" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="417" y1="422" x2="432" y2="422" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <rect x="436" y="300" width="210" height="68" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="448" y="321" class="svg-step">roll up the small packs</text>
+                <text x="448" y="340" class="svg-sub">--geometric=2, no walk</text>
+                <text x="448" y="356" class="svg-sub">+ --write-midx</text>
+                <rect x="436" y="388" width="210" height="68" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="448" y="409" class="svg-step">every pack rolls up</text>
+                <text x="448" y="428" class="svg-sub">all-into-one --cruft</text>
+                <text x="448" y="444" class="svg-sub">+ --write-midx</text>
+                <!-- legacy column -->
+                <line x1="666" y1="14" x2="666" y2="456" stroke="#deded9"/>
+                <text x="686" y="24" class="svg-lane">LEGACY: git gc --auto</text>
+                <rect x="686" y="38" width="384" height="34" rx="17" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="878" y="60" text-anchor="middle" class="svg-sub">scripts, cron jobs; no porcelain caller</text>
+                <rect x="686" y="92" width="220" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="698" y="117" class="svg-sub">gc.log &lt; 1 day old?</text>
+                <rect x="686" y="150" width="220" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="698" y="175" class="svg-sub">more than 50 packs?</text>
+                <rect x="686" y="208" width="220" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="698" y="233" class="svg-sub">objects/17 × 256 &gt; 6912?</text>
+                <line x1="796" y1="74" x2="796" y2="90" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="796" y1="134" x2="796" y2="148" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="796" y1="192" x2="796" y2="206" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <text x="804" y="145" class="svg-sub">no</text>
+                <text x="804" y="203" class="svg-sub">no</text>
+                <line x1="908" y1="112" x2="926" y2="112" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="908" y1="170" x2="926" y2="170" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <line x1="908" y1="228" x2="926" y2="228" stroke="#252525" stroke-width="2" marker-end="url(#mnt-ctl)"/>
+                <text x="930" y="116" class="svg-sub">yes: skip</text>
+                <text x="930" y="174" class="svg-sub">yes: all-into-one</text>
+                <text x="930" y="232" class="svg-sub">yes: repack -d -l</text>
+                <text x="796" y="268" text-anchor="middle" class="svg-sub">no: nothing to do</text>
+                <!-- inset -->
+                <text x="686" y="302" class="svg-lane">INSET: THE ONE SHARD gc COUNTS</text>
+                <g fill="#f7f7f5" stroke="#deded9" stroke-width="0.6">
+                  <rect x="686" y="314" width="128" height="128"/>
+                </g>
+                <path d="M686,322 H814 M686,330 H814 M686,338 H814 M686,346 H814 M686,354 H814 M686,362 H814 M686,370 H814 M686,378 H814 M686,386 H814 M686,394 H814 M686,402 H814 M686,410 H814 M686,418 H814 M686,426 H814 M686,434 H814 M694,314 V442 M702,314 V442 M710,314 V442 M718,314 V442 M726,314 V442 M734,314 V442 M742,314 V442 M750,314 V442 M758,314 V442 M766,314 V442 M774,314 V442 M782,314 V442 M790,314 V442 M798,314 V442 M806,314 V442" stroke="#deded9" stroke-width="0.6" fill="none"/>
+                <rect x="742" y="322" width="8" height="8" fill="#d98226"/>
+                <text x="830" y="334" class="svg-sub">objects/17 = 1 of 256</text>
+                <text x="830" y="360" class="svg-sub">27 × 256 = 6,912: not &gt;</text>
+                <text x="830" y="380" class="svg-sub">28 × 256 = 7,168: repack</text>
+                <text x="830" y="406" class="svg-note">gc.auto 6700, rounded up</text>
+                <text x="830" y="424" class="svg-note">to a multiple of 256</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Since 2.54, your commits trigger geometric maintenance, not gc, and gc's threshold still reads
+              one directory in 256. Thresholds from <code>builtin/gc.c</code>; the 27/28 boundary measured with
+              <code>lab/scratch/maintenance/mkblobs.py</code>.
+            </p>
+          </figure>
+
+          <p>
+            The geometric task weighs packs by object count. It finds the smallest packs that break a
+            factor-2 progression and rolls them into one with <code>pack-objects --stdin-packs</code>, which
+            copies objects without walking reachability. Only when every pack would roll up does it fall back
+            to gc's all-into-one <code>--cruft</code> repack (<code>builtin/gc.c:1570-1671</code>). The
+            difference shows. A repository with 700 reachable loose objects, 3 of them in <code>17/</code>, is
+            below gc's threshold. Yet a single <code>git commit</code> there ran a cruft repack and wrote a
+            multi-pack index, because with no packs at all, "every pack" rolls up
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The ten tasks run under <code>objects/maintenance.lock</code>, and a busy lock makes
+            <code>--auto</code> exit 0 silently. In v2.55 the lock passes to the detached child
+            (<code>6e95b07e5f</code>) <span class="src">from the code</span>. The trade-off is in the strategy's
+            own commit, <code>d9bccf2ec3</code>: "pruning of unreferenced objects is not going to happen
+            regularly anymore". The next section is about that pruning.
+          </p>
