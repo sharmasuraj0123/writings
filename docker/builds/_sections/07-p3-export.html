@@ -1,0 +1,178 @@
+          <h2 id="p3-export"><span class="secnum">{{S}}</span>Exporters, cache export and attestations</h2>
+          <p>
+            A solved build is a set of snapshots, not an image. An exporter turns the result into something outside
+            BuildKit. The client defines five exporter names, <code>image</code>, <code>local</code>, <code>tar</code>,
+            <code>oci</code> and <code>docker</code> (<code>buildkit/client/exporters.go:9-15</code>), and dockerd adds a
+            sixth, <code>moby</code>, which the classic <code>/build</code> path checks for
+            (<code>moby/daemon/internal/builder-next/builder.go:408</code>). The image exporter accepts
+            <code>push</code>, <code>push-by-digest</code> and <code>unpack</code>, returns
+            <code>containerimage.digest</code> (the root manifest or index) plus the config digest, and pushes in a
+            finalize callback after the export is written (<code>exporter/containerimage/export.go:66-68,
+            373-402</code>) <span class="src">from the code</span>.
+          </p>
+          <h3>Layers are made at the end</h3>
+          <p>
+            No step in <a href="#p3-solver">§04</a> produced a tarball. Layer blobs are computed lazily, at export, from
+            pairs of snapshots. On the overlayfs or stargz snapshotters BuildKit first tries an "overlay differ" that
+            reads the upper directory directly, then falls back to containerd's walking differ; <code>fuse-overlayfs</code>
+            and <code>native</code> skip the fast path (<code>cache/blobs.go:168-250</code>)
+            <span class="src">from the code</span>. The digests, DiffIDs and ChainIDs of those blobs are
+            <a href="../images/#p2-hashes">Part 2</a>'s subject. The frontend's history entries land in the config.
+            alpine's amd64 config shows them as published, with the same DiffID Part 2 derived from the layer
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>"created_by": "ADD alpine-minirootfs-3.24.3-x86_64.tar.gz / # buildkit",
+"comment": "buildkit.dockerfile.v0"
+"created_by": "CMD [\"/bin/sh\"]", "comment": "buildkit.dockerfile.v0", "empty_layer": true
+"diff_ids": ["sha256:75c137aedfb2760f88629236cb7b797630aed0c3d91d626d1d1bb694878fc2ba"]</code></pre>
+          <p>
+            All three timestamps in that config are <code>2026-10-21T22:37:22.870489069Z</code>. With
+            <code>SOURCE_DATE_EPOCH</code> set, the exporter clamps <code>created</code> to the epoch; with no
+            <code>created</code> at all it uses the last history timestamp (<code>writer.go:830-857</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>Cache export flattens the link graph</h3>
+          <p>
+            Remote cache (<code>registry</code>, <code>local</code>, <code>gha</code>) is an OCI index or manifest of
+            layer blobs plus one JSON document of type <code>application/vnd.buildkit.cacheconfig.v0</code>. It holds
+            <code>layers</code>, each a blob with a parent index, and <code>records</code>, each a digest with layer
+            pointers and <code>inputs</code> links to other records (<code>cache/remotecache/v1/types/spec.go:9-49</code>).
+            That is the bbolt link graph of §04 written out as arrays. <code>--cache-to type=inline</code> exports no
+            separate artifact. It puts the same JSON into the image config under the key
+            <code>moby.buildkit.cache.v0</code> (<code>exporter/containerimage/writer.go:859-865</code>)
+            <span class="src">from the code</span>. Mode <code>min</code>, the default, exports the final result's chain;
+            <code>max</code> exports every intermediate vertex. An unknown mode is dropped with a debug log
+            (<code>control/control.go:491-495</code>):
+          </p>
+<pre><code>		if exportMode, supported := parseCacheExportMode(e.Attrs["mode"]); !supported {
+			bklog.G(ctx).Debugf("skipping invalid cache export mode: %s", e.Attrs["mode"])
+		} else {
+			exp.CacheExportMode = exportMode
+		}</code></pre>
+          <p>
+            So <code>mode=maximum</code> silently means <code>min</code> (register D56, class D, unchanged on
+            <code>master</code>). Which backends exist at all depends on dockerd's image store
+            (<code>moby/daemon/internal/builder-next/controller.go:227-237, 512-519</code>). With the containerd store,
+            dockerd's BuildKit imports <code>gha</code>, <code>local</code> and <code>registry</code> and exports those
+            plus <code>inline</code>. With the legacy graphdriver store it imports <code>registry</code> (through a
+            moby-specific <code>localinlinecache</code>) and <code>local</code>, and exports only <code>inline</code>.
+            Neither registers <code>s3</code> or <code>azblob</code>, though BuildKit ships both (D55, class D)
+            <span class="src">from the code</span>. buildx never sends that request to a graphdriver host. With the
+            docker driver there, it rejects every <code>--cache-to</code> type except <code>inline</code> on the
+            client and prints "Cache export is not supported for the docker driver. Switch to a different driver, or
+            turn on the containerd image store, and try again." (<code>buildx/build/opt.go:271-275</code>,
+            <code>build/utils.go:193-197</code>; asserted by buildx's own test, <code>tests/build.go:973-983</code>)
+            <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-export-artifacts">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What a build exports: the image index with its attestations, and the cache</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 490" role="img" aria-label="Left, alpine:latest as exported: an image index pointing at a linux/amd64 manifest and at an unknown/unknown attestation manifest whose reference.digest annotation names the amd64 manifest; the manifest points at a config with BuildKit history and one DiffID; the attestation points at in-toto layers. Right, a cache export: a manifest of layer blobs plus a cacheconfig.v0 JSON with layers and records; the inline variant writes that JSON into the image config under moby.buildkit.cache.v0. Below, the cache backends dockerd registers for each image store.">
+                <defs>
+                  <marker id="fig-export-artifacts-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-export-artifacts-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">IMAGE EXPORTER (alpine:latest, measured)</text>
+                <text x="600" y="26" class="svg-lane">CACHE EXPORTER (from the code)</text>
+
+                <rect x="30" y="44" width="210" height="96" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="66" class="svg-step">image index</text>
+                <text x="42" y="86" class="svg-sub">sha256:be2656061b53…</text>
+                <text x="42" y="104" class="svg-sub">8 platforms, each paired</text>
+                <text x="42" y="122" class="svg-sub">with an attestation</text>
+
+                <rect x="290" y="44" width="250" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="302" y="66" class="svg-step">manifest · linux/amd64</text>
+                <text x="302" y="86" class="svg-sub">sha256:c26612752c78…</text>
+                <text x="302" y="104" class="svg-sub">1 config + 1 gzip layer</text>
+                <line x1="242" y1="78" x2="286" y2="78" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-export-artifacts-data)"/>
+
+                <rect x="290" y="134" width="250" height="96" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="302" y="156" class="svg-step">config</text>
+                <text x="302" y="176" class="svg-sub">history: ADD … # buildkit</text>
+                <text x="302" y="194" class="svg-sub">diff_ids: [75c137aedfb2…]</text>
+                <text x="302" y="214" class="svg-sub">(+ moby.buildkit.cache.v0)</text>
+                <line x1="415" y1="116" x2="415" y2="130" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-export-artifacts-data)"/>
+
+                <rect x="290" y="262" width="250" height="112" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="302" y="284" class="svg-step">attestation manifest</text>
+                <text x="302" y="304" class="svg-sub">sha256:964745728d17…</text>
+                <text x="302" y="322" class="svg-sub">platform unknown/unknown</text>
+                <text x="302" y="340" class="svg-sub">type attestation-manifest</text>
+                <text x="302" y="360" class="svg-sub" style="fill:#765b98">reference.digest = c26612752c78…</text>
+                <path d="M135,142 L135,310 L286,310" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-export-artifacts-data)"/>
+                <path d="M544,300 L566,300 L566,80 L544,80" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-export-artifacts-state)"/>
+
+                <rect x="290" y="394" width="250" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="302" y="416" class="svg-step">in-toto layers</text>
+                <text x="302" y="436" class="svg-sub">SPDX SBOM · SLSA provenance</text>
+                <line x1="415" y1="376" x2="415" y2="390" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-export-artifacts-data)"/>
+
+                <rect x="600" y="44" width="450" height="150" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="612" y="66" class="svg-step">cache manifest or index (registry, local, gha)</text>
+                <text x="612" y="88" class="svg-sub">layer blobs of the cached results</text>
+                <text x="612" y="108" class="svg-sub">+ application/vnd.buildkit.cacheconfig.v0</text>
+                <text x="632" y="128" class="svg-sub">"layers":  [{"blob": …, "parent": …}]</text>
+                <text x="632" y="146" class="svg-sub">"records": [{"digest", "layers", "inputs"}]</text>
+                <text x="612" y="174" class="svg-sub">mode=min: final chain · mode=max: every vertex</text>
+
+                <rect x="600" y="214" width="450" height="56" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="612" y="236" class="svg-step">--cache-to type=inline</text>
+                <text x="612" y="256" class="svg-sub">same JSON, in the image config: moby.buildkit.cache.v0</text>
+
+                <rect x="600" y="290" width="450" height="144" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="612" y="312" class="svg-lane">BACKENDS DOCKERD REGISTERS</text>
+                <text x="612" y="336" class="svg-step">containerd image store</text>
+                <text x="612" y="354" class="svg-sub">import gha local registry</text>
+                <text x="612" y="370" class="svg-sub">export gha inline local registry</text>
+                <text x="830" y="336" class="svg-step">graphdriver store</text>
+                <text x="830" y="354" class="svg-sub">import registry* local</text>
+                <text x="830" y="370" class="svg-sub" style="fill:#ad4b43">export inline only</text>
+                <text x="612" y="398" class="svg-sub">neither: s3, azblob</text>
+                <text x="612" y="418" class="svg-note">* through moby's localinlinecache</text>
+
+                <text x="30" y="472" class="svg-note">Attestations ride inside the index as extra manifests; the cache is a separate artifact unless it is inline.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Left: alpine:latest's index as fetched with <code>docker buildx imagetools inspect</code>, measured here; the
+              bracketed config key appears only with inline cache export, which alpine does not use. Right: read from
+              <code>cache/remotecache/v1/types/spec.go</code> and <code>controller.go</code>; no cache was exported here.
+            </p>
+          </figure>
+
+          <h3>Attestations in the index</h3>
+          <p>
+            Attestations are extra manifests in the image index with platform <code>unknown/unknown</code>, annotated
+            <code>vnd.docker.reference.type: attestation-manifest</code> and
+            <code>vnd.docker.reference.digest: &lt;subject manifest&gt;</code>, whose layers are in-toto statements
+            (<code>docs/attestations/attestation-storage.md:92-122</code>) <span class="src">from the code</span>. Since
+            BuildKit v0.32 they are also OCI artifacts by default: <code>artifactType:
+            application/vnd.docker.attestation.manifest.v1+json</code>, an empty config and a <code>subject</code>
+            descriptor, with the annotations kept (<code>exporter/containerimage/writer.go</code>:613-716). alpine's
+            index pairs every platform that way; amd64 <code>sha256:c26612752c78…</code> pairs with attestation
+            <code>sha256:964745728d17…</code> <span class="recon">measured here</span>. The provenance default differs
+            by layer (<code>solver/llbsolver/provenance.go:408-418</code>):
+          </p>
+<pre><code>	mode := "max"
+	if v, ok := attrs["mode"]; ok {
+		switch v {
+		case "full":
+			mode = "max"
+		case "max", "min":
+			mode = v</code></pre>
+          <p>
+            buildx adds <code>mode=min,inline-only=true</code> by default, but only when the builder supports
+            attestations, so the docker driver on the graphdriver store gets no provenance at all
+            (<code>buildx/build/opt.go:349-373</code>). An explicit <code>--provenance=true</code> reaches BuildKit with
+            no mode (<code>util/buildflags/attests.go:173-181</code>), and so does raw <code>buildctl</code> with
+            <code>attest:provenance=</code>; both get <code>max</code>, which records the Dockerfile, build-arg
+            values and secret IDs (register D59, class D). A <code>max</code> record embeds the full LLB with its
+            <code>digestMapping</code>, which is what made <a href="#p3-llb">§03</a> possible. alpine's lists
+            <code>GIT_AUTH_HEADER</code> and <code>GIT_AUTH_TOKEN</code> as optional secrets, by ID only
+            <span class="recon">measured here</span>.
+          </p>

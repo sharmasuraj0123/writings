@@ -1,0 +1,125 @@
+          <h2 id="p1-spec"><span class="secnum">{{S}}</span>Create is bookkeeping; start builds the world</h2>
+          <p>
+            <code>POST /containers/create</code> touches no runtime at all. It resolves the image locally, merges
+            the config, allocates an ID and a name, creates the read-write layer, writes JSON to disk and emits a
+            <code>create</code> event (<code>moby/daemon/create.go</code>:171-290). containerd is not called
+            until start. A missing image gives the 404 that the CLI's pull-and-retry waits for
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The ID is 32 random bytes in hex, 64 characters, drawn again if its 12-character short form is all
+            digits, because the short ID becomes the default hostname
+            (<code>moby/daemon/internal/stringid/stringid.go</code>:36-60). The program is fixed now from
+            Entrypoint and Cmd; for <code>alpine sh</code> that is <code>Path:"sh"</code> with no args
+            (<code>moby/daemon/container.go</code>:134-157). The record lands in
+            <code>/var/lib/docker/containers/&lt;id&gt;/</code>, created mode 0710, as two files written
+            atomically with mode 0600: <code>config.v2.json</code> and <code>hostconfig.json</code>. They are
+            split on purpose. <code>HostConfig</code> carries <code>json:"-"</code> with the comment "do not
+            serialize the host config in the json, otherwise we'll make the container unportable"
+            (<code>moby/daemon/container/container.go</code>:105) <span class="src">from the code</span>. Every
+            later state change is checkpointed twice, to disk and into an in-memory go-memdb replica that answers
+            <code>docker ps</code> without taking container locks (<code>container/container.go</code>:225-238).
+          </p>
+          <p>
+            One CLI flag writes more than JSON. After create, <code>--use-api-socket</code> copies a
+            <code>config.json</code> holding the user's resolved registry credentials to
+            <code>/run/secrets/docker/config.json</code> in the writable layer
+            (<code>cli/cli/command/container/create.go</code>:244-310). The comment there admits it: "This can
+            leave around the config if the container doesn't get deleted" (<code>create.go</code>:268-269;
+            finding D8, class D) <span class="src">from the code</span>.
+          </p>
+
+          <h3>Start, under one lock</h3>
+          <p>
+            <code>containerStart</code> runs under the container lock: mount the read-write layer, set up the
+            network sandbox and mounts, <code>createSpec</code>, <code>ReplaceContainer</code> in containerd,
+            <code>NewTask</code> (shim plus <code>runc create</code>), <code>initializeCreatedTask</code> (network
+            into the new netns), <code>tsk.Start</code> (<code>runc start</code>), <code>SetRunning</code>, health
+            monitor, checkpoint, <code>start</code> event (<code>moby/daemon/start.go</code>:82-271)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The OCI spec is not stored at create. It is regenerated on every start:
+            <code>oci.DefaultSpec()</code> plus about seventeen <code>SpecOpts</code> in a fixed order, from
+            cgroups through namespaces, capabilities, seccomp and mounts to the masked paths (<code>moby/daemon/oci_linux.go</code>:1024-1079)
+            <span class="src">from the code</span>. So a daemon upgrade changes the sandbox of an existing
+            container the next time it starts <span class="recon">reconstruction</span>. Figure {{fig-spec-layers}}
+            lists what that spec takes away, who applies each part, and what the same files read on this
+            sandbox, which is itself a container.
+          </p>
+
+          <figure class="figure wide" id="fig-spec-layers">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What Docker's default spec removes, who applies it, and what this sandbox shows</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Layer</th><th>Docker 29.9.2 default</th><th>Applied by</th><th>Mechanism</th><th>Read live on this sandbox</th></tr></thead>
+                <tbody>
+                  <tr><td>Namespaces</td><td>mount, network, <strong>time</strong>, uts, pid, ipc; cgroup (private on v2); user only with userns-remap</td><td>dockerd spec; runc init</td><td>one <code>unshare</code> in C, before Go starts (§05)</td><td class="hl-orange" style="background: var(--orange-soft)">cgroup, ipc, mnt, net, pid, uts private; time and user are the host's</td></tr>
+                  <tr><td>Capabilities</td><td>14 (listed below)</td><td>runc init</td><td>bounding set, then permitted and effective, in <code>finalizeNamespace</code></td><td class="hl-green" style="background: var(--green-soft)"><code>CapBnd</code> <code>00000000a80425fb</code>: the same 14</td></tr>
+                  <tr><td>Seccomp</td><td>default action <code>SCMP_ACT_ERRNO</code>, errno 1 (EPERM); 426 syscall names, 361 allowed unconditionally</td><td>dockerd resolves and inlines; runc init loads</td><td><code>prctl(PR_SET_SECCOMP)</code>, before caps are dropped</td><td class="hl-orange" style="background: var(--orange-soft)"><code>Seccomp: 0</code>, no filter</td></tr>
+                  <tr><td>AppArmor</td><td><code>docker-default</code>: no <code>mount</code>, no AF_ALG or vsock, few <code>/proc</code> writes; silently skipped without <code>/sbin/apparmor_parser</code>, with <code>$container</code> set, or under rootless detach-netns</td><td>runc init</td><td>LSM exec label, set before sysctls and masks</td><td class="hl-orange" style="background: var(--orange-soft)"><code>cri-containerd.apparmor.d</code> (enforce)</td></tr>
+                  <tr><td>Masked paths</td><td>12 fixed, e.g. <code>/proc/kcore</code>, <code>/sys/firmware</code>, plus thermal paths</td><td>runc init</td><td>files: bind <code>/dev/null</code> over; dirs: read-only tmpfs</td><td class="hl-green" style="background: var(--green-soft)">4 files are binds of <code>/null</code>; <code>/proc/acpi</code>, <code>/proc/scsi</code>, <code>/sys/firmware</code> are ro tmpfs</td></tr>
+                  <tr><td>Read-only paths</td><td><code>/proc/{bus,fs,irq,sys,sysrq-trigger}</code></td><td>runc init</td><td>self-bind, then <code>MS_REMOUNT|MS_RDONLY</code></td><td class="hl-green" style="background: var(--green-soft)">the same five, ro sub-binds of one proc mount</td></tr>
+                  <tr><td><code>/dev</code></td><td>64 MiB tmpfs (<code>size=65536k</code>); fresh devpts (<code>newinstance,ptmxmode=0666</code>)</td><td>runc init</td><td>mount, mknod, <code>/dev/ptmx</code> symlink</td><td class="hl-green" style="background: var(--green-soft)">tmpfs <code>size=65536k</code>; devpts <code>ptmxmode=666</code></td></tr>
+                  <tr><td>Device rules</td><td>deny all; allow c 1:5, 1:3, 1:9, 1:8, 5:0, 5:1; deny c 10:229; runc appends "mknod any char/block device"</td><td>runc parent</td><td><code>bpf</code> program of type <code>CGROUP_DEVICE</code></td><td>not readable from inside</td></tr>
+                  <tr><td>cgroup</td><td><code>system.slice:docker:&lt;id&gt;</code> (systemd driver) or <code>/docker/&lt;id&gt;</code>; limits only if asked</td><td>runc parent</td><td>pid into <code>cgroup.procs</code> before init forks; limits written after</td><td class="hl-green" style="background: var(--green-soft)"><code>cpu.max</code> <code>200000 100000</code>; <code>memory.max</code> 8 GiB</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              The spec dockerd builds removes a lot, and runc applies almost all of it from inside the new
+              namespaces. Defaults are read from <code>moby/daemon/pkg/oci/defaults.go</code>, the vendored
+              <code>moby/profiles/seccomp/default.json</code> and runc <span class="src">from the code</span>. The
+              last column is this Kubernetes sandbox's own <code>/proc</code> and <code>/sys/fs/cgroup</code>:
+              green where it matches Docker's default, orange where Kubernetes chose differently
+              <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>Defaults worth knowing</h3>
+          <p>
+            Since docker-v29.5.0 the default namespace list includes a private time namespace
+            (<code>moby/daemon/pkg/oci/defaults.go</code>:117-124; commit <code>d5370d34d3</code>, 7 April 2026),
+            dropped on kernels older than 5.6 or with the daemon feature <code>"time-namespaces": false</code>.
+            Tools that compare <code>/proc/&lt;pid&gt;/ns/time</code>, or run <code>nsenter</code> without
+            <code>-T</code>, now see a new namespace (finding D17, class E) <span class="src">from the code</span>.
+            The 14 capabilities are CHOWN, DAC_OVERRIDE, FSETID, FOWNER, MKNOD, NET_RAW, SETGID, SETUID, SETFCAP,
+            SETPCAP, NET_BIND_SERVICE, SYS_CHROOT, KILL and AUDIT_WRITE, in the bounding, permitted and effective
+            sets only (<code>moby/daemon/pkg/oci/caps/defaults.go</code>:4-21). For a private network namespace
+            dockerd also sets <code>net.ipv4.ip_unprivileged_port_start</code> to 0, so ports below 1024 bind
+            without <code>CAP_NET_BIND_SERVICE</code> (<code>oci_linux.go</code>:753-775). Seccomp is inlined
+            into the spec, and not applied at all for <code>--privileged</code> unless a profile is given
+            (<code>moby/daemon/seccomp_linux.go</code>:19-58) <span class="src">from the code</span>.
+          </p>
+          <p>
+            <code>--init</code> is a spec rewrite, and only for a private PID namespace,
+            <code>moby/daemon/oci_linux.go</code>:731-745 <span class="src">from the code</span>:
+          </p>
+<pre><code>if c.HostConfig.PidMode.IsPrivate() {
+	if (c.HostConfig.Init != nil &amp;&amp; *c.HostConfig.Init) ||
+		(c.HostConfig.Init == nil &amp;&amp; daemonCfg.Init) {
+		s.Process.Args = append([]string{inContainerInitPath, "--", c.Path}, c.Args...)
+		path, err := daemonCfg.LookupInitPath() // this will fall back to DefaultInitBinary and return an absolute path
+		if err != nil {
+			return err
+		}
+		s.Mounts = append(s.Mounts, specs.Mount{
+			Destination: inContainerInitPath,
+			Type:        "bind",
+			Source:      path,
+			Options:     []string{"bind", "ro"},
+		})
+	}</code></pre>
+          <p>
+            The binary bind-mounted read-only at <code>/sbin/docker-init</code> is tini: the installed
+            <code>/usr/libexec/docker/docker-init --version</code> prints <code>tini version 0.19.0 - git.de40ad0</code>
+            <span class="recon">measured here</span>. Without it, <code>sh</code> is PID 1, which per
+            <code>pid_namespaces(7)</code> gets only the signals it has handlers for
+            <span class="recon">reconstruction</span>. The CLI
+            sends <code>"Init":true</code> only when the flag is given, and <code>null</code> otherwise so the
+            daemon's own default applies (<code>cli/cli/command/container/opts.go</code>:724-727)
+            <span class="src">from the code</span>.
+          </p>

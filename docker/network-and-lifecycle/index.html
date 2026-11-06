@@ -1,0 +1,2695 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Docker Engine 29.9.2 taken apart, part 4: port publishing as DNAT plus docker-proxy, the iptables and nftables chains, the embedded DNS server at 127.0.0.11, the stdcopy frame and the log pipeline, stop, kill and restart policies, health, OOM, stats and events, the 2013-2026 history, and the full register of 100 findings."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/docker/network-and-lifecycle/" />
+    <meta property="og:title" content="Networks, I/O and the long run" />
+    <meta property="og:description" content="Part 4 of a four-part Docker teardown at Engine 29.9.2 (0367cbeb): -p 8080:80 as a bound-but-deaf socket, a kernel DNAT and a docker-proxy for loopback and hairpin, moby's golden iptables and nftables rules, 127.0.0.11 as a dockerd goroutine behind NAT in your netns, the 8-byte stdcopy frame, blocking and unbounded logs, the 10-second SIGKILL, docker kill -s HUP disabling unless-stopped (D77), OOMKilled and CPU % as thin readers, thirteen years of history, and 100 verified findings." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/docker/network-and-lifecycle/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Networks, I/O and the long run" />
+    <meta name="twitter:description" content="Docker 29.9.2 taken apart, part 4: published ports, iptables, 127.0.0.11, the stdcopy frame, logs, stop and restart, stats and events, the history, and all 100 findings." />
+    <title>Networks, I/O and the long run — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · After start: pipes and small state machines</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#p4-lede">01 · After start: pipes and small state machines</a>
+        <a class="toc-parent" href="#p4-network">02 · A bridge, a veth and a published port</a>
+        <a class="toc-parent" href="#p4-dns">03 · 127.0.0.11 is dockerd</a>
+        <a class="toc-parent" href="#p4-bytes">04 · Frames and logs</a>
+        <a class="toc-parent" href="#p4-stop">05 · Signals, stop and restart</a>
+        <a class="toc-parent" href="#p4-observe">06 · Health, OOM, stats, events, cp and pause</a>
+        <a class="toc-parent" href="#p4-history">07 · Thirteen years of moving work out of one binary</a>
+        <a class="toc-parent" href="#p4-findings">08 · The findings register</a>
+        <a class="toc-parent" href="#p4-sources">09 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#p4-lede">01 · Pipes and states</a>
+        <a href="#p4-network">02 · Bridge, veth, port</a>
+        <a href="#p4-dns">03 · 127.0.0.11 is dockerd</a>
+        <a href="#p4-bytes">04 · Frames and logs</a>
+        <a href="#p4-stop">05 · Signals, stop, restart</a>
+        <a href="#p4-observe">06 · Health, OOM, stats</a>
+        <a href="#p4-history">07 · Thirteen years</a>
+        <a href="#p4-findings">08 · Findings register</a>
+        <a href="#p4-sources">09 · Sources</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Languages & Tools</p>
+        <h1>Networks, I/O and the long run<span class="status-pill">Teardown</span></h1>
+        <p class="dek">
+          After runc start, Docker is byte pipelines and small state machines, and both lose or block more than users assume. This last part of a four-part teardown follows -p 8080:80 through netfilter and docker-proxy, finds the DNS server at 127.0.0.11 running inside dockerd, takes apart the 8-byte frame behind attach and logs, times docker stop to its SIGKILL, shows how docker kill -s HUP can switch off a restart policy, reads health, OOM, stats and events as thin readers over cgroup files and in-memory rings, tells thirteen years of moving work out of one binary, and ends with the register of all 100 findings.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 23 October 2026 · Subject: <code>moby@0367cbeb</code> (Docker Engine 29.9.2) · Part 4 of 4 · Read from the source and the specs; measured where this machine allows</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#p4-lede">After start: pipes and small state machines</a></li>
+          <li><a href="#p4-network">A bridge, a veth and a published port</a></li>
+          <li><a href="#p4-dns">127.0.0.11 is dockerd</a></li>
+          <li><a href="#p4-bytes">Frames and logs</a></li>
+          <li><a href="#p4-stop">Signals, stop and restart</a></li>
+          <li><a href="#p4-observe">Health, OOM, stats, events, cp and pause</a></li>
+          <li><a href="#p4-history">Thirteen years of moving work out of one binary</a></li>
+          <li><a href="#p4-findings">The findings register</a></li>
+          <li><a href="#p4-sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from the pinned sources, cited as
+              <code>repo/path:line</code>: moby <code>docker-v29.9.2</code> (<code>0367cbeb</code>), docker/cli v29.9.2,
+              containerd v2.4.2, runc v1.5.2, and Docker's own docs and release notes where named.
+              <span class="recon">measured here</span> marks bytes or numbers observed on the research box. No container
+              ran there: the sandbox has no <code>CAP_SYS_ADMIN</code> or <code>CAP_NET_ADMIN</code>, and dockerd could not
+              start. So "measured here" covers the real <code>docker</code> CLI 29.8.2 talking to a hand-written <em>mock
+              daemon</em> (client bytes real, server bytes invented, and said so each time), the installed binaries' own
+              output, this sandbox's own <code>/proc</code> and <code>/sys/fs/cgroup</code>, git history and GitHub's
+              advisory API. The iptables and nftables dumps are <em>moby's golden test files</em>: the real firewall code
+              run by moby's tests, not a live host. <span class="recon">reconstruction</span> marks a judgement I drew from
+              those sources rather than read in one place.
+            </p>
+            <p>
+              This is Part 4 of 4 of <a href="../">Docker, taken apart</a>. <a href="../run-path/">Part 1</a> follows
+              <code>docker run</code> to a process; <a href="../images/">Part 2</a> covers images, layers and the
+              registry; <a href="../builds/">Part 3</a> covers how BuildKit builds. This part ends with the register of
+              every finding in the collection.
+            </p>
+          </div>
+
+          <h2 id="p4-lede"><span class="secnum">01</span>After start: pipes and small state machines</h2>
+          <p class="lede">
+            A container is an ordinary Linux process, and Docker is a relay of five programs that mostly get out of its
+            way. Mostly. After <code>runc start</code> the relay is gone, but <code>dockerd</code> keeps three jobs: it
+            carries the container's bytes, it answers the container's questions, and it decides what happens when the
+            process stops. This part claims that each of those jobs is either a byte pipeline or a small state machine,
+            and that both lose or block data more often than users assume.
+          </p>
+          <p>
+            <a href="../run-path/">Part 1</a> ended with a process parked on a FIFO while <code>dockerd</code> wired its
+            network (<a href="../run-path/#p1-fifo">§06 there</a>). This part starts at that wire. A bridge network is a
+            Linux bridge, a veth pair and a set of netfilter rules. Publishing a port binds a real socket on the host,
+            attaches a filter so it hears nothing, and lets the kernel's DNAT carry almost every packet. A user-space
+            relay, <code>docker-proxy</code>, is left with three narrow cases: loopback, hairpin and IPv6 to an
+            IPv4-only container. Name resolution is stranger. The DNS server at <code>127.0.0.11</code> is a goroutine
+            inside <code>dockerd</code>, and NAT rules in the container's own namespace steer the queries to it. It
+            forwards some of them from the host's namespace, past the firewall you may have written for the container
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The bytes come next. Attach, exec and <code>docker logs</code> share one frame format: eight header bytes,
+            then a payload. The reader on the client drops a frame cut short without saying so. Logging is synchronous
+            and unbounded by default. A slow log driver can back-pressure the container's own <code>write(2)</code>, and
+            a json-file log with no <code>max-size</code> grows until the disk fills. The two buffers that do not block
+            are the ones that drop data, and one of them is on by default <span class="src">from the code</span>.
+          </p>
+          <p>
+            Then the long run. <code>docker stop</code> signals PID 1 only. The kernel's rule for a namespace's init
+            process means a plain <code>sh</code> never sees that SIGTERM, so stop becomes a ten-second wait and a
+            SIGKILL. The restart manager is a few booleans and a backoff timer, and one of those booleans is set by
+            every <code>docker kill -s</code>. So sending SIGHUP to reload nginx can quietly switch off an
+            <code>unless-stopped</code> policy. That is finding D77, the headline of the collection's register. It is
+            still on moby's <code>master</code>, and a fix has been open since August 2026. Health checks, OOM flags,
+            <code>docker stats</code> and <code>docker events</code> turn out to be thin readers over cgroup files and
+            in-memory rings. Each one answers a slightly different question from the one its name suggests.
+          </p>
+          <p>
+            The last two content sections step back. §07 tells the history as thirteen years of moving work out of one
+            binary: LXC, then libcontainer, runc and the OCI, containerd and its shim, the Moby split, and Kubernetes
+            moving off <code>dockerd</code>. In 2026 the movement reversed for the first time, with containerd running
+            inside <code>dockerd</code> when no system copy is installed. §08 is the register of all 100 findings from
+            the four parts, grouped by class, each with its upstream status and a way to check it.
+          </p>
+          <p>
+            None of this ran live. No container could start on the research box, so the CLI traces here are the real
+            docker CLI 29.8.2 against a mock daemon. The firewall rules are moby's own golden test files, and the
+            stats arithmetic uses this sandbox's own cgroup files. Each figure says which of those it is
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <h2 id="p4-network"><span class="secnum">02</span>A bridge, a veth and a published port</h2>
+          <p>
+            runc makes the network namespace; <code>dockerd</code> adopts it. For a bridge container the OCI spec
+            carries a <code>network</code> namespace entry with an empty path, so runc creates a fresh one
+            (<code>moby/daemon/oci_linux.go:242-270</code>). After the task is created, and before its process runs,
+            <code>initializeCreatedTask</code> calls <code>sb.SetKey("/proc/&lt;pid&gt;/ns/net")</code> and then
+            <code>allocateNetwork</code> (<code>moby/daemon/start_linux.go:17-43</code>). No OCI hook is involved for
+            <code>docker run</code> any more. The old <code>libnetwork-setkey</code> prestart hook was removed in 26.0,
+            restored in 26.1 and removed again in 28.0. It survives only for BuildKit's <code>RUN</code> steps on the
+            default bridge <span class="src">from the code</span>. <code>SetKey</code> pins the namespace with a bind
+            mount, so it outlives any one process, in
+            <code>moby/daemon/libnetwork/osl/namespace_linux.go:152-158</code>:
+          </p>
+<pre><code>func mountNetworkNamespace(basePath string, lnPath string) error {
+	err := syscall.Mount(basePath, lnPath, "bind", syscall.MS_BIND, "")
+	if err != nil {
+		return fmt.Errorf("bind-mount %s -&gt; %s: %w", basePath, lnPath, err)
+	}
+	return nil
+}</code></pre>
+          <p>
+            The target is a file under <code>/var/run/docker/netns/</code> named by a 12-character key. The bridge
+            driver then creates a veth pair. The host end is <code>veth</code> plus seven random hex characters,
+            enslaved to <code>docker0</code> or <code>br-&lt;12 chars of network ID&gt;</code>. When the namespace path
+            is already known, the peer is created directly inside it and renamed to the lowest free <code>ethN</code>.
+            Since 28.0.0 the container's MAC is random and locally administered. Before that it was
+            <code>02:42:</code> plus the IPv4 address, and overlay endpoints still are
+            (<code>bridge_linux.go:1249-1299</code>, <code>netutils/utils.go:40-46</code>)
+            <span class="src">from the code</span>. One detail of the setup steps is a doc drift. The driver sets the
+            filter-FORWARD policy to DROP only when <em>it</em> flipped <code>ip_forward</code> from 0 to 1, while the
+            docs state the DROP unconditionally (D64, <code>setup_ip_forwarding.go:38-59</code>).
+          </p>
+          <h3>What <code>-p 8080:80</code> builds</h3>
+          <p>
+            Publishing starts by normalising the request. With no host IP and the default <code>--ip=0.0.0.0</code>,
+            one <code>-p</code> becomes two bindings: one on <code>0.0.0.0</code> and one on <code>[::]</code>. If the
+            container has no IPv6 address, the IPv6 binding targets its IPv4 address, which only a user-space relay can
+            do (D67, <code>port_mapping_linux.go:195-289</code>). The <code>nat</code> portmapper then reserves the host
+            port for real: <code>dockerd</code> calls <code>socket</code>, <code>bind</code> and, for TCP,
+            <code>listen</code> on each host address. A listening socket could accept connections before any DNAT rule
+            exists, so a one-instruction cBPF program is attached first. It returns 0, which tells the kernel to drop
+            every packet, and TCP clients simply retransmit their SYN
+            (<code>portallocator/osallocator_linux.go:192-200, 300-305</code>) <span class="src">from the code</span>.
+            Ephemeral ports for <code>-p 80</code> or <code>-P</code> come from the kernel's
+            <code>ip_local_port_range</code>, which on this sandbox reads 32768–60999 with no reserved ports
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The order inside <code>mapPorts</code> is: bind the sockets, add the firewall rules, detach the filter,
+            start <code>docker-proxy</code> with the bound socket as fd 4 and a status pipe as fd 3, and close
+            <code>dockerd</code>'s copy (<code>port_mapping_linux.go:105-193</code>). Each proxy is started from a
+            goroutine locked to its OS thread, because <code>Pdeathsig</code> fires when the creating <em>thread</em>
+            dies (go.dev/issue/27505). That is one <code>dockerd</code> thread per published binding, two per
+            <code>-p</code> with IPv6 (D76) <span class="src">from the code</span>. The installed
+            <code>docker-proxy -help</code> lists exactly <code>-container-ip</code>, <code>-container-port</code>, <code>-host-ip</code>,
+            <code>-host-port</code>, <code>-proto</code>, <code>-use-listen-fd</code>, <code>-v</code> and
+            <code>-version</code> <span class="recon">measured here</span>. The DNAT rule itself is built
+            in <code>moby/daemon/libnetwork/drivers/bridge/internal/iptabler/port.go:94-114</code>:
+          </p>
+<pre><code>hostIP := "0/0"
+if !b.HostIP.IsUnspecified() {
+	hostIP = b.HostIP.String()
+}
+args := []string{
+	"-p", b.Proto.String(),
+	"-d", hostIP,
+	"--dport", strconv.Itoa(int(b.HostPort)),
+	"-j", "DNAT",
+	"--to-destination", net.JoinHostPort(b.IP.String(), strconv.Itoa(int(b.Port))),
+}
+if !n.ipt.config.Hairpin {
+	args = append(args, "!", "-i", n.config.IfName)
+}</code></pre>
+          <p>
+            <code>Hairpin</code> is true only when the userland proxy is off. With the default proxy on, the rule skips
+            packets that arrive on the bridge, and the nat-OUTPUT jump skips <code>127.0.0.0/8</code>. So the kernel
+            DNATs every remote connection, and <code>docker-proxy</code> carries three cases: connections to a loopback
+            host address, a container reaching a published port through a host address, and host IPv6 to a
+            container's IPv4 (Figure 1). The proxy holds the port in every case, but carries
+            almost none of the traffic <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-port-publish-path">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">Three ways a packet reaches 192.168.0.2:80 after <code>-p 8080:80</code></p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 556" role="img" aria-label="Row A: a remote client's packet to a host address on port 8080 passes nat PREROUTING, is DNATed in the DOCKER chain to 192.168.0.2:80, and is accepted by the filter chains into the container. Row B: a host process connecting to 127.0.0.1:8080 skips the nat OUTPUT jump and is accepted by docker-proxy, which opens a new connection to the container. Row C: a container on the same bridge connecting to a host address arrives on br-dummy, is excluded from DNAT, and is relayed by docker-proxy. A bottom band lists what changes with --userland-proxy=false.">
+                <defs>
+                  <marker id="pp-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="21" y="24" class="svg-lane">(A) A REMOTE CLIENT: DNAT IN THE KERNEL</text>
+                <rect x="21" y="36" width="240" height="88" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="33" y="58" class="svg-step">remote client</text>
+                <text x="33" y="78" class="svg-sub">dst &lt;host address&gt;:8080</text>
+                <text x="33" y="96" class="svg-sub">arrives on the host's NIC</text>
+                <rect x="287" y="36" width="240" height="88" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="299" y="58" class="svg-step">nat PREROUTING</text>
+                <text x="299" y="78" class="svg-sub">-m addrtype --dst-type LOCAL</text>
+                <text x="299" y="96" class="svg-sub">-j DOCKER</text>
+                <rect x="553" y="36" width="240" height="88" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="565" y="58" class="svg-step">nat DOCKER</text>
+                <text x="565" y="78" class="svg-sub">! -i br-dummy --dport 8080</text>
+                <text x="565" y="96" class="svg-sub">DNAT → 192.168.0.2:80</text>
+                <rect x="819" y="36" width="240" height="88" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="831" y="58" class="svg-step">filter FORWARD → container</text>
+                <text x="831" y="78" class="svg-sub">DOCKER-FORWARD → -BRIDGE</text>
+                <text x="831" y="96" class="svg-sub">→ DOCKER: ACCEPT :80</text>
+                <text x="831" y="114" class="svg-sub">→ veth → eth0</text>
+                <line x1="262" y1="80" x2="284" y2="80" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="528" y1="80" x2="550" y2="80" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="794" y1="80" x2="816" y2="80" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+
+                <text x="21" y="160" class="svg-lane">(B) THE HOST ITSELF: CURL 127.0.0.1:8080</text>
+                <rect x="21" y="172" width="240" height="88" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="33" y="194" class="svg-step">process on the host</text>
+                <text x="33" y="214" class="svg-sub">connect 127.0.0.1:8080</text>
+                <text x="33" y="232" class="svg-sub">leaves via nat OUTPUT</text>
+                <rect x="287" y="172" width="240" height="88" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="299" y="194" class="svg-step">nat OUTPUT</text>
+                <text x="299" y="214" class="svg-sub">! -d 127.0.0.0/8 … -j DOCKER</text>
+                <text x="299" y="232" class="svg-sub">loopback skipped: no DNAT</text>
+                <rect x="553" y="172" width="240" height="88" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="565" y="194" class="svg-step">docker-proxy (user space)</text>
+                <text x="565" y="214" class="svg-sub">accept() on fd 4, the socket</text>
+                <text x="565" y="232" class="svg-sub">dockerd bound and filtered</text>
+                <rect x="819" y="172" width="240" height="88" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="831" y="194" class="svg-step">a second connection</text>
+                <text x="831" y="214" class="svg-sub">proxy → 192.168.0.2:80</text>
+                <text x="831" y="232" class="svg-sub">bytes copied both ways</text>
+                <line x1="262" y1="216" x2="284" y2="216" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="528" y1="216" x2="550" y2="216" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="794" y1="216" x2="816" y2="216" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+
+                <text x="21" y="296" class="svg-lane">(C) HAIRPIN: A CONTAINER TO A PUBLISHED PORT</text>
+                <rect x="21" y="308" width="240" height="88" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="33" y="330" class="svg-step">container on br-dummy</text>
+                <text x="33" y="350" class="svg-sub">connect &lt;host address&gt;:8080</text>
+                <text x="33" y="368" class="svg-sub">enters the host from the bridge</text>
+                <rect x="287" y="308" width="240" height="88" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="299" y="330" class="svg-step">nat PREROUTING → DOCKER</text>
+                <text x="299" y="350" class="svg-sub">-i br-dummy: the DNAT rule's</text>
+                <text x="299" y="368" class="svg-sub">! -i br-dummy excludes it</text>
+                <rect x="553" y="308" width="240" height="88" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="565" y="330" class="svg-step">docker-proxy on 0.0.0.0:8080</text>
+                <text x="565" y="350" class="svg-sub">a local socket accepts it</text>
+                <text x="565" y="368" class="svg-sub">(also: host v6 → v4-only ctr)</text>
+                <rect x="819" y="308" width="240" height="88" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="831" y="330" class="svg-step">→ 192.168.0.2:80</text>
+                <text x="831" y="350" class="svg-sub">reply returns through the</text>
+                <text x="831" y="368" class="svg-sub">proxy, so the path is symmetric</text>
+                <line x1="262" y1="352" x2="284" y2="352" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="528" y1="352" x2="550" y2="352" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="794" y1="352" x2="816" y2="352" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+
+                <rect x="21" y="424" width="1038" height="116" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="33" y="446" class="svg-lane">INSET: --USERLAND-PROXY=FALSE (MOBY'S GOLDEN DIFF)</text>
+                <text x="33" y="470" class="svg-sub">nat OUTPUT     loses ! -d 127.0.0.0/8, so loopback is DNATed too</text>
+                <text x="33" y="490" class="svg-sub">nat DOCKER     DNAT loses ! -i br-dummy, so hairpin is DNATed too</text>
+                <text x="33" y="510" class="svg-sub">POSTROUTING    + MASQUERADE -o br-dummy --src-type LOCAL</text>
+                <text x="33" y="530" class="svg-sub">POSTROUTING    + MASQUERADE -s 192.168.0.2 -d 192.168.0.2 --dport 80</text>
+                <text x="620" y="470" class="svg-sub">bridge ports: hairpin mode on</text>
+                <text x="620" y="490" class="svg-sub">route_localnet = 1 on br-dummy</text>
+                <text x="620" y="510" class="svg-sub">br_netfilter required</text>
+                <text x="620" y="530" class="svg-sub">no [::] binding for a v4-only ctr</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Rules from moby's golden test files for one container 192.168.0.2 on <code>br-dummy</code> (the real
+              firewaller code run by moby's tests, not a live host); the paths through them are read from the code.
+              Blue boxes are netfilter, orange is user space, green is the container. With the proxy on, the proxy holds
+              the port but only rows B and C pass through it. The inset's last line is D67: turning the proxy off
+              silently drops the only IPv6 path to an IPv4-only container.
+            </p>
+          </figure>
+
+          <h3>The chains</h3>
+          <p>
+            Docker puts one rule into the built-in filter FORWARD chain, <code>-j DOCKER-FORWARD</code>. The controller
+            later inserts <code>-j DOCKER-USER</code> above it, so user rules run first, and <code>dockerd</code> never
+            deletes rules there. <code>DOCKER-FORWARD</code> fans out to <code>DOCKER-CT</code>,
+            <code>DOCKER-INTERNAL</code> and <code>DOCKER-BRIDGE</code>, which jumps to <code>DOCKER</code>. There, one
+            ACCEPT per published port sits above a final DROP for traffic entering the bridge
+            (<code>iptabler/iptabler.go:205-226</code>, <code>firewall_linux.go:30-77</code>). The old
+            <code>DOCKER-ISOLATION-STAGE-1/2</code> chains are now only deleted <span class="src">from the code</span>.
+            Each endpoint also gets a raw-table DROP for packets addressed to the container that did not arrive on its
+            bridge, the "direct routing" block of 28.x. Publishing on <code>127.0.0.1</code> adds
+            <code>raw PREROUTING -d 127.0.0.1 --dport 8080 ! -i lo -j DROP</code>. Before 28.0.0 such a port was
+            reachable from the same L2 segment, and <code>DOCKER_INSECURE_NO_IPTABLES_RAW=1</code> still removes both
+            kinds of drop silently (D75). In <code>routed</code> gateway mode there is no NAT, so the host port is
+            ignored and <code>-p 8080:80</code> opens container port 80 (D74). Figure 2 draws the
+            default rule set and its nftables twin.
+          </p>
+
+          <figure class="figure wide" id="fig-iptables-chains">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">Built-in chains, Docker's chains and the nftables <code>docker-bridges</code> table for the same container</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 600" role="img" aria-label="Left: built-in chains raw PREROUTING, filter FORWARD, nat PREROUTING, nat OUTPUT and nat POSTROUTING with Docker's rules. Middle: DOCKER-USER, DOCKER-FORWARD and the chains it jumps to, ending in DOCKER with an ACCEPT for port 80 and a DROP, plus the nat DOCKER chain with the DNAT rule. Right: the nftables table docker-bridges with verdict maps keyed by interface name, per-bridge chains and comments.">
+                <defs>
+                  <marker id="ic-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">BUILT-IN CHAINS</text>
+                <text x="330" y="22" class="svg-lane">DOCKER'S CHAINS (IPTABLES)</text>
+                <text x="724" y="22" class="svg-lane">NFTABLES: TABLE IP DOCKER-BRIDGES</text>
+
+                <rect x="20" y="34" width="270" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="54" class="svg-step">raw PREROUTING</text>
+                <text x="32" y="74" class="svg-sub">-d 192.168.0.2 ! -i br-dummy DROP</text>
+
+                <rect x="20" y="104" width="270" height="74" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="124" class="svg-step">filter FORWARD</text>
+                <text x="32" y="144" class="svg-sub">-j DOCKER-USER   (controller)</text>
+                <text x="32" y="162" class="svg-sub">-j DOCKER-FORWARD</text>
+
+                <rect x="20" y="300" width="270" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="320" class="svg-step">nat PREROUTING</text>
+                <text x="32" y="340" class="svg-sub">--dst-type LOCAL -j DOCKER</text>
+                <rect x="20" y="370" width="270" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="390" class="svg-step">nat OUTPUT</text>
+                <text x="32" y="410" class="svg-sub">! -d 127.0.0.0/8 LOCAL -j DOCKER</text>
+                <rect x="20" y="440" width="270" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="460" class="svg-step">nat POSTROUTING</text>
+                <text x="32" y="480" class="svg-sub">-s 192.168.0.0/24 ! -o br MASQ</text>
+
+                <rect x="330" y="34" width="340" height="42" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="342" y="60" class="svg-step">DOCKER-USER: user rules, never edited</text>
+                <rect x="330" y="90" width="340" height="92" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="110" class="svg-step">DOCKER-FORWARD</text>
+                <text x="342" y="130" class="svg-sub">-j DOCKER-CT</text>
+                <text x="342" y="146" class="svg-sub">-j DOCKER-INTERNAL   (empty here)</text>
+                <text x="342" y="162" class="svg-sub">-j DOCKER-BRIDGE</text>
+                <text x="342" y="178" class="svg-sub">-i br-dummy -j ACCEPT   (ICC on)</text>
+                <rect x="330" y="196" width="340" height="42" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="222" class="svg-sub">DOCKER-CT: -o br RELATED,ESTABLISHED ACCEPT</text>
+                <rect x="330" y="250" width="340" height="38" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="274" class="svg-sub">DOCKER-BRIDGE: -o br-dummy -j DOCKER</text>
+                <rect x="330" y="300" width="340" height="74" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="320" class="svg-step">DOCKER (filter)</text>
+                <text x="342" y="340" class="svg-sub">-d 192.168.0.2 ! -i br -o br tcp 80 ACCEPT</text>
+                <text x="342" y="358" class="svg-sub">! -i br-dummy -o br-dummy -j DROP</text>
+                <rect x="330" y="388" width="340" height="56" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="408" class="svg-step">DOCKER (nat)</text>
+                <text x="342" y="428" class="svg-sub">! -i br-dummy tcp 8080 DNAT .0.2:80</text>
+
+                <line x1="290" y1="144" x2="326" y2="58" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <line x1="290" y1="160" x2="326" y2="132" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <path d="M670,130 C690,140 690,200 674,212" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <path d="M670,162 C700,190 700,250 674,266" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <path d="M670,274 C700,290 700,310 674,322" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <line x1="290" y1="334" x2="326" y2="406" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <line x1="290" y1="404" x2="326" y2="416" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+
+                <text x="330" y="476" class="svg-note">Removed: DOCKER-ISOLATION-STAGE-1/2. Isolation</text>
+                <text x="330" y="492" class="svg-note">between networks is the per-network DROP in DOCKER.</text>
+                <text x="20" y="528" class="svg-note">Not in the golden file: DOCKER-USER (added by the controller,</text>
+                <text x="20" y="544" class="svg-note">not this test) and a FORWARD DROP policy (set only when</text>
+                <text x="20" y="560" class="svg-note">dockerd itself flips ip_forward 0 → 1, D64).</text>
+
+                <rect x="724" y="34" width="336" height="104" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="736" y="54" class="svg-step">verdict maps, keyed by ifname</text>
+                <text x="736" y="74" class="svg-sub">filter-forward-in-jumps</text>
+                <text x="736" y="90" class="svg-sub">filter-forward-out-jumps</text>
+                <text x="736" y="106" class="svg-sub">nat-postrouting-in/out-jumps</text>
+                <text x="736" y="126" class="svg-sub">"br-dummy" : jump …__br-dummy</text>
+                <rect x="724" y="150" width="336" height="58" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="736" y="170" class="svg-step">chain filter-FORWARD (base)</text>
+                <text x="736" y="190" class="svg-sub">oifname vmap @filter-forward-in-jumps</text>
+                <rect x="724" y="220" width="336" height="110" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="240" class="svg-step">filter-forward-in__br-dummy</text>
+                <text x="736" y="260" class="svg-sub">ct state established,related accept</text>
+                <text x="736" y="276" class="svg-sub">iifname "br-dummy" accept "ICC"</text>
+                <text x="736" y="292" class="svg-sub">ip daddr .0.2 tcp dport 80 accept</text>
+                <text x="736" y="308" class="svg-sub">drop "UNPUBLISHED PORT DROP"</text>
+                <rect x="724" y="342" width="336" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="362" class="svg-step">nat-prerouting-and-output</text>
+                <text x="736" y="382" class="svg-sub">tcp dport 8080 dnat to .0.2:80 "DNAT"</text>
+                <rect x="724" y="412" width="336" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="432" class="svg-step">raw-PREROUTING (base)</text>
+                <text x="736" y="452" class="svg-sub">daddr .0.2 drop "DROP DIRECT ACCESS"</text>
+                <rect x="724" y="482" width="336" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="502" class="svg-step">nat-postrouting-out__br-dummy</text>
+                <text x="736" y="522" class="svg-sub">saddr 192.168.0.0/24 "MASQUERADE"</text>
+                <path d="M892,208 L892,216" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <text x="724" y="566" class="svg-note">No DOCKER-USER chain in this mode (D70); users add</text>
+                <text x="724" y="582" class="svg-note">their own table with base chains at other priorities.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Golden test files, not a live host: moby's <code>TestIptabler</code> and <code>TestNftabler</code> output
+              for one container 192.168.0.2 with <code>8080:80/tcp</code>, proxy on, ICC on, masquerade, nat mode.
+              Thick arrows are jumps. "<code>.0.2</code>" abbreviates 192.168.0.2. The nftables table dispatches per
+              bridge through verdict maps rather than linear jump lists, and every rule carries a comment.
+            </p>
+          </figure>
+          <p>
+            Four smaller findings sit in the same tree. <code>Endpoint.Less</code>'s comment names <code>ep.name</code>
+            as the last tie-break, but the code compares network names (D66). Both branches of
+            <code>selectFirewallBackend</code> return nil (D71). <code>docs/networkdb.md</code> links an
+            <code>overlay.md</code> that does not exist (D73). And joining several containers' namespaces under
+            <code>userns-remap</code> silently overwrites the user namespace, a known FIXME, moby#46210 (D72)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The nftables backend is experimental and opt-in in 29.x (<code>--firewall-backend=nftables</code>). It has
+            no DOCKER-USER chain, does not enable IP forwarding, and refuses swarm mode unless the
+            <code>swarm-nftables</code> feature is set (D70) <span class="src">from the code</span>. One more
+            measurement for scale: this sandbox's own <code>eth0</code> is also a veth (<code>eth0@if26</code>, a random
+            locally administered MAC, a /32 address, gateway 169.254.1.1). That is a CNI-style network built by
+            another runtime, not a Docker bridge <span class="recon">measured here</span>.
+          </p>
+
+          <h2 id="p4-dns"><span class="secnum">03</span>127.0.0.11 is dockerd</h2>
+          <p>
+            On a user-defined network, a container's <code>/etc/resolv.conf</code> lists one nameserver,
+            <code>127.0.0.11</code>. No process inside the container listens there. The resolver is a Go DNS server,
+            miekg/dns v1.1.73, running as goroutines inside <code>dockerd</code>. Its UDP and TCP sockets are opened
+            <em>inside the container's network namespace</em>, on 127.0.0.11 with port 0, by a function run on a thread
+            that <code>dockerd</code> has switched into that namespace
+            (<code>moby/daemon/libnetwork/resolver.go:146-203</code>, <code>sandbox_dns_unix.go:87-94</code>)
+            <span class="src">from the code</span>. One resolver starts per sandbox, the first time an endpoint joins
+            with resolution enabled.
+          </p>
+          <p>
+            Port 0 means the kernel picks a random port, so something has to turn <code>:53</code> into that port.
+            <code>dockerd</code> writes NAT rules into the container's own nat table, in
+            <code>moby/daemon/libnetwork/resolver_unix.go:37-42</code>:
+          </p>
+<pre><code>rules := [][]string{
+	{"-t", "nat", "-I", outputChain, "-d", resolverIP, "-p", "udp", "--dport", dnsPort, "-j", "DNAT", "--to-destination", laddr},
+	{"-t", "nat", "-I", postroutingChain, "-s", resolverIP, "-p", "udp", "--sport", ipPort, "-j", "SNAT", "--to-source", ":" + dnsPort},
+	{"-t", "nat", "-I", outputChain, "-d", resolverIP, "-p", "tcp", "--dport", dnsPort, "-j", "DNAT", "--to-destination", ltcpaddr},
+	{"-t", "nat", "-I", postroutingChain, "-s", resolverIP, "-p", "tcp", "--sport", tcpPort, "-j", "SNAT", "--to-source", ":" + dnsPort},
+}</code></pre>
+          <p>
+            The chains are <code>DOCKER_OUTPUT</code> and <code>DOCKER_POSTROUTING</code>, jumped to from nat OUTPUT and
+            POSTROUTING for <code>-d 127.0.0.11</code>. A query to <code>127.0.0.11:53</code> is DNATed to the real
+            port, and the answer's source port is SNATed back to 53, so the application sees an ordinary server. In
+            nftables mode the same trick lives in a per-namespace table <code>ip docker-dns</code>. Every one of these
+            rules is IPv4. The file carries <code>// TODO IPv6 support</code>, and an IPv6-only network still gets
+            <code>nameserver 127.0.0.11</code> (D69) <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-dns-resolver">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">One DNS query from a container: NAT in its namespace, an answer from dockerd, two ways out</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 470" role="img" aria-label="Inside the container network namespace an application sends a UDP query to 127.0.0.11 port 53. nat OUTPUT jumps to DOCKER_OUTPUT, which DNATs it to 127.0.0.11 at a random port, where a socket owned by a dockerd goroutine receives it. The resolver answers names from libnetwork's service records, or forwards. A host resolv.conf upstream is dialed from the host network namespace and leaves with the host's address, bypassing the bridge firewall. A --dns upstream is dialed from inside the container namespace and goes out through the veth and the bridge. The reply's source port is SNATed back to 53 in DOCKER_POSTROUTING.">
+                <defs>
+                  <marker id="dn-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="dn-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <rect x="16" y="16" width="500" height="438" rx="6" fill="#ffffff" stroke="#367f59" stroke-width="1.4" stroke-dasharray="6 4"/>
+                <text x="30" y="38" class="svg-lane">CONTAINER NETWORK NAMESPACE</text>
+                <rect x="564" y="16" width="500" height="438" rx="6" fill="#ffffff" stroke="#252525" stroke-width="1.4" stroke-dasharray="6 4"/>
+                <text x="578" y="38" class="svg-lane">HOST NETWORK NAMESPACE (DOCKERD)</text>
+
+                <rect x="34" y="54" width="220" height="62" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="46" y="76" class="svg-step">application</text>
+                <text x="46" y="96" class="svg-sub">UDP → 127.0.0.11:53</text>
+                <rect x="34" y="140" width="464" height="62" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="46" y="162" class="svg-step">nat OUTPUT → DOCKER_OUTPUT</text>
+                <text x="46" y="182" class="svg-sub">-d 127.0.0.11 --dport 53 DNAT → 127.0.0.11:&lt;random&gt;</text>
+                <rect x="34" y="226" width="464" height="80" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="46" y="248" class="svg-step">socket 127.0.0.11:&lt;random&gt;</text>
+                <text x="46" y="268" class="svg-sub">opened in this netns by a dockerd thread</text>
+                <text x="46" y="286" class="svg-sub">switched into it (InvokeFunc); owned by dockerd</text>
+                <rect x="34" y="330" width="464" height="62" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="46" y="352" class="svg-step">reply: nat POSTROUTING → DOCKER_POSTROUTING</text>
+                <text x="46" y="372" class="svg-sub">-s 127.0.0.11 --sport &lt;random&gt; SNAT → :53</text>
+                <text x="46" y="424" class="svg-note">IPv4 only ("TODO IPv6 support", D69)</text>
+
+                <line x1="144" y1="116" x2="144" y2="137" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dn-data)"/>
+                <line x1="144" y1="202" x2="144" y2="223" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dn-data)"/>
+                <line x1="380" y1="306" x2="380" y2="327" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dn-data)"/>
+
+                <rect x="582" y="54" width="464" height="98" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="594" y="76" class="svg-step">resolver goroutines (miekg/dns)</text>
+                <text x="594" y="96" class="svg-sub">A, AAAA, PTR, SRV, MX from service records</text>
+                <text x="594" y="114" class="svg-sub">TTL 600, answers shuffled; a.b.c tries "a.b.c",</text>
+                <text x="594" y="132" class="svg-sub">then "a.b" in network c, then "a" in "b.c"</text>
+                <line x1="499" y1="262" x2="578" y2="110" stroke="#252525" stroke-width="2" marker-end="url(#dn-ctl)"/>
+                <text x="520" y="200" class="svg-sub">read</text>
+
+                <rect x="582" y="176" width="464" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="594" y="203" class="svg-sub">else forward: ≤3 upstreams, 4 s each, ≤1024 in flight</text>
+                <line x1="814" y1="152" x2="814" y2="173" stroke="#252525" stroke-width="2" marker-end="url(#dn-ctl)"/>
+
+                <rect x="582" y="246" width="224" height="146" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="594" y="268" class="svg-step">host resolv.conf upstream</text>
+                <text x="594" y="288" class="svg-sub">HostLoopback = true</text>
+                <text x="594" y="306" class="svg-sub">dialed in the host netns</text>
+                <text x="594" y="324" class="svg-sub">source: the host's address</text>
+                <text x="594" y="342" class="svg-sub">never crosses FORWARD or</text>
+                <text x="594" y="360" class="svg-sub">DOCKER-USER (D63)</text>
+                <rect x="822" y="246" width="224" height="146" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="834" y="268" class="svg-step">--dns upstream</text>
+                <text x="834" y="288" class="svg-sub">ExecFunc: dialed inside</text>
+                <text x="834" y="306" class="svg-sub">the container netns</text>
+                <text x="834" y="324" class="svg-sub">veth → bridge → FORWARD</text>
+                <text x="834" y="342" class="svg-sub">→ MASQUERADE, like any</text>
+                <text x="834" y="360" class="svg-sub">container traffic</text>
+                <line x1="694" y1="220" x2="694" y2="243" stroke="#252525" stroke-width="2" marker-end="url(#dn-ctl)"/>
+                <line x1="934" y1="220" x2="934" y2="243" stroke="#252525" stroke-width="2" marker-end="url(#dn-ctl)"/>
+                <text x="582" y="424" class="svg-note">Internal-only sandboxes: no forwarding at all, so no leak.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Read from the code (<code>resolver.go</code>, <code>resolver_unix.go</code>, <code>resolvconf.go</code>);
+              nothing here ran. The red box is the surprise: a query a container sends to a nameserver taken from the
+              host's resolv.conf leaves from the host namespace, so a DOCKER-USER rule that blocks the container's
+              egress does not block its DNS.
+            </p>
+          </figure>
+
+          <p>
+            Names come first from libnetwork's service records: container names, aliases, the 12-character short ID
+            and the hostname. A name with only an IPv4 record gets an empty authoritative AAAA answer rather than
+            being forwarded <span class="src">from the code</span>. Everything else goes upstream, and where the dial
+            happens depends on where the upstream came from, in
+            <code>moby/daemon/libnetwork/resolver.go:490-505</code>:
+          </p>
+<pre><code>if server.HostLoopback {
+	return net.DialTimeout(proto, addr, extIOTimeout)
+}
+
+var (
+	extConn net.Conn
+	dialErr error
+)
+err := r.backend.ExecFunc(func() {
+	extConn, dialErr = net.DialTimeout(proto, addr, extIOTimeout)
+})</code></pre>
+          <p>
+            Servers copied from the host's resolv.conf are marked <code>HostLoopback</code> and dialed from the host
+            namespace. That is what lets a host-local resolver such as <code>127.0.0.53</code> work. It also means the
+            query leaves with the host's address and never crosses the bridge's FORWARD chain (D63). Servers given with
+            <code>--dns</code> are dialed from inside the container. When <code>/etc/resolv.conf</code> names only
+            <code>127.0.0.53</code>, libnetwork reads <code>/run/systemd/resolve/resolv.conf</code> instead
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The container's file is generated and bind-mounted. It lists <code>nameserver 127.0.0.11</code>, keeps the
+            host's search and options, adds <code>ndots:0</code> if no ndots is present, and records the stashed
+            upstreams in a trailing <code># ExtServers: [...]</code> comment. A hash file lets <code>dockerd</code>
+            notice user edits, and after one it stops rewriting the file. The default <code>bridge</code> gets none of
+            this. Resolution is disabled there, so containers cannot find each other by name; loopback nameservers are
+            stripped, and 8.8.8.8 and 8.8.4.4 are substituted if nothing remains (D68). One comment has drifted too:
+            <code>TransformForIntNS</code> promises to "use the defaults" when there are no external nameservers, but
+            the code only appends a warning (D65) <span class="src">from the code</span>. None of this could be
+            observed here. The commands in §09 show what a live host would print
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <h2 id="p4-bytes"><span class="secnum">04</span>Frames and logs</h2>
+          <p>
+            A container without a TTY has two output streams, but an HTTP response is one byte stream. Docker
+            multiplexes them with a frame: eight header bytes, then a payload. Byte 0 is the stream (0 stdin, 1 stdout,
+            2 stderr, 3 "systemerr"), bytes 1–3 are zero, and bytes 4–7 are the payload length as a big-endian uint32
+            (<code>moby/api/pkg/stdcopy/stdcopy.go:14-27</code>). The daemon emits one frame per <code>Write</code>
+            call, header and payload in a single write from a pooled buffer, with no coalescing or splitting
+            (<code>moby/daemon/internal/stdcopymux/writer.go:32-55</code>). Three producers use it: non-TTY attach,
+            non-TTY exec, and <code>GET /containers/{id}/logs</code>. Only the logs path ever sends type 3
+            <span class="src">from the code</span>. <a href="../run-path/#p1-client">Part 1</a> shows the hijacked
+            attach connection these frames travel on.
+          </p>
+          <p>
+            To watch the reader work, the real docker CLI 29.8.2 was pointed at a mock daemon that writes hand-made
+            frames <span class="recon">measured here</span>. The CLI asked <code>GET …/json</code> before
+            <code>GET …/logs</code>: it decides framed or raw from the container's <code>Config.Tty</code>, not from the
+            <code>Content-Type</code> the daemon labels since API 1.42. The bytes it decoded are in Figure
+            4.
+          </p>
+
+          <figure class="figure wide" id="fig-stdcopy-frame">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">Four frames as the CLI received them, and what it did with each</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 318" role="img" aria-label="Four frames in byte order. Frame one: type 01, three zero bytes, length 00 00 00 13 (19), payload 'line one on stdout' and a newline; the CLI writes it to stdout. Frame two: type 02, length 19, 'line two on stderr'; written to stderr. Frame three: type 03, length 00 00 00 42 (66), 'Error grabbing logs: log message is too large (1000001 > 1000000)'; the CLI prints 'error from daemon in stream' and exits 1. Frame four: type 01, length 0e (14), 'never printed'; the CLI never reads it.">
+                <text x="20" y="22" class="svg-lane">TYPE</text>
+                <text x="74" y="22" class="svg-lane">ZERO</text>
+                <text x="186" y="22" class="svg-lane">LENGTH (BIG-ENDIAN)</text>
+                <text x="346" y="22" class="svg-lane">PAYLOAD</text>
+                <text x="786" y="22" class="svg-lane">THE REAL CLI</text>
+
+                <rect x="20" y="34" width="46" height="40" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="32" y="59" class="svg-sub">01</text>
+                <rect x="74" y="34" width="104" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="84" y="59" class="svg-sub">00 00 00</text>
+                <rect x="186" y="34" width="150" height="40" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="196" y="59" class="svg-sub">00 00 00 13 = 19</text>
+                <rect x="346" y="34" width="420" height="40" rx="3" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="358" y="59" class="svg-sub">"line one on stdout\n"</text>
+                <text x="786" y="59" class="svg-sub">→ stdout</text>
+
+                <rect x="20" y="86" width="46" height="40" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="32" y="111" class="svg-sub">02</text>
+                <rect x="74" y="86" width="104" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="84" y="111" class="svg-sub">00 00 00</text>
+                <rect x="186" y="86" width="150" height="40" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="196" y="111" class="svg-sub">00 00 00 13 = 19</text>
+                <rect x="346" y="86" width="420" height="40" rx="3" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="358" y="111" class="svg-sub">"line two on stderr\n"</text>
+                <text x="786" y="111" class="svg-sub">→ stderr</text>
+
+                <rect x="20" y="138" width="46" height="58" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="32" y="172" class="svg-sub">03</text>
+                <rect x="74" y="138" width="104" height="58" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="84" y="172" class="svg-sub">00 00 00</text>
+                <rect x="186" y="138" width="150" height="58" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="196" y="172" class="svg-sub">00 00 00 42 = 66</text>
+                <rect x="346" y="138" width="420" height="58" rx="3" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="358" y="161" class="svg-sub">"Error grabbing logs: log message is</text>
+                <text x="358" y="181" class="svg-sub"> too large (1000001 &gt; 1000000)\n"</text>
+                <text x="786" y="161" class="svg-sub">"error from daemon in stream: …"</text>
+                <text x="786" y="181" class="svg-sub">exit 1; reading stops here</text>
+
+                <rect x="20" y="208" width="46" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="32" y="233" class="svg-sub">01</text>
+                <rect x="74" y="208" width="104" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="84" y="233" class="svg-sub">00 00 00</text>
+                <rect x="186" y="208" width="150" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="196" y="233" class="svg-sub">00 00 00 0e = 14</text>
+                <rect x="346" y="208" width="420" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="358" y="233" class="svg-sub">"never printed\n"</text>
+                <text x="786" y="233" class="svg-sub">never read</text>
+
+                <line x1="20" y1="268" x2="1060" y2="268" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="290" class="svg-sub">other mock streams:  cut mid-frame → partial frame dropped, exit 0  ·  first byte 0x68 ('h') →</text>
+                <text x="20" y="308" class="svg-sub">"unrecognized stream: 104", exit 1  ·  TTY container → raw bytes, no headers at all</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Frames authored by a mock daemon, decoded by the real docker CLI 29.8.2; the bytes are from
+              <code>logs-syserr.od</code>. The daemon's own emission is read in code only. A real type-3 frame carries
+              exactly this text when the <code>local</code> driver meets a record over 1,000,000 bytes, and it is
+              in-band because the HTTP 200 was sent before streaming began.
+            </p>
+          </figure>
+
+          <p>
+            Two reader paths are worth seeing in code. In <code>moby/api/pkg/stdcopy/stdcopy.go:107-127</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>for nr &lt; frameSize+stdWriterPrefixLen {
+	var nr2 int
+	nr2, err = multiplexedSource.Read(buf[nr:])
+	nr += nr2
+	if errors.Is(err, io.EOF) {
+		if nr &lt; frameSize+stdWriterPrefixLen {
+			return written, nil
+		}
+		break
+	}
+	…
+}
+if stream == Systemerr {
+	return written, fmt.Errorf("error from daemon in stream: %s", string(buf[stdWriterPrefixLen:frameSize+stdWriterPrefixLen]))
+}</code></pre>
+          <p>
+            A stream that ends inside a frame returns <code>nil</code>: a clean EOF, with the partial frame silently
+            dropped. The mock's truncated stream ended with exit 0. The buffer also grows to whatever the header
+            announces, up to 4 GiB, with no cap. Both are in the public <code>api/pkg/stdcopy</code> package, which the
+            CLI vendors unchanged (D79).
+          </p>
+          <h3>Logs: one copier, blocking, unbounded</h3>
+          <p>
+            Every container gets one <code>logger.Copier</code>, with a goroutine per stream reading the broadcaster
+            into a 16 KiB buffer. It splits on <code>\n</code> and stamps each line with <code>time.Now()</code> at copy
+            time, not when the process wrote it. Longer lines become "partial" messages that share an ID; json-file
+            does not store that ID, so a missing trailing newline is the only trace
+            (<code>moby/daemon/logger/copier.go:102-165</code>) <span class="src">from the code</span>.
+            Figure 5 follows a line from the container to <code>docker logs</code>.
+          </p>
+
+          <figure class="figure wide" id="fig-log-pipeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">From the container's <code>write(2)</code> to <code>docker logs</code>: where it blocks, where it drops</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 492" role="img" aria-label="The container writes to fds 1 and 2, which the shim holds as FIFOs. dockerd's broadcaster fans out to attach clients and to the log copier. The copier splits lines at 16 KiB and calls the driver inline, which blocks back to the container's write by default; the optional non-blocking ring of 1 MB drops the newest message when full. The driver writes json-file or local files; remote drivers also feed a dual-logging cache that is a ring by default. Reading goes through the LogFile reader, a 4096-message watcher channel and stdcopy frames to the CLI. A rotation ladder shows max-file of 2 or more renaming the live file to .1, and max-file of 1 unlinking it.">
+                <defs>
+                  <marker id="lp-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="lp-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">WRITE PATH</text>
+                <rect x="20" y="34" width="170" height="74" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="32" y="56" class="svg-step">container</text>
+                <text x="32" y="76" class="svg-sub">write(2) on fd 1, 2</text>
+                <rect x="214" y="34" width="170" height="74" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="226" y="56" class="svg-step">shim</text>
+                <text x="226" y="76" class="svg-sub">holds the FIFOs</text>
+                <rect x="408" y="34" width="170" height="74" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="420" y="56" class="svg-step">broadcaster</text>
+                <text x="420" y="76" class="svg-sub">in dockerd</text>
+                <rect x="602" y="34" width="210" height="74" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="614" y="56" class="svg-step">attach clients</text>
+                <text x="614" y="76" class="svg-sub">stdcopy frames</text>
+                <text x="614" y="94" class="svg-sub">(exit drain capped 2 s)</text>
+                <rect x="408" y="140" width="250" height="92" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="420" y="162" class="svg-step">Copier, one per container</text>
+                <text x="420" y="182" class="svg-sub">16 KiB buffer, split on \n</text>
+                <text x="420" y="200" class="svg-sub">timestamp at copy time</text>
+                <text x="420" y="218" class="svg-sub">longer lines → partials</text>
+                <rect x="682" y="140" width="190" height="92" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="694" y="162" class="svg-step">ring (optional)</text>
+                <text x="694" y="182" class="svg-sub">mode=non-blocking</text>
+                <text x="694" y="200" class="svg-sub">1 MB; full → drop</text>
+                <text x="694" y="218" class="svg-sub">the newest, silently</text>
+                <rect x="896" y="140" width="164" height="92" rx="4" fill="#f7f7f5" stroke="#252525" stroke-width="1.4"/>
+                <text x="908" y="162" class="svg-step">driver.Log()</text>
+                <text x="908" y="182" class="svg-sub">called inline</text>
+                <text x="908" y="200" class="svg-sub">by default</text>
+
+                <line x1="191" y1="71" x2="211" y2="71" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="385" y1="71" x2="405" y2="71" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="579" y1="71" x2="599" y2="71" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="493" y1="109" x2="493" y2="137" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="659" y1="186" x2="679" y2="186" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="873" y1="186" x2="893" y2="186" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <path d="M978,140 C978,118 860,124 840,124 L120,124 C104,124 104,116 104,111" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#lp-state)"/>
+                <text x="120" y="138" class="svg-note">blocking by default: a slow driver stalls write(2)</text>
+
+                <text x="20" y="268" class="svg-lane">STORAGE</text>
+                <rect x="20" y="280" width="300" height="92" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="302" class="svg-step">json-file (the default)</text>
+                <text x="32" y="322" class="svg-sub">{"log","stream","attrs","time"}</text>
+                <text x="32" y="340" class="svg-sub">max-size -1: never rotates</text>
+                <text x="32" y="358" class="svg-sub">max-file 1</text>
+                <rect x="340" y="280" width="300" height="92" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="352" y="302" class="svg-step">local</text>
+                <text x="352" y="322" class="svg-sub">[len][protobuf LogEntry][len]</text>
+                <text x="352" y="340" class="svg-sub">20 MiB × 5 files, gzip</text>
+                <text x="352" y="358" class="svg-sub">trailing len: --tail reads back</text>
+                <rect x="660" y="280" width="400" height="92" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="672" y="302" class="svg-step">syslog, fluentd, gelf, awslogs …</text>
+                <text x="672" y="322" class="svg-sub">+ dual-logging cache, local format,</text>
+                <text x="672" y="340" class="svg-sub">container-cached.log; wrapped in a ring</text>
+                <text x="672" y="358" class="svg-sub">when mode is unset: lossy by default (D86)</text>
+                <line x1="978" y1="233" x2="978" y2="277" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <path d="M978,252 L170,252 L170,277" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="490" y1="252" x2="490" y2="277" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+
+                <text x="20" y="404" class="svg-lane">ROTATION (BEFORE EACH WRITE, SIZE ≥ MAX-SIZE)</text>
+                <text x="20" y="428" class="svg-sub">max-file ≥ 2:  .N-1 → .N … .1 → .2,  live → .1,  open live with O_TRUNC</text>
+                <text x="20" y="448" class="svg-sub">max-file = 1:  unlink live, start empty: all history gone (D78)</text>
+                <text x="20" y="476" class="svg-lane">READ PATH</text>
+                <text x="120" y="476" class="svg-sub">LogFile reader → watcher chan (4096) → stdcopy → HTTP → CLI;  -f only while running (D87)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Read from the code (<code>copier.go</code>, <code>ring.go</code>, <code>logfile.go</code>,
+              <code>local_cache.go</code>); nothing here was run. Red dashed boxes are the two buffers that drop data,
+              and one of them, the dual-logging cache, is on by default for drivers that cannot be read back. The
+              dashed purple arrow is the back-pressure that the default blocking mode applies.
+            </p>
+          </figure>
+
+          <p>
+            Logging is blocking by default. Unless <code>mode=non-blocking</code> is set, the copier calls the driver
+            inline, so a slow driver back-pressures the FIFO, the shim and finally the container's
+            <code>write(2)</code>. json-file is also unbounded by default: with no <code>max-size</code> the capacity is
+            −1 and nothing rotates <span class="src">from the code</span>. Setting <code>max-size</code> without
+            <code>max-file</code> is worse than it looks, in
+            <code>moby/daemon/logger/loggerutils/logfile.go:227-230</code>:
+          </p>
+<pre><code>if w.maxFiles &lt; 2 {
+	if err := unlink(fname); err != nil &amp;&amp; !errors.Is(err, fs.ErrNotExist) {
+		log.G(context.TODO()).WithError(err).Error("Error unlinking current log file")
+	}</code></pre>
+          <p>
+            <code>max-file</code> defaults to 1, so every rotation throws the whole history away. The docs say no
+            rotation happens by default; they do not say this (D78). Rotation never truncates in place, because a
+            reader may still hold the old file open.
+          </p>
+          <p>
+            The non-blocking alternative trades stalls for loss. A ring buffer, 1 MB of line bytes by default
+            (<code>max-buffer-size</code>), sits in front of the driver; when it is full, the newest message is dropped
+            and <code>Enqueue</code> returns nil (<code>moby/daemon/logger/ring.go:163-183</code>). The budget counts only
+            <code>len(Line)</code>: each message costs roughly 380 bytes of heap, so short lines can use tens of times
+            the nominal 1 MB, and empty lines count zero and are never dropped <span class="src">from the code</span>. Drivers that cannot
+            be read back, such as syslog or fluentd, get a hidden <code>local</code>-format cache so that
+            <code>docker logs</code> still works. That cache is wrapped in the same ring when <code>mode</code> is
+            unset, so it is lossy by default while the primary driver blocks (D86). The formats lose things too.
+            json-file escapes like Go's <code>encoding/json</code> and replaces invalid UTF-8 with
+            <code>�</code>, so binary output does not survive. <code>local</code> refuses any record whose length
+            header exceeds 1,000,000 bytes, and that refusal is the text in Figure 4's type-3 frame
+            <span class="src">from the code</span>. One last surprise: <code>docker logs -f</code> on a stopped
+            container prints the history and exits, and a later <code>docker start</code> does not reattach it (D87).
+          </p>
+
+          <h2 id="p4-stop"><span class="secnum">05</span>Signals, stop and restart</h2>
+          <p>
+            <code>docker stop</code> is a signal, a wait and a SIGKILL. On the wire it is one request. Against the mock
+            daemon, <code>docker stop -t 3 -s SIGINT web</code> sent
+            <code>POST /v1.56/containers/web/stop?signal=SIGINT&amp;t=3</code>, and a plain <code>docker stop web</code>
+            sent no query at all, so the container's own <code>StopTimeout</code> applies
+            <span class="recon">measured here</span>. <code>docker kill -s HUP</code> became <code>kill?signal=HUP</code>.
+            The daemon side is in <code>moby/daemon/stop.go:85-89, 115-118</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>	// 1. Send a stop signal
+	err := daemon.killPossiblyDeadProcess(ctx, ctr, stopSignal)
+	if err != nil {
+		wait = 2 * time.Second
+	}
+…
+	// Stop either failed or container didn't exit, so fallback to kill.
+	if err := daemon.kill(ctx, ctr); err != nil {</code></pre>
+          <p>
+            The signal is the container's <code>StopSignal</code>, else SIGTERM. The wait is the request's
+            <code>t</code>, else the container's <code>StopTimeout</code>, else 10 seconds on Linux. A negative timeout
+            waits forever. The stop runs under <code>context.WithoutCancel</code>, so pressing Ctrl-C on
+            <code>docker stop</code> does not abort it, and stopping a stopped container returns 304
+            <span class="src">from the code</span>.
+          </p>
+          <h3>Only PID 1 hears it</h3>
+          <p>
+            The signal travels <code>dockerd</code> → containerd <code>Task.Kill</code> → shim → a fresh
+            <code>runc kill &lt;id&gt; &lt;sig&gt;</code> → the container's init process. Nothing else in the container
+            is signalled; only SIGKILL with a shared PID namespace is fanned out to the whole cgroup
+            (<code>runc/libcontainer/container_linux.go:396-426</code>). Then the kernel applies its rule for a
+            namespace's init process: a signal for which init has no handler is dropped, even when root sends it. Only
+            SIGKILL and SIGSTOP from an ancestor namespace are forced (pid_namespaces(7)). A <code>sh</code> or a naive
+            binary as PID 1 never sees the SIGTERM. <code>docker stop</code> therefore always waits the full timeout and
+            ends in SIGKILL. The exit code is 137 because the shim's reaper encodes a signal death as 128 plus the
+            signal number (<code>containerd/pkg/sys/reaper/reaper_unix.go:280-289</code>) <span class="src">from the
+            code</span>. Figure 6 draws the clock. <code>--init</code> puts tini v0.19.0 in front as
+            PID 1; it has handlers and forwards the signal to the real program, which then dies of the default action
+            (<a href="../run-path/#p1-spec">Part 1 §03</a> shows the rewrite).
+          </p>
+
+          <figure class="figure wide" id="fig-stop-timeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title"><code>docker stop</code> with the default 10-second timeout, for three kinds of PID 1</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 370" role="img" aria-label="A time axis from 0 to 22 seconds. At t equals 0 the stop signal goes from dockerd through containerd, the shim and runc kill to PID 1 only. Lane one: tini from --init forwards SIGTERM to the child, which dies; tini exits 143. Lane two: sh as PID 1 has no handler, the kernel drops the signal, and at 10 seconds dockerd sends SIGKILL through containerd; exit 137. Lane three: if no exit event arrives within 10 more seconds, at 20 seconds dockerd calls kill(2) on the host PID itself and gives up at 22 seconds.">
+                <defs>
+                  <marker id="st-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">THE SIGNAL PATH AT T = 0</text>
+                <text x="20" y="46" class="svg-sub">dockerd → containerd Task.Kill → shim → runc kill &lt;id&gt; SIGTERM → PID 1 only</text>
+
+                <line x1="220" y1="78" x2="1050" y2="78" stroke="#252525" stroke-width="2" marker-end="url(#st-ctl)"/>
+                <line x1="240" y1="70" x2="240" y2="86" stroke="#252525" stroke-width="2"/>
+                <text x="232" y="66" class="svg-num">0 s</text>
+                <line x1="560" y1="70" x2="560" y2="86" stroke="#252525" stroke-width="2"/>
+                <text x="548" y="66" class="svg-num">10 s</text>
+                <line x1="880" y1="70" x2="880" y2="86" stroke="#252525" stroke-width="2"/>
+                <text x="868" y="66" class="svg-num">20 s</text>
+                <line x1="944" y1="70" x2="944" y2="86" stroke="#252525" stroke-width="2"/>
+                <text x="934" y="66" class="svg-num">22 s</text>
+
+                <text x="20" y="128" class="svg-step">--init (tini)</text>
+                <text x="20" y="146" class="svg-sub">has handlers</text>
+                <rect x="240" y="108" width="320" height="50" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="252" y="129" class="svg-sub">tini forwards SIGTERM → child dies</text>
+                <text x="252" y="147" class="svg-sub">exit 143 = 128 + 15, well before 10 s</text>
+
+                <text x="20" y="208" class="svg-step">sh as PID 1</text>
+                <text x="20" y="226" class="svg-sub">no handler</text>
+                <rect x="240" y="188" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="252" y="209" class="svg-sub">kernel drops SIGTERM: init of a pid</text>
+                <text x="252" y="227" class="svg-sub">namespace, no handler; nothing happens</text>
+                <rect x="560" y="188" width="320" height="50" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="572" y="209" class="svg-sub">daemon.kill: SIGKILL via containerd</text>
+                <text x="572" y="227" class="svg-sub">exit 137 = 128 + 9 (shim reaper)</text>
+
+                <text x="20" y="288" class="svg-step">no exit event</text>
+                <text x="20" y="306" class="svg-sub">SIGKILL lost</text>
+                <rect x="560" y="268" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="572" y="289" class="svg-sub">wait 10 s for containerd's exit event</text>
+                <text x="572" y="307" class="svg-sub">(75 s on Windows)</text>
+                <rect x="880" y="268" width="180" height="50" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="892" y="289" class="svg-sub">kill(2) on host PID,</text>
+                <text x="892" y="307" class="svg-sub">2 s more, then error</text>
+                <text x="20" y="352" class="svg-note">Times are the code's defaults, not measurements: no container ran on the research box.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Read from <code>stop.go</code>, <code>kill.go</code>, the shim's reaper and pid_namespaces(7). The middle
+              lane is the common case for images whose entrypoint is a shell script: every <code>docker stop</code>
+              costs the full timeout. The last lane is <code>dockerd</code> bypassing the stack entirely.
+            </p>
+          </figure>
+
+          <h3>The restart manager, and D77</h3>
+          <p>
+            After an exit, the restart manager decides. Its backoff is 100 ms, doubling on each restart, capped at one
+            minute, and reset whenever the last run lasted 10 seconds or more
+            (<code>moby/daemon/internal/restartmanager/restartmanager.go:11-15, 65-78</code>). <code>always</code>
+            restarts, <code>unless-stopped</code> restarts unless <code>hasBeenManuallyStopped</code>,
+            <code>on-failure[:N]</code> restarts on a non-zero exit while the count is below N, and <code>no</code>
+            returns before taking any lock. A manual stop also cancels the manager outright, so after
+            <code>docker stop</code> no policy restarts at exit. The policies diverge only at daemon startup, where a
+            stopped <code>always</code> container comes back and an <code>unless-stopped</code> one does not
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The flag that makes a stop "manual" is set in <code>moby/daemon/kill.go:80-103</code>, and its placement is
+            finding D77 <span class="src">from the code</span>:
+          </p>
+<pre><code>var unpause bool
+if container.Config.StopSignal != "" &amp;&amp; stopSignal != syscall.SIGKILL {
+	containerStopSignal, err := signal.ParseSignal(container.Config.StopSignal)
+	if err != nil {
+		return err
+	}
+	if containerStopSignal == stopSignal {
+		container.ExitOnNext()
+		unpause = container.State.Paused
+	}
+} else {
+	container.ExitOnNext()
+	unpause = container.State.Paused
+}
+
+if !daemon.IsShuttingDown() {
+	container.HasBeenManuallyStopped = true
+	if err := container.CheckpointTo(ctx, daemon.containersReplica); err != nil {
+	…
+}</code></pre>
+          <p>
+            <code>ExitOnNext</code> cancels the manager. Without a <code>StopSignal</code> in the config, the
+            <code>else</code> branch runs for <em>any</em> signal, so <code>docker kill -s HUP</code> cancels
+            <code>always</code> and <code>on-failure</code> too. And <code>HasBeenManuallyStopped = true</code> sits
+            outside the if/else, so every <code>docker kill -s</code> marks the container as manually stopped, even with
+            a <code>STOPSIGNAL</code>. It is checkpointed to disk, so it also survives a daemon restart. Send SIGHUP to
+            reload nginx, and the next crash of an <code>unless-stopped</code> container is never restarted. PR #26464
+            (v1.13.0, 2016) fixed only the <code>ExitOnNext</code> half. Issues #41302 and #47792 are open, and fix PR
+            #53415 has been open and unmerged since 2026-08-19. <code>kill.go</code> is byte-identical on
+            <code>master</code>. The workaround is to signal the process directly, with
+            <code>docker exec c kill -HUP 1</code>. Figure 7 lays out every case.
+          </p>
+
+          <figure class="figure wide" id="fig-restart-policy">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">Is the container restarted? By policy and by what happened before its next exit</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Policy</th><th>Exits by itself</th><th>After stop, or kill with SIGKILL or StopSignal</th><th>After kill -s HUP, no StopSignal</th><th>After kill -s HUP, StopSignal set</th><th>At daemon restart, after a manual stop</th></tr></thead>
+                <tbody>
+                  <tr><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td></tr>
+                  <tr><td>on-failure[:N]</td><td>if exit ≠ 0 and count &lt; N</td><td>no (cancelled)</td><td class="hl-red" style="background: var(--red-soft)">no (cancelled, D77)</td><td>if exit ≠ 0 and count &lt; N</td><td>decided by the last exit code</td></tr>
+                  <tr><td>always</td><td>yes</td><td>no (cancelled)</td><td class="hl-red" style="background: var(--red-soft)">no (cancelled, D77)</td><td>yes</td><td class="hl-green" style="background: var(--green-soft)">yes</td></tr>
+                  <tr><td>unless-stopped</td><td>yes</td><td>no (cancelled)</td><td class="hl-red" style="background: var(--red-soft)">no (D77)</td><td class="hl-red" style="background: var(--red-soft)">no (flag set, D77)</td><td>no</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Cells read from <code>kill.go:80-103</code>, <code>restartmanager.go:46-91</code>,
+              <code>monitor.go:98-117</code> and <code>daemon.go:577</code>; not run. Red cells are D77: a signal
+              meant for the application switches the policy off. Backoff between restarts: 100 ms × 2 per restart, at
+              most 60 s, reset after a run of 10 s or more. A user <code>docker start</code> clears the flag and the
+              count.
+            </p>
+          </figure>
+
+          <h2 id="p4-observe"><span class="secnum">06</span>Health, OOM, stats, events, cp and pause</h2>
+          <p>
+            Docker's observability commands are thin readers. Each reads a cgroup file, an in-memory ring or a container
+            lock, and each answers a slightly different question from the one its name suggests.
+          </p>
+          <h3>Health checks</h3>
+          <p>
+            A probe is an ordinary <code>exec</code> in the container: same user, working directory and environment, no
+            TTY, no stdin, with output captured into a 4,096-byte buffer. It shows up in <code>docker events</code> as
+            <code>exec_create</code>. The defaults are interval 30 s, timeout 30 s, retries 3, start period 0 and start
+            interval 5 s, and the first probe runs one interval <em>after</em> start. A container therefore stays
+            <code>starting</code> for at least 30 seconds. A timeout kills the probe and records exit code −1. Only the
+            last five results are kept, and an event fires only on a transition
+            (<code>moby/daemon/health.go:23-44, 111-152, 238-251</code>). Then nothing happens. The restart manager
+            never looks at health, so <code>unhealthy</code> acts on nothing outside swarm and other orchestrators
+            (D88) <span class="src">from the code</span>. The same finding adds that <code>--tmpfs</code> mounts default
+            to <code>noexec,nosuid,nodev</code>, so a script copied into a <code>--tmpfs /tmp</code> will not run.
+          </p>
+          <h3>OOM</h3>
+          <p>
+            On cgroup v2 the shim watches the container cgroup's <code>memory.events</code> with inotify, re-reads it
+            on every wakeup and publishes <code>TaskOOM</code> whenever <code>oom_kill</code> grows
+            (<code>containerd/internal/oom/watcher.go:102-141</code>). The watcher is armed right after
+            <code>runc create</code>, while init still waits on the FIFO, so an early OOM is not missed. On any
+            <code>TaskOOM</code>, <code>dockerd</code> sets <code>State.OOMKilled</code>. The victim may be a child while
+            PID 1 keeps running. Docker sets no <code>memory.oom.group</code>, and runc's systemd scopes default to
+            <code>OOMPolicy=continue</code>, so the kernel normally kills one process it chooses. <code>OOMKilled:
+            true</code> means "something in this cgroup was OOM-killed during this run" (D82)
+            <span class="src">from the code</span>. This sandbox's own cgroup shows why the counters need care (comments mine)
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ cat /sys/fs/cgroup/memory.events      # this sandbox, not a Docker container
+low 0
+high 0
+max 7452          # times usage hit memory.max
+oom 0             # times the cgroup went OOM
+oom_kill 0        # the counter the shim watches
+oom_group_kill 0</code></pre>
+          <p>
+            <code>docker stats</code> reports cgroup v2 <code>failcnt</code> as <code>oom</code>, not <code>max</code>.
+            Here the two read 0 and 7,452 (D83). This sandbox's cgroup also has <code>memory.oom.group</code> set to 1, which a
+            Docker container's would not.
+          </p>
+          <h3>Stats</h3>
+          <p>
+            One daemon-wide goroutine samples every watched container in turn, then sleeps one second, so the real period
+            is a second plus the sampling time. Each sample is a containerd <code>Task.Metrics</code> round trip to the
+            shim, which reads <code>cpu.stat</code>, <code>memory.stat</code>, <code>memory.current</code> and the rest.
+            The "system" side is not from cgroups at all: <code>dockerd</code> sums the first seven fields of
+            <code>/proc/stat</code>'s <code>cpu</code> line and counts <code>cpuN</code> lines as online CPUs
+            (<code>moby/daemon/stats_unix.go:296-357</code>). The CLI then computes, in
+            <code>cli/cli/command/container/stats_helpers.go:196-198</code>:
+          </p>
+<pre><code>	if systemDelta &gt; 0.0 &amp;&amp; cpuDelta &gt; 0.0 {
+		cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
+	}</code></pre>
+          <p>
+            That is a percentage of one CPU, scaled by the host's CPU count, never by the container's
+            <code>cpu.max</code> quota. A Python re-implementation over this sandbox's files gives a cpuDelta of
+            2,005,555,000 ns against a systemDelta of 7,930,000,000 ns on 8 CPUs: 202.33 %, for a cgroup whose
+            <code>cpu.max</code> reads <code>200000 100000</code>, a two-CPU quota <span class="recon">measured
+            here</span>. It is arithmetic over real files, not <code>dockerd</code> output. MEM USAGE is
+            <code>memory.current − inactive_file</code>: 8,190,771,200 − 370,188,288 bytes, or 7.28 GiB. Two more
+            quirks. The first streamed sample has empty <code>precpu_stats</code>, so it is a lifetime average. And
+            <code>--no-stream</code> sends <code>stream=false</code> without <code>one-shot</code>, as the mock
+            trace shows, so the daemon waits for two samples first <span class="src">from the code</span>.
+          </p>
+          <h3>Events</h3>
+          <p>
+            The event history is an in-memory slice of the last 256 events. <code>--since</code> can replay only that,
+            and nothing from before a daemon restart. Live delivery goes through a publisher that waits at most 100 ms
+            per subscriber per event, then skips that subscriber, silently. The 256 is documented; the drop is not
+            (D85, <code>moby/daemon/events/events.go:13-31</code>). Container labels are copied <em>over</em> the
+            event's attributes, so a label named <code>exitCode</code> falsifies every <code>die</code> event (D84,
+            an inference from <code>maps.Copy</code>). The wire format is JSON lines, served as
+            <code>application/jsonl</code> from API 1.52, although the API changelog lists the change under 1.53 (D90)
+            <span class="src">from the code</span>. Fed four mock events, the CLI rendered
+            <code>kill … signal=15</code>, then <code>die … exitCode=143</code>,
+            <code>health_status: unhealthy</code> and <code>oom</code> <span class="recon">measured here</span>.
+          </p>
+          <h3><code>docker cp</code>, pause and checkpoints</h3>
+          <p>
+            <code>docker cp</code> is three verbs on <code>/containers/{id}/archive</code>: <code>HEAD</code> to stat,
+            <code>GET</code> for a tar and <code>PUT</code> to extract one. Copying out, the CLI sent a single
+            <code>GET</code> with no <code>HEAD</code> <span class="recon">measured here</span>. Since 24.0 the daemon
+            does the copy in a private mount namespace, so symlinks resolve inside the container. That code was still
+            being patched for CVEs in 2026. The <code>GET</code> holds the container lock until the client has read the
+            whole tar, so a slow copy blocks <code>docker stop</code>, <code>kill</code> and <code>pause</code> on that
+            container (D81, inferred from code, not observed). Pause writes <code>1</code> to
+            <code>cgroup.freeze</code>, and runc polls <code>cgroup.events</code> every 10 ms, up to 1,000 times, for
+            <code>frozen 1</code>. The processes receive no signal. Pausing a paused container is a 409; unpausing a
+            running one is an untyped error, so HTTP 500. <code>docker commit</code> pauses by default and ignores both
+            errors (D89). The experimental checkpoint path has the part's one latent bug. When containerd's index lacks
+            the checkpoint manifest, <code>CreateCheckpoint</code> wraps a nil error, which yields nil, and reports
+            success. Stock containerd never reaches that branch (D80) <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="p4-history"><span class="secnum">07</span>Thirteen years of moving work out of one binary</h2>
+          <p>
+            The five-program relay of <a href="../run-path/">Part 1</a> was not designed. It accreted, one extraction at
+            a time, and the code still carries the seams. moby's first commit is dated 2013-01-18. The next day's commit
+            is "Prototyping with a mock CLI and daemon", and a month later the code was already split into
+            <code>docker/server</code> and <code>docker/client</code>. The client/daemon boundary is as old as the
+            project <span class="recon">measured here</span>, from git history. Docker 0.1.0, the "Initial public
+            release", is dated 2013-03-23 in the changelog. It already had push, pull and layers. dotCloud renamed
+            itself Docker, Inc. that October. Figure 8 lays the extractions out in three lanes.
+          </p>
+
+          <figure class="figure wide" id="fig-history-timeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">2013–2026 in five eras: Engine releases, the runtime layer, the ecosystem</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 512" role="img" aria-label="A grid of five eras from 2013 to 2026 across three lanes. Engine: 0.1.0 in 2013, libcontainer as default driver in 0.9, LXC removed in 1.10, containerd and runc from 1.11, CalVer from 17.03, BuildKit opt-in in 18.09, SemVer and buildx from 23.0, the containerd image store as default in 29.0, and the pin 29.9.2 in October 2026. Runtime: libcontainer in 2014, OCI and runc in 2015, containerd in 2015 and at CNCF in 2017, CRI in-tree in 2020, runc 1.0 in 2021, containerd 2.0 in 2024, and containerd embedded in dockerd in 2026. Ecosystem: Moby in 2017, Mirantis in 2019, Desktop licensing and Compose v2 in 2021, dockershim removed in 2022, Compose v5 in 2025.">
+                <rect x="140" y="12" width="164" height="30" rx="3" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="150" y="32" class="svg-lane">2013–2014</text>
+                <rect x="312" y="12" width="196" height="30" rx="3" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="322" y="32" class="svg-lane">2015–2016</text>
+                <rect x="516" y="12" width="196" height="30" rx="3" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="526" y="32" class="svg-lane">2017–2019</text>
+                <rect x="720" y="12" width="196" height="30" rx="3" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="730" y="32" class="svg-lane">2020–2022</text>
+                <rect x="924" y="12" width="140" height="30" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="934" y="32" class="svg-lane">2023–2026</text>
+
+                <text x="16" y="72" class="svg-lane">ENGINE</text>
+                <text x="16" y="90" class="svg-sub">releases</text>
+                <text x="150" y="72" class="svg-sub">2013-01-18 first</text>
+                <text x="150" y="90" class="svg-sub">   commit</text>
+                <text x="150" y="108" class="svg-sub">2013-03-23 0.1.0</text>
+                <text x="150" y="126" class="svg-sub">2014-03-10 0.9:</text>
+                <text x="150" y="144" class="svg-sub">   libcontainer</text>
+                <text x="150" y="162" class="svg-sub">   is the default</text>
+                <text x="322" y="72" class="svg-sub">2015-08 1.8: LXC</text>
+                <text x="322" y="90" class="svg-sub">   deprecated</text>
+                <text x="322" y="108" class="svg-sub">2016-02 1.10: LXC gone</text>
+                <text x="322" y="126" class="svg-sub">2016-04-13 1.11:</text>
+                <text x="322" y="144" class="svg-sub">   containerd + runc</text>
+                <text x="322" y="162" class="svg-sub">2016-07 1.12: live-</text>
+                <text x="322" y="180" class="svg-sub">   restore, swarm mode</text>
+                <text x="526" y="72" class="svg-sub">2017-03 17.03: CalVer</text>
+                <text x="526" y="90" class="svg-sub">2018-11 18.09: BuildKit</text>
+                <text x="526" y="108" class="svg-sub">   without experimental</text>
+                <text x="526" y="126" class="svg-sub">2019-07 19.03: rootless</text>
+                <text x="526" y="144" class="svg-sub">   (experimental)</text>
+                <text x="730" y="72" class="svg-sub">2020-12 20.10: cgroup</text>
+                <text x="730" y="90" class="svg-sub">   v2, rootless GA</text>
+                <text x="730" y="108" class="svg-sub">2022: no stable 22.x</text>
+                <text x="934" y="72" class="svg-sub">23.0 SemVer,</text>
+                <text x="934" y="90" class="svg-sub">   buildx default</text>
+                <text x="934" y="108" class="svg-sub">24.0 ctrd store</text>
+                <text x="934" y="126" class="svg-sub">25.0 rro binds</text>
+                <text x="934" y="144" class="svg-sub">no 27.0.0</text>
+                <text x="934" y="162" class="svg-sub">28.0 routing block</text>
+                <text x="934" y="180" class="svg-sub">29.0 ctrd store</text>
+                <text x="934" y="198" class="svg-sub">   default (fresh)</text>
+                <text x="934" y="216" class="svg-sub">2026-10-20 29.9.2</text>
+
+                <line x1="16" y1="232" x2="1064" y2="232" stroke="#deded9" stroke-width="1"/>
+                <text x="16" y="258" class="svg-lane">RUNTIME</text>
+                <text x="16" y="276" class="svg-sub">layer</text>
+                <text x="150" y="258" class="svg-sub">2014-02-18</text>
+                <text x="150" y="276" class="svg-sub">   libcontainer</text>
+                <text x="150" y="294" class="svg-sub">   in the Docker repo</text>
+                <text x="322" y="258" class="svg-sub">2015-06-22 OCI; runc</text>
+                <text x="322" y="276" class="svg-sub">   donated</text>
+                <text x="322" y="294" class="svg-sub">2015-11-05 containerd</text>
+                <text x="322" y="312" class="svg-sub">   first commit</text>
+                <text x="526" y="258" class="svg-sub">2017-03-29 containerd</text>
+                <text x="526" y="276" class="svg-sub">   joins CNCF</text>
+                <text x="526" y="294" class="svg-sub">2017-07-19 OCI 1.0</text>
+                <text x="526" y="312" class="svg-sub">2019-02-28 graduates</text>
+                <text x="730" y="258" class="svg-sub">2020-10-07 CRI merged</text>
+                <text x="730" y="276" class="svg-sub">   into containerd</text>
+                <text x="730" y="294" class="svg-sub">2021-06-22 runc 1.0.0,</text>
+                <text x="730" y="312" class="svg-sub">   after 5 years of rc</text>
+                <text x="934" y="258" class="svg-sub">2024-11 ctrd 2.0</text>
+                <text x="934" y="276" class="svg-sub">29.7: embedded</text>
+                <text x="934" y="294" class="svg-sub">   containerd (exp)</text>
+                <text x="934" y="312" class="svg-sub">29.8: automatic</text>
+                <text x="934" y="330" class="svg-sub">   fallback to it</text>
+
+                <line x1="16" y1="346" x2="1064" y2="346" stroke="#deded9" stroke-width="1"/>
+                <text x="16" y="372" class="svg-lane">ECOSYSTEM</text>
+                <text x="150" y="372" class="svg-sub">2013-03 PyCon</text>
+                <text x="150" y="390" class="svg-sub">   lightning talk</text>
+                <text x="150" y="408" class="svg-sub">2013-10 dotCloud</text>
+                <text x="150" y="426" class="svg-sub">   → Docker, Inc.</text>
+                <text x="150" y="444" class="svg-sub">2014-10 Compose 1.0</text>
+                <text x="322" y="372" class="svg-sub">2016-07 swarm mode</text>
+                <text x="322" y="390" class="svg-sub">   inside dockerd</text>
+                <text x="526" y="372" class="svg-sub">2017-04-18 Moby;</text>
+                <text x="526" y="390" class="svg-sub">   docker/cli split</text>
+                <text x="526" y="408" class="svg-sub">2019-11-13 Mirantis</text>
+                <text x="526" y="426" class="svg-sub">   buys Enterprise</text>
+                <text x="730" y="372" class="svg-sub">2020-12 dockershim</text>
+                <text x="730" y="390" class="svg-sub">   deprecated (1.20)</text>
+                <text x="730" y="408" class="svg-sub">2021-08-31 Desktop</text>
+                <text x="730" y="426" class="svg-sub">   licensing; Compose v2</text>
+                <text x="730" y="444" class="svg-sub">2022-05 k8s 1.24:</text>
+                <text x="730" y="462" class="svg-sub">   dockershim removed</text>
+                <text x="934" y="372" class="svg-sub">2025-07 Swarm</text>
+                <text x="934" y="390" class="svg-sub">   support +5 years</text>
+                <text x="934" y="408" class="svg-sub">2025-12 Compose v5</text>
+                <text x="16" y="500" class="svg-note">Engine dates are release-note dates where they differ from git tag dates by a day or two.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Dates from git tags at the pins (<span class="recon">measured here</span>), Docker's release notes,
+              and the OCI, CNCF, Kubernetes and Mirantis announcements. The runtime lane is the story: each era moves
+              one job out of the Docker binary, and the last cell moves containerd back in.
+            </p>
+          </figure>
+
+          <h3>Out of the binary</h3>
+          <p>
+            First the kernel interface left LXC's userland. libcontainer began in the Docker repository on 2014-02-18,
+            and 0.9 (2014-03-10) made its "native" driver the default. LXC was deprecated in 1.8 and removed in 1.10.
+            The announcement gave the reason as LXC's userland changing from one distribution to the next. Then the
+            runtime left the company. The Open Container Initiative launched on 2015-06-22, with runc donated to it.
+            runc's history begins with libcontainer's first commit, because the code moved with its history. runc then
+            stayed a "1.0 release candidate" for five years while Docker shipped it: v1.0.0-rc1 came on 2016-06-03 and
+            v1.0.0 on 2021-06-22 <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Then supervision left <code>dockerd</code>. containerd's first commit is 2015-11-05, and Docker 1.11.0
+            (2016-04-13) was the first release to run containers through containerd and runc. It shipped four Linux
+            binaries: <code>docker</code>, <code>docker-containerd</code>, <code>docker-containerd-shim</code> and
+            <code>docker-runc</code>. Containers survived a daemon restart only from 1.12, which added
+            <code>--live-restore</code> and split out <code>docker-proxy</code>. containerd joined the CNCF on 2017-03-29
+            and graduated on 2019-02-28. The graduation release says "Born at Docker in 2014", more than a year before
+            the repository's first commit (D93). containerd's <code>SCOPE.md</code> still excludes networking, build,
+            volumes and logging. That is why libnetwork, BuildKit and the log drivers of §02–§04 live in
+            <code>dockerd</code> <span class="src">from the code</span>.
+          </p>
+          <p>
+            The project itself split. docker/docker became the Moby Project on 2017-04-18, and the client moved to
+            docker/cli that month. In 2026 the CLI imports <code>github.com/moby/moby/api</code> v1.56.1 and
+            <code>client</code> v0.6.2 as separate modules. The client folder has moved back into moby
+            (<code>cli/vendor.mod:36-37</code>). Kubernetes moved off <code>dockerd</code> next. dockershim, the CRI
+            adapter that lived inside the kubelet, was deprecated in 1.20 and removed in 1.24, and Docker itself did not
+            change. CRI was merged into containerd's tree on 2020-10-07. At the pin, <code>dockerd</code> starts its
+            managed containerd with CRI off unless <code>--cri-containerd</code> is set <span class="src">from the
+            code</span>. Judging by their titles, that keeps a default Docker Engine out of reach of containerd's 2026
+            batch of CRI-plugin advisories <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            The company split as well. On 2019-11-13 Mirantis bought Docker's Enterprise business, and Swarm went with
+            it; in July 2025 Mirantis extended Swarm support for five more years. From 2021-08-31, Docker Desktop needed
+            a paid subscription in organisations with 250 or more employees or $10 million in revenue. The Engine,
+            containerd, runc and BuildKit stayed Apache-2.0. Compose followed the plugin pattern: the Python
+            <code>docker-compose</code> of 2014 became the Go <code>docker compose</code> CLI plugin in 2021, and the next
+            major, v5.0.0 in December 2025, skipped 3 and 4 to avoid confusion with the old file-format versions. On
+            this machine Compose answers v5.6.0 to the hidden <code>docker-cli-plugin-metadata</code> subcommand
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The docs around this history have drifted in small ways. <code>dockerd-rootless.sh</code> calls
+            gvisor-tap-vsock the default in one place and the last fallback in another, and the 29.5.0 notes call it the
+            "new default" (D91). Docker's VMM page gives two ranges for libkrun that cannot both be right (D92). The
+            19.03 notes' link text reads <code>moby/moby#380050</code> for pull 38050 (D94).
+          </p>
+          <h3>Versions, defaults and the reversal</h3>
+          <p>
+            Version numbers moved too. 17.03 switched to YY.MM CalVer, there was never a stable 22.x, and 23.0 went to
+            SemVer while making buildx the default builder. There is no Engine 27.0.0: a tag made by mistake was cached
+            by the Go module mirror, so 27.0.1 came first (D96). The 25–29 defaults are in
+            <a href="../run-path/">Parts 1</a> and <a href="../images/">2</a>. Two belong here. Read-only binds became
+            recursively read-only in 25.0, except for API &lt; 1.44 clients (D98). 29.0 raised the minimum API version
+            to 1.44 and 29.3 lowered it back to 1.40, so old SDKs behave differently by minor release (D97).
+          </p>
+          <p>
+            In 2026 the extraction reversed for the first time. 29.7.0 added an experimental
+            <code>embedded-containerd</code> that runs containerd's gRPC server inside <code>dockerd</code>. Since
+            29.8.0, <code>dockerd</code> falls back to it automatically when the containerd binary is missing, no
+            system containerd runs and no <code>--containerd</code> is set. Shims remain separate processes, so the
+            container still has no daemon ancestor (<a href="../run-path/#p1-shim">Part 1 §04</a>, D7). Pinned is not
+            installed either. The 29.9.2 source pins containerd 2.4.2 and runc 1.5.2, but packages ship their own
+            <code>containerd.io</code>. This box runs Engine 29.8.2 with containerd 2.3.6 and runc 1.5.1 (D95)
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The code at the pins shows where the work went. Counting hand-written Go and excluding vendored and
+            generated files: moby 382,553 lines, containerd 239,292, BuildKit 216,094, cli 110,387, distribution 55,769
+            and runc 31,969. Only 22,321 of runc's lines are non-test, about a tenth of <code>dockerd</code>'s. moby's
+            <code>vendor/</code> holds 2.23 million lines, and libnetwork, at 48,507 non-test lines, is its largest
+            subsystem <span class="recon">measured here</span>. Repository advisory lists count moby 26 (1 critical),
+            containerd 33 (5 critical), runc 13 and BuildKit 24, but they start in 2020–2021. Landmark CVEs such as
+            2019-5736 are absent (D100). moby's one critical, CVE-2024-41110 (2024-07-23), is a regression of an AuthZ bug
+            fixed in 18.09.1 in January 2019, and CVE-2026-34040, fixed in 29.3.1, is an incomplete fix for it (D99).
+          </p>
+
+          <h2 id="p4-findings"><span class="secnum">08</span>The findings register</h2>
+          <p>
+            Reading the pinned sources line by line against their docs, and measuring what this machine allowed, left
+            100 findings across the four parts. Figure 9 lists every one. They come from eight
+            topic dossiers, each checked by a separate verification pass, then deduplicated. Verification overrode the
+            dossiers wherever they disagreed. Findings it could not confirm were narrowed or dropped. The
+            <code>ptrace</code> half of D16 is gone, for example, and nothing is called a bug that verification did not
+            leave a bug.
+          </p>
+          <p>
+            The classes are fixed. <strong>A</strong> is a latent bug. <strong>B</strong> would be a bug fixed upstream
+            after the pin. <strong>C</strong> is doc drift: docs, comments or changelogs that disagree with the code or
+            with each other, where the code wins. <strong>D</strong> is a gotcha, correct by design or by accident but
+            surprising. <strong>E</strong> is a behaviour change, a default that moved at or after the pin. The counts
+            are A 6, B 0, C 21, D 67 and E 6. By part: D1–D22 in <a href="../run-path/">Part 1</a>, D23–D50 in
+            <a href="../images/">Part 2</a>, D51–D62 in <a href="../builds/">Part 3</a> and D63–D100 here.
+          </p>
+          <p>
+            Class B is empty for a measured reason. On 2026-10-23 the verifiers checked each finding against the default
+            branch of its repository: moby and docker/cli <code>master</code>, runc and containerd <code>main</code>,
+            BuildKit <code>master</code>, distribution <code>main</code> and docker/docs <code>main</code>. None had been
+            fixed since the pin. The "Upstream" column records what they saw; "on master" means the cited code is still
+            there. No reports were filed by this project. Where an upstream issue or pull request is named, as for D77
+            and D38, it was found, not filed <span class="recon">measured here</span>, from GitHub and the clones.
+            Upstream did move near some rows. runc's <code>main</code> replaced the exec.fifo poll after v1.5.2 (D22),
+            and containerd 2.4 records exit status in the bundle while moby keeps its own duplicate-exit filter (D11).
+            Those are behaviour changes, not fixes.
+          </p>
+          <h3>What the classes hold</h3>
+          <p>
+            The six latent bugs are small. A bad <code>detachKeys</code> in the config fails only after the container
+            exists (D3). One attach write ignores its error (D10). distribution's downgrade path hands an OCI manifest to a client that
+            asked for schema2 only (D36). <code>4 * 1048 * 1048</code> is a typo for 1024 (D42). Joined namespaces under
+            <code>userns-remap</code> overwrite each other's user namespace (D72). And <code>CreateCheckpoint</code>
+            reports success by wrapping a nil error, in a branch stock containerd never reaches (D80). None is a
+            security issue as found.
+          </p>
+          <p>
+            The 21 doc drifts mostly share a cause: the code moved and the prose did not. The live-restore page still
+            speaks of YY.MM releases (D12). The API changelog puts a 1.52 change under 1.53 (D90). The firewall docs state
+            a DROP policy that the code sets only conditionally (D64). Some drifts are inside the code: comments that
+            name the wrong field (D66), the wrong runc version (D19) or a fallback that does nothing (D65).
+          </p>
+          <p>
+            The 67 gotchas fall into four patterns. Several decisions rest on string matching: exit codes 125–127 (D1)
+            and the "created" state after a failed start (D9). Some paths drop data silently: a cut frame (D79), a slow
+            event subscriber (D85), the dual-logging cache (D86) and a broken credential helper (D47). Some names say less
+            than they seem to: "image ID" (D23), <code>OOMKilled</code> (D82) and CPU % (D83). And the code a host
+            runs is not always the code that was pinned (D95). The six behaviour changes are all deliberate, and most are
+            in the release notes. They matter because a host's behaviour now depends on the 29.x minor: the time
+            namespace (D17), the API floor (D97) and recursive read-only binds (D98).
+          </p>
+          <h3>Why D77 heads the list</h3>
+          <p>
+            D77 is the one most likely to hurt someone today. It is triggered by an ordinary operation, a reload signal
+            sent with <code>docker kill -s</code>. It fails silently, much later, at the next crash. It persists across
+            daemon restarts because the flag is checkpointed. It has an open fix and open issues going back to 2020, and
+            its first half was fixed in 2016. Its reproduction is three commands, in the D group's notes below. A
+            reader with a Docker host can run it in under a minute.
+          </p>
+          <p>
+            Rows marked <span class="recon">measured here</span> were reproduced on the research box, from registry and
+            lab traffic, the CLI against the mock daemon, or this sandbox's own files. The rest need a real Docker host,
+            or are code reading. Evidence is abbreviated to the file name and lines; the parts give full paths. Each
+            row's "Part" link goes to the section that discusses it, or to the part when no single section does.
+          </p>
+
+          <figure class="figure wide" id="fig-findings-register">
+            <div class="figure-head">
+              <span class="figure-label">Figure 9</span>
+              <p class="figure-title">All 100 findings by class, with evidence, upstream status and where each is discussed</p>
+            </div>
+            <div class="figure-body">
+              <details open>
+              <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">HEADLINE · D77</summary>
+              <table style="font-size: 13px; table-layout: fixed; width: 100%">
+              <thead><tr><th style="width: 7%">#</th><th style="width: 45%">Finding</th><th style="width: 24%">Evidence</th><th style="width: 17%">Upstream</th><th style="width: 7%">Part</th></tr></thead>
+              <tbody>
+              <tr><td>D77</td><td>docker kill -s &lt;sig&gt; can switch off restart policies, including unless-stopped with STOPSIGNAL</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">kill.go:80-103; restartmanager.go:46-91</td><td class="hl-red" style="background: var(--red-soft)">on master; #41302, #47792 open; PR #53415 open</td><td><a href="#p4-stop">4</a></td></tr>
+              </tbody>
+              </table>
+              </details>
+              <details open style="margin-top: 18px">
+              <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">A · LATENT BUGS, STILL PRESENT UPSTREAM (6)</summary>
+              <table style="font-size: 13px; table-layout: fixed; width: 100%">
+              <thead><tr><th style="width: 7%">#</th><th style="width: 45%">Finding</th><th style="width: 24%">Evidence</th><th style="width: 17%">Upstream</th><th style="width: 7%">Part</th></tr></thead>
+              <tbody>
+              <tr><td>D3</td><td>--detach-keys is validated from the flag, not the effective value: a bad config value fails after create</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">run.go:143-149; hijack.go:101-103</td><td>still on cli master</td><td><a href="../run-path/#p1-client">1</a></td></tr>
+              <tr><td>D10</td><td>Attach errors after the hijack are hand-written HTTP; the 101 write ignores errors (FIXME)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">container_routes.go:1142-1191</td><td>still on master</td><td><a href="../run-path/#p1-client">1</a></td></tr>
+              <tr><td>D36</td><td>distribution serves an OCI manifest to a schema2-only client via the list downgrade; logs say "schema1" <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">handlers/manifests.go:180-212</td><td>main byte-identical</td><td><a href="../images/#p2-server">2</a></td></tr>
+              <tr><td>D42</td><td>MaxManifestSize = 4 * 1048 * 1048: a typo for 1024, harmless</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">resolver.go:53-64</td><td>unchanged</td><td><a href="../images/#p2-wire">2</a></td></tr>
+              <tr><td>D72</td><td>Joining several netns under userns-remap silently overwrites the user namespace (moby#46210)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">oci_linux.go:254-262</td><td>FIXME on master</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D80</td><td>CreateCheckpoint reports success on "invalid checkpoint" (wraps a nil error); unreachable with stock containerd</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">libcontainerd/remote/client.go:454-456</td><td>identical; no issue</td><td><a href="#p4-observe">4</a></td></tr>
+              </tbody>
+              </table>
+              </details>
+              <details style="margin: 6px 0 4px">
+              <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for A</summary>
+              <pre><code># D3: a bad detachKeys in the config fails only after create
+              echo '{"detachKeys":"bogus"}' &gt; ~/.docker/config.json; docker run -it alpine; docker ps -a
+              # D36 (localhost distribution v3.1.2): GET a list tag with a schema2-only Accept;
+              #      an OCI manifest comes back (42-storage-lab.txt step T, measured here)
+              # D72: --userns-remap plus --network container:a with a second joined namespace
+              # D10, D42, D80: code reading; D80 needs a non-standard task service</code></pre>
+              </details>
+              <details open style="margin-top: 18px">
+              <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">C · DOC DRIFT: DOCS, COMMENTS OR CHANGELOGS DISAGREE WITH THE CODE (21)</summary>
+              <table style="font-size: 13px; table-layout: fixed; width: 100%">
+              <thead><tr><th style="width: 7%">#</th><th style="width: 45%">Finding</th><th style="width: 24%">Evidence</th><th style="width: 17%">Upstream</th><th style="width: 7%">Part</th></tr></thead>
+              <tbody>
+              <tr><td>D12</td><td>The live-restore page speaks of YY.MM patch releases; Engine left YY.MM at 23.0</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">docs: live-restore</td><td>page unchanged</td><td><a href="../run-path/#p1-exit">1</a></td></tr>
+              <tr><td>D16</td><td>Seccomp docs list clock_adjtime as blocked; the profile allows it <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">seccomp/default.json:78; docs</td><td>page unchanged</td><td><a href="../run-path/#p1-runc">1</a></td></tr>
+              <tr><td>D19</td><td>A comment says rootless without cgroup or pidns becomes an error "in runc 1.3"; in 1.5.2 it still warns</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">process_linux.go:828-836</td><td>still on main</td><td><a href="../run-path/">1</a></td></tr>
+              <tr><td>D20</td><td>runc's CHANGELOG lists CVE-2025-31133 twice for CVE-2026-41579</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">runc CHANGELOG.md:112-120</td><td>still on main</td><td><a href="../run-path/">1</a></td></tr>
+              <tr><td>D33</td><td>containerd's bolt schema comment says bucket "image"; the code uses "images"</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">metadata/buckets.go:65 vs :150</td><td>unchanged</td><td><a href="../images/#p2-store">2</a></td></tr>
+              <tr><td>D34</td><td>schema1 errors disagree on the containerd version that dropped it (2.0 vs 2.1)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pull.go:222-226; resolver.go:447-450</td><td>unchanged</td><td><a href="../images/">2</a></td></tr>
+              <tr><td>D35</td><td>Storage docs show only containerd-snapshotter: true; false is the explicit opt-out</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">image_store_choice.go:110-150</td><td>unchanged</td><td><a href="../images/#p2-two-stores">2</a></td></tr>
+              <tr><td>D38</td><td>distribution v3.1.2 has no referrers API (PR #4828 open)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">api/v2/descriptors.go:400-1541</td><td>unchanged</td><td><a href="../images/#p2-server">2</a></td></tr>
+              <tr><td>D41</td><td>Out-of-order PATCH returns RANGE_INVALID, a code not in the OCI spec <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">blobupload.go:145-166</td><td>unchanged</td><td><a href="../images/#p2-server">2</a></td></tr>
+              <tr><td>D45</td><td>Hub's live ratelimit window (3600 s) disagrees with its docs and token (21600 s) <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">03-head-tag.txt; 02-token.txt</td><td>docs unchanged</td><td><a href="../images/#p2-wire">2</a></td></tr>
+              <tr><td>D51</td><td>COPY --link --chmod silently drops link semantics, though the reference recommends the pair</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">convert_copy.go:336-355</td><td>still on master</td><td><a href="../builds/#p3-frontend">3</a></td></tr>
+              <tr><td>D64</td><td>FORWARD policy DROP is set only if dockerd flipped ip_forward; docs say always</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">setup_ip_forwarding.go:38-59</td><td>on master</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D65</td><td>TransformForIntNS promises "use the defaults"; the code only warns</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">resolvconf.go:241-292</td><td>on master</td><td><a href="#p4-dns">4</a></td></tr>
+              <tr><td>D66</td><td>Endpoint.Less's comment names ep.name as the last tie-break; code compares network names</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">sandbox.go:613-667</td><td>on master</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D71</td><td>selectFirewallBackend's two branches both return nil (cosmetic)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">firewall_linux.go:15-28</td><td>on master</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D73</td><td>docs/networkdb.md links an overlay.md that does not exist</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">libnetwork/docs/networkdb.md:27</td><td>on master</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D90</td><td>The API changelog puts jsonl events at 1.53; the code serves it from 1.52</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">system_routes.go:333-340</td><td>unchanged</td><td><a href="#p4-observe">4</a></td></tr>
+              <tr><td>D91</td><td>dockerd-rootless.sh and the 29.5.0 notes disagree on when gvisor-tap-vsock is the default</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">dockerd-rootless.sh:14, 41, 122-160</td><td>on master</td><td><a href="#p4-history">4</a></td></tr>
+              <tr><td>D92</td><td>Docker's VMM page gives two incompatible libkrun version ranges</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">docs desktop/features/vmm.md:21-43</td><td>docs unchanged</td><td><a href="#p4-history">4</a></td></tr>
+              <tr><td>D93</td><td>CNCF says containerd was "born at Docker in 2014"; its first commit is 2015-11-05</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">cncf.io 2019-02-28 release</td><td>page unchanged</td><td><a href="#p4-history">4</a></td></tr>
+              <tr><td>D94</td><td>The 19.03 notes' link text says moby#380050 for pull 38050</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">docs release-notes/19.03.md:554</td><td>docs unchanged</td><td><a href="#p4-history">4</a></td></tr>
+              </tbody>
+              </table>
+              </details>
+              <details style="margin: 6px 0 4px">
+              <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for C</summary>
+              <pre><code># D16: count the profile's rules (runc-kernel T6, measured here)
+              python3 -c 'import json;d=json.load(open("default.json"));print(len({n for s in d["syscalls"] for n in s["names"]}))'   # 426
+              # D41: PATCH an upload out of order; the error code is RANGE_INVALID (41-push-lab.txt step D)
+              # D45: curl -sI an anonymous HEAD on ratelimitpreview/test; read ratelimit-limit
+              # D64: iptables -S FORWARD on a host where ip_forward was already 1
+              # D90: curl --unix-socket /var/run/docker.sock -sI localhost/v1.52/events
+              # the rest: read the cited line beside the cited doc</code></pre>
+              </details>
+              <details open style="margin-top: 18px">
+              <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">D · GOTCHAS: CORRECT BY DESIGN OR ACCIDENT, BUT SURPRISING (67, WITH D77 ABOVE)</summary>
+              <table style="font-size: 13px; table-layout: fixed; width: 100%">
+              <thead><tr><th style="width: 7%">#</th><th style="width: 45%">Finding</th><th style="width: 24%">Evidence</th><th style="width: 17%">Upstream</th><th style="width: 7%">Part</th></tr></thead>
+              <tbody>
+              <tr><td>D1</td><td>Exit codes 125/126/127 come from substring-matching error text, on both CLI and daemon</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">run.go:326-356; errors.go:126-166</td><td>still on master</td><td><a href="../run-path/#p1-shim">1</a></td></tr>
+              <tr><td>D2</td><td>ENOTDIR (a file bound over a directory) maps to 127 "command not found"</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">errors.go:152-157</td><td>still on master</td><td><a href="../run-path/#p1-shim">1</a></td></tr>
+              <tr><td>D4</td><td>StdinOnce closes the container's stdin only without a TTY; with -it it closes this attach's output</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">stream/attach.go:69-80</td><td>still on master</td><td><a href="../run-path/#p1-client">1</a></td></tr>
+              <tr><td>D5</td><td>Exit-time stdio drain is capped at 2 s; late output may not reach an attached client</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">monitor.go:84-86</td><td>still on master</td><td><a href="../run-path/#p1-exit">1</a></td></tr>
+              <tr><td>D6</td><td>Without live-restore, a dockerd restart shuts down containers that survived the crash</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">daemon.go:458-535</td><td>intended</td><td><a href="../run-path/#p1-exit">1</a></td></tr>
+              <tr><td>D7</td><td>Embedded containerd switches on silently when no containerd is installed or running; docker info shows nothing</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">daemon_unix.go:132-149; info.go:255-268</td><td>unchanged; in 29.8.0 notes</td><td><a href="../run-path/#p1-shim">1</a></td></tr>
+              <tr><td>D8</td><td>--use-api-socket copies registry credentials into the writable layer, and may leave them there</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">create.go:244-310</td><td>still on master</td><td><a href="../run-path/#p1-spec">1</a></td></tr>
+              <tr><td>D9</td><td>A start failing in network setup leaves the container created, detected by string-matching ErrorMsg</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">monitor.go:39-51</td><td>still on master</td><td><a href="../run-path/#p1-exit">1</a></td></tr>
+              <tr><td>D13</td><td>runc appends "mknod any char/block device" to every container's device rules; users cannot remove it</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">specconv/spec_linux.go:220-254</td><td>still on main</td><td><a href="../run-path/#p1-runc">1</a></td></tr>
+              <tr><td>D14</td><td>Without no-new-privileges, the seccomp filter goes on before caps drop: profiles must allow runc init's later calls</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">standard_init_linux.go:188-248</td><td>intended</td><td><a href="../run-path/#p1-runc">1</a></td></tr>
+              <tr><td>D15</td><td>socketcall(2) is allowed, so 32-bit code can bypass the AF_ALG/AF_VSOCK socket() block</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">seccomp/default.json:4-10, 374</td><td>documented</td><td><a href="../run-path/#p1-runc">1</a></td></tr>
+              <tr><td>D18</td><td>runc exec arms AppArmor after finalizeNamespace, create before the masks; both only set an on-exec profile, so confinement is identical (runc#5362 would unify it)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">setns_init_linux.go:117-122; apparmor_linux.go:52-68</td><td>still on main; PR open</td><td><a href="../run-path/#p1-runc">1</a></td></tr>
+              <tr><td>D21</td><td>Kernels 6.17 to before 7.2 corrupt runc &lt; 1.5.2's memory while setting cgroup v2 device rules</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">runc CHANGELOG.md:16-21</td><td>worked around at the pin</td><td><a href="../run-path/">1</a></td></tr>
+              <tr><td>D23</td><td>"Image ID" means config digest in the legacy store and index digest in the containerd store</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">image_list.go:439; image/fs.go:112-126</td><td>unchanged</td><td><a href="../images/#p2-two-stores">2</a></td></tr>
+              <tr><td>D24</td><td>Upgraded hosts keep the legacy store silently if any prior graphdriver dir exists</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">image_store_choice.go:105-134</td><td>intended</td><td><a href="../images/#p2-two-stores">2</a></td></tr>
+              <tr><td>D25</td><td>The containerd store keeps compressed blobs and snapshots, and fetches every blob: disk ≈ both</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">image_pull.go:224-237</td><td>unchanged</td><td><a href="../images/#p2-store">2</a></td></tr>
+              <tr><td>D26</td><td>userns-remap disables the containerd image store</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">daemon_linux.go:28-40</td><td>unchanged</td><td><a href="../images/#p2-two-stores">2</a></td></tr>
+              <tr><td>D27</td><td>Overlay-native differs emit opaque whiteouts; appliers that handle only .wh.&lt;name&gt; leak lower files</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">image-spec layer.md:315; archive_linux.go:69-93</td><td>unchanged</td><td><a href="../images/#p2-layers">2</a></td></tr>
+              <tr><td>D28</td><td>moby and containerd write different whiteout headers: same deletion, different DiffIDs</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">archive_linux.go:54-63; tar.go:557-580</td><td>unchanged</td><td><a href="../images/#p2-layers">2</a></td></tr>
+              <tr><td>D29</td><td>Docker's attestations hang off the index, so Hub's referrers endpoint returns nothing for alpine <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">referrers-alpine-amd64.json</td><td>measured here</td><td><a href="../images/#p2-lede">2</a></td></tr>
+              <tr><td>D30</td><td>A DiffID covers the tar's end padding (1,192 zero bytes for alpine) <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">apply.go:134-137; layer_store.go:218-256</td><td>—</td><td><a href="../images/">2</a></td></tr>
+              <tr><td>D31</td><td>overlay2's 26-char links fit 128 lowers in a page; a long SELinux label still fails the mount</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">overlay2/overlay.go:69-86, 580-602</td><td>unchanged</td><td><a href="../images/#p2-two-stores">2</a></td></tr>
+              <tr><td>D32</td><td>containerd and moby handle overlay whiteouts in a user namespace differently</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">apply_linux.go:34-73; archive_linux.go:97-140</td><td>unchanged</td><td><a href="../images/#p2-layers">2</a></td></tr>
+              <tr><td>D37</td><td>Offline GC deleted a blob mounted into a repo without a manifest, and left a list pointing at a 404 <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">garbagecollect.go:34-240</td><td>main identical</td><td><a href="../images/#p2-server">2</a></td></tr>
+              <tr><td>D39</td><td>distribution ignores ?digest= on POST uploads: 202, body discarded <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">blobupload.go:67-104</td><td>main identical</td><td><a href="../images/#p2-server">2</a></td></tr>
+              <tr><td>D40</td><td>An empty upload session answers Range: 0-0, which claims byte 0 was received <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">blobupload.go:373-382</td><td>main identical</td><td><a href="../images/#p2-server">2</a></td></tr>
+              <tr><td>D43</td><td>containerd retries 408/429 at once, with no backoff and no Retry-After, up to 5 attempts</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">resolver.go:772-897</td><td>unchanged</td><td><a href="../images/#p2-wire">2</a></td></tr>
+              <tr><td>D44</td><td>dockerd's 3 download slots are shared by every concurrent pull</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">containerd/service.go:61-131</td><td>identical</td><td><a href="../images/#p2-credentials">2</a></td></tr>
+              <tr><td>D46</td><td>Hub and ghcr ignore Accept; distribution enforces it with 404 <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">manifests.go:95-178</td><td>spec still TODO</td><td><a href="../images/#p2-server">2</a></td></tr>
+              <tr><td>D47</td><td>An undecodable X-Registry-Auth is ignored on pull: an anonymous pull, not an error</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">image_routes.go:102-106</td><td>identical</td><td><a href="../images/#p2-credentials">2</a></td></tr>
+              <tr><td>D48</td><td>manifest inspect calls the helper's get twice; logout ghcr.io erases four times <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">logout.go:54-77</td><td>cli master identical</td><td><a href="../images/#p2-credentials">2</a></td></tr>
+              <tr><td>D49</td><td>Without http.secret, each registry replica signs upload state differently; LB uploads break</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">handlers/app.go:683-692</td><td>unchanged</td><td><a href="../images/#p2-server">2</a></td></tr>
+              <tr><td>D50</td><td>Tag listing sends Link on a full final page: one wasted round trip <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">handlers/tags.go:36-98</td><td>main identical</td><td><a href="../images/#p2-server">2</a></td></tr>
+              <tr><td>D52</td><td>Rotating a secret's value never invalidates a cached RUN --mount=type=secret step</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ops/exec.go:297-303</td><td>intended</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D53</td><td>Proxy build-args and --add-host IPs are scrubbed from the RUN cache key</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ops/exec.go:114-132</td><td>on master</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D54</td><td>A cache mount's id= and sharing= are cleared from the cache key</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ops/exec.go:93-112</td><td>intended</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D55</td><td>On the legacy store dockerd's builder exports only inline cache; no s3 or azblob</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">builder-next/controller.go:227-519</td><td>on master</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D56</td><td>An invalid --cache-to mode= is silently treated as min</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">control/control.go:491-727</td><td>on master</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D57</td><td>dockerd's BuildKit execs runc directly; containerd tooling never sees RUN steps</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">executor_linux.go:56-90</td><td>on master</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D58</td><td>Default build GC evicts cache mounts and sources first: 48 h idle, e·π·φ ≈ 13.8 %</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">worker/gc.go:18-50</td><td>on master</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D59</td><td>BuildKit's own provenance default is mode=max; buildx asks for min</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">llbsolver/provenance.go:408-418</td><td>unchanged</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D60</td><td>.dockerignore does not filter COPY --from=&lt;stage&gt;</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">convert.go:1120-1132</td><td>unchanged</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D61</td><td>Mode, uid/gid and xattrs count in the COPY content hash; mtime does not</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">contenthash/filehash.go:44-73</td><td>unchanged</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D63</td><td>DNS to host-resolv.conf upstreams is dialed from the host netns, bypassing DOCKER-USER</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">resolvconf.go:251-266; resolver.go:483-509</td><td>intended</td><td><a href="#p4-dns">4</a></td></tr>
+              <tr><td>D67</td><td>One -p spawns two proxies; --userland-proxy=false drops the only v6 path to a v4-only container</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">port_mapping_linux.go:195-289</td><td>unchanged</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D68</td><td>The default bridge has no embedded DNS; loopback nameservers stripped, 8.8.8.8 substituted</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">network.go:986-988; resolvconf.go:297-398</td><td>documented</td><td><a href="#p4-dns">4</a></td></tr>
+              <tr><td>D69</td><td>The embedded DNS plumbing is IPv4-only (TODO IPv6 support)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">resolver_unix.go:14-93</td><td>on master</td><td><a href="#p4-dns">4</a></td></tr>
+              <tr><td>D70</td><td>nftables mode has no DOCKER-USER; swarm refused without a feature flag</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config_linux.go:129-140</td><td>unchanged</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D74</td><td>Routed gateway mode ignores the host port: -p 8080:80 opens port 80</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">routed/mapper_linux.go:23-46</td><td>unchanged</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D75</td><td>127.0.0.1 publishes were reachable from the L2 segment before 28.0; an env var removes the fix</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">iptabler/port.go:187-225</td><td>unchanged</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D76</td><td>Each docker-proxy pins one locked OS thread in dockerd</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">portmapper/proxy_linux.go:21-158</td><td>on master</td><td><a href="#p4-network">4</a></td></tr>
+              <tr><td>D78</td><td>json-file is unbounded by default; max-size without max-file unlinks all history</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">jsonfilelog.go:39-72; logfile.go:227-230</td><td>unchanged</td><td><a href="#p4-bytes">4</a></td></tr>
+              <tr><td>D79</td><td>StdCopy treats a cut frame as clean EOF and allocates whatever a header claims <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">api/pkg/stdcopy/stdcopy.go:26-116</td><td>identical</td><td><a href="#p4-bytes">4</a></td></tr>
+              <tr><td>D81</td><td>docker cp out holds the container lock until the tar is read, blocking stop/kill/pause (inferred)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">archive_unix.go:40-92</td><td>unchanged</td><td><a href="#p4-observe">4</a></td></tr>
+              <tr><td>D82</td><td>OOMKilled means some process in the cgroup was killed, not PID 1</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">monitor.go:190-206</td><td>unchanged</td><td><a href="#p4-observe">4</a></td></tr>
+              <tr><td>D83</td><td>stats CPU % is scaled by host CPUs, not quota; failcnt is oom, not max <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">stats_helpers.go:183-200; stats_unix.go:245-249</td><td>unchanged</td><td><a href="#p4-observe">4</a></td></tr>
+              <tr><td>D84</td><td>Labels overwrite event attributes: a label named exitCode falsifies die events (inferred)</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">daemon/events.go:26-38</td><td>unchanged</td><td><a href="#p4-observe">4</a></td></tr>
+              <tr><td>D85</td><td>Live events are dropped for a subscriber slower than 100 ms, silently</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">events/events.go:13-96; pubsub publisher.go</td><td>unchanged</td><td><a href="#p4-observe">4</a></td></tr>
+              <tr><td>D86</td><td>The dual-logging cache is a lossy ring by default; primary logging blocks</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">cache/local_cache.go:42-51</td><td>unchanged</td><td><a href="#p4-bytes">4</a></td></tr>
+              <tr><td>D87</td><td>logs -f on a stopped container prints history and exits; start does not reattach</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">daemon/logs.go:78, 148-167</td><td>unchanged</td><td><a href="#p4-bytes">4</a></td></tr>
+              <tr><td>D88</td><td>--tmpfs is noexec; first probe after one interval; unhealthy triggers nothing outside swarm</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">oci_linux.go:522-536; health.go:23-41</td><td>unchanged</td><td><a href="#p4-observe">4</a></td></tr>
+              <tr><td>D89</td><td>Unpausing an unpaused container is a 500, pausing a paused one 409; commit ignores both</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">unpause.go:27-29; pause.go:34-37</td><td>unchanged</td><td><a href="#p4-observe">4</a></td></tr>
+              <tr><td>D95</td><td>Pinned is not installed: packages ship their own containerd.io (2.3.6 / runc 1.5.1 here) <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">Dockerfile:142-147, 248-253</td><td>—</td><td><a href="#p4-history">4</a></td></tr>
+              <tr><td>D96</td><td>There is no Engine 27.0.0 and no stable 22.x <span class="recon">measured here</span></td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">release-notes/27.md:633-636</td><td>—</td><td><a href="#p4-history">4</a></td></tr>
+              <tr><td>D99</td><td>AuthZ body forwarding regressed twice: CVE-2024-41110, then an incomplete fix CVE-2026-34040</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">GHSA-v23v-6jw2-98fq, -x744-4wpc-v9h2</td><td>fixed in 29.3.1</td><td><a href="#p4-history">4</a></td></tr>
+              <tr><td>D100</td><td>Repo-level GHSA lists start in 2020–2021, so landmark CVEs are absent</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">history-ecosystem/*-ghsa.json</td><td>—</td><td><a href="#p4-history">4</a></td></tr>
+              </tbody>
+              </table>
+              </details>
+              <details style="margin: 6px 0 4px">
+              <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for D</summary>
+              <pre><code># D77, the headline (needs a real host):
+              docker run -d --name c --restart unless-stopped --stop-signal SIGTERM nginx
+              docker kill -s HUP c; docker exec c kill 1; sleep 2; docker ps -a   # not restarted
+              # workaround: docker exec c kill -HUP 1   (or kill -HUP on the host PID)
+              # D1: docker run alpine /nonexistent; echo $?    → 127
+              # D67, D76: ps -ef | grep docker-proxy; ls /proc/$(pidof dockerd)/task | wc -l
+              # D63: drop the container's subnet in DOCKER-USER, then docker exec c nslookup example.com
+              # D78: docker run --log-opt max-size=1k …; ls -l /var/lib/docker/containers/&lt;id&gt;/
+              # D81: docker cp c:/big - | pv -L 1k &gt;/dev/null &amp; sleep 1; time docker stop c
+              # D82: fork a memory hog child in a --memory container; PID 1 survives, OOMKilled: true
+              # D83: lifecycle-io stats_sample.py over /sys/fs/cgroup (measured here: 202.33 %)
+              # D29, D30, D37, D39, D40, D46, D48, D50: the Part 2 lab files (measured here)
+              # D79: the mock daemon's trunc stream (CLI exit 0, partial frame dropped; measured here)</code></pre>
+              </details>
+              <details open style="margin-top: 18px">
+              <summary style="cursor: pointer; font: 700 11px var(--mono); letter-spacing: 0.08em; color: var(--ink-faint); margin-bottom: 10px">E · BEHAVIOUR CHANGES AT OR AFTER THE PIN (6)</summary>
+              <table style="font-size: 13px; table-layout: fixed; width: 100%">
+              <thead><tr><th style="width: 7%">#</th><th style="width: 45%">Finding</th><th style="width: 24%">Evidence</th><th style="width: 17%">Upstream</th><th style="width: 7%">Part</th></tr></thead>
+              <tbody>
+              <tr><td>D11</td><td>containerd 2.4's shim records exit status in the bundle, so the duplicate exit carries the real status; moby's duplicate-exit filter is still needed</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">shim task/service.go:658-800; monitor.go:55</td><td>both on default branches</td><td><a href="../run-path/#p1-exit">1</a></td></tr>
+              <tr><td>D17</td><td>Since 29.5.0 containers get a private time namespace by default</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pkg/oci/defaults.go:117-124</td><td>on master</td><td><a href="../run-path/#p1-spec">1</a></td></tr>
+              <tr><td>D22</td><td>After v1.5.2, runc replaced the exec.fifo 100 ms poll with poll(2) + pidfd; poststart hooks moved to start</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">container_linux.go:233-265</td><td>changed after pin, in 1.6.0-rc.1</td><td><a href="../run-path/#p1-fifo">1</a></td></tr>
+              <tr><td>D62</td><td>v0.34.0 dropped the DiffID/ChainID fallback for image-source cache keys; moby ≥ 29.8.2 re-adds a verified ChainID key for bases in the classic store</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">containerimage/pull.go:62-183</td><td>on master</td><td><a href="../builds/">3</a></td></tr>
+              <tr><td>D97</td><td>Minimum API went 1.40 → 1.44 in 29.0 and back to 1.40 in 29.3</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">config/config.go:61-71; 29.md</td><td>—</td><td><a href="#p4-history">4</a></td></tr>
+              <tr><td>D98</td><td>Read-only binds became recursively read-only in 25.0, except for API &lt; 1.44</td><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">25.0.md:192-193; 26.0.md:126</td><td>—</td><td><a href="#p4-history">4</a></td></tr>
+              </tbody>
+              </table>
+              </details>
+              <details style="margin: 6px 0 4px">
+              <summary style="cursor: pointer; font: 600 12px var(--mono); color: var(--ink-soft)">Reproductions for E</summary>
+              <pre><code># D17: readlink /proc/&lt;ctr-pid&gt;/ns/time; readlink /proc/1/ns/time   (differ since 29.5.0)
+              # D22: diff runc v1.5.2 and main libcontainer/container_linux.go
+              # D97: curl --unix-socket /var/run/docker.sock localhost/v1.41/version on 29.0 vs 29.3+
+              # D98: docker run -v /:/host:ro alpine touch /host/&lt;nested mount&gt;/x  (fails since 25.0)</code></pre>
+              </details>
+            </div>
+            <p class="figure-caption">
+              From DOSSIER §4 after verification. Upstream status is each repository's default branch as checked on
+              2026-10-23; no finding was fixed upstream after the pin, and none was reported by this project. Paths are
+              shortened to file and lines; each part gives the full repository path. The reproductions under each class
+              need a real Docker host unless marked measured here.
+            </p>
+          </figure>
+
+          <h2 id="p4-sources"><span class="secnum">09</span>Sources</h2>
+          <ul>
+            <li>moby <code>docker-v29.9.2</code> (<code>0367cbeb49b9</code>), docker/cli v29.9.2, containerd v2.4.2, runc v1.5.2; pid_namespaces(7); Docker's docs and release notes; the OCI, CNCF, Kubernetes, Mirantis and Docker announcements behind §07's dates, as cited in the dossier's ledger.</li>
+            <li>Lab evidence in <code>~/docker-ref/lab/results/</code>: <code>networking/</code> (golden iptables and nft files, diffs, <code>docker-proxy</code> help, this host's netns), <code>lifecycle-io/</code> (mock daemon, CLI sessions, wire logs, frame bytes, cgroup reads, stats re-implementation) and <code>history-ecosystem/</code> (line counts, advisories, binary versions).</li>
+          </ul>
+          <p class="footnote">
+            <strong>Provenance.</strong> Paths and excerpts were re-read at the pins. Labels: CLI traces are the real
+            docker CLI 29.8.2 against a hand-written mock daemon (its responses are invented); rule dumps are moby's golden test files;
+            stats figures are arithmetic over this sandbox's cgroup files. Nothing here observed a running
+            <code>dockerd</code>. From code only: two proxies and two threads per <code>-p</code> (D67, D76), the DNS
+            bypass (D63), the 10-second stop of a shell PID 1, D77, and <code>docker cp</code> blocking stop (D81).
+            The nftables backend with firewalld, networking on live-restore and ring-logger memory are read from code.
+            Open: Desktop's 2026 network stack, OOM victims with <code>--init</code>, and secondary-only history dates.
+            TTY logs as <code>stdout</code> (the shim's <code>CopyConsole</code>), the tmpfs default size
+            (<code>size=50%</code>, kernel tmpfs.rst) and Docker 1.10 shipping the embedded DNS (CHANGELOG, #19198)
+            are now cited. On a
+            real host: <code>sudo iptables-save; sudo nft list ruleset</code>; <code>ps -ef | grep docker-proxy</code>;
+            <code>time docker stop $(docker run -d alpine sleep 1000)</code>, then inspect its exit code, which should be
+            137; a DOCKER-USER drop plus <code>nslookup</code> under <code>tcpdump -i any port 53</code>; and the D77
+            reproduction in §08.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Docker, taken apart</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../run-path/">Part 1: From docker run to a process</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../images/">Part 2: Images, layers and the registry</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../builds/">Part 3: How BuildKit builds</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

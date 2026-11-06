@@ -1,0 +1,125 @@
+          <h2 id="p3-frontend"><span class="secnum">{{S}}</span>From Dockerfile to LLB</h2>
+          <p>
+            A frontend is a compiler. Its input is a Dockerfile and a set of options; its output is an LLB definition the
+            solver can run. <code>Dockerfile2LLB</code> works in three stages. <code>parser.Parse</code> turns bytes into
+            an AST of <code>Node</code>s. <code>instructions.Parse</code> turns the AST into typed <code>Stage</code>s
+            plus the global <code>ARG</code>s. A dispatch loop then turns each stage into an <code>llb.State</code>. An
+            empty Dockerfile, or one with no stages, is an error
+            (<code>buildkit/frontend/dockerfile/dockerfile2llb/convert.go:236-279</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>What the parser keeps</h3>
+          <p>
+            Each AST node keeps the instruction's value, its flags, any heredoc bodies, and the comment lines just above
+            it as <code>PrevComment</code>, which only the linter reads. Every other comment is thrown away, including one
+            inside a line continuation (<code>parser/parser.go:31-42, 334-338</code>). That one decision explains a cache
+            behaviour in <a href="#p3-solver">§04</a>: editing a comment cannot change anything downstream, because no comment survives the
+            parser. There are exactly three parser directives, <code>syntax</code>, <code>escape</code> and
+            <code>check</code>. Scanning stops at the first line that is not a <code>#</code> comment of the form
+            <code>key=value</code> with a known key, and a repeated directive is an error
+            (<code>parser/directives.go:14-24, 50-96</code>). <code>DetectSyntax</code> also accepts
+            <code>// syntax=</code> and a JSON <code>{"syntax": …}</code> form and skips a leading <code>#!</code>, so a
+            file that is not a Dockerfile can pick its compiler the same way <span class="src">from the code</span>.
+          </p>
+          <h3>What each instruction becomes</h3>
+          <p>
+            Most instructions produce no vertex at all. <code>ENV</code>, <code>ARG</code>, <code>USER</code>,
+            <code>LABEL</code>, <code>CMD</code>, <code>ENTRYPOINT</code>, <code>EXPOSE</code> and the metadata part of
+            <code>WORKDIR</code> only edit the state and the image config. <code>ENV</code> and <code>ARG</code> call
+            <code>State.AddEnv</code>, so they reach the graph only through the <code>Meta.env</code> of later
+            <code>RUN</code>s. Every instruction still appends a history entry to the image config, with
+            <code>EmptyLayer: true</code> for the metadata-only ones (<code>convert.go:1331-1344, 1708-1713,
+            1817-1829</code>) <span class="src">from the code</span>. The rest map one to one:
+          </p>
+          <ul>
+            <li><code>FROM image</code> is resolved to a digest <em>during compilation</em>.
+              <code>ResolveImageConfig</code> fetches the config, the reference is rewritten to
+              <code>name:tag@sha256:…</code>, and the pinned reference becomes a <code>docker-image://</code> SourceOp. A
+              base whose config has no DiffIDs and no non-empty history becomes <code>llb.Scratch()</code>
+              (<code>convert.go:695-753</code>).</li>
+            <li><code>RUN</code> becomes an ExecOp whose root mount output is the next state. Shell form is prefixed
+              with the image's <code>SHELL</code> or the OS default. A heredoc that starts with <code>#!</code> is written
+              into a 0755 file by a scratch FileOp, mounted read-only under <code>/dev/pipes/</code>, and executed
+              directly (<code>convert.go:1360-1384, 1405-1508</code>).</li>
+            <li><code>COPY</code> and <code>ADD</code> become a FileOp copy action with
+              <code>CopyDirContentsOnly</code>, <code>FollowSymlinks</code>, <code>AllowWildcard</code>,
+              <code>AllowEmptyWildcard</code> and <code>CreateDestPath</code> set; <code>ADD</code> adds
+              <code>AttemptUnpack</code> for local archives, and a URL or git source becomes its own SourceOp
+              (<code>convert_copy.go:180-293</code>).</li>
+          </ul>
+          <p>
+            <code>COPY --link</code> takes a different shape. The copy goes onto an empty <code>llb.Scratch()</code>
+            and the result is joined to the current state with a <code>MergeOp</code>, so the new layer does not depend
+            on the layers below it. The condition is one line, <code>convert_copy.go:337</code>, and the two branches are
+            <code>:352-355</code>:
+          </p>
+<pre><code>	if cfg.opt.llbCaps != nil &amp;&amp; cfg.opt.llbCaps.Supports(pb.CapMergeOp) == nil &amp;&amp; cfg.link &amp;&amp; cfg.chmod == "" {
+…
+		d.state = d.state.WithOutput(llb.Merge([]llb.State{d.state, llb.Scratch().File(a, copyOpts...)}, mergeOpts...).Output())
+	} else {
+		d.state = d.state.File(a, fileOpt...)
+	}</code></pre>
+          <p>
+            <code>cfg.chmod == ""</code> means a <code>COPY --link --chmod=…</code> silently becomes an ordinary
+            copy. Meanwhile the Dockerfile reference suggests <code>--chmod</code> as one fix for directory modes under
+            <code>--link</code> (<code>frontend/dockerfile/docs/reference.md:2008-2014</code>), and
+            <code>--link --chown=&lt;name&gt;</code> is a hard error by contrast. This is register D51, class C (doc
+            drift), still the same on BuildKit's <code>master</code> <span class="src">from the code</span>.
+          </p>
+          <h3>Stages that never exist</h3>
+          <p>
+            Stage dependencies come from <code>FROM &lt;stage&gt;</code>, <code>COPY --from</code> and
+            <code>RUN --mount=from=</code>. Cycles are rejected, and <code>ONBUILD</code> triggers are re-resolved in a
+            loop because they can add edges (<code>convert.go:518-586</code>). The frontend then computes
+            <code>allReachableStages(target)</code> and never dispatches any other stage unless
+            <code>AllStages</code> is set; the default target is the last stage (<code>convert.go:507-510, 589,
+            779-783</code>). An unused stage is not skipped at run time. It never becomes LLB. Base images of every stage
+            are resolved concurrently, one goroutine per stage, but only reachable stages fetch a config
+            <span class="src">from the code</span>. Nothing in the frontend schedules parallel work: independent stages
+            are disjoint subgraphs of one DAG, and the solver runs independent edges at the same time
+            (<code>docs/dev/solver.md:225-232</code>).
+          </p>
+          <h3><code># syntax=</code> swaps the compiler</h3>
+          <p>
+            The built-in frontend reads the Dockerfile first. If a <code>BUILDKIT_SYNTAX</code> build-arg or a
+            <code># syntax=</code> line names an image, it forwards the whole build to it
+            (<code>frontend/dockerfile/builder/build.go:54-58, 62-63</code>):
+          </p>
+<pre><code>	if _, ok := opts["cmdline"]; !ok {
+		if cmdline, ok := opts[keySyntaxArg]; ok {
+			p := strings.SplitN(strings.TrimSpace(cmdline), " ", 2)
+			res, err := forwardGateway(ctx, c, p[0], cmdline)
+			if err != nil &amp;&amp; len(errdefs.Sources(err)) == 0 {
+…
+		} else if ref, cmdline, loc, ok := parser.DetectSyntax(src.Data); ok {
+			res, err := forwardGateway(ctx, c, ref, cmdline)</code></pre>
+          <p>
+            The build-arg wins over the line, and the <code>cmdline</code> check stops a forwarded frontend from
+            forwarding again. <code>forwardGateway</code> is a nested <code>Solve</code> with
+            <code>Frontend: "gateway.v0"</code>, the image in <code>source</code> and the directive in
+            <code>cmdline</code>. <code>gateway.v0</code> resolves the image to a digest, solves it as ordinary LLB and
+            runs its entrypoint, <code>/run</code> by default, through the same executor as a <code>RUN</code> step. The
+            options arrive as <code>BUILDKIT_FRONTEND_OPT_&lt;n&gt;</code> environment variables. The frontend talks back
+            over gRPC on its own stdin and stdout: two <code>os.Pipe()</code>s wrapped as a <code>net.Conn</code>,
+            served by a <code>grpc.Server</code> exposing <code>LLBBridge</code>
+            (<code>frontend/gateway/gateway.go:489-534</code>) <span class="src">from the code</span>. Through it the
+            frontend can resolve image configs, call <code>Solve</code> recursively, read files out of results, run
+            containers with <code>NewContainer</code> and <code>ExecProcess</code>, warn, and finally
+            <code>Return</code> (<code>frontend/gateway/pb/gateway.proto:15-46</code>). Images opt into features with
+            the <code>moby.buildkit.frontend.caps</code> label; a hard-coded list of four
+            <code>docker/dockerfile:1.1.x</code> digests is granted the "inputs" cap because they predate the label.
+          </p>
+          <p>
+            alpine:latest was built this way. Its published SLSA provenance for linux/amd64 records the frontend and the
+            three keys <code>build.go</code> sets <span class="recon">measured here</span>:
+          </p>
+<pre><code>"frontend": "gateway.v0",
+"build-arg:BUILDKIT_SYNTAX": "tianon/buildkit:0.16@sha256:74e9cc0b4cdd66fe1ef01e9ca16a74e400d10aa52ba568ae56e8c38eb70695a3",
+"cmdline":                   "tianon/buildkit:0.16@sha256:74e9cc0b…",
+"source":                    "tianon/buildkit:0.16@sha256:74e9cc0b…"</code></pre>
+          <p>
+            The Dockerfile itself, base64 in the same record, is three lines: <code>FROM scratch</code>,
+            <code>ADD alpine-minirootfs-3.24.3-x86_64.tar.gz /</code> and <code>CMD ["/bin/sh"]</code>
+            <span class="recon">measured here</span>. <code>FROM scratch</code> and <code>CMD</code> make no vertex. The
+            next section takes the graph that remains apart byte by byte.
+          </p>

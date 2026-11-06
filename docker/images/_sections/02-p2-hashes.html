@@ -1,0 +1,187 @@
+          <h2 id="p2-hashes"><span class="secnum">{{S}}</span>Digest, DiffID, ChainID</h2>
+          <p>
+            "The same layer" has three hashes, and they answer three different questions. The <em>digest</em> in the
+            manifest is the sha256 of the bytes as stored and shipped, which are usually gzip. The <em>DiffID</em> in the
+            config is the sha256 of the uncompressed tar (<code>image-spec/config.md:26-31</code>). The
+            <em>ChainID</em> names a stack of layers applied in order (<code>config.md:42-53</code>)
+            <span class="src">from the code</span>. The first is for transport, the second pins content, the third
+            names a filesystem state.
+          </p>
+          <p>
+            Each exists because one consumer needs it. A registry and a downloader verify a blob by its digest without
+            decompressing anything. A runtime verifies what it extracted by the DiffID, whatever compression arrived.
+            A snapshotter asks "do I already have exactly this filesystem?" by ChainID, without knowing which image
+            or registry the layers came from <span class="recon">reconstruction</span>. Mixing them up is the usual
+            source of "why are these two digests different?"
+          </p>
+          <h3>One tar, many digests</h3>
+          <p>
+            The alpine layer checks out at both ends. The 3,853,109 bytes served by the CDN hash to the manifest's
+            <code>7b229517…</code>. Inflated, they are an 8,709,632-byte tar that hashes to the config's
+            <code>75c137ae…</code> <span class="recon">measured here</span>. Recompressing that tar breaks the first
+            hash and keeps the second:
+          </p>
+<pre><code># same tar, different compressors -&gt; different digest, same diffID
+75c137aedfb2760f88629236cb7b797630aed0c3d91d626d1d1bb694878fc2ba  diffID (uncompressed tar)
+7b229517ed222597277036d94892173207d01a731ab3a88eeb1de2e963a2c788  registry blob (gzip as published)
+112b2e6f53918c25745148597450376649b5b7f41a2e0fe78d1e3ab13b2422fd  gzip -9 -n recompress
+11bb4b9d8a07090f1d678ade19e579845d0ffe39eec23557d3f79f69081b19fb  gzip -1 -n recompress</code></pre>
+          <p>
+            So two registries, or two builders, can hold the same image content under different manifest digests. The
+            gzip header shows what the builder did to stay reproducible. Hub's alpine layer starts
+            <code>1f 8b 08 00 00 00 00 00 00 ff</code>: deflate, no flags, MTIME zero, OS <code>0xff</code> (unknown).
+            The distroless layers also zero MTIME but write OS <code>0x03</code> (Unix)
+            <span class="recon">measured here</span>. A zero timestamp is what lets the same input give the same
+            bytes.
+          </p>
+          <p>
+            Inside the gzip is a POSIX ustar archive: <code>ustar\0</code> and version <code>00</code> at offset 257
+            of the first header. It has 515 entries, of which 335 are symlinks, 96 directories and 84 regular files,
+            with no hardlinks and no PAX headers. Nearly every applet is a symlink to <code>/bin/busybox</code>
+            (804,616 bytes). Every entry is owned 0/0 except <code>etc/shadow</code>, which is 0/42
+            <span class="recon">measured here</span>.
+          </p>
+          <h3>The padding is part of the name</h3>
+          <p>
+            A tar ends with two 512-byte zero blocks, and writers pad further to a record size. The alpine tar ends
+            with 1,192 zero bytes after its last non-zero byte, and all of them are inside the 8,709,632 hashed bytes
+            <span class="recon">measured here</span>. An extractor that stops reading at the end-of-archive marker
+            hashes fewer bytes and computes the wrong DiffID. containerd's applier drains the stream after the tar
+            reader stops, in <code>containerd/core/diff/apply/apply.go:134-137</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	// Read any trailing data
+	if _, err := io.Copy(io.Discard, rc); err != nil {
+		return emptyDesc, err
+	}</code></pre>
+          <p>
+            The same fact makes DiffIDs fragile across tools. Python's <code>tarfile</code> pads to a 10,240-byte
+            record (20 × 512), so the five-entry layer of the hand-built image in §03 is 10,240 bytes of tar
+            <span class="recon">measured here</span>. Another writer would pad differently and produce another
+            DiffID for the same files. The spec asks for reproducible packing and suggests tar-split to keep the
+            original headers (<code>image-spec/config.md:29</code>), and moby's legacy store does exactly that
+            (§07).
+          </p>
+          <h3>ChainID is one line of string concatenation</h3>
+          <p>
+            ChainID(L0) is DiffID(L0). Each later ChainID is the sha256 of the previous ChainID, one ASCII space, and
+            the next DiffID, with the <code>sha256:</code> prefixes included in the hashed string. The reference
+            implementation is <code>image-spec/identity/chainid.go:56-67</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>func ChainIDs(dgsts []digest.Digest) []digest.Digest {
+	if len(dgsts) &lt; 2 {
+		return dgsts
+	}
+
+	parent := digest.FromBytes([]byte(dgsts[0] + " " + dgsts[1]))
+	next := dgsts[1:]
+	next[0] = parent
+	ChainIDs(next)
+
+	return dgsts
+}</code></pre>
+          <p>
+            Because each rung hashes the one below, a ChainID names an ordered <em>application</em>. Layer C on top of
+            A and B has a different ChainID from C alone, although both end in the same changeset
+            (<code>config.md:65-83</code>). Alpine has one layer, so its ChainID equals its DiffID. The
+            <code>gcr.io/distroless/static-debian12</code> amd64 image has twelve. Recomputed by hand, every layer
+            digest and DiffID matched its manifest and config, and the ladder ends at
+            <code>sha256:5e555e7975e2…80db</code> <span class="recon">measured here</span>. Figure
+            {{fig-hash-derivation}} draws both halves.
+          </p>
+
+          <figure class="figure wide" id="fig-hash-derivation">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Three hashes of a layer: transport digests, one DiffID, and the ChainID ladder</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 500" role="img" aria-label="Left: three gzip encodings of the alpine tar with three different digests all inflate to one 8,709,632-byte tar whose sha256 is the DiffID 75c137ae. Right: the ChainID ladder for distroless static-debian12, where each rung hashes the previous ChainID, a space, and the next DiffID, ending at 5e555e7975e2.">
+                <defs>
+                  <marker id="hd-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="hd-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">ALPINE: ONE TAR, THREE ENCODINGS</text>
+                <text x="580" y="26" class="svg-lane">DISTROLESS: THE CHAINID LADDER</text>
+                <line x1="556" y1="16" x2="556" y2="480" stroke="#deded9"/>
+
+                <rect x="30" y="44" width="160" height="62" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="66" class="svg-step">as published</text>
+                <text x="42" y="84" class="svg-sub">7b229517ed22…</text>
+                <text x="42" y="98" class="svg-sub">3,853,109 B</text>
+                <rect x="204" y="44" width="160" height="62" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="216" y="66" class="svg-step">gzip -9 -n</text>
+                <text x="216" y="84" class="svg-sub">112b2e6f5391…</text>
+                <rect x="378" y="44" width="160" height="62" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="390" y="66" class="svg-step">gzip -1 -n</text>
+                <text x="390" y="84" class="svg-sub">11bb4b9d8a07…</text>
+                <text x="390" y="98" class="svg-sub">4,006,599 B</text>
+                <text x="30" y="124" class="svg-note">three manifest digests: the sha256 of the bytes as shipped</text>
+
+                <line x1="110" y1="134" x2="230" y2="166" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#hd-data)"/>
+                <line x1="284" y1="134" x2="284" y2="166" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#hd-data)"/>
+                <line x1="458" y1="134" x2="338" y2="166" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#hd-data)"/>
+                <text x="300" y="150" class="svg-sub">inflate</text>
+
+                <rect x="120" y="170" width="330" height="150" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="134" y="194" class="svg-step">uncompressed tar · 8,709,632 B</text>
+                <text x="134" y="214" class="svg-sub">header 1 · offset 257: ustar\0 00</text>
+                <text x="134" y="232" class="svg-sub">515 entries: 335 symlinks,</text>
+                <text x="134" y="248" class="svg-sub">96 dirs, 84 regular files</text>
+                <rect x="134" y="262" width="302" height="44" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="146" y="280" class="svg-step">last 1,192 bytes: 00 00 00 …</text>
+                <text x="146" y="296" class="svg-sub">end blocks + padding, all hashed</text>
+
+                <line x1="284" y1="322" x2="284" y2="358" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <text x="294" y="344" class="svg-sub">sha256 over every byte</text>
+                <rect x="120" y="362" width="330" height="56" rx="4" fill="#ffffff" stroke="#367f59" stroke-width="1.6"/>
+                <text x="134" y="384" class="svg-step">DiffID = config.rootfs.diff_ids[0]</text>
+                <text x="134" y="402" class="svg-sub">sha256:75c137aedfb2…  (= ChainID)</text>
+                <text x="30" y="448" class="svg-note">An extractor that stops at the end-of-archive marker</text>
+                <text x="30" y="464" class="svg-note">hashes 1,192 bytes too few and gets the wrong DiffID.</text>
+
+                <text x="580" y="56" class="svg-num">L0</text>
+                <text x="612" y="56" class="svg-sub">ChainID = DiffID = 7223ea1323e8…</text>
+                <line x1="640" y1="66" x2="640" y2="86" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <rect x="580" y="90" width="470" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="590" y="110" class="svg-num">L1</text>
+                <text x="612" y="110" class="svg-sub">sha256("sha256:7223ea13…" + " " + "sha256:8fa10c01…")</text>
+                <text x="612" y="132" class="svg-sub">= 5217b01660b5…</text>
+                <line x1="640" y1="148" x2="640" y2="168" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <rect x="580" y="172" width="470" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="590" y="192" class="svg-num">L2</text>
+                <text x="612" y="192" class="svg-sub">sha256("sha256:5217b016…" + " " + "sha256:35b5ba6e…")</text>
+                <text x="612" y="214" class="svg-sub">= 32a12b65383d…</text>
+                <line x1="640" y1="230" x2="640" y2="250" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <rect x="580" y="254" width="470" height="74" rx="4" fill="#ffffff" stroke="#deded9" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="590" y="274" class="svg-num">L3–L10</text>
+                <text x="648" y="274" class="svg-sub">7f73eafc… fdaace00… 14b282df… 492c6420…</text>
+                <text x="648" y="292" class="svg-sub">85d9b4c1… c7b875d3… af4a1140… 2a080d78…</text>
+                <text x="648" y="314" class="svg-note">L4 is 67 gzip bytes: a 1,536-byte tar holding only "."</text>
+                <line x1="640" y1="330" x2="640" y2="350" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <rect x="580" y="354" width="470" height="60" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="590" y="374" class="svg-num">L11</text>
+                <text x="612" y="374" class="svg-sub">sha256("sha256:2a080d78…" + " " + "sha256:5904c32f…")</text>
+                <text x="612" y="398" class="svg-step">= sha256:5e555e7975e2…80db</text>
+                <text x="580" y="448" class="svg-note">The space and both "sha256:" prefixes are hashed. Change one DiffID,</text>
+                <text x="580" y="464" class="svg-note">or the order, and every rung above it changes.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              All values measured here. The three left-hand digests differ only in compression; the DiffID does not
+              move. On the right the left operand of each rung is the previous ChainID and the right operand is that
+              layer's DiffID, read from <code>distroless-config.json</code>. The final ChainID names the whole
+              twelve-layer filesystem.
+            </p>
+          </figure>
+
+          <p>
+            distroless shows two more things a consumer must tolerate. Bazel writes every timestamp at the epoch, and
+            the layers mix path styles: some entries are <code>./etc/passwd</code>, others
+            <code>etc/nsswitch.conf</code>. Appliers clean names before use; containerd calls
+            <code>filepath.Clean(hdr.Name)</code> (<code>containerd/pkg/archive/tar.go:248-249</code>)
+            <span class="src">from the code</span>. The smallest layer is 67 gzip bytes. It inflates to 1,536 bytes:
+            one header for <code>.</code> and the two end blocks. It is a real layer whose only content is the root
+            directory's metadata <span class="recon">measured here</span>. The ChainID's job comes in §06: it is the
+            name under which an unpacked filesystem is stored and shared.
+          </p>

@@ -1,0 +1,209 @@
+          <h2 id="p2-wire"><span class="secnum">{{S}}</span>Pulling alpine, request by request</h2>
+          <p>
+            A pull is a short conversation over HTTPS. The client pings the registry, gets a token from a different
+            host, asks once which digest the tag means, and from then on asks for content only by digest. The trace
+            below is <code>curl</code> on 23 October 2026, anonymous, from this box to Docker Hub, issuing the same
+            requests containerd's resolver issues <span class="recon">measured here</span>. It is not
+            <code>dockerd</code>'s own traffic: <code>dockerd</code> could not run here, so its request shapes are
+            read from the code.
+          </p>
+          <p>
+            <code>docker.io</code> is not a host that serves the API. containerd hard-codes the mapping to
+            <code>registry-1.docker.io</code> (<code>containerd/core/remotes/docker/resolver.go:141-146</code>)
+            <span class="src">from the code</span>. The first request, <code>GET /v2/</code>, gets a 401 whose
+            challenge names where to go next:
+          </p>
+<pre><code>&lt; HTTP/2 401
+&lt; www-authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io"
+--timing-- dns=0.008915 connect=0.038051 tls=0.074767 ttfb=0.105519 total=0.105744 code=401
+{"errors":[{"code":"UNAUTHORIZED","message":"authentication required","detail":null}]}</code></pre>
+          <p>
+            The challenge has no <code>scope</code>, because nothing has been asked for yet; distribution's challenge
+            builder only appends one when the access set is non-empty
+            (<code>distribution/registry/auth/token/accesscontroller.go:125-146</code>). The client then asks
+            <code>auth.docker.io</code> for <code>scope=repository:library/alpine:pull</code>. Hub returns a
+            2,698-character RS256 JWT with an <code>x5c</code> certificate chain, <code>aud registry.docker.io</code>,
+            an empty <code>sub</code> and a 300-second life, with <code>nbf</code> back-dated 300 seconds. It sends the
+            same value under both <code>token</code> and <code>access_token</code>, the compatibility mode the token
+            spec allows <span class="recon">measured here</span>. The token endpoint sits behind Cloudflare with its own
+            limit (<code>x-ratelimit-limit: 3000, 3000;w=60</code>).
+          </p>
+          <h3>The one trusted header</h3>
+          <p>
+            With the token, the client sends <code>HEAD /v2/library/alpine/manifests/latest</code>. The answer is a
+            content type, a length of 9,218 and a <code>docker-content-digest</code>, with an <code>etag</code> equal to
+            the quoted digest. That is all a resolver needs. containerd takes the header as the image's identity and
+            only GETs and hashes the manifest itself when the header or the length is missing.
+            <code>containerd/core/remotes/docker/resolver.go:391-405</code> says so in a comment
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>// trusted registry was contacted, in this case use
+// the digest header (or content from GET)
+if dgst == "" {
+	// this is the only point at which we trust the registry. we use the
+	// content headers to assemble a descriptor for the name. when this becomes
+	// more robust, we mostly get this information from a secure trust store.
+	dgstHeader := digest.Digest(resp.Header.Get("Docker-Content-Digest"))
+
+	if dgstHeader != "" &amp;&amp; size != -1 {
+		if err := dgstHeader.Validate(); err != nil {
+			return "", ocispec.Descriptor{}, fmt.Errorf("%q in header not a valid digest: %w", dgstHeader, err)
+		}
+		dgst = dgstHeader
+	}
+}</code></pre>
+          <p>
+            Everything after this point is checked. Integrity is enforced at the content store rather than in HTTP:
+            <code>content.Copy</code> commits with the expected digest and the local writer fails on a mismatch
+            (<code>containerd/plugins/content/local/writer.go:134-136</code>). A registry that lies in the HEAD can
+            name the wrong image, but cannot serve bytes that disagree with the name it gave
+            <span class="recon">reconstruction</span>. Resolution also caps manifests at <code>MaxManifestSize</code>,
+            defined as <code>4 * 1048 * 1048</code>: 4,393,216 bytes, a harmless typo for 1024 (register D42).
+          </p>
+          <p>
+            The resolver's <code>Accept</code> lists Docker schema2 manifest, Docker manifest list, OCI manifest, OCI
+            index and <code>*/*</code>, in that order (<code>resolver.go:171-178</code>). Hub ignores it for this tag:
+            seven different Accept values, including none at all, all got the same OCI index with the same digest
+            <span class="recon">measured here</span>. §08 shows a registry that does not.
+          </p>
+          <h3>By digest, then to the CDN</h3>
+          <p>
+            The client fetches the index and the amd64 manifest by digest, then the blobs. A blob GET on Hub is a 307
+            with an empty body. The <code>Location</code> is on <code>production.cloudfront.docker.com</code>, and its
+            path is distribution's blob layout under a <code>/registry-v2</code> root, signed with CloudFront
+            parameters:
+          </p>
+<pre><code>location: https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/7b/
+          7b229517ed222597277036d94892173207d01a731ab3a88eeb1de2e963a2c788/data?&lt;signed-query-redacted&gt;</code></pre>
+          <p>
+            The CDN answered from S3 (<code>server: AmazonS3</code>, <code>x-cache: Hit from cloudfront</code>), with
+            <code>age: 141278</code> on the layer: cached for about 39 hours. A <code>Range: bytes=0-15</code> request
+            through the same redirect got a 206 with <code>content-range: bytes 0-15/3853109</code> and the gzip magic
+            <code>1f 8b 08</code> <span class="recon">measured here</span>. curl sent no <code>Authorization</code> on the
+            CDN hop because it drops credentials on cross-host redirects. containerd sends none either: it follows up to
+            10 redirects and re-runs its authorizer on each, and the authorizer is keyed by host
+            (<code>resolver.go:703-712</code>, <code>authorizer.go:121-125</code>) <span class="src">from the code</span>.
+            Figure {{fig-pull-wire}} lays out the whole exchange.
+          </p>
+
+          <figure class="figure wide" id="fig-pull-wire">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">An anonymous pull of alpine:latest from Docker Hub, with measured times per request</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 640" role="img" aria-label="Sequence diagram across four hosts: the client, registry-1.docker.io, auth.docker.io and production.cloudfront.docker.com. Ping 401 in 106 ms, token 87 ms, HEAD of the tag 180 ms returning the trusted digest header, index GET 163 ms, manifest GET 161 ms, blob GET redirected with 307 in 97 ms, config from the CDN 173 ms, layer from the CDN 214 ms, and a range request 206 in 145 ms. Below, the rate limit in the token's claims (100 per 21600 seconds) is set against the response header (100 per 3600).">
+                <style>.pw-halo{paint-order:stroke;stroke:#ffffff;stroke-width:4px;stroke-linejoin:round}</style>
+                <defs>
+                  <marker id="pw-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="pw-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="110" y="26" text-anchor="middle" class="svg-lane">CLIENT</text>
+                <text x="520" y="26" text-anchor="middle" class="svg-lane">REGISTRY-1.DOCKER.IO</text>
+                <text x="760" y="26" text-anchor="middle" class="svg-lane">AUTH.DOCKER.IO</text>
+                <text x="960" y="26" text-anchor="middle" class="svg-lane">CLOUDFRONT</text>
+                <line x1="110" y1="36" x2="110" y2="500" stroke="#b8b8b1" stroke-width="1.2"/>
+                <line x1="520" y1="36" x2="520" y2="500" stroke="#b8b8b1" stroke-width="1.2"/>
+                <line x1="760" y1="36" x2="760" y2="500" stroke="#b8b8b1" stroke-width="1.2"/>
+                <line x1="960" y1="36" x2="960" y2="500" stroke="#b8b8b1" stroke-width="1.2"/>
+
+                <text x="30" y="62" class="svg-num">106 ms</text>
+                <text x="120" y="56" class="svg-sub pw-halo">GET /v2/</text>
+                <line x1="112" y1="62" x2="516" y2="62" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="76" x2="114" y2="76" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="90" class="svg-sub pw-halo">401 · Bearer realm=auth.docker.io/token (no scope)</text>
+
+                <text x="30" y="118" class="svg-num">87 ms</text>
+                <text x="120" y="112" class="svg-sub pw-halo">GET /token?service=registry.docker.io&amp;scope=repository:library/alpine:pull</text>
+                <line x1="112" y1="118" x2="756" y2="118" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="758" y1="132" x2="114" y2="132" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="146" class="svg-sub pw-halo">200 · RS256 JWT, 2,698 chars, exp − iat = 300 s</text>
+
+                <rect x="112" y="156" width="406" height="54" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="30" y="174" class="svg-num">180 ms</text>
+                <text x="120" y="172" class="svg-sub">HEAD /v2/library/alpine/manifests/latest</text>
+                <line x1="112" y1="178" x2="516" y2="178" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="190" x2="114" y2="190" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="204" class="svg-sub">200 · docker-content-digest: sha256:be2656061b53…</text>
+                <text x="530" y="186" class="svg-step">the one trusted header</text>
+                <text x="530" y="204" class="svg-note">tag → digest; all later requests by digest</text>
+
+                <text x="30" y="236" class="svg-num">163 ms</text>
+                <text x="120" y="230" class="svg-sub pw-halo">GET …/manifests/sha256:be2656061b53…</text>
+                <line x1="112" y1="236" x2="516" y2="236" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="248" x2="114" y2="248" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="262" class="svg-sub pw-halo">200 · OCI index, 9,218 B</text>
+
+                <text x="30" y="288" class="svg-num">161 ms</text>
+                <text x="120" y="282" class="svg-sub pw-halo">GET …/manifests/sha256:c26612752c78…</text>
+                <line x1="112" y1="288" x2="516" y2="288" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="300" x2="114" y2="300" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="314" class="svg-sub pw-halo">200 · amd64 manifest, 1,022 B</text>
+
+                <text x="30" y="340" class="svg-num">97 ms</text>
+                <text x="120" y="334" class="svg-sub pw-halo">GET …/blobs/sha256:b92841763c5c…</text>
+                <line x1="112" y1="340" x2="516" y2="340" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="352" x2="114" y2="352" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="366" class="svg-sub pw-halo">307 · Location: production.cloudfront.docker.com/…/data</text>
+
+                <text x="30" y="392" class="svg-num">173 ms</text>
+                <text x="530" y="386" class="svg-sub pw-halo">GET …/blobs/sha256/b9/…/data (no Authorization)</text>
+                <line x1="112" y1="392" x2="956" y2="392" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="958" y1="404" x2="114" y2="404" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="418" class="svg-sub pw-halo">200 · config, 611 B · x-cache: Hit · age 141277</text>
+
+                <text x="30" y="444" class="svg-num">214 ms</text>
+                <text x="530" y="438" class="svg-sub pw-halo">GET …/blobs/sha256/7b/…/data</text>
+                <line x1="112" y1="444" x2="956" y2="444" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="958" y1="456" x2="114" y2="456" stroke="#3c6f97" stroke-width="2.4" marker-end="url(#pw-data)"/>
+                <text x="120" y="470" class="svg-sub pw-halo">200 · layer, 3,853,109 B · first byte at 140 ms</text>
+
+                <text x="30" y="496" class="svg-num">145 ms</text>
+                <text x="530" y="490" class="svg-sub pw-halo">Range: bytes=0-15 (via the same 307)</text>
+                <line x1="112" y1="496" x2="956" y2="496" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <text x="580" y="514" class="svg-sub pw-halo">206 · bytes 0-15/3853109 · 1f 8b 08 …</text>
+
+                <rect x="30" y="540" width="490" height="84" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="42" y="562" class="svg-lane">IN THE JWT'S ACCESS CLAIM</text>
+                <text x="42" y="584" class="svg-sub">"pull_limit": "100",</text>
+                <text x="42" y="602" class="svg-sub">"pull_limit_interval": "21600"   (6 hours)</text>
+                <rect x="560" y="540" width="490" height="84" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="572" y="562" class="svg-lane">IN THE HEAD RESPONSE HEADERS</text>
+                <text x="572" y="584" class="svg-sub">ratelimit-limit: 100;w=3600       (1 hour)</text>
+                <text x="572" y="602" class="svg-sub">ratelimit-remaining: 96;w=3600</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured here with curl on 23 October 2026; each time is the <code>total</code> from that request's
+              saved <code>--timing--</code> line, so each includes its own DNS, TCP and TLS setup. Thick black arrows are
+              requests, blue arrows responses. The two boxes at the bottom disagree on the rate-limit window;
+              Docker's documentation sides with the JWT.
+            </p>
+          </figure>
+
+          <p>
+            Added up, the eight requests before the range probe take about 1.18 seconds; the 3.85 MB layer body
+            itself arrived in the 74 ms between its first byte and its last. For a small image a pull is bound by
+            round trips, not bandwidth <span class="recon">reconstruction</span>. How the client handles failures
+            matters on that path. In containerd every request goes through <code>doWithRetries</code> with
+            <code>maxAttempts = 5</code> total. A 401 feeds the authorizer; 408 and 429 retry at once, with no
+            backoff and no reading of <code>Retry-After</code> (<code>resolver.go:772</code>, <code>:884-885</code>).
+            Only transport errors sleep, a fixed 50 ms (<code>:816-844</code>) <span class="src">from the code</span>.
+            Against a registry that is rate-limiting, each retried GET may count (register D43).
+          </p>
+          <h3>The rate limit's window</h3>
+          <p>
+            Hub's manifest responses carry both <code>x-ratelimit-*</code> and IETF-draft <code>ratelimit-*</code>
+            headers. Docker's documentation says anonymous users get 100 pulls per 6 hours and shows
+            <code>w=21600</code>; the JWT says <code>pull_limit_interval: 21600</code>; the live header says
+            <code>w=3600</code>, re-probed at 15:20:40 UTC with the same result. Which is authoritative is unresolved
+            (D45). The docs also say HEAD does not count and GET does. On <code>ratelimitpreview/test</code>, two HEADs
+            left <code>remaining</code> at 92, one GET dropped it to 91, and a HEAD after it stayed at 91
+            <span class="recon">measured here</span>. The egress IP is shared, so others may have pulled too.
+          </p>
+          <p>
+            Other registries differ in small ways <span class="recon">measured here</span>. ghcr.io issues an opaque
+            56-character token instead of a JWT, 404s the referrers endpoint, and redirects blobs to Azure Blob SAS
+            URLs. public.ecr.aws uses realm <code>https://public.ecr.aws/token/</code>, and the slash-less URL 301s.
+            mcr.microsoft.com answers <code>GET /v2/</code> with 200 and needs no token at all.
+          </p>

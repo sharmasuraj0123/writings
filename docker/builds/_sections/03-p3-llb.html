@@ -1,0 +1,177 @@
+          <h2 id="p3-llb"><span class="secnum">{{S}}</span>LLB: a Merkle DAG of protobuf</h2>
+          <p>
+            LLB, BuildKit's low-level build format, is defined in one protobuf file, <code>solver/pb/ops.proto</code>.
+            One <code>Op</code> is one vertex of the graph: a list of input edges, then exactly one of seven op kinds,
+            then an optional platform and worker constraints. An input edge is not a pointer. It is the sha256 digest of
+            the input op's marshaled bytes plus an output index (<code>buildkit/solver/pb/ops.proto:10-25, 37-42</code>)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>message Op {
+	// changes to this structure must be represented in json.go.
+	// inputs is a set of input edges.
+	repeated Input inputs = 1;
+	oneof op {
+		ExecOp exec = 2;
+		SourceOp source = 3;
+		FileOp file = 4;
+		BuildOp build = 5;
+		MergeOp merge = 6;
+		DiffOp diff = 7;
+		PassthroughOp passthrough = 8;
+	}
+	Platform platform = 10;
+	WorkerConstraints constraints = 11;
+}
+…
+message Input {
+	// digest of the marshaled input Op
+	string digest = 1;
+	// output index of the input Op
+	int64 index = 2;
+}</code></pre>
+          <p>
+            Naming each input by the hash of its bytes makes the graph a Merkle DAG, the same construction as an image
+            (<a href="../images/#p2-lede">Part 2</a>) or a git commit. The four kinds a Dockerfile uses are small.
+            <code>SourceOp</code> is a URL-like <code>identifier</code> (<code>local://</code>,
+            <code>docker-image://</code>, <code>git://</code>, <code>https://</code>) plus string attributes.
+            <code>FileOp</code> is a chain of actions: <code>copy</code>, <code>mkfile</code>, <code>mkdir</code>,
+            <code>rm</code>, <code>symlink</code>. <code>ExecOp</code> carries <code>Meta</code> (args, env, cwd, user,
+            proxy env, extra hosts, hostname, ulimits, cgroup parent, valid exit codes), mounts, a network mode, a
+            security mode, secret env vars and CDI devices. <code>MergeOp</code> and <code>DiffOp</code> let a build
+            stack and subtract layers; <code>Merge(A,B)</code> lays B over A with B winning, and the docs call it
+            associative (<code>ops.proto:45-69, 196-203, 320-341</code>; <code>docs/dev/merge-diff.md:25-40</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            A <code>Definition</code>, the thing a client sends in <code>Solve</code>, is a flat list of marshaled ops, a
+            separate <code>metadata</code> map keyed by op digest, and a source map (<code>ops.proto:309-318</code>).
+            Descriptions, the ignore-cache flag, progress groups and Dockerfile line numbers all live in the side maps,
+            outside the hashed bytes. <code>State.Marshal</code> marshals inputs first, depth-first, so the list comes out
+            in topological order with duplicates removed. It hashes each op with protobuf's deterministic mode, which
+            sorts map keys (<code>client/llb/marshal.go:167-169</code>). Last it appends one op with no kind at all, whose
+            single input points at the result. That <em>terminal</em> vertex is how the solver finds the root
+            (<code>client/llb/state.go:156-165</code>) <span class="src">from the code</span>.
+          </p>
+          <h3>alpine's three vertices, re-derived</h3>
+          <p>
+            A <code>max</code> provenance record embeds the whole definition as JSON, plus a <code>digestMapping</code>
+            from each op's digest to a name like <code>step1</code>. alpine:latest's amd64 record holds three ops: a git
+            SourceOp, a FileOp copy that reads the tarball out of that checkout, and the terminal op. JSON is not the
+            hashed form, so the digests can only be checked by re-encoding. A 37-line Python script writes each op back
+            as proto3 by hand (varint tags, length-prefixed strings, zero values omitted, map entries in key order) and
+            hashes the result. All three digests match the published ones <span class="recon">measured here</span>:
+          </p>
+<pre><code>step0 computed   sha256:d6495f741434b0751c18449a07ab9d060470572db32aebe08fc92e4cda371cbe
+step0 provenance sha256:d6495f741434b0751c18449a07ab9d060470572db32aebe08fc92e4cda371cbe
+step1 computed   sha256:954bf26d1da1bfb9d78b1d198538b8c4445c03bac3537b442ec118bbf7cfbb4e
+step1 provenance sha256:954bf26d1da1bfb9d78b1d198538b8c4445c03bac3537b442ec118bbf7cfbb4e
+step2 computed   sha256:f8182904ba1c20747acc8c111dc78b1b82b1989fd0ee55d2c4dbf735bef6ac5b
+step2 provenance sha256:f8182904ba1c20747acc8c111dc78b1b82b1989fd0ee55d2c4dbf735bef6ac5b</code></pre>
+          <p>
+            Two versions of the script exist. The first takes each input digest from the published mapping, so it checks
+            each vertex on its own. The second, <code>llbdigest-chained.py</code>, feeds each computed digest into the
+            next op, so the match above checks the chain end to end. Both hard-code the six copy booleans as 1, which is
+            what this record holds; a record with a false flag would need the encoder extended
+            <span class="recon">measured here</span>. The bytes are short enough to read whole. Figure
+            {{fig-vertex-bytes}} annotates them field by field.
+          </p>
+
+          <figure class="figure wide" id="fig-vertex-bytes">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The bytes of alpine's three LLB vertices, and what one changed digit does</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 530" role="img" aria-label="Three protobuf records. step0, 246 bytes, is a SourceOp: tag 1a, length 241, then the 94-byte git identifier, sorted attrs and an empty constraints field 5a 00. Its sha256 d6495f741434 appears as the input digest at the start of step1, 172 bytes, a FileOp copy with input minus one as a ten-byte varint, the tarball source path, mode minus one, six true booleans, timestamp minus one and empty constraints. The sha256 of step1, 954bf26d1da1, is the only content of step2, 75 bytes: tag 0a length 73, tag 0a length 71, the 71-character digest string, index 0 omitted. Changing one hex digit of the git commit in step0 changes all three digests to 9d01836c2ce2, a4cbf1baaf71 and 39f4f11cb933.">
+                <defs>
+                  <marker id="fig-vertex-bytes-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="30" y="30" class="svg-lane">VERTEX BYTES (HEX)</text>
+                <text x="290" y="30" class="svg-lane">FIELD</text>
+                <text x="770" y="30" class="svg-lane">SHA256 OF THE BYTES</text>
+
+                <rect x="30" y="44" width="700" height="122" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="42" y="66" class="svg-step">step0 · SourceOp · 246 B</text>
+                <text x="42" y="88" class="svg-sub">1a f1 01</text>
+                <text x="290" y="88" class="svg-sub">field 3 (source), length 241</text>
+                <text x="42" y="106" class="svg-sub">0a 5e 67 69 74 3a 2f 2f …</text>
+                <text x="290" y="106" class="svg-sub">identifier, 94 B: git://…/docker-alpine.git#5aec467f…:x86_64</text>
+                <text x="42" y="124" class="svg-sub">12 27 0a 14 67 69 74 2e …</text>
+                <text x="290" y="124" class="svg-sub">attrs, keys sorted: git.authheadersecret, …</text>
+                <text x="42" y="142" class="svg-sub">5a 00</text>
+                <text x="290" y="142" class="svg-sub">field 11 (constraints), empty</text>
+
+                <rect x="30" y="190" width="700" height="164" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="212" class="svg-step">step1 · FileOp copy · 172 B</text>
+                <text x="42" y="234" class="svg-sub">0a 49 0a 47 73 68 61 32 …</text>
+                <text x="290" y="234" class="svg-sub">inputs[0]: digest "sha256:d6495f74…cbe" (71 B)</text>
+                <text x="42" y="252" class="svg-sub">22 5d 12 5b</text>
+                <text x="290" y="252" class="svg-sub">field 4 (file), 93 B → actions, 91 B</text>
+                <text x="42" y="270" class="svg-sub">08 ff ff ff ff ff ff ff ff ff 01</text>
+                <text x="290" y="270" class="svg-sub">input = −1 (scratch): a ten-byte varint</text>
+                <text x="42" y="288" class="svg-sub">22 4e 0a 27 2f 61 6c 70 …</text>
+                <text x="290" y="288" class="svg-sub">copy: src /alpine-minirootfs-3.24.3-x86_64.tar.gz</text>
+                <text x="42" y="306" class="svg-sub">12 01 2f 20 ff … 01</text>
+                <text x="290" y="306" class="svg-sub">dest "/", mode −1 (unset)</text>
+                <text x="42" y="324" class="svg-sub">28 01 30 01 … 50 01</text>
+                <text x="290" y="324" class="svg-sub">six copy flags, all true</text>
+                <text x="42" y="342" class="svg-sub">58 ff … ff 01 5a 00</text>
+                <text x="290" y="342" class="svg-sub">timestamp −1 (unset) · constraints {}</text>
+
+                <rect x="30" y="374" width="700" height="86" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="394" class="svg-step">step2 · terminal op (no kind) · 75 B</text>
+                <text x="42" y="416" class="svg-sub">0a 49 0a 47 73 68 61 32 35 36 3a</text>
+                <text x="290" y="416" class="svg-sub">inputs[0] (73 B) → digest (71 B) → "sha256:"</text>
+                <text x="42" y="438" class="svg-sub">39 35 34 62 66 32 36 64 …</text>
+                <text x="290" y="438" class="svg-sub">"954bf26d…b4e" · index 0 omitted · 2+2+71 = 75</text>
+
+                <rect x="770" y="44" width="280" height="122" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="66" class="svg-step">sha256 of these 246 B</text>
+                <text x="782" y="88" class="svg-sub">d6495f741434…cbe</text>
+                <text x="782" y="122" class="svg-note">one hex digit of the commit edited:</text>
+                <text x="782" y="144" class="svg-sub" style="fill:#ad4b43">9d01836c2ce2…</text>
+
+                <rect x="770" y="190" width="280" height="164" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="212" class="svg-step">sha256 of these 172 B</text>
+                <text x="782" y="234" class="svg-sub">954bf26d1da1…b4e</text>
+                <text x="782" y="300" class="svg-note">same edit, input digest changed:</text>
+                <text x="782" y="322" class="svg-sub" style="fill:#ad4b43">a4cbf1baaf71…</text>
+
+                <rect x="770" y="374" width="280" height="86" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="394" class="svg-step">sha256 of these 75 B</text>
+                <text x="782" y="416" class="svg-sub">f8182904ba1c…b5c  (root)</text>
+                <text x="782" y="438" class="svg-sub" style="fill:#ad4b43">edited: 39f4f11cb933…</text>
+
+                <path d="M910,168 L910,178 L748,178 L748,230 L734,230" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-vertex-bytes-data)"/>
+                <path d="M910,356 L910,364 L748,364 L748,412 L734,412" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-vertex-bytes-data)"/>
+
+                <text x="30" y="494" class="svg-note">Each blue arrow carries a digest from where it is computed to where the next vertex embeds it as text. Change one byte at the</text>
+                <text x="30" y="512" class="svg-note">source and every digest below it moves: the definition is pinned by its last 32 bytes, the way an image is pinned by its index digest.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured here from <code>step0.pb</code>, <code>step1.pb</code> and <code>step2.pb</code>, the bytes the
+              chained encoder wrote for alpine:latest's published linux/amd64 provenance; the edited digests are its
+              output with one hex digit of the git commit changed. Elided bytes (…) are spelled out in the files. Tags
+              are <code>(field &lt;&lt; 3) | wiretype</code>: <code>0a</code> is field 1 length-delimited,
+              <code>5a</code> is field 11, <code>58</code> is field 11 as a varint inside the copy action.
+            </p>
+          </figure>
+
+          <p>
+            The ripple in the right-hand column is the point. Because inputs are named by digest, editing one character of
+            the root SourceOp changes the digest of every vertex downstream <span class="recon">measured here</span>. The
+            reverse also holds, and it explains most of <a href="#p3-solver">§04</a>. Anything kept outside the op bytes
+            cannot change a digest. Comments never reach LLB, and line numbers travel in the source map, so moving a
+            Dockerfile line or editing a comment leaves every vertex digest as it was
+            (<code>parser/parser.go:334-338</code>; <code>ops.proto:309-318</code>)
+            <span class="src">from the code</span>, <span class="recon">reconstruction</span> for the conclusion.
+          </p>
+          <p>
+            A vertex digest is still not a cache key. The solver uses it to merge identical work inside one run: two jobs
+            that load the same digest share one state in <code>Solver.actives</code>, and the step runs once
+            (<code>solver/jobs.go:41-50, 547-611</code>). But <code>docker-image://alpine:latest</code> means different
+            bytes next week, so the solver's design doc says the digest is good only for deduplication during a run
+            (<code>docs/dev/solver.md:61-67</code>) <span class="src">from the code</span>. Persistent caching needs
+            something else.
+          </p>

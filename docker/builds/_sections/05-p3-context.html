@@ -1,0 +1,150 @@
+          <h2 id="p3-context"><span class="secnum">{{S}}</span>The context is pulled, not pushed</h2>
+          <p>
+            A client that sends a build might be expected to upload its directory. BuildKit reverses the direction: the
+            client is the gRPC <em>server</em>. buildx registers a file-sync provider in its
+            session, and BuildKit calls <code>FileSync.DiffCopy</code> (or the older <code>TarStream</code>) back into
+            it, both bidirectional streams of <code>fsutil.types.Packet</code>
+            (<code>buildkit/session/filesync/filesync.proto:10-13</code>). What to send travels as gRPC metadata on that
+            call, under four keys (<code>session/filesync/filesync.go:25-30</code>)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>const (
+	keyIncludePatterns    = "include-patterns"
+	keyExcludePatterns    = "exclude-patterns"
+	keyFollowPaths        = "followpaths"
+	keyDirName            = "dir-name"
+	keyExporterMetaPrefix = "exporter-md-"</code></pre>
+          <p>
+            The client applies those filters itself before anything is sent, by wrapping the directory in
+            <code>fsutil.NewFilterFS</code> (<code>filesync.go:110-145</code>). An excluded file is never read and never
+            leaves the client <span class="src">from the code</span>. That is the practical meaning of
+            <code>.dockerignore</code> now: it trims what is sent, not only what <code>COPY</code> sees.
+          </p>
+          <h3>Three transfers per build</h3>
+          <p>
+            A Dockerfile build makes three separate local transfers, and they are the first three lines of
+            <code>--progress=plain</code> output (<code>frontend/dockerui/config.go:348-363, 522-585</code>). <code>[internal]
+            load build definition</code> reads the Dockerfile from the <code>dockerfile</code> local, with FollowPaths
+            limited to the Dockerfile, <code>&lt;Dockerfile&gt;.dockerignore</code> and <code>dockerfile</code>.
+            <code>load .dockerignore</code> reads <code>.dockerignore</code> from the <code>context</code> local, used only
+            if no per-Dockerfile ignore file was found. <code>load build context</code> is the filtered main context
+            <span class="src">from the code</span>. The last one is narrowed twice. The exclude patterns come from
+            <code>.dockerignore</code>. The FollowPaths come from the Dockerfile: each <code>COPY</code>/<code>ADD</code>
+            source and each <code>RUN --mount</code> bind source is added to <code>ctxPaths</code>, which becomes
+            <code>llb.FollowPaths</code> on the context source (<code>dockerfile2llb/convert.go:1145-1150,
+            1850-1875</code>; <code>convert_runmount.go:141-146</code>). For Figure {{fig-dockerfile-llb-dag}} that is
+            <code>go.mod</code> and <code>main.go</code> and nothing else. <code>COPY . .</code> names the path
+            <code>/</code> and switches the narrowing off.
+          </p>
+          <h3>The wire: STAT, REQ, DATA, FIN</h3>
+          <p>
+            <code>DiffCopy</code> speaks fsutil's packet protocol, five types in one enum
+            (<code>buildkit/vendor/github.com/tonistiigi/fsutil/types/wire.proto:10-23</code>; fsutil
+            <code>v0.0.0-20260819142231-83cac42c1c52</code> as vendored):
+          </p>
+<pre><code>  enum PacketType {
+    PACKET_STAT = 0;
+    PACKET_REQ = 1;
+    PACKET_DATA = 2;
+    PACKET_FIN = 3;
+    PACKET_ERR = 4;
+  }</code></pre>
+          <p>
+            The sender streams one <code>STAT</code> for every file that survived the filters and ends the list with an
+            empty <code>STAT</code> (<code>fsutil/send.go:182</code>). The receiver compares each record with what it
+            already holds and answers <code>REQ &lt;id&gt;</code> only for files that differ
+            (<code>receive.go:425</code>). The sender returns <code>DATA</code> chunks for each requested id, with an
+            empty <code>DATA</code> to close a file (<code>send.go:146</code>). The receiver sends <code>FIN</code> and the
+            sender answers it (<code>receive.go:224</code>; <code>send.go:101-106</code>)
+            <span class="src">from the code</span>. Figure {{fig-context-transfer}} draws one exchange.
+          </p>
+
+          <figure class="figure wide" id="fig-context-transfer">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">BuildKit asks the client for the context: one <code>FileSync.DiffCopy</code> exchange</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 450" role="img" aria-label="Two lifelines, buildx as the FileSync server and dockerd's BuildKit as the caller. BuildKit opens DiffCopy with metadata dir-name context, followpaths go.mod and main.go, and the exclude patterns. buildx filters the directory through FilterFS, then streams STAT go.mod, STAT main.go and an empty STAT. BuildKit compares them with its retained snapshot and requests only main.go with REQ 2. buildx sends DATA chunks for id 2 and an empty DATA. BuildKit sends FIN and buildx answers FIN. On the right, the retained snapshot keyed by name, shared key hint and client shared key, and the cacheUpdater that updates content-hash records as files arrive.">
+                <defs>
+                  <marker id="fig-context-transfer-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-context-transfer-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-context-transfer-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <rect x="30" y="20" width="260" height="56" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="42" class="svg-step">buildx · FileSync server</text>
+                <text x="42" y="62" class="svg-sub">serves the context directory</text>
+                <rect x="520" y="20" width="260" height="56" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="532" y="42" class="svg-step">dockerd · BuildKit local source</text>
+                <text x="532" y="62" class="svg-sub">the gRPC caller</text>
+                <line x1="160" y1="78" x2="160" y2="420" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="3 3"/>
+                <line x1="650" y1="78" x2="650" y2="420" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="3 3"/>
+
+                <line x1="648" y1="106" x2="164" y2="106" stroke="#252525" stroke-width="2" marker-end="url(#fig-context-transfer-ctl)"/>
+                <text x="190" y="98" class="svg-sub">DiffCopy · dir-name=context · followpaths=[go.mod main.go]</text>
+                <text x="190" y="122" class="svg-sub">exclude-patterns=&lt;.dockerignore&gt;</text>
+
+                <rect x="40" y="134" width="240" height="40" rx="4" fill="#ffffff" stroke="#3c6f97" stroke-width="1"/>
+                <text x="52" y="158" class="svg-sub">NewFilterFS drops excluded files</text>
+
+                <line x1="164" y1="196" x2="646" y2="196" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="190" class="svg-sub">STAT 1 go.mod (mode, uid, gid, size, …)</text>
+                <line x1="164" y1="222" x2="646" y2="222" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="216" class="svg-sub">STAT 2 main.go</text>
+                <line x1="164" y1="248" x2="646" y2="248" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="242" class="svg-sub">STAT (empty): end of list</text>
+
+                <line x1="646" y1="282" x2="164" y2="282" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="276" class="svg-sub">REQ 2: only the file that differs</text>
+                <line x1="164" y1="316" x2="646" y2="316" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="310" class="svg-sub">DATA 2 chunk … DATA 2 (empty): file done</text>
+                <line x1="646" y1="350" x2="164" y2="350" stroke="#252525" stroke-width="2" marker-end="url(#fig-context-transfer-ctl)"/>
+                <text x="190" y="344" class="svg-sub">FIN</text>
+                <line x1="164" y1="378" x2="646" y2="378" stroke="#252525" stroke-width="2" marker-end="url(#fig-context-transfer-ctl)"/>
+                <text x="190" y="372" class="svg-sub">FIN</text>
+
+                <rect x="720" y="180" width="330" height="96" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="732" y="202" class="svg-step">retained mutable snapshot</text>
+                <text x="732" y="222" class="svg-sub">name:sharedKeyHint:&lt;client key&gt;</text>
+                <text x="732" y="240" class="svg-sub">last build's go.mod and main.go</text>
+                <text x="732" y="262" class="svg-note">what the STATs are compared against</text>
+                <path d="M716,230 L656,230" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-context-transfer-state)"/>
+
+                <rect x="720" y="300" width="330" height="76" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="732" y="322" class="svg-step">cacheUpdater</text>
+                <text x="732" y="342" class="svg-sub">updates contenthash records</text>
+                <text x="732" y="360" class="svg-sub">as each file arrives (§04)</text>
+                <path d="M656,326 L716,326" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-context-transfer-state)"/>
+
+                <text x="30" y="440" class="svg-note">Here only main.go changed since the last build, so one REQ follows three STATs. On a first build every file is requested.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Reconstruction from <code>session/filesync/filesync.go</code>, fsutil's <code>send.go</code> and
+              <code>receive.go</code>, and <code>source/local/source.go:204-280</code>; not traced, since no daemon ran
+              here. The packets ride inside the session stream buildx opened to dockerd, so the "server" never listens on
+              a port.
+            </p>
+          </figure>
+
+          <p>
+            The incremental part lives on the daemon side. BuildKit keeps a retained mutable snapshot per
+            <code>name:sharedKeyHint:&lt;client shared key&gt;</code> and syncs into it again on the next build, so a
+            second build sends only the files that changed, and a <code>cacheUpdater</code> updates the content-hash
+            records of <a href="#p3-solver">§04</a> as files land (<code>source/local/source.go:204-280</code>)
+            <span class="src">from the code</span>. The content key a <code>COPY</code> needs is therefore mostly computed
+            before the solver asks for it <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            The same inversion covers everything else a build takes from the client. A secret's bytes are fetched over
+            the session with <code>secrets.GetSecret</code> when a <code>RUN</code> mounts it, and an SSH mount is a
+            socket that proxies back to the client's agent over the same session
+            (<code>solver/llbsolver/mounts/secretmount_unix.go:16-75</code>; <code>mounts/mount.go:200-239</code>)
+            <span class="src">from the code</span>. Nothing is uploaded in advance; dockerd asks when a step needs it.
+          </p>
+          <p>
+            One boundary surprises people. <code>.dockerignore</code> patterns are applied to context
+            <code>COPY</code>s as an ignore matcher, but not to <code>COPY --from=&lt;stage&gt;</code>, whose source is
+            another stage's filesystem (<code>dockerfile2llb/convert.go:1120-1132</code>). That is register D60, class
+            D: expected from the code, often assumed otherwise <span class="src">from the code</span>.
+          </p>

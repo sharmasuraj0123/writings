@@ -1,0 +1,157 @@
+          <h2 id="p2-lede"><span class="secnum">{{S}}</span>An image is a tree of hashes</h2>
+          <p class="lede">
+            A container is an ordinary Linux process, and Docker is five programs that agree on names made of sha256
+            hashes. This part is about those names. An image is a tree of JSON documents and tarballs. Every node is
+            named by the sha256 of its exact bytes, so a name you trust fixes everything below it. The registry is
+            trusted at one point only: the response header that turns a tag into a digest. Everything after that is
+            checked on arrival.
+          </p>
+          <p>
+            The unit is the <em>descriptor</em>: a <code>mediaType</code>, a <code>digest</code> and a
+            <code>size</code>, with optional <code>urls</code>, <code>annotations</code> and <code>data</code>
+            (<code>image-spec/descriptor.md:27-60</code>) <span class="src">from the code</span>. A digest is
+            <code>&lt;alg&gt;:&lt;encoded&gt;</code> over the exact bytes; for sha256 that is 64 lowercase hex
+            characters. The spec asks a consumer to check <code>size</code> before hashing, which bounds the read.
+            Three document types use descriptors. An <em>index</em> points at one manifest per platform. A
+            <em>manifest</em> points at one config and an ordered list of layers, base first. The <em>config</em> is
+            the runtime defaults plus the list of uncompressed layer hashes. Its sha256 is the OCI ImageID
+            (<code>image-spec/config.md:85-89</code>). Both index and manifest carry <code>schemaVersion: 2</code>,
+            which the spec says exists only for Docker compatibility and will never change. Each index entry carries a
+            <code>platform</code>. containerd's matcher normalises the arm64 variant <code>v8</code> to the empty
+            string, so <code>linux/arm64</code> and <code>linux/arm64/v8</code> select the same entry
+            (<code>moby/vendor/github.com/containerd/platforms/database.go:87-94</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>alpine:latest, fetched on 23 October 2026</h3>
+          <p>
+            Fetched anonymously from Docker Hub at 14:38 UTC, the tag resolves to an OCI index of 9,218 bytes. Its
+            sha256 equals the <code>docker-content-digest</code> header the registry sent
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>content-type: application/vnd.oci.image.index.v1+json
+content-length: 9218
+docker-content-digest: sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+
+$ sha256sum index.json
+be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a  index.json</code></pre>
+          <p>
+            The index holds 16 descriptors: eight platforms (amd64, arm/v6, arm/v7, arm64/v8, 386, ppc64le, riscv64,
+            s390x), each followed by a second manifest whose platform is <code>unknown/unknown</code>. Half the entries
+            are not runnable images. They are BuildKit attestations: an SPDX SBOM and SLSA provenance, stored as two
+            uncompressed <code>application/vnd.in-toto+json</code> "layers" of 79,673 and 5,639 bytes. Seven
+            attestation manifests are 838 bytes; the arm/v6 one is 566. The amd64 path is short. Its manifest
+            <code>c26612752c78…</code> is 1,022 bytes and names a 611-byte config <code>b92841763c5c…</code> and one gzip
+            layer <code>7b229517ed22…</code> of 3,853,109 bytes <span class="recon">measured here</span>.
+            Figure {{fig-alpine-dag}} draws the tree.
+          </p>
+
+          <figure class="figure wide" id="fig-alpine-dag">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">alpine:latest on Docker Hub as a tree of digests, with real sizes</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 430" role="img" aria-label="The tag latest resolves through a HEAD request to an OCI index of 9,218 bytes with 16 entries. The amd64 manifest of 1,022 bytes points at a 611-byte config and a 3,853,109-byte gzip layer. Beside it, an attestation manifest with platform unknown/unknown points at two in-toto layers and refers back to the amd64 manifest through an annotation, not through the subject field.">
+                <defs>
+                  <marker id="dag-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="dag-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="dag-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">TAG</text>
+                <text x="210" y="26" class="svg-lane">INDEX</text>
+                <text x="470" y="26" class="svg-lane">MANIFESTS</text>
+                <text x="780" y="26" class="svg-lane">CONFIG AND LAYERS</text>
+
+                <rect x="30" y="60" width="140" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="84" class="svg-step">alpine:latest</text>
+                <text x="42" y="104" class="svg-sub">a mutable name</text>
+                <line x1="172" y1="92" x2="206" y2="92" stroke="#252525" stroke-width="2" marker-end="url(#dag-ctl)"/>
+                <text x="30" y="148" class="svg-note">HEAD → one trusted</text>
+                <text x="30" y="164" class="svg-note">header names the index</text>
+
+                <rect x="210" y="52" width="220" height="150" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="222" y="76" class="svg-step">OCI image index</text>
+                <text x="222" y="96" class="svg-sub">sha256:be2656061b53…</text>
+                <text x="222" y="114" class="svg-sub">9,218 B · 16 descriptors</text>
+                <text x="222" y="138" class="svg-sub">8 platforms, each followed</text>
+                <text x="222" y="154" class="svg-sub">by an attestation manifest</text>
+                <text x="222" y="178" class="svg-sub">+7 platform pairs not drawn</text>
+
+                <rect x="470" y="52" width="260" height="96" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="482" y="76" class="svg-step">image manifest · linux/amd64</text>
+                <text x="482" y="96" class="svg-sub">sha256:c26612752c78…</text>
+                <text x="482" y="114" class="svg-sub">1,022 B · oci.image.manifest.v1</text>
+                <text x="482" y="132" class="svg-sub">1 config + 1 layer</text>
+
+                <rect x="470" y="236" width="260" height="110" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="482" y="260" class="svg-step">attestation manifest</text>
+                <text x="482" y="280" class="svg-sub">sha256:964745728d17…</text>
+                <text x="482" y="298" class="svg-sub">838 B · platform unknown/unknown</text>
+                <text x="482" y="316" class="svg-sub">vnd.docker.reference.type:</text>
+                <text x="482" y="332" class="svg-sub" style="white-space:pre">  attestation-manifest</text>
+
+                <line x1="432" y1="100" x2="466" y2="100" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+                <path d="M432,170 L450,170 L450,280 L466,280" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+
+                <path d="M600,234 L600,152" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#dag-state)"/>
+                <text x="608" y="170" class="svg-sub" style="fill:#765b98">vnd.docker.</text>
+                <text x="608" y="186" class="svg-sub" style="fill:#765b98">reference.digest</text>
+                <text x="608" y="202" class="svg-sub">= c26612752c78…</text>
+                <text x="608" y="222" class="svg-note">annotation, not subject</text>
+
+                <rect x="770" y="40" width="280" height="70" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="782" y="62" class="svg-step">config · oci.image.config.v1</text>
+                <text x="782" y="82" class="svg-sub">sha256:b92841763c5c… · 611 B</text>
+                <text x="782" y="98" class="svg-sub">diff_ids: [sha256:75c137aedfb2…]</text>
+
+                <rect x="770" y="124" width="280" height="70" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="782" y="146" class="svg-step">layer · tar+gzip</text>
+                <text x="782" y="166" class="svg-sub">sha256:7b229517ed22…</text>
+                <text x="782" y="182" class="svg-sub">3,853,109 B → 8,709,632 B tar</text>
+
+                <line x1="732" y1="80" x2="766" y2="76" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+                <line x1="732" y1="120" x2="766" y2="154" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+
+                <rect x="770" y="236" width="280" height="54" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="258" class="svg-step">in-toto · SPDX document</text>
+                <text x="782" y="276" class="svg-sub">sha256:3ec36f3670df… · 79,673 B</text>
+                <rect x="770" y="300" width="280" height="54" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="322" class="svg-step">in-toto · SLSA provenance v0.2</text>
+                <text x="782" y="340" class="svg-sub">sha256:3da1513d2124… · 5,639 B</text>
+                <line x1="732" y1="262" x2="766" y2="262" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+                <line x1="732" y1="320" x2="766" y2="326" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+
+                <text x="30" y="392" class="svg-note">Every arrow is a descriptor: mediaType + digest + size. Each child's bytes must hash to the digest its parent holds,</text>
+                <text x="30" y="410" class="svg-note">so the 64 hex characters of the index digest pin all of the 3,853,109 + 611 + 1,022 bytes of the amd64 image.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured here on 23 October 2026. Blue arrows are descriptors from parent to child. The dashed purple
+              arrow is an annotation the attestation carries; OCI 1.1's <code>subject</code> field, which Hub's
+              referrers API would index, is not set, so that API returns an empty index for the amd64 digest.
+            </p>
+          </figure>
+
+          <p>
+            The config is 611 bytes of BuildKit output. Its two history entries are the Dockerfile lines with
+            <code># buildkit</code> appended, and the second is marked <code>empty_layer</code>, so
+            <code>history</code> has two entries and <code>diff_ids</code> one <span class="recon">measured here</span>:
+          </p>
+<pre><code>"created_by":"ADD alpine-minirootfs-3.24.3-x86_64.tar.gz / # buildkit"
+"created_by":"CMD [\"/bin/sh\"]","comment":"buildkit.dockerfile.v0","empty_layer":true
+"rootfs":{"type":"layers","diff_ids":["sha256:75c137aedfb2760f88629236cb7b797630aed0c3d91d626d1d1bb694878fc2ba"]}</code></pre>
+          <p>
+            The attestations point at their image through the annotation <code>vnd.docker.reference.digest</code>, not
+            through <code>subject</code>. Hub does implement the OCI referrers endpoint. Asked for the amd64 digest, it
+            returns 200 with an empty index <span class="recon">measured here</span>. A tool that finds SBOMs only
+            through referrers finds none (register D29). That is the legacy layout: since v0.32, BuildKit's image
+            exporter also writes each attestation manifest as an OCI artifact with <code>subject</code> by default,
+            so images built that way can be found through referrers on registries that index it
+            (<code>exporter/containerimage/writer.go</code>:613-678) <span class="src">from the code</span>. Older tags show the format before BuildKit:
+            <code>alpine:3.10</code> and <code>3.15</code> are still served as Docker manifest lists, and their configs
+            carry the Docker-only keys <code>container</code>, <code>container_config</code> and
+            <code>docker_version</code>. The two families map one to one: the manifest list is the index, and the
+            Docker gzip layer type is "interchangeable and fully compatible" with OCI's
+            (<code>image-spec/media-types.md:41-64</code>). <a href="../builds/#p3-export">Part 3</a> shows where
+            BuildKit writes the attestations.
+          </p>

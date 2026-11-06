@@ -1,0 +1,1246 @@
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from the pinned sources, cited as
+              <code>repo/path:line</code>: BuildKit <code>v0.34.1</code> (<code>f5b59a1f2fb2</code>, the same commit as the
+              v0.34.0 that moby vendors), moby <code>docker-v29.9.2</code> (<code>0367cbeb</code>), docker/cli v29.9.2,
+              and the OCI image-spec v1.1.1. <span class="recon">measured here</span> marks bytes and digests observed on
+              23 October 2026 on a 2-vCPU Linux box: the machine's buildx v0.37.1 and docker CLI 29.8.2 run without a
+              daemon, and alpine:latest's published index, config and SLSA provenance fetched from Docker Hub with
+              <code>docker buildx imagetools inspect</code>, whose LLB vertices were then re-encoded and hashed by a
+              37-line script. No container ran on that box: it lacks <code>CAP_SYS_ADMIN</code>, so <code>dockerd</code>
+              could not start, and no build ran here. The provenance is a record of a real build run by Docker's official
+              images pipeline, not by me. Where BuildKit's runtime behaviour is described, it is read from the code.
+              <span class="recon">reconstruction</span> marks a judgement I drew from those sources rather than read in
+              one place.
+            </p>
+            <p>
+              This is Part 3 of 4 of <a href="../">Docker, taken apart</a>. <a href="../run-path/">Part 1</a> follows
+              <code>docker run</code> to a process; <a href="../images/">Part 2</a> covers images, layers and the
+              registry; <a href="../network-and-lifecycle/">Part 4</a> covers networks, I/O and the long run, and ends
+              with the findings register.
+            </p>
+          </div>
+
+          <h2 id="p3-lede"><span class="secnum">01</span>BuildKit never runs your Dockerfile</h2>
+          <p class="lede">
+            A container is an ordinary Linux process, and Docker is a relay of programs that agree on names made of
+            sha256 hashes. A build adds two more names to that relay and one more compiler. BuildKit never executes a
+            Dockerfile. It compiles the text into LLB, a graph of protobuf records, each named by the sha256 of its own
+            bytes. It keys its cache on that graph and on file content, never on timestamps. And it asks the client for
+            the build context; the client does not push it.
+          </p>
+          <p>
+            The first hop is a rename. The docker CLI treats <code>build</code>, <code>builder</code>,
+            <code>image build</code> and <code>bake</code> as calls to a plugin whose default name is
+            <code>buildx</code>, and <code>forwardBuilder</code> rewrites the argument vector before the CLI runs the plugin as a child process
+            <span class="src">from the code</span>. The table that does it is
+            <code>cli/cmd/docker/builder.go:149-164</code>:
+          </p>
+<pre><code>func forwardBuilder(alias string, args, osargs []string) ([]string, []string, []string, bool) {
+	aliases := [][3][]string{
+		{
+			{"bake"},
+			{alias, "bake"},
+			{},
+		},
+		{
+			{"builder"},
+			{alias},
+			{"builder"},
+		},
+		{
+			{"build"},
+			{alias, "build"},
+			{},</code></pre>
+          <p>
+            On the forwarded path the CLI also prepends <code>BUILDX_BUILDER=&lt;current context&gt;</code> to the
+            plugin's environment, so <code>docker build</code> targets the daemon's own builder and loads a local image
+            even after <code>docker buildx use</code> picked a container builder (<code>builder.go:132-141</code>).
+            <code>DOCKER_BUILDKIT=0</code> still selects the legacy builder on Linux, now with a deprecation warning. A
+            missing plugin falls back to the legacy builder with a "DEPRECATED" warning, unless
+            <code>DOCKER_BUILDKIT=1</code> forced BuildKit, in which case it fails <span class="src">from the code</span>.
+            Engine 23.0.0 (released 2023-02-01) made this the default on Linux. On this machine the rewrite is visible
+            without a daemon: <code>docker build --help</code> prints buildx's usage line, and <code>docker buildx ls</code>
+            shows the <code>default</code> builder in an error state because nothing listens on the socket
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>github.com/docker/buildx v0.37.1 0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a
+Usage:  docker buildx build [OPTIONS] PATH | URL | -
+Aliases:
+  docker build, docker builder build, docker image build, docker buildx b</code></pre>
+          <p>
+            The second hop shares a socket with everything else. dockerd's <code>httpHandler.ServeHTTP</code> sends any
+            HTTP/2 request whose <code>Content-Type</code> starts with <code>application/grpc</code> to a gRPC server
+            (or to an optional <code>grpcProxy</code> that claims the service), and every other request to the REST API
+            (<code>moby/daemon/command/httphandler.go:38-48</code>). The listener speaks HTTP/1, HTTP/2 and cleartext
+            HTTP/2 (h2c) at once. buildx does not use that route. Its docker driver opens <code>POST /grpc</code>
+            with <code>Upgrade: h2c</code>, an HTTP/1.1 upgrade that dockerd answers with a 101 and serves with a
+            deprecated <code>http2.Server.ServeConn</code>, and calls BuildKit's <code>Control</code> service inside
+            it: <code>Solve</code> to start a build, <code>Status</code> to stream progress
+            (<code>buildkit/api/services/control/control.proto:15-24</code>). The session goes over a second
+            hijacked connection, <code>POST /session</code>, not <code>Control.Session</code>
+            (<code>buildx/driver/docker/driver.go:62-75</code>; <code>moby/daemon/server/router/grpc/grpc_routes.go:11-52</code>).
+            Both routes are marked deprecated, and buildx v0.37.1 still uses them, as do v0.37.2 and buildx
+            <code>master</code> <span class="src">from the code</span>.
+          </p>
+          <p>
+            Inside dockerd sit two builders. The daemon still constructs the legacy
+            <code>dockerfile.NewBuildManager</code> and an embedded BuildKit rooted at
+            <code>&lt;data-root&gt;/buildkit</code> (<code>moby/daemon/command/daemon.go:471-480</code>). The embedded
+            controller registers exactly two frontends: <code>dockerfile.v0</code>, compiled into dockerd, and
+            <code>gateway.v0</code>, which runs a frontend shipped as an image. It keeps its cache index in a bbolt file,
+            <code>cache.db</code>, and runs every <code>RUN</code> step by exec'ing <code>runc</code> itself, with no
+            containerd task <span class="src">from the code</span>. Figure 1 draws the whole
+            relay. The direction of the thin arrows is the surprise this part keeps returning to.
+          </p>
+
+          <figure class="figure wide" id="fig-build-process-map">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">Who talks to whom in one <code>docker build</code></p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 470" role="img" aria-label="The docker CLI rewrites docker build into buildx build and execs the buildx plugin. buildx opens POST /grpc on dockerd's API socket, upgrades it to h2c and sends gRPC Control.Solve and Control.Status inside it; the session runs on a second hijacked connection, POST /session. A handler that routes native application/grpc requests away from REST also exists, but buildx does not use it. Inside dockerd the BuildKit controller holds the dockerfile.v0 and gateway.v0 frontends, the solver with cache.db, and the runc executor. dockerd calls back into buildx for session services: FileSync.DiffCopy, Secrets, SSH and Auth. The executor execs runc, which starts the RUN step container; a gateway frontend runs as its own container and talks the LLBBridge gRPC service over its stdin and stdout.">
+                <defs>
+                  <marker id="fig-build-process-map-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-build-process-map-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">CLIENT</text>
+                <text x="350" y="26" class="svg-lane">DOCKERD (ONE API SOCKET)</text>
+                <text x="830" y="26" class="svg-lane">PROCESSES DOCKERD STARTS</text>
+
+                <rect x="30" y="48" width="240" height="70" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="72" class="svg-step">docker CLI</text>
+                <text x="42" y="92" class="svg-sub">docker build .</text>
+                <text x="42" y="108" class="svg-sub">forwardBuilder: argv rewrite</text>
+                <line x1="150" y1="120" x2="150" y2="170" stroke="#252525" stroke-width="2" marker-end="url(#fig-build-process-map-ctl)"/>
+                <text x="160" y="142" class="svg-sub">exec buildx build .</text>
+                <text x="160" y="158" class="svg-sub">+ BUILDX_BUILDER=ctx</text>
+
+                <rect x="30" y="176" width="240" height="190" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="200" class="svg-step">buildx v0.37.1 (plugin)</text>
+                <text x="42" y="220" class="svg-sub">gRPC client of Control</text>
+                <text x="42" y="248" class="svg-lane">SESSION SERVER</text>
+                <text x="42" y="268" class="svg-sub">FileSync  the context</text>
+                <text x="42" y="286" class="svg-sub">Secrets   --secret values</text>
+                <text x="42" y="304" class="svg-sub">SSH       agent forwarding</text>
+                <text x="42" y="322" class="svg-sub">Auth      registry creds</text>
+                <text x="42" y="350" class="svg-note">the client serves; dockerd asks</text>
+
+                <rect x="350" y="48" width="430" height="318" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <rect x="366" y="64" width="398" height="56" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-width="1"/>
+                <text x="378" y="86" class="svg-step">httpHandler.ServeHTTP</text>
+                <text x="378" y="106" class="svg-sub">buildx: POST /grpc → h2c gRPC · POST /session</text>
+
+                <rect x="366" y="134" width="398" height="218" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="378" y="156" class="svg-step">embedded BuildKit controller</text>
+                <text x="378" y="176" class="svg-sub">root: &lt;data-root&gt;/buildkit</text>
+                <rect x="378" y="188" width="180" height="70" rx="4" fill="#ffffff" stroke="#367f59" stroke-width="1"/>
+                <text x="390" y="208" class="svg-step">frontends</text>
+                <text x="390" y="228" class="svg-sub">dockerfile.v0</text>
+                <text x="390" y="246" class="svg-sub">gateway.v0</text>
+                <rect x="572" y="188" width="180" height="70" rx="4" fill="#ffffff" stroke="#367f59" stroke-width="1"/>
+                <text x="584" y="208" class="svg-step">solver</text>
+                <text x="584" y="228" class="svg-sub">edges, cache keys</text>
+                <text x="584" y="246" class="svg-sub">cache.db (bbolt)</text>
+                <rect x="378" y="270" width="374" height="70" rx="4" fill="#ffffff" stroke="#367f59" stroke-width="1"/>
+                <text x="390" y="290" class="svg-step">runc executor (BuildKit's runcexecutor)</text>
+                <text x="390" y="310" class="svg-sub">execs the runc binary directly</text>
+                <text x="390" y="328" class="svg-sub">no containerd task · not in docker ps</text>
+                <line x1="560" y1="223" x2="568" y2="223" stroke="#252525" stroke-width="2" marker-end="url(#fig-build-process-map-ctl)"/>
+
+                <line x1="272" y1="200" x2="346" y2="200" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-build-process-map-ctl)"/>
+                <text x="278" y="190" class="svg-sub">Solve</text>
+                <text x="278" y="216" class="svg-sub">Status</text>
+                <line x1="348" y1="300" x2="274" y2="300" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-build-process-map-data)"/>
+                <text x="280" y="290" class="svg-sub" style="fill:#3c6f97">calls</text>
+                <text x="280" y="316" class="svg-sub" style="fill:#3c6f97">back</text>
+
+                <rect x="830" y="48" width="220" height="112" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="842" y="70" class="svg-step">frontend container</text>
+                <text x="842" y="90" class="svg-sub">from # syntax= image</text>
+                <text x="842" y="108" class="svg-sub">entrypoint /run</text>
+                <text x="842" y="126" class="svg-sub">LLBBridge gRPC on</text>
+                <text x="842" y="144" class="svg-sub">its stdin/stdout</text>
+                <path d="M565,186 L565,127 L800,127 L800,104 L826,104" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-start="url(#fig-build-process-map-data)" marker-end="url(#fig-build-process-map-data)"/>
+
+                <rect x="830" y="214" width="220" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="842" y="236" class="svg-step">runc (short-lived)</text>
+                <text x="842" y="256" class="svg-sub">DOCKER_BUILDKIT_RUNC_COMMAND</text>
+                <line x1="754" y1="290" x2="800" y2="290" stroke="#252525" stroke-width="2"/>
+                <path d="M800,290 L800,242 L826,242" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-build-process-map-ctl)"/>
+
+                <rect x="830" y="296" width="220" height="70" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="842" y="318" class="svg-step">RUN step container</text>
+                <text x="842" y="338" class="svg-sub">network: bridge sandbox</text>
+                <text x="842" y="354" class="svg-sub">via a prestart hook</text>
+                <line x1="940" y1="272" x2="940" y2="292" stroke="#252525" stroke-width="2" marker-end="url(#fig-build-process-map-ctl)"/>
+
+                <line x1="30" y1="400" x2="60" y2="400" stroke="#252525" stroke-width="2.4"/>
+                <text x="68" y="404" class="svg-sub">control: a call that starts work</text>
+                <line x1="330" y1="400" x2="360" y2="400" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="368" y="404" class="svg-sub">data: bytes asked for or returned</text>
+                <text x="30" y="440" class="svg-note">Every thin arrow out of dockerd points back at a client: the context, the secrets, the SSH agent and the frontend's</text>
+                <text x="30" y="458" class="svg-note">graph are all requested by the daemon over a channel the client opened.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Read from the code at cli v29.9.2, moby 29.9.2, BuildKit v0.34.1 and buildx v0.37.2; nothing here was traced, because
+              dockerd could not start on this box. The legacy builder and the classic <code>POST /build</code> route
+              (which always solves with <code>dockerfile.v0</code>) also exist inside dockerd and are not drawn.
+            </p>
+          </figure>
+
+          <p>
+            The rest of this part follows one build through that relay. <a href="#p3-frontend">§02</a> compiles the
+            Dockerfile. <a href="#p3-llb">§03</a> takes the resulting graph apart byte by byte, using the one real build
+            record this machine could fetch: the provenance Docker Hub publishes for alpine:latest.
+            <a href="#p3-solver">§04</a> follows the solver and its two cache keys, <a href="#p3-context">§05</a> the
+            context transfer, <a href="#p3-run">§06</a> the <code>RUN</code> containers, and
+            <a href="#p3-export">§07</a> what a build writes out. The image format those outputs land in is
+            <a href="../images/#p2-lede">Part 2</a>'s subject; the runc that runs each step is
+            <a href="../run-path/#p1-runc">Part 1</a>'s.
+          </p>
+
+          <h2 id="p3-frontend"><span class="secnum">02</span>From Dockerfile to LLB</h2>
+          <p>
+            A frontend is a compiler. Its input is a Dockerfile and a set of options; its output is an LLB definition the
+            solver can run. <code>Dockerfile2LLB</code> works in three stages. <code>parser.Parse</code> turns bytes into
+            an AST of <code>Node</code>s. <code>instructions.Parse</code> turns the AST into typed <code>Stage</code>s
+            plus the global <code>ARG</code>s. A dispatch loop then turns each stage into an <code>llb.State</code>. An
+            empty Dockerfile, or one with no stages, is an error
+            (<code>buildkit/frontend/dockerfile/dockerfile2llb/convert.go:236-279</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>What the parser keeps</h3>
+          <p>
+            Each AST node keeps the instruction's value, its flags, any heredoc bodies, and the comment lines just above
+            it as <code>PrevComment</code>, which only the linter reads. Every other comment is thrown away, including one
+            inside a line continuation (<code>parser/parser.go:31-42, 334-338</code>). That one decision explains a cache
+            behaviour in <a href="#p3-solver">§04</a>: editing a comment cannot change anything downstream, because no comment survives the
+            parser. There are exactly three parser directives, <code>syntax</code>, <code>escape</code> and
+            <code>check</code>. Scanning stops at the first line that is not a <code>#</code> comment of the form
+            <code>key=value</code> with a known key, and a repeated directive is an error
+            (<code>parser/directives.go:14-24, 50-96</code>). <code>DetectSyntax</code> also accepts
+            <code>// syntax=</code> and a JSON <code>{"syntax": …}</code> form and skips a leading <code>#!</code>, so a
+            file that is not a Dockerfile can pick its compiler the same way <span class="src">from the code</span>.
+          </p>
+          <h3>What each instruction becomes</h3>
+          <p>
+            Most instructions produce no vertex at all. <code>ENV</code>, <code>ARG</code>, <code>USER</code>,
+            <code>LABEL</code>, <code>CMD</code>, <code>ENTRYPOINT</code>, <code>EXPOSE</code> and the metadata part of
+            <code>WORKDIR</code> only edit the state and the image config. <code>ENV</code> and <code>ARG</code> call
+            <code>State.AddEnv</code>, so they reach the graph only through the <code>Meta.env</code> of later
+            <code>RUN</code>s. Every instruction still appends a history entry to the image config, with
+            <code>EmptyLayer: true</code> for the metadata-only ones (<code>convert.go:1331-1344, 1708-1713,
+            1817-1829</code>) <span class="src">from the code</span>. The rest map one to one:
+          </p>
+          <ul>
+            <li><code>FROM image</code> is resolved to a digest <em>during compilation</em>.
+              <code>ResolveImageConfig</code> fetches the config, the reference is rewritten to
+              <code>name:tag@sha256:…</code>, and the pinned reference becomes a <code>docker-image://</code> SourceOp. A
+              base whose config has no DiffIDs and no non-empty history becomes <code>llb.Scratch()</code>
+              (<code>convert.go:695-753</code>).</li>
+            <li><code>RUN</code> becomes an ExecOp whose root mount output is the next state. Shell form is prefixed
+              with the image's <code>SHELL</code> or the OS default. A heredoc that starts with <code>#!</code> is written
+              into a 0755 file by a scratch FileOp, mounted read-only under <code>/dev/pipes/</code>, and executed
+              directly (<code>convert.go:1360-1384, 1405-1508</code>).</li>
+            <li><code>COPY</code> and <code>ADD</code> become a FileOp copy action with
+              <code>CopyDirContentsOnly</code>, <code>FollowSymlinks</code>, <code>AllowWildcard</code>,
+              <code>AllowEmptyWildcard</code> and <code>CreateDestPath</code> set; <code>ADD</code> adds
+              <code>AttemptUnpack</code> for local archives, and a URL or git source becomes its own SourceOp
+              (<code>convert_copy.go:180-293</code>).</li>
+          </ul>
+          <p>
+            <code>COPY --link</code> takes a different shape. The copy goes onto an empty <code>llb.Scratch()</code>
+            and the result is joined to the current state with a <code>MergeOp</code>, so the new layer does not depend
+            on the layers below it. The condition is one line, <code>convert_copy.go:337</code>, and the two branches are
+            <code>:352-355</code>:
+          </p>
+<pre><code>	if cfg.opt.llbCaps != nil &amp;&amp; cfg.opt.llbCaps.Supports(pb.CapMergeOp) == nil &amp;&amp; cfg.link &amp;&amp; cfg.chmod == "" {
+…
+		d.state = d.state.WithOutput(llb.Merge([]llb.State{d.state, llb.Scratch().File(a, copyOpts...)}, mergeOpts...).Output())
+	} else {
+		d.state = d.state.File(a, fileOpt...)
+	}</code></pre>
+          <p>
+            <code>cfg.chmod == ""</code> means a <code>COPY --link --chmod=…</code> silently becomes an ordinary
+            copy. Meanwhile the Dockerfile reference suggests <code>--chmod</code> as one fix for directory modes under
+            <code>--link</code> (<code>frontend/dockerfile/docs/reference.md:2008-2014</code>), and
+            <code>--link --chown=&lt;name&gt;</code> is a hard error by contrast. This is register D51, class C (doc
+            drift), still the same on BuildKit's <code>master</code> <span class="src">from the code</span>.
+          </p>
+          <h3>Stages that never exist</h3>
+          <p>
+            Stage dependencies come from <code>FROM &lt;stage&gt;</code>, <code>COPY --from</code> and
+            <code>RUN --mount=from=</code>. Cycles are rejected, and <code>ONBUILD</code> triggers are re-resolved in a
+            loop because they can add edges (<code>convert.go:518-586</code>). The frontend then computes
+            <code>allReachableStages(target)</code> and never dispatches any other stage unless
+            <code>AllStages</code> is set; the default target is the last stage (<code>convert.go:507-510, 589,
+            779-783</code>). An unused stage is not skipped at run time. It never becomes LLB. Base images of every stage
+            are resolved concurrently, one goroutine per stage, but only reachable stages fetch a config
+            <span class="src">from the code</span>. Nothing in the frontend schedules parallel work: independent stages
+            are disjoint subgraphs of one DAG, and the solver runs independent edges at the same time
+            (<code>docs/dev/solver.md:225-232</code>).
+          </p>
+          <h3><code># syntax=</code> swaps the compiler</h3>
+          <p>
+            The built-in frontend reads the Dockerfile first. If a <code>BUILDKIT_SYNTAX</code> build-arg or a
+            <code># syntax=</code> line names an image, it forwards the whole build to it
+            (<code>frontend/dockerfile/builder/build.go:54-58, 62-63</code>):
+          </p>
+<pre><code>	if _, ok := opts["cmdline"]; !ok {
+		if cmdline, ok := opts[keySyntaxArg]; ok {
+			p := strings.SplitN(strings.TrimSpace(cmdline), " ", 2)
+			res, err := forwardGateway(ctx, c, p[0], cmdline)
+			if err != nil &amp;&amp; len(errdefs.Sources(err)) == 0 {
+…
+		} else if ref, cmdline, loc, ok := parser.DetectSyntax(src.Data); ok {
+			res, err := forwardGateway(ctx, c, ref, cmdline)</code></pre>
+          <p>
+            The build-arg wins over the line, and the <code>cmdline</code> check stops a forwarded frontend from
+            forwarding again. <code>forwardGateway</code> is a nested <code>Solve</code> with
+            <code>Frontend: "gateway.v0"</code>, the image in <code>source</code> and the directive in
+            <code>cmdline</code>. <code>gateway.v0</code> resolves the image to a digest, solves it as ordinary LLB and
+            runs its entrypoint, <code>/run</code> by default, through the same executor as a <code>RUN</code> step. The
+            options arrive as <code>BUILDKIT_FRONTEND_OPT_&lt;n&gt;</code> environment variables. The frontend talks back
+            over gRPC on its own stdin and stdout: two <code>os.Pipe()</code>s wrapped as a <code>net.Conn</code>,
+            served by a <code>grpc.Server</code> exposing <code>LLBBridge</code>
+            (<code>frontend/gateway/gateway.go:489-534</code>) <span class="src">from the code</span>. Through it the
+            frontend can resolve image configs, call <code>Solve</code> recursively, read files out of results, run
+            containers with <code>NewContainer</code> and <code>ExecProcess</code>, warn, and finally
+            <code>Return</code> (<code>frontend/gateway/pb/gateway.proto:15-46</code>). Images opt into features with
+            the <code>moby.buildkit.frontend.caps</code> label; a hard-coded list of four
+            <code>docker/dockerfile:1.1.x</code> digests is granted the "inputs" cap because they predate the label.
+          </p>
+          <p>
+            alpine:latest was built this way. Its published SLSA provenance for linux/amd64 records the frontend and the
+            three keys <code>build.go</code> sets <span class="recon">measured here</span>:
+          </p>
+<pre><code>"frontend": "gateway.v0",
+"build-arg:BUILDKIT_SYNTAX": "tianon/buildkit:0.16@sha256:74e9cc0b4cdd66fe1ef01e9ca16a74e400d10aa52ba568ae56e8c38eb70695a3",
+"cmdline":                   "tianon/buildkit:0.16@sha256:74e9cc0b…",
+"source":                    "tianon/buildkit:0.16@sha256:74e9cc0b…"</code></pre>
+          <p>
+            The Dockerfile itself, base64 in the same record, is three lines: <code>FROM scratch</code>,
+            <code>ADD alpine-minirootfs-3.24.3-x86_64.tar.gz /</code> and <code>CMD ["/bin/sh"]</code>
+            <span class="recon">measured here</span>. <code>FROM scratch</code> and <code>CMD</code> make no vertex. The
+            next section takes the graph that remains apart byte by byte.
+          </p>
+
+          <h2 id="p3-llb"><span class="secnum">03</span>LLB: a Merkle DAG of protobuf</h2>
+          <p>
+            LLB, BuildKit's low-level build format, is defined in one protobuf file, <code>solver/pb/ops.proto</code>.
+            One <code>Op</code> is one vertex of the graph: a list of input edges, then exactly one of seven op kinds,
+            then an optional platform and worker constraints. An input edge is not a pointer. It is the sha256 digest of
+            the input op's marshaled bytes plus an output index (<code>buildkit/solver/pb/ops.proto:10-25, 37-42</code>)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>message Op {
+	// changes to this structure must be represented in json.go.
+	// inputs is a set of input edges.
+	repeated Input inputs = 1;
+	oneof op {
+		ExecOp exec = 2;
+		SourceOp source = 3;
+		FileOp file = 4;
+		BuildOp build = 5;
+		MergeOp merge = 6;
+		DiffOp diff = 7;
+		PassthroughOp passthrough = 8;
+	}
+	Platform platform = 10;
+	WorkerConstraints constraints = 11;
+}
+…
+message Input {
+	// digest of the marshaled input Op
+	string digest = 1;
+	// output index of the input Op
+	int64 index = 2;
+}</code></pre>
+          <p>
+            Naming each input by the hash of its bytes makes the graph a Merkle DAG, the same construction as an image
+            (<a href="../images/#p2-lede">Part 2</a>) or a git commit. The four kinds a Dockerfile uses are small.
+            <code>SourceOp</code> is a URL-like <code>identifier</code> (<code>local://</code>,
+            <code>docker-image://</code>, <code>git://</code>, <code>https://</code>) plus string attributes.
+            <code>FileOp</code> is a chain of actions: <code>copy</code>, <code>mkfile</code>, <code>mkdir</code>,
+            <code>rm</code>, <code>symlink</code>. <code>ExecOp</code> carries <code>Meta</code> (args, env, cwd, user,
+            proxy env, extra hosts, hostname, ulimits, cgroup parent, valid exit codes), mounts, a network mode, a
+            security mode, secret env vars and CDI devices. <code>MergeOp</code> and <code>DiffOp</code> let a build
+            stack and subtract layers; <code>Merge(A,B)</code> lays B over A with B winning, and the docs call it
+            associative (<code>ops.proto:45-69, 196-203, 320-341</code>; <code>docs/dev/merge-diff.md:25-40</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            A <code>Definition</code>, the thing a client sends in <code>Solve</code>, is a flat list of marshaled ops, a
+            separate <code>metadata</code> map keyed by op digest, and a source map (<code>ops.proto:309-318</code>).
+            Descriptions, the ignore-cache flag, progress groups and Dockerfile line numbers all live in the side maps,
+            outside the hashed bytes. <code>State.Marshal</code> marshals inputs first, depth-first, so the list comes out
+            in topological order with duplicates removed. It hashes each op with protobuf's deterministic mode, which
+            sorts map keys (<code>client/llb/marshal.go:167-169</code>). Last it appends one op with no kind at all, whose
+            single input points at the result. That <em>terminal</em> vertex is how the solver finds the root
+            (<code>client/llb/state.go:156-165</code>) <span class="src">from the code</span>.
+          </p>
+          <h3>alpine's three vertices, re-derived</h3>
+          <p>
+            A <code>max</code> provenance record embeds the whole definition as JSON, plus a <code>digestMapping</code>
+            from each op's digest to a name like <code>step1</code>. alpine:latest's amd64 record holds three ops: a git
+            SourceOp, a FileOp copy that reads the tarball out of that checkout, and the terminal op. JSON is not the
+            hashed form, so the digests can only be checked by re-encoding. A 37-line Python script writes each op back
+            as proto3 by hand (varint tags, length-prefixed strings, zero values omitted, map entries in key order) and
+            hashes the result. All three digests match the published ones <span class="recon">measured here</span>:
+          </p>
+<pre><code>step0 computed   sha256:d6495f741434b0751c18449a07ab9d060470572db32aebe08fc92e4cda371cbe
+step0 provenance sha256:d6495f741434b0751c18449a07ab9d060470572db32aebe08fc92e4cda371cbe
+step1 computed   sha256:954bf26d1da1bfb9d78b1d198538b8c4445c03bac3537b442ec118bbf7cfbb4e
+step1 provenance sha256:954bf26d1da1bfb9d78b1d198538b8c4445c03bac3537b442ec118bbf7cfbb4e
+step2 computed   sha256:f8182904ba1c20747acc8c111dc78b1b82b1989fd0ee55d2c4dbf735bef6ac5b
+step2 provenance sha256:f8182904ba1c20747acc8c111dc78b1b82b1989fd0ee55d2c4dbf735bef6ac5b</code></pre>
+          <p>
+            Two versions of the script exist. The first takes each input digest from the published mapping, so it checks
+            each vertex on its own. The second, <code>llbdigest-chained.py</code>, feeds each computed digest into the
+            next op, so the match above checks the chain end to end. Both hard-code the six copy booleans as 1, which is
+            what this record holds; a record with a false flag would need the encoder extended
+            <span class="recon">measured here</span>. The bytes are short enough to read whole. Figure
+            2 annotates them field by field.
+          </p>
+
+          <figure class="figure wide" id="fig-vertex-bytes">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">The bytes of alpine's three LLB vertices, and what one changed digit does</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 530" role="img" aria-label="Three protobuf records. step0, 246 bytes, is a SourceOp: tag 1a, length 241, then the 94-byte git identifier, sorted attrs and an empty constraints field 5a 00. Its sha256 d6495f741434 appears as the input digest at the start of step1, 172 bytes, a FileOp copy with input minus one as a ten-byte varint, the tarball source path, mode minus one, six true booleans, timestamp minus one and empty constraints. The sha256 of step1, 954bf26d1da1, is the only content of step2, 75 bytes: tag 0a length 73, tag 0a length 71, the 71-character digest string, index 0 omitted. Changing one hex digit of the git commit in step0 changes all three digests to 9d01836c2ce2, a4cbf1baaf71 and 39f4f11cb933.">
+                <defs>
+                  <marker id="fig-vertex-bytes-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="30" y="30" class="svg-lane">VERTEX BYTES (HEX)</text>
+                <text x="290" y="30" class="svg-lane">FIELD</text>
+                <text x="770" y="30" class="svg-lane">SHA256 OF THE BYTES</text>
+
+                <rect x="30" y="44" width="700" height="122" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="42" y="66" class="svg-step">step0 · SourceOp · 246 B</text>
+                <text x="42" y="88" class="svg-sub">1a f1 01</text>
+                <text x="290" y="88" class="svg-sub">field 3 (source), length 241</text>
+                <text x="42" y="106" class="svg-sub">0a 5e 67 69 74 3a 2f 2f …</text>
+                <text x="290" y="106" class="svg-sub">identifier, 94 B: git://…/docker-alpine.git#5aec467f…:x86_64</text>
+                <text x="42" y="124" class="svg-sub">12 27 0a 14 67 69 74 2e …</text>
+                <text x="290" y="124" class="svg-sub">attrs, keys sorted: git.authheadersecret, …</text>
+                <text x="42" y="142" class="svg-sub">5a 00</text>
+                <text x="290" y="142" class="svg-sub">field 11 (constraints), empty</text>
+
+                <rect x="30" y="190" width="700" height="164" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="212" class="svg-step">step1 · FileOp copy · 172 B</text>
+                <text x="42" y="234" class="svg-sub">0a 49 0a 47 73 68 61 32 …</text>
+                <text x="290" y="234" class="svg-sub">inputs[0]: digest "sha256:d6495f74…cbe" (71 B)</text>
+                <text x="42" y="252" class="svg-sub">22 5d 12 5b</text>
+                <text x="290" y="252" class="svg-sub">field 4 (file), 93 B → actions, 91 B</text>
+                <text x="42" y="270" class="svg-sub">08 ff ff ff ff ff ff ff ff ff 01</text>
+                <text x="290" y="270" class="svg-sub">input = −1 (scratch): a ten-byte varint</text>
+                <text x="42" y="288" class="svg-sub">22 4e 0a 27 2f 61 6c 70 …</text>
+                <text x="290" y="288" class="svg-sub">copy: src /alpine-minirootfs-3.24.3-x86_64.tar.gz</text>
+                <text x="42" y="306" class="svg-sub">12 01 2f 20 ff … 01</text>
+                <text x="290" y="306" class="svg-sub">dest "/", mode −1 (unset)</text>
+                <text x="42" y="324" class="svg-sub">28 01 30 01 … 50 01</text>
+                <text x="290" y="324" class="svg-sub">six copy flags, all true</text>
+                <text x="42" y="342" class="svg-sub">58 ff … ff 01 5a 00</text>
+                <text x="290" y="342" class="svg-sub">timestamp −1 (unset) · constraints {}</text>
+
+                <rect x="30" y="374" width="700" height="86" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="394" class="svg-step">step2 · terminal op (no kind) · 75 B</text>
+                <text x="42" y="416" class="svg-sub">0a 49 0a 47 73 68 61 32 35 36 3a</text>
+                <text x="290" y="416" class="svg-sub">inputs[0] (73 B) → digest (71 B) → "sha256:"</text>
+                <text x="42" y="438" class="svg-sub">39 35 34 62 66 32 36 64 …</text>
+                <text x="290" y="438" class="svg-sub">"954bf26d…b4e" · index 0 omitted · 2+2+71 = 75</text>
+
+                <rect x="770" y="44" width="280" height="122" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="66" class="svg-step">sha256 of these 246 B</text>
+                <text x="782" y="88" class="svg-sub">d6495f741434…cbe</text>
+                <text x="782" y="122" class="svg-note">one hex digit of the commit edited:</text>
+                <text x="782" y="144" class="svg-sub" style="fill:#ad4b43">9d01836c2ce2…</text>
+
+                <rect x="770" y="190" width="280" height="164" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="212" class="svg-step">sha256 of these 172 B</text>
+                <text x="782" y="234" class="svg-sub">954bf26d1da1…b4e</text>
+                <text x="782" y="300" class="svg-note">same edit, input digest changed:</text>
+                <text x="782" y="322" class="svg-sub" style="fill:#ad4b43">a4cbf1baaf71…</text>
+
+                <rect x="770" y="374" width="280" height="86" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="394" class="svg-step">sha256 of these 75 B</text>
+                <text x="782" y="416" class="svg-sub">f8182904ba1c…b5c  (root)</text>
+                <text x="782" y="438" class="svg-sub" style="fill:#ad4b43">edited: 39f4f11cb933…</text>
+
+                <path d="M910,168 L910,178 L748,178 L748,230 L734,230" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-vertex-bytes-data)"/>
+                <path d="M910,356 L910,364 L748,364 L748,412 L734,412" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-vertex-bytes-data)"/>
+
+                <text x="30" y="494" class="svg-note">Each blue arrow carries a digest from where it is computed to where the next vertex embeds it as text. Change one byte at the</text>
+                <text x="30" y="512" class="svg-note">source and every digest below it moves: the definition is pinned by its last 32 bytes, the way an image is pinned by its index digest.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured here from <code>step0.pb</code>, <code>step1.pb</code> and <code>step2.pb</code>, the bytes the
+              chained encoder wrote for alpine:latest's published linux/amd64 provenance; the edited digests are its
+              output with one hex digit of the git commit changed. Elided bytes (…) are spelled out in the files. Tags
+              are <code>(field &lt;&lt; 3) | wiretype</code>: <code>0a</code> is field 1 length-delimited,
+              <code>5a</code> is field 11, <code>58</code> is field 11 as a varint inside the copy action.
+            </p>
+          </figure>
+
+          <p>
+            The ripple in the right-hand column is the point. Because inputs are named by digest, editing one character of
+            the root SourceOp changes the digest of every vertex downstream <span class="recon">measured here</span>. The
+            reverse also holds, and it explains most of <a href="#p3-solver">§04</a>. Anything kept outside the op bytes
+            cannot change a digest. Comments never reach LLB, and line numbers travel in the source map, so moving a
+            Dockerfile line or editing a comment leaves every vertex digest as it was
+            (<code>parser/parser.go:334-338</code>; <code>ops.proto:309-318</code>)
+            <span class="src">from the code</span>, <span class="recon">reconstruction</span> for the conclusion.
+          </p>
+          <p>
+            A vertex digest is still not a cache key. The solver uses it to merge identical work inside one run: two jobs
+            that load the same digest share one state in <code>Solver.actives</code>, and the step runs once
+            (<code>solver/jobs.go:41-50, 547-611</code>). But <code>docker-image://alpine:latest</code> means different
+            bytes next week, so the solver's design doc says the digest is good only for deduplication during a run
+            (<code>docs/dev/solver.md:61-67</code>) <span class="src">from the code</span>. Persistent caching needs
+            something else.
+          </p>
+
+          <h2 id="p3-solver"><span class="secnum">04</span>The solver and the two cache keys</h2>
+          <p>
+            Take a small two-stage Dockerfile with a third stage nobody uses. Figure 3 draws
+            the graph the frontend would emit for it and, on each vertex, the keys the solver would compute. The example
+            is mine and was not built here; every mapping in it is read from the code cited in
+            <a href="#p3-frontend">§02</a> and below <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-dockerfile-llb-dag">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">A Dockerfile beside its LLB DAG, with each vertex's cache keys</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 500" role="img" aria-label="Left, an eight-line Dockerfile with a build stage from golang, an unused debug stage and a final stage from alpine. Right, its LLB graph: two docker-image SourceOps keyed by manifest digest and platform, a local context SourceOp limited to go.mod and main.go whose key contains the session ID, a FileOp copy keyed fast by the op with basenames and slow by the content of the two paths, an ExecOp keyed by its scrubbed definition only, a second FileOp copy of /app keyed slow by the content of /app, and the terminal op. The debug stage and CMD produce no vertex.">
+                <defs>
+                  <marker id="fig-dockerfile-llb-dag-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="30" y="28" class="svg-lane">DOCKERFILE</text>
+                <text x="400" y="28" class="svg-lane">LLB VERTICES AND THEIR KEYS</text>
+
+                <rect x="30" y="44" width="340" height="250" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="70" class="svg-sub">FROM golang AS build</text>
+                <text x="290" y="70" class="svg-num">V1</text>
+                <text x="42" y="94" class="svg-sub">COPY go.mod main.go ./</text>
+                <text x="290" y="94" class="svg-num">V2 V3</text>
+                <text x="42" y="118" class="svg-sub">RUN go build -o /app .</text>
+                <text x="290" y="118" class="svg-num">V4</text>
+                <text x="42" y="146" class="svg-sub" style="fill:#b8b8b1">FROM alpine AS debug</text>
+                <text x="42" y="170" class="svg-sub" style="fill:#b8b8b1">RUN apk add strace</text>
+                <text x="290" y="158" class="svg-sub" style="fill:#b8b8b1">pruned</text>
+                <text x="42" y="198" class="svg-sub">FROM alpine</text>
+                <text x="290" y="198" class="svg-num">V5</text>
+                <text x="42" y="222" class="svg-sub">COPY --from=build /app /app</text>
+                <text x="290" y="222" class="svg-num">V6</text>
+                <text x="42" y="246" class="svg-sub">CMD ["/app"]</text>
+                <text x="250" y="246" class="svg-sub">no vertex</text>
+                <text x="42" y="278" class="svg-note">terminal op V7 is appended by Marshal</text>
+
+                <rect x="30" y="314" width="340" height="96" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-width="1" stroke-dasharray="4 3"/>
+                <text x="42" y="336" class="svg-step">stage "debug": never dispatched</text>
+                <text x="42" y="356" class="svg-sub">allReachableStages(target) skips it;</text>
+                <text x="42" y="374" class="svg-sub">its base config is never fetched</text>
+                <text x="42" y="392" class="svg-sub">and no vertex exists for it</text>
+
+                <rect x="400" y="44" width="205" height="76" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="412" y="66" class="svg-step">V1 SourceOp · golang</text>
+                <text x="412" y="86" class="svg-sub">docker-image://…@sha256:…</text>
+                <text x="412" y="106" class="svg-sub">key: manifest + platform</text>
+                <rect x="620" y="44" width="205" height="76" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="632" y="66" class="svg-step">V2 SourceOp · local://context</text>
+                <text x="632" y="86" class="svg-sub">FollowPaths: go.mod, main.go</text>
+                <text x="632" y="106" class="svg-sub">key holds the session ID</text>
+                <rect x="845" y="44" width="205" height="76" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="857" y="66" class="svg-step">V5 SourceOp · alpine</text>
+                <text x="857" y="86" class="svg-sub">docker-image://…@sha256:…</text>
+                <text x="857" y="106" class="svg-sub">key: manifest + platform</text>
+
+                <rect x="400" y="160" width="300" height="76" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="412" y="182" class="svg-step">V3 FileOp copy go.mod main.go ./</text>
+                <text x="412" y="202" class="svg-sub">fast: op with basenames only</text>
+                <text x="412" y="222" class="svg-sub">slow: content of the two paths</text>
+                <line x1="500" y1="122" x2="500" y2="156" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-dockerfile-llb-dag-data)"/>
+                <path d="M720,122 L720,140 L640,140 L640,156" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-dockerfile-llb-dag-data)"/>
+
+                <rect x="400" y="276" width="300" height="76" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="412" y="298" class="svg-step">V4 ExecOp · go build -o /app .</text>
+                <text x="412" y="318" class="svg-sub">fast: scrubbed op JSON</text>
+                <text x="412" y="338" class="svg-sub">slow: none (root mount is writable)</text>
+                <line x1="550" y1="238" x2="550" y2="272" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-dockerfile-llb-dag-data)"/>
+
+                <rect x="740" y="276" width="310" height="76" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="752" y="298" class="svg-step">V6 FileOp copy /app → /app</text>
+                <text x="752" y="318" class="svg-sub">fast: op + selector /app</text>
+                <text x="752" y="338" class="svg-sub">slow: content of /app in V4's output</text>
+                <line x1="702" y1="314" x2="736" y2="314" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-dockerfile-llb-dag-data)"/>
+                <line x1="947" y1="122" x2="947" y2="272" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-dockerfile-llb-dag-data)"/>
+
+                <rect x="790" y="392" width="210" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="802" y="414" class="svg-step">V7 terminal op</text>
+                <text x="802" y="434" class="svg-sub">one input: V6 output 0</text>
+                <line x1="895" y1="354" x2="895" y2="388" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-dockerfile-llb-dag-data)"/>
+
+                <text x="30" y="470" class="svg-note">V2's own key never matches across builds; V3 hits anyway when go.mod and main.go hash the same. V1 and V5 can</text>
+                <text x="30" y="488" class="svg-note">key on a manifest digest without pulling a layer, and V4 runs only if no result is linked under its key.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Reconstruction from the frontend and solver code; this Dockerfile was not built. V1 and V5 are pinned to
+              digests while the Dockerfile is compiled; the ellipses stand for those digests. Green: sources. Blue: file
+              copies, which get content keys. Orange: the one exec.
+            </p>
+          </figure>
+
+          <h3>Edges, states and a scheduler</h3>
+          <p>
+            Every op implements <code>CacheMap</code> (how to key it), <code>Exec</code> (run it) and
+            <code>Acquire</code>. <code>CacheMap.Digest</code> is the op's own checksum; each <code>Deps[i]</code> may
+            add a <code>Selector</code> and a <code>ComputeDigestFunc</code> that keys input <em>i</em> by its content
+            (<code>buildkit/solver/types.go:169-249</code>). Both calls run at most once per vertex, behind flightcontrol
+            groups (<code>solver/jobs.go:1164-1166, 1243-1250</code>). One scheduler goroutine pops edges off a queue
+            and calls <code>edge.unpark</code>; the real work runs in async functions connected to edges by "pipes"
+            (<code>solver/scheduler.go:61-96</code>). Each edge moves through four states, declared in
+            <code>solver/edge.go:14-21</code> as <code>edgeStatusInitial</code>, <code>edgeStatusCacheFast</code>,
+            <code>edgeStatusCacheSlow</code> and <code>edgeStatusComplete</code>. The solver raises an input's desired
+            state only as far as the current edge needs <span class="src">from the code</span>. So if one input already
+            gives a definition-based match, the others are never content-hashed, and an image input is never pulled
+            (<code>docs/dev/solver.md:25-29</code>). Layers are lazy anyway: the puller records a handle per layer at
+            key time and fetches bytes only when a later step needs the snapshot
+            (<code>source/containerimage/pull.go:156-171</code>). Figure 4 shows the two tiers.
+          </p>
+          <h3>The fast key: a scrubbed definition</h3>
+          <p>
+            A root key is <code>sha256("&lt;cacheMapDigest&gt;@&lt;output&gt;")</code> (<code>solver/cachemanager.go:451-457</code>).
+            A key with dependencies is not a hash chain. It is a node in a link graph, found by following
+            <code>CacheInfoLink{Input, Output, Digest, Selector}</code> edges out of each dependency's keys, and given a
+            random ID when no link exists yet. The links persist in <code>cache.db</code>'s four bbolt buckets,
+            <code>_result</code>, <code>_links</code>, <code>_byresult</code> and <code>_backlinks</code>
+            <span class="src">from the code</span>. For an ExecOp, <code>CacheMap</code> hashes JSON
+            <code>{Type: "buildkit.exec.v0", Exec: op, OS, Arch, …}</code> of a cleaned copy of the op
+            (<code>solver/llbsolver/ops/exec.go:114-132</code>):
+          </p>
+<pre><code>func (e *ExecOp) CacheMap(ctx context.Context, jobCtx solver.JobContext, index int) (*solver.CacheMap, bool, error) {
+	op := cloneExecOp(e.op)
+
+	for i := range op.Meta.ExtraHosts {
+		h := op.Meta.ExtraHosts[i]
+		h.IP = ""
+		op.Meta.ExtraHosts[i] = h
+	}
+
+	for i := range op.Mounts {
+		m := op.Mounts[i]
+		m.Selector = ""
+
+		if checkShouldClearCacheOpts(m) {
+			m.CacheOpt.ID = ""
+			m.CacheOpt.Sharing = 0
+		}
+	}
+	op.Meta.ProxyEnv = nil</code></pre>
+          <p>
+            Proxy settings, <code>--add-host</code> IPs, mount selectors and a cache mount's custom <code>id</code> or
+            non-default <code>sharing</code> all drop out (register D53, D54, both class D, intended). Separately,
+            <code>getMountDeps</code> skips secret, SSH and tmpfs mounts, so a rotated secret value never invalidates a
+            cached <code>RUN</code> (<code>exec.go:297-303</code>; D52, class D). A <code>RUN</code> mount gets a
+            content key only when that is safe, with no output or read-only (<code>exec.go:315-337</code>)
+            <span class="src">from the code</span>. All three are unchanged on BuildKit's <code>master</code>.
+          </p>
+
+          <figure class="figure wide" id="fig-cache-keys">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">Edge states and the two cache-key tiers</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 470" role="img" aria-label="Top: an edge's four states, initial, cache-fast, cache-slow and complete. Left lane: the definition key, sha256 over the JSON of a cleaned op with ProxyEnv, ExtraHosts IP, mount selectors and non-default cache-mount id and sharing struck out, rooted as sha256 of digest at output and linked to parents through CacheInfoLink records in cache.db. Right lane: the content key, built per file from a tar header without mtime plus the file bytes, per directory from child keys and digests in radix order, and per input as sha256 of the NUL-joined digests of its selectors. A dashed arrow shows Cache().Query linking the definition keys to the content key.">
+                <defs>
+                  <marker id="fig-cache-keys-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-cache-keys-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">EDGE STATE (solver/edge.go:14-21)</text>
+                <rect x="30" y="40" width="200" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="70" class="svg-step">initial</text>
+                <rect x="290" y="40" width="230" height="50" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="302" y="62" class="svg-step">cache-fast</text>
+                <text x="302" y="80" class="svg-sub">definition keys checked</text>
+                <rect x="580" y="40" width="230" height="50" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="592" y="62" class="svg-step">cache-slow</text>
+                <text x="592" y="80" class="svg-sub">content keys checked</text>
+                <rect x="870" y="40" width="180" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="882" y="62" class="svg-step">complete</text>
+                <text x="882" y="80" class="svg-sub">loaded or Exec run</text>
+                <line x1="232" y1="65" x2="286" y2="65" stroke="#252525" stroke-width="2" marker-end="url(#fig-cache-keys-ctl)"/>
+                <line x1="522" y1="65" x2="576" y2="65" stroke="#252525" stroke-width="2" marker-end="url(#fig-cache-keys-ctl)"/>
+                <line x1="812" y1="65" x2="866" y2="65" stroke="#252525" stroke-width="2" marker-end="url(#fig-cache-keys-ctl)"/>
+
+                <text x="30" y="130" class="svg-lane">FAST: DEFINITION KEY</text>
+                <rect x="30" y="142" width="490" height="230" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="164" class="svg-step">ExecOp.CacheMap: sha256 over JSON of a cleaned op</text>
+                <text x="42" y="186" class="svg-sub">{Type: "buildkit.exec.v0", Exec: op, OS, Arch, …}</text>
+                <text x="42" y="210" class="svg-sub">removed before hashing:</text>
+                <text x="62" y="230" class="svg-sub" style="fill:#ad4b43;text-decoration:line-through">Meta.ProxyEnv</text>
+                <text x="62" y="248" class="svg-sub" style="fill:#ad4b43;text-decoration:line-through">Meta.ExtraHosts[i].IP</text>
+                <text x="62" y="266" class="svg-sub" style="fill:#ad4b43;text-decoration:line-through">Mounts[i].Selector</text>
+                <text x="62" y="284" class="svg-sub" style="fill:#ad4b43;text-decoration:line-through">CacheOpt.ID, Sharing (custom)</text>
+                <text x="42" y="310" class="svg-sub">root key  = sha256("&lt;digest&gt;@&lt;output&gt;")</text>
+                <text x="42" y="330" class="svg-sub">other keys = link-graph nodes via</text>
+                <text x="42" y="348" class="svg-sub">CacheInfoLink{Input, Output, Digest, Selector}</text>
+
+                <text x="560" y="130" class="svg-lane">SLOW: CONTENT KEY</text>
+                <rect x="560" y="142" width="490" height="230" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="572" y="164" class="svg-step">file: tar header from stat, then the bytes</text>
+                <text x="572" y="186" class="svg-sub">name (blank) mode uid gid size typeflag linkname</text>
+                <text x="572" y="204" class="svg-sub">uname gname devmajor devminor</text>
+                <text x="572" y="222" class="svg-sub">xattrs: security.capability only</text>
+                <text x="900" y="204" class="svg-sub" style="fill:#ad4b43;text-decoration:line-through">mtime</text>
+                <text x="572" y="252" class="svg-step">directory: child key + child digest</text>
+                <text x="572" y="272" class="svg-sub">in radix-tree order, recursively</text>
+                <text x="572" y="302" class="svg-step">input: one digest per selector</text>
+                <text x="572" y="322" class="svg-sub">sha256(d1 \0 d2 \0 … dn)</text>
+                <text x="572" y="348" class="svg-sub">→ NewCacheKey(dgst, "", -1)</text>
+
+                <path d="M800,374 L800,410 L280,410 L280,378" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-cache-keys-state)"/>
+                <text x="300" y="432" class="svg-sub" style="fill:#765b98">Cache().Query(defKeys + slowKey): link both tiers in cache.db</text>
+                <text x="30" y="458" class="svg-note">A rebuild whose definition key is new but whose bytes hash the same finds the old result through this link.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              From the code: <code>solver/edge.go:14-21, 708-721</code>, <code>solver/llbsolver/ops/exec.go:114-187</code>,
+              <code>cache/contenthash/filehash.go:44-73</code>, <code>tarsum.go:38-75</code>,
+              <code>checksum.go:903-925</code> and <code>ops/opsutils/contenthash.go:31-71</code>. The name is blanked in
+              the header and added during the directory walk.
+            </p>
+          </figure>
+
+          <h3>The slow key: a tarsum without mtime</h3>
+          <p>
+            A FileOp copy's own digest keeps only the <em>basename</em> of each source. The full paths, with wildcard,
+            include and exclude settings, become that input's <code>Selector</code>, and a
+            <code>ComputeDigestFunc</code> content-hashes exactly those paths (<code>ops/file.go:110-119,
+            160-180</code>). A file's record starts as a tar header built from its stat, with the file bytes after it. The
+            header is serialised in "V1 tarsum" order, which is the legacy v0 field list minus one field
+            (<code>buildkit/cache/contenthash/tarsum.go:60-67</code>):
+          </p>
+<pre><code>// Copy all headers from v0 excluding the 'mtime' header (the 5th element).
+v0headers := v0TarHeaderSelect(h)
+orderedHeaders = append(orderedHeaders, v0headers[0:5]...)
+orderedHeaders = append(orderedHeaders, v0headers[6:]...)</code></pre>
+          <p>
+            A directory hashes each child's key and digest in radix-tree order, several selectors are hashed in parallel,
+            and the input's key is sha256 of their NUL-joined digests. When it is ready, <code>edge.go:708-721</code>
+            builds <code>NewCacheKey(dgst, "", -1)</code> and calls <code>Cache().Query</code> to link the definition
+            keys to it <span class="src">from the code</span>. That link is the payoff. The local context's own key
+            includes the session ID, so <code>[internal] load build context</code> never matches across builds
+            (<code>source/local/source.go:129-162</code>); a <code>COPY</code> hits only because identical bytes produce
+            an identical content key. Mode, owner and xattrs count; mtime does not (D61, class D). Image sources key on
+            <code>{Digest: &lt;manifest digest&gt;, OS, Arch, …}</code>. Since v0.34.0, commit <code>5cf302ff6</code>,
+            the config's DiffIDs are no longer an alternate key, because they are unverified at lookup and could poison the
+            cache (<code>source/containerimage/pull.go:62-84, 175-183</code>; D62, class E). Figure
+            5 turns all this into answers.
+          </p>
+
+          <figure class="figure" id="fig-cache-bust-table">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">Does this bust the cache?</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead><tr><th>Change between two builds</th><th>Busts?</th><th>Why</th></tr></thead>
+                <tbody>
+                  <tr><td>Edit a comment</td><td class="hl-green" style="background: var(--green-soft)">no</td><td>the parser drops comments (F19, F80)</td></tr>
+                  <tr><td>Insert blank lines, shift a block down</td><td class="hl-green" style="background: var(--green-soft)">no</td><td>line numbers live in the source map (F80)</td></tr>
+                  <tr><td><code>touch</code> a copied file</td><td class="hl-green" style="background: var(--green-soft)">no</td><td>mtime is not in the header (F77)</td></tr>
+                  <tr><td><code>chmod</code> a copied file</td><td class="hl-red" style="background: var(--red-soft)">yes</td><td>mode is in the header (F76, D61)</td></tr>
+                  <tr><td>Edit a copied file</td><td class="hl-red" style="background: var(--red-soft)">yes</td><td>its bytes are hashed (F76)</td></tr>
+                  <tr><td>Edit a file no <code>COPY</code> selects</td><td class="hl-green" style="background: var(--green-soft)">no</td><td>only selected paths are hashed (F71, F85)</td></tr>
+                  <tr><td>Change a build-arg value</td><td class="hl-orange" style="background: var(--orange-soft)">later <code>RUN</code>s</td><td>in scope it is in <code>Meta.env</code>; earlier steps keep their keys (F42)</td></tr>
+                  <tr><td>Change <code>HTTP_PROXY</code></td><td class="hl-green" style="background: var(--green-soft)">no</td><td><code>ProxyEnv</code> is dropped (F67, D53)</td></tr>
+                  <tr><td>Change an <code>--add-host</code> IP</td><td class="hl-green" style="background: var(--green-soft)">no</td><td>the IP is blanked (F67, D53)</td></tr>
+                  <tr><td>Rotate a secret's value</td><td class="hl-green" style="background: var(--green-soft)">no</td><td>secret mounts add no dependency (F69, D52)</td></tr>
+                  <tr><td>Change a cache mount's custom <code>id=</code></td><td class="hl-green" style="background: var(--green-soft)">no</td><td>cleared from the key (F68, D54)</td></tr>
+                  <tr><td>Retag the base, same digest</td><td class="hl-green" style="background: var(--green-soft)">no</td><td>the key is the manifest digest (F62, F74)</td></tr>
+                  <tr><td>Base re-pushed: new manifest, same layers</td><td class="hl-red" style="background: var(--red-soft)">yes</td><td>no DiffID fallback since v0.34.0 (F74, D62); but on the classic store, a base already present locally (no <code>--pull</code>) is keyed by its verified ChainID (<code>moby.buildkit.local-image.v1:</code>, moby ≥ 29.8.2), so no bust</td></tr>
+                  <tr><td>Add <code>--chmod</code> to <code>COPY --link</code></td><td class="hl-red" style="background: var(--red-soft)">yes</td><td>it stops being a Merge onto scratch (F45, D51)</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Every row is code inference, not a measurement: no build ran here. Ids are buildkit ledger facts (F) and
+              register findings (D). On a real host, <code>docker build --progress=plain .</code> twice with the change
+              in between shows <code>CACHED</code> or not.
+            </p>
+          </figure>
+
+          <h2 id="p3-context"><span class="secnum">05</span>The context is pulled, not pushed</h2>
+          <p>
+            A client that sends a build might be expected to upload its directory. BuildKit reverses the direction: the
+            client is the gRPC <em>server</em>. buildx registers a file-sync provider in its
+            session, and BuildKit calls <code>FileSync.DiffCopy</code> (or the older <code>TarStream</code>) back into
+            it, both bidirectional streams of <code>fsutil.types.Packet</code>
+            (<code>buildkit/session/filesync/filesync.proto:10-13</code>). What to send travels as gRPC metadata on that
+            call, under four keys (<code>session/filesync/filesync.go:25-30</code>)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>const (
+	keyIncludePatterns    = "include-patterns"
+	keyExcludePatterns    = "exclude-patterns"
+	keyFollowPaths        = "followpaths"
+	keyDirName            = "dir-name"
+	keyExporterMetaPrefix = "exporter-md-"</code></pre>
+          <p>
+            The client applies those filters itself before anything is sent, by wrapping the directory in
+            <code>fsutil.NewFilterFS</code> (<code>filesync.go:110-145</code>). An excluded file is never read and never
+            leaves the client <span class="src">from the code</span>. That is the practical meaning of
+            <code>.dockerignore</code> now: it trims what is sent, not only what <code>COPY</code> sees.
+          </p>
+          <h3>Three transfers per build</h3>
+          <p>
+            A Dockerfile build makes three separate local transfers, and they are the first three lines of
+            <code>--progress=plain</code> output (<code>frontend/dockerui/config.go:348-363, 522-585</code>). <code>[internal]
+            load build definition</code> reads the Dockerfile from the <code>dockerfile</code> local, with FollowPaths
+            limited to the Dockerfile, <code>&lt;Dockerfile&gt;.dockerignore</code> and <code>dockerfile</code>.
+            <code>load .dockerignore</code> reads <code>.dockerignore</code> from the <code>context</code> local, used only
+            if no per-Dockerfile ignore file was found. <code>load build context</code> is the filtered main context
+            <span class="src">from the code</span>. The last one is narrowed twice. The exclude patterns come from
+            <code>.dockerignore</code>. The FollowPaths come from the Dockerfile: each <code>COPY</code>/<code>ADD</code>
+            source and each <code>RUN --mount</code> bind source is added to <code>ctxPaths</code>, which becomes
+            <code>llb.FollowPaths</code> on the context source (<code>dockerfile2llb/convert.go:1145-1150,
+            1850-1875</code>; <code>convert_runmount.go:141-146</code>). For Figure 3 that is
+            <code>go.mod</code> and <code>main.go</code> and nothing else. <code>COPY . .</code> names the path
+            <code>/</code> and switches the narrowing off.
+          </p>
+          <h3>The wire: STAT, REQ, DATA, FIN</h3>
+          <p>
+            <code>DiffCopy</code> speaks fsutil's packet protocol, five types in one enum
+            (<code>buildkit/vendor/github.com/tonistiigi/fsutil/types/wire.proto:10-23</code>; fsutil
+            <code>v0.0.0-20260819142231-83cac42c1c52</code> as vendored):
+          </p>
+<pre><code>  enum PacketType {
+    PACKET_STAT = 0;
+    PACKET_REQ = 1;
+    PACKET_DATA = 2;
+    PACKET_FIN = 3;
+    PACKET_ERR = 4;
+  }</code></pre>
+          <p>
+            The sender streams one <code>STAT</code> for every file that survived the filters and ends the list with an
+            empty <code>STAT</code> (<code>fsutil/send.go:182</code>). The receiver compares each record with what it
+            already holds and answers <code>REQ &lt;id&gt;</code> only for files that differ
+            (<code>receive.go:425</code>). The sender returns <code>DATA</code> chunks for each requested id, with an
+            empty <code>DATA</code> to close a file (<code>send.go:146</code>). The receiver sends <code>FIN</code> and the
+            sender answers it (<code>receive.go:224</code>; <code>send.go:101-106</code>)
+            <span class="src">from the code</span>. Figure 6 draws one exchange.
+          </p>
+
+          <figure class="figure wide" id="fig-context-transfer">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">BuildKit asks the client for the context: one <code>FileSync.DiffCopy</code> exchange</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 450" role="img" aria-label="Two lifelines, buildx as the FileSync server and dockerd's BuildKit as the caller. BuildKit opens DiffCopy with metadata dir-name context, followpaths go.mod and main.go, and the exclude patterns. buildx filters the directory through FilterFS, then streams STAT go.mod, STAT main.go and an empty STAT. BuildKit compares them with its retained snapshot and requests only main.go with REQ 2. buildx sends DATA chunks for id 2 and an empty DATA. BuildKit sends FIN and buildx answers FIN. On the right, the retained snapshot keyed by name, shared key hint and client shared key, and the cacheUpdater that updates content-hash records as files arrive.">
+                <defs>
+                  <marker id="fig-context-transfer-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-context-transfer-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-context-transfer-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <rect x="30" y="20" width="260" height="56" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="42" class="svg-step">buildx · FileSync server</text>
+                <text x="42" y="62" class="svg-sub">serves the context directory</text>
+                <rect x="520" y="20" width="260" height="56" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="532" y="42" class="svg-step">dockerd · BuildKit local source</text>
+                <text x="532" y="62" class="svg-sub">the gRPC caller</text>
+                <line x1="160" y1="78" x2="160" y2="420" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="3 3"/>
+                <line x1="650" y1="78" x2="650" y2="420" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="3 3"/>
+
+                <line x1="648" y1="106" x2="164" y2="106" stroke="#252525" stroke-width="2" marker-end="url(#fig-context-transfer-ctl)"/>
+                <text x="190" y="98" class="svg-sub">DiffCopy · dir-name=context · followpaths=[go.mod main.go]</text>
+                <text x="190" y="122" class="svg-sub">exclude-patterns=&lt;.dockerignore&gt;</text>
+
+                <rect x="40" y="134" width="240" height="40" rx="4" fill="#ffffff" stroke="#3c6f97" stroke-width="1"/>
+                <text x="52" y="158" class="svg-sub">NewFilterFS drops excluded files</text>
+
+                <line x1="164" y1="196" x2="646" y2="196" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="190" class="svg-sub">STAT 1 go.mod (mode, uid, gid, size, …)</text>
+                <line x1="164" y1="222" x2="646" y2="222" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="216" class="svg-sub">STAT 2 main.go</text>
+                <line x1="164" y1="248" x2="646" y2="248" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="242" class="svg-sub">STAT (empty): end of list</text>
+
+                <line x1="646" y1="282" x2="164" y2="282" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="276" class="svg-sub">REQ 2: only the file that differs</text>
+                <line x1="164" y1="316" x2="646" y2="316" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-context-transfer-data)"/>
+                <text x="190" y="310" class="svg-sub">DATA 2 chunk … DATA 2 (empty): file done</text>
+                <line x1="646" y1="350" x2="164" y2="350" stroke="#252525" stroke-width="2" marker-end="url(#fig-context-transfer-ctl)"/>
+                <text x="190" y="344" class="svg-sub">FIN</text>
+                <line x1="164" y1="378" x2="646" y2="378" stroke="#252525" stroke-width="2" marker-end="url(#fig-context-transfer-ctl)"/>
+                <text x="190" y="372" class="svg-sub">FIN</text>
+
+                <rect x="720" y="180" width="330" height="96" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="732" y="202" class="svg-step">retained mutable snapshot</text>
+                <text x="732" y="222" class="svg-sub">name:sharedKeyHint:&lt;client key&gt;</text>
+                <text x="732" y="240" class="svg-sub">last build's go.mod and main.go</text>
+                <text x="732" y="262" class="svg-note">what the STATs are compared against</text>
+                <path d="M716,230 L656,230" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-context-transfer-state)"/>
+
+                <rect x="720" y="300" width="330" height="76" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="732" y="322" class="svg-step">cacheUpdater</text>
+                <text x="732" y="342" class="svg-sub">updates contenthash records</text>
+                <text x="732" y="360" class="svg-sub">as each file arrives (§04)</text>
+                <path d="M656,326 L716,326" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-context-transfer-state)"/>
+
+                <text x="30" y="440" class="svg-note">Here only main.go changed since the last build, so one REQ follows three STATs. On a first build every file is requested.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Reconstruction from <code>session/filesync/filesync.go</code>, fsutil's <code>send.go</code> and
+              <code>receive.go</code>, and <code>source/local/source.go:204-280</code>; not traced, since no daemon ran
+              here. The packets ride inside the session stream buildx opened to dockerd, so the "server" never listens on
+              a port.
+            </p>
+          </figure>
+
+          <p>
+            The incremental part lives on the daemon side. BuildKit keeps a retained mutable snapshot per
+            <code>name:sharedKeyHint:&lt;client shared key&gt;</code> and syncs into it again on the next build, so a
+            second build sends only the files that changed, and a <code>cacheUpdater</code> updates the content-hash
+            records of <a href="#p3-solver">§04</a> as files land (<code>source/local/source.go:204-280</code>)
+            <span class="src">from the code</span>. The content key a <code>COPY</code> needs is therefore mostly computed
+            before the solver asks for it <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            The same inversion covers everything else a build takes from the client. A secret's bytes are fetched over
+            the session with <code>secrets.GetSecret</code> when a <code>RUN</code> mounts it, and an SSH mount is a
+            socket that proxies back to the client's agent over the same session
+            (<code>solver/llbsolver/mounts/secretmount_unix.go:16-75</code>; <code>mounts/mount.go:200-239</code>)
+            <span class="src">from the code</span>. Nothing is uploaded in advance; dockerd asks when a step needs it.
+          </p>
+          <p>
+            One boundary surprises people. <code>.dockerignore</code> patterns are applied to context
+            <code>COPY</code>s as an ignore matcher, but not to <code>COPY --from=&lt;stage&gt;</code>, whose source is
+            another stage's filesystem (<code>dockerfile2llb/convert.go:1120-1132</code>). That is register D60, class
+            D: expected from the code, often assumed otherwise <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="p3-run"><span class="secnum">06</span>RUN, mounts and the runc executor</h2>
+          <p>
+            A <code>RUN</code> step is a container, but not one that Docker's own run path ever sees.
+            <a href="../run-path/#p1-shim">Part 1</a> follows <code>docker run</code> from dockerd through containerd and
+            a shim to <code>runc</code>. dockerd's embedded BuildKit skips the middle: it builds BuildKit's own
+            <code>runcexecutor</code> and hands it the name of the <code>runc</code> binary
+            (<code>moby/daemon/internal/builder-next/executor_linux.go:56-59, 80-86</code>):
+          </p>
+<pre><code>	// TODO: FIXME: testing env var, replace with something better or remove in a major version or two
+	runcCmds := []string{"runc"}
+	if runcOverride := os.Getenv("DOCKER_BUILDKIT_RUNC_COMMAND"); runcOverride != "" {
+		runcCmds = []string{runcOverride}
+…
+	exec, err := runcexecutor.New(runcexecutor.Opt{
+		Root:                filepath.Join(opts.root, "executor"),
+		CommandCandidates:   runcCmds,
+		DefaultCgroupParent: opts.cgroupParent,
+		Rootless:            opts.rootless,
+		NoPivot:             os.Getenv("DOCKER_RAMDISK") != "",
+		IdentityMapping:     idmap,</code></pre>
+          <p>
+            No containerd task is created, so build containers appear in neither <code>docker ps</code> nor
+            <code>ctr</code>, and containerd events and runtime classes never apply to them. That is register D57,
+            class D, unchanged on moby <code>master</code> <span class="src">from the code</span>. The claim is code
+            inference here; on a real host, <code>sudo ctr -n moby c ls</code> and <code>ps -ef | grep runc</code>
+            during a long <code>RUN sleep 60</code> would show it.
+          </p>
+          <h3>The network: the last prestart hook</h3>
+          <p>
+            The default build network is a libnetwork sandbox on Docker's <code>bridge</code> network; <code>host</code>
+            and <code>none</code> are BuildKit's built-in providers (<code>executor_linux.go:23-31</code>). Attaching a
+            build container to <code>bridge</code> uses an older mechanism than <code>docker run</code> does. The
+            sandbox is created with <code>OptionUseExternalKey</code>, and runc runs a <code>libnetwork-setkey</code>
+            re-exec of dockerd as an OCI <em>prestart hook</em>. The hook reads the runtime's <code>specs.State</code>
+            JSON on stdin and sends <code>{ContainerID, Key}</code> over the unix socket
+            <code>/run/docker/libnetwork/&lt;short-controller-id&gt;.sock</code>
+            (<code>moby/daemon/libnetwork/sandbox_externalkey_unix.go:26-190</code>). The network namespace does not
+            exist yet when the endpoint joins, so <code>sbJoin</code> defers addresses and routes until
+            <code>SetKey</code> arrives (<code>libnetwork/endpoint.go:544-567</code>). The endpoint is created with
+            <code>CreateOptionDisableResolution</code>, so a build step does not get the embedded DNS server that
+            <a href="../network-and-lifecycle/#p4-dns">Part 4</a> describes <span class="src">from the code</span>. Since
+            v0.31.0 BuildKit also has an optional proxy network mode, and dockerd wires it when
+            <code>proxyprovider.Supported()</code> holds, with a loopback-filtered host provider
+            (<code>executor_linux.go:62-78</code>).
+          </p>
+          <h3>Five mount types</h3>
+          <p>
+            <code>RUN --mount</code> accepts <code>bind</code> (the default), <code>cache</code>, <code>tmpfs</code>,
+            <code>secret</code> and <code>ssh</code>, with sharing modes <code>shared</code>, <code>private</code> and
+            <code>locked</code>; <code>mode</code>, <code>uid</code> and <code>gid</code> are rejected on bind and tmpfs
+            (<code>frontend/dockerfile/instructions/commands_runmount.go:13-42, 268-280</code>)
+            <span class="src">from the code</span>. Each lowers to an exec mount in LLB, and each has its own runtime
+            shape:
+          </p>
+          <ul>
+            <li><strong>bind</strong> is read-only unless <code>rw</code> is given. With <code>rw</code> it is marked
+              <code>ForceNoOutput</code>, so writes are discarded and never become a layer
+              (<code>dockerfile2llb/convert_runmount.go:103-107</code>).</li>
+            <li><strong>cache</strong> without <code>id</code> uses the cleaned target path as its ID, namespaced by the
+              frontend's <code>cacheIDNamespace</code>, and becomes <code>llb.AsPersistentCacheDir</code>
+              (<code>convert_runmount.go:69-120</code>). At run time it is a retained mutable snapshot found through the
+              metadata index <code>cache-dir:&lt;id&gt;[:&lt;base ref&gt;]</code>. <code>shared</code> hands one ref to
+              every concurrent user, <code>private</code> makes a new ref when the existing one is locked, and
+              <code>locked</code> polls every 100 ms until the holder lets go
+              (<code>solver/llbsolver/mounts/mount.go:68-154, 459-460</code>).</li>
+            <li><strong>secret</strong> is a fresh tmpfs (<code>nodev,nosuid</code>, plus <code>noexec</code> unless the
+              mode has an exec bit) in a 0711 temporary directory. The bytes are written to a random file name with mode
+              0600 and chowned to the requested uid and gid; the default target is <code>/run/secrets/&lt;id&gt;</code>
+              (<code>mounts/secretmount_unix.go:16-75</code>).</li>
+            <li><strong>ssh</strong> defaults to <code>/run/buildkit/ssh_agent.&lt;n&gt;</code> and sets
+              <code>SSH_AUTH_SOCK</code> to the first one if the user has not (<code>client/llb/exec.go:155-164</code>).</li>
+          </ul>
+          <p>
+            Read together with <a href="#p3-solver">§04</a>, the rules line up. Secret, SSH and tmpfs mounts never feed
+            the cache key, and a writable mount with output stays definition-keyed. A cache mount is state outside the
+            graph: its contents can differ between two runs of a step with the same key
+            <span class="recon">reconstruction</span>.
+          </p>
+          <h3>Garbage collection takes cache mounts first</h3>
+          <p>
+            dockerd's builder GC is on unless explicitly disabled. With nothing configured, the limits are 10 % of the
+            disk reserved, 80 % max used and 20 % min free, each computed as (whole GiB in that share of the disk + 1) × 10^9 bytes,
+            or 2 GB reserved if the disk cannot be stat'ed (<code>moby/daemon/config/builder.go:94-96</code>;
+            <code>worker/gc.go:74-79</code>). The first rule is the odd one
+            (<code>moby/daemon/internal/builder-next/worker/gc.go:18, 44-50</code>):
+          </p>
+<pre><code>// tempCachePercent represents the percentage ratio of the cache size in bytes to temporarily keep for a short period of time (couple of days)
+…
+	return []client.PruneInfo{
+		// if build cache uses more than 512MB delete the most easily reproducible data after it has not been used for 2 days
+		{
+			Filter:       []string{"type==source.local", "type==exec.cachemount", "type==source.git.checkout"},
+			KeepDuration: 48 * time.Hour,
+			MaxUsedSpace: tempCacheReservedSpace,
+		},</code></pre>
+          <p>
+            <code>tempCachePercent</code> is <code>math.E * math.Pi * math.Phi</code>, which the comment calls
+            "a mathematically pleasing" choice of about 13.8, with a 512 MB floor. So cache mounts, synced contexts and git
+            checkouts unused for 48 hours go first once they pass about 13.8 % of the reserved space (register D58,
+            class D) <span class="src">from the code</span>. A worked case: on a disk of 100 × 10^9 bytes, 10 % is
+            10^10 bytes, which <code>diskPercentage</code> counts as 9 whole GiB, so the reserve is
+            <code>(9 + 1) × 10^9</code> = 10 GB and the cache-mount threshold is about 1.38 GB
+            <span class="recon">reconstruction</span>, arithmetic on <code>worker/gc.go:74-77</code>.
+          </p>
+
+          <h2 id="p3-export"><span class="secnum">07</span>Exporters, cache export and attestations</h2>
+          <p>
+            A solved build is a set of snapshots, not an image. An exporter turns the result into something outside
+            BuildKit. The client defines five exporter names, <code>image</code>, <code>local</code>, <code>tar</code>,
+            <code>oci</code> and <code>docker</code> (<code>buildkit/client/exporters.go:9-15</code>), and dockerd adds a
+            sixth, <code>moby</code>, which the classic <code>/build</code> path checks for
+            (<code>moby/daemon/internal/builder-next/builder.go:408</code>). The image exporter accepts
+            <code>push</code>, <code>push-by-digest</code> and <code>unpack</code>, returns
+            <code>containerimage.digest</code> (the root manifest or index) plus the config digest, and pushes in a
+            finalize callback after the export is written (<code>exporter/containerimage/export.go:66-68,
+            373-402</code>) <span class="src">from the code</span>.
+          </p>
+          <h3>Layers are made at the end</h3>
+          <p>
+            No step in <a href="#p3-solver">§04</a> produced a tarball. Layer blobs are computed lazily, at export, from
+            pairs of snapshots. On the overlayfs or stargz snapshotters BuildKit first tries an "overlay differ" that
+            reads the upper directory directly, then falls back to containerd's walking differ; <code>fuse-overlayfs</code>
+            and <code>native</code> skip the fast path (<code>cache/blobs.go:168-250</code>)
+            <span class="src">from the code</span>. The digests, DiffIDs and ChainIDs of those blobs are
+            <a href="../images/#p2-hashes">Part 2</a>'s subject. The frontend's history entries land in the config.
+            alpine's amd64 config shows them as published, with the same DiffID Part 2 derived from the layer
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>"created_by": "ADD alpine-minirootfs-3.24.3-x86_64.tar.gz / # buildkit",
+"comment": "buildkit.dockerfile.v0"
+"created_by": "CMD [\"/bin/sh\"]", "comment": "buildkit.dockerfile.v0", "empty_layer": true
+"diff_ids": ["sha256:75c137aedfb2760f88629236cb7b797630aed0c3d91d626d1d1bb694878fc2ba"]</code></pre>
+          <p>
+            All three timestamps in that config are <code>2026-10-21T22:37:22.870489069Z</code>. With
+            <code>SOURCE_DATE_EPOCH</code> set, the exporter clamps <code>created</code> to the epoch; with no
+            <code>created</code> at all it uses the last history timestamp (<code>writer.go:830-857</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>Cache export flattens the link graph</h3>
+          <p>
+            Remote cache (<code>registry</code>, <code>local</code>, <code>gha</code>) is an OCI index or manifest of
+            layer blobs plus one JSON document of type <code>application/vnd.buildkit.cacheconfig.v0</code>. It holds
+            <code>layers</code>, each a blob with a parent index, and <code>records</code>, each a digest with layer
+            pointers and <code>inputs</code> links to other records (<code>cache/remotecache/v1/types/spec.go:9-49</code>).
+            That is the bbolt link graph of §04 written out as arrays. <code>--cache-to type=inline</code> exports no
+            separate artifact. It puts the same JSON into the image config under the key
+            <code>moby.buildkit.cache.v0</code> (<code>exporter/containerimage/writer.go:859-865</code>)
+            <span class="src">from the code</span>. Mode <code>min</code>, the default, exports the final result's chain;
+            <code>max</code> exports every intermediate vertex. An unknown mode is dropped with a debug log
+            (<code>control/control.go:491-495</code>):
+          </p>
+<pre><code>		if exportMode, supported := parseCacheExportMode(e.Attrs["mode"]); !supported {
+			bklog.G(ctx).Debugf("skipping invalid cache export mode: %s", e.Attrs["mode"])
+		} else {
+			exp.CacheExportMode = exportMode
+		}</code></pre>
+          <p>
+            So <code>mode=maximum</code> silently means <code>min</code> (register D56, class D, unchanged on
+            <code>master</code>). Which backends exist at all depends on dockerd's image store
+            (<code>moby/daemon/internal/builder-next/controller.go:227-237, 512-519</code>). With the containerd store,
+            dockerd's BuildKit imports <code>gha</code>, <code>local</code> and <code>registry</code> and exports those
+            plus <code>inline</code>. With the legacy graphdriver store it imports <code>registry</code> (through a
+            moby-specific <code>localinlinecache</code>) and <code>local</code>, and exports only <code>inline</code>.
+            Neither registers <code>s3</code> or <code>azblob</code>, though BuildKit ships both (D55, class D)
+            <span class="src">from the code</span>. buildx never sends that request to a graphdriver host. With the
+            docker driver there, it rejects every <code>--cache-to</code> type except <code>inline</code> on the
+            client and prints "Cache export is not supported for the docker driver. Switch to a different driver, or
+            turn on the containerd image store, and try again." (<code>buildx/build/opt.go:271-275</code>,
+            <code>build/utils.go:193-197</code>; asserted by buildx's own test, <code>tests/build.go:973-983</code>)
+            <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-export-artifacts">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">What a build exports: the image index with its attestations, and the cache</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 490" role="img" aria-label="Left, alpine:latest as exported: an image index pointing at a linux/amd64 manifest and at an unknown/unknown attestation manifest whose reference.digest annotation names the amd64 manifest; the manifest points at a config with BuildKit history and one DiffID; the attestation points at in-toto layers. Right, a cache export: a manifest of layer blobs plus a cacheconfig.v0 JSON with layers and records; the inline variant writes that JSON into the image config under moby.buildkit.cache.v0. Below, the cache backends dockerd registers for each image store.">
+                <defs>
+                  <marker id="fig-export-artifacts-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-export-artifacts-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">IMAGE EXPORTER (alpine:latest, measured)</text>
+                <text x="600" y="26" class="svg-lane">CACHE EXPORTER (from the code)</text>
+
+                <rect x="30" y="44" width="210" height="96" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="66" class="svg-step">image index</text>
+                <text x="42" y="86" class="svg-sub">sha256:be2656061b53…</text>
+                <text x="42" y="104" class="svg-sub">8 platforms, each paired</text>
+                <text x="42" y="122" class="svg-sub">with an attestation</text>
+
+                <rect x="290" y="44" width="250" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="302" y="66" class="svg-step">manifest · linux/amd64</text>
+                <text x="302" y="86" class="svg-sub">sha256:c26612752c78…</text>
+                <text x="302" y="104" class="svg-sub">1 config + 1 gzip layer</text>
+                <line x1="242" y1="78" x2="286" y2="78" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-export-artifacts-data)"/>
+
+                <rect x="290" y="134" width="250" height="96" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="302" y="156" class="svg-step">config</text>
+                <text x="302" y="176" class="svg-sub">history: ADD … # buildkit</text>
+                <text x="302" y="194" class="svg-sub">diff_ids: [75c137aedfb2…]</text>
+                <text x="302" y="214" class="svg-sub">(+ moby.buildkit.cache.v0)</text>
+                <line x1="415" y1="116" x2="415" y2="130" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-export-artifacts-data)"/>
+
+                <rect x="290" y="262" width="250" height="112" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="302" y="284" class="svg-step">attestation manifest</text>
+                <text x="302" y="304" class="svg-sub">sha256:964745728d17…</text>
+                <text x="302" y="322" class="svg-sub">platform unknown/unknown</text>
+                <text x="302" y="340" class="svg-sub">type attestation-manifest</text>
+                <text x="302" y="360" class="svg-sub" style="fill:#765b98">reference.digest = c26612752c78…</text>
+                <path d="M135,142 L135,310 L286,310" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-export-artifacts-data)"/>
+                <path d="M544,300 L566,300 L566,80 L544,80" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#fig-export-artifacts-state)"/>
+
+                <rect x="290" y="394" width="250" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="302" y="416" class="svg-step">in-toto layers</text>
+                <text x="302" y="436" class="svg-sub">SPDX SBOM · SLSA provenance</text>
+                <line x1="415" y1="376" x2="415" y2="390" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-export-artifacts-data)"/>
+
+                <rect x="600" y="44" width="450" height="150" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="612" y="66" class="svg-step">cache manifest or index (registry, local, gha)</text>
+                <text x="612" y="88" class="svg-sub">layer blobs of the cached results</text>
+                <text x="612" y="108" class="svg-sub">+ application/vnd.buildkit.cacheconfig.v0</text>
+                <text x="632" y="128" class="svg-sub">"layers":  [{"blob": …, "parent": …}]</text>
+                <text x="632" y="146" class="svg-sub">"records": [{"digest", "layers", "inputs"}]</text>
+                <text x="612" y="174" class="svg-sub">mode=min: final chain · mode=max: every vertex</text>
+
+                <rect x="600" y="214" width="450" height="56" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="612" y="236" class="svg-step">--cache-to type=inline</text>
+                <text x="612" y="256" class="svg-sub">same JSON, in the image config: moby.buildkit.cache.v0</text>
+
+                <rect x="600" y="290" width="450" height="144" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="612" y="312" class="svg-lane">BACKENDS DOCKERD REGISTERS</text>
+                <text x="612" y="336" class="svg-step">containerd image store</text>
+                <text x="612" y="354" class="svg-sub">import gha local registry</text>
+                <text x="612" y="370" class="svg-sub">export gha inline local registry</text>
+                <text x="830" y="336" class="svg-step">graphdriver store</text>
+                <text x="830" y="354" class="svg-sub">import registry* local</text>
+                <text x="830" y="370" class="svg-sub" style="fill:#ad4b43">export inline only</text>
+                <text x="612" y="398" class="svg-sub">neither: s3, azblob</text>
+                <text x="612" y="418" class="svg-note">* through moby's localinlinecache</text>
+
+                <text x="30" y="472" class="svg-note">Attestations ride inside the index as extra manifests; the cache is a separate artifact unless it is inline.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Left: alpine:latest's index as fetched with <code>docker buildx imagetools inspect</code>, measured here; the
+              bracketed config key appears only with inline cache export, which alpine does not use. Right: read from
+              <code>cache/remotecache/v1/types/spec.go</code> and <code>controller.go</code>; no cache was exported here.
+            </p>
+          </figure>
+
+          <h3>Attestations in the index</h3>
+          <p>
+            Attestations are extra manifests in the image index with platform <code>unknown/unknown</code>, annotated
+            <code>vnd.docker.reference.type: attestation-manifest</code> and
+            <code>vnd.docker.reference.digest: &lt;subject manifest&gt;</code>, whose layers are in-toto statements
+            (<code>docs/attestations/attestation-storage.md:92-122</code>) <span class="src">from the code</span>. Since
+            BuildKit v0.32 they are also OCI artifacts by default: <code>artifactType:
+            application/vnd.docker.attestation.manifest.v1+json</code>, an empty config and a <code>subject</code>
+            descriptor, with the annotations kept (<code>exporter/containerimage/writer.go</code>:613-716). alpine's
+            index pairs every platform that way; amd64 <code>sha256:c26612752c78…</code> pairs with attestation
+            <code>sha256:964745728d17…</code> <span class="recon">measured here</span>. The provenance default differs
+            by layer (<code>solver/llbsolver/provenance.go:408-418</code>):
+          </p>
+<pre><code>	mode := "max"
+	if v, ok := attrs["mode"]; ok {
+		switch v {
+		case "full":
+			mode = "max"
+		case "max", "min":
+			mode = v</code></pre>
+          <p>
+            buildx adds <code>mode=min,inline-only=true</code> by default, but only when the builder supports
+            attestations, so the docker driver on the graphdriver store gets no provenance at all
+            (<code>buildx/build/opt.go:349-373</code>). An explicit <code>--provenance=true</code> reaches BuildKit with
+            no mode (<code>util/buildflags/attests.go:173-181</code>), and so does raw <code>buildctl</code> with
+            <code>attest:provenance=</code>; both get <code>max</code>, which records the Dockerfile, build-arg
+            values and secret IDs (register D59, class D). A <code>max</code> record embeds the full LLB with its
+            <code>digestMapping</code>, which is what made <a href="#p3-llb">§03</a> possible. alpine's lists
+            <code>GIT_AUTH_HEADER</code> and <code>GIT_AUTH_TOKEN</code> as optional secrets, by ID only
+            <span class="recon">measured here</span>.
+          </p>
+
+          <h2 id="p3-sources"><span class="secnum">08</span>Sources</h2>
+          <ul>
+            <li>BuildKit <code>v0.34.1</code> (<code>f5b59a1f2fb2</code>, the same source as the v0.34.0 moby vendors), moby <code>docker-v29.9.2</code> (<code>0367cbeb49b9</code>), docker/cli v29.9.2, and BuildKit's <code>docs/dev/solver.md</code>, <code>docs/dev/merge-diff.md</code> and <code>docs/attestations/</code>; Docker's release notes for Engine 23.0 and its SLSA provenance page for buildx's default.</li>
+            <li>Lab evidence in <code>~/docker-ref/lab/results/buildkit/</code>: <code>t1-cli.txt</code>, <code>alpine-provenance.json</code> (60,178 B), <code>alpine-amd64-config.json</code>, <code>t5-alpine-index.txt</code>, <code>llbdigest.py</code> and <code>llbdigest-chained.py</code> with their <code>step{0,1,2}.pb</code>, <code>t3-digests.txt</code> and <code>t3b-merkle.txt</code>.</li>
+          </ul>
+          <p class="footnote">
+            <strong>Provenance.</strong> Paths and excerpts were re-read in the pinned checkouts. The vertex digests,
+            protobuf bytes, provenance fields, config history and index pairs are measured; the provenance itself
+            records a build run by Docker's official-images pipeline, not here. No <code>dockerd</code> started on this
+            box, so no build ran: the cache behaviour, the context exchange, the runc executor and every figure except
+            Figures 2 and the left half of 7 are read from code. buildx's
+            transport (<code>/grpc</code> + <code>/session</code>) and its cache-export error were settled by reading
+            buildx v0.37.2, not by a trace. <code>localinlinecache</code> after v0.34 and the gateway container (a writable
+            throwaway rootfs; the <code>readonly</code> TODO is at <code>frontend/gateway/gateway.go:122</code>) are
+            read from code. docker/cli v18.09.0 enabled BuildKit from <code>DOCKER_BUILDKIT</code> or the daemon's
+            setting (<code>cli/command/cli.go</code>). With a real host:
+            <code>docker build --progress=plain .</code> twice around a comment edit, a <code>touch</code> and a
+            <code>chmod</code>; <code>docker ps</code>, <code>sudo ctr -n moby c ls</code> and
+            <code>ps -ef | grep runc</code> during <code>RUN sleep 60</code>; <code>socat -v</code> on the socket during a
+            build; <code>--cache-to type=registry</code> on an overlay2 host. Findings use the numbers of
+            <a href="../network-and-lifecycle/#p4-findings">Part 4's register</a>; none was reported upstream.
+          </p>
+        </section>
+      </article>

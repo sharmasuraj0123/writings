@@ -1,0 +1,208 @@
+          <h2 id="p1-client"><span class="secnum">{{S}}</span>Five calls on three connections</h2>
+          <p>
+            <code>docker run</code> is not one request. The daemon has no "run" endpoint. The CLI composes run
+            out of five API calls: a ping, a create, a hijacked attach, a wait and a start, in that order. Attach
+            and wait are issued <em>before</em> start, so no early output and no fast exit can be missed.
+            <code>cli/cli/command/container/run.go</code>:151, 186, 203-206 is the core of it
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	containerID, err := createContainer(ctx, dockerCli, containerCfg, &amp;runOpts.createOptions)
+…
+		closeFn, err := attachContainer(ctx, dockerCli, containerID, &amp;errCh, config, client.ContainerAttachOptions{
+…
+	statusChan := waitExitOrRemoved(statusCtx, apiClient, containerID, copts.autoRemove)
+
+	// start the container
+	if _, err := apiClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {</code></pre>
+          <p>
+            To watch the bytes, the real <code>docker</code> CLI 29.8.2 was pointed at a mock daemon: a Python
+            server shaped after moby's router code. Everything the CLI sent is real. Everything the "daemon" sent
+            back was invented by the mock, and its <code>Server</code> header says <code>[MOCK]</code>
+            <span class="recon">measured here</span>. Figure {{fig-run-sequence}} is that trace.
+          </p>
+
+          <figure class="figure wide" id="fig-run-sequence">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title"><code>docker run -it alpine sh</code> on the wire: five calls on three connections</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 600" role="img" aria-label="Sequence diagram of docker run -it alpine sh between the real docker CLI 29.8.2 and a mock daemon. Connection 1 carries two pings, the create request and the wait request. Connection 2 carries the attach request, upgraded to a raw stream. Connection 3 carries the start request. The typed exit and the wait body arrive at the end.">
+                <defs>
+                  <marker id="fig-run-sequence-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-run-sequence-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="16" y="40" class="svg-lane">TIME</text>
+                <text x="94" y="40" class="svg-lane">TERMINAL</text>
+                <text x="200" y="40" class="svg-lane">CLI 29.8.2 (REAL)</text>
+                <text x="1064" y="40" class="svg-lane" text-anchor="end">DAEMON (MOCK)</text>
+                <line x1="124" y1="52" x2="124" y2="520" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="250" y1="52" x2="250" y2="520" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="980" y1="52" x2="980" y2="520" stroke="#b8b8b1" stroke-width="1.5"/>
+
+                <!-- open-stream bars -->
+                <rect x="988" y="264" width="8" height="196" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <line x1="1012" y1="334" x2="1012" y2="486" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <text x="1000" y="512" class="svg-sub" text-anchor="middle">#2 raw · #1 pending</text>
+
+                <!-- rows -->
+                <text x="16" y="100" class="svg-sub">+0.228 s</text>
+                <rect x="258" y="86" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="264" y="98" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="296" y="98" class="svg-sub" style="fill:#252525">HEAD /_ping ×2 (unversioned path)</text>
+                <line x1="252" y1="106" x2="976" y2="106" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="128" class="svg-sub">200 OK · Api-Version: 1.56 · Ostype: linux</text>
+                <line x1="978" y1="134" x2="254" y2="134" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="168" class="svg-sub">+0.236 s</text>
+                <rect x="258" y="154" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="264" y="166" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="296" y="166" class="svg-sub" style="fill:#252525">POST /v1.56/containers/create · 1,713-byte JSON, "Tty":true, "StdinOnce":true</text>
+                <line x1="252" y1="174" x2="976" y2="174" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="196" class="svg-sub">201 Created · {"Id": "4f1c0ffee000…", "Warnings": []}</text>
+                <line x1="978" y1="202" x2="254" y2="202" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="236" class="svg-sub">+0.244 s</text>
+                <rect x="258" y="222" width="26" height="16" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="264" y="234" class="svg-sub" style="fill:#252525">#2</text>
+                <text x="296" y="234" class="svg-sub" style="fill:#252525">POST …/attach?stderr=1&amp;stdin=1&amp;stdout=1&amp;stream=1 · Upgrade: tcp</text>
+                <line x1="252" y1="242" x2="976" y2="242" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="264" class="svg-sub">HTTP/1.1 101 UPGRADED · application/vnd.docker.raw-stream</text>
+                <line x1="978" y1="270" x2="254" y2="270" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="304" class="svg-sub">+0.244 s</text>
+                <rect x="258" y="290" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="264" y="302" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="296" y="302" class="svg-sub" style="fill:#252525">POST …/wait?condition=next-exit</text>
+                <line x1="252" y1="310" x2="976" y2="310" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="332" class="svg-sub">200 OK · Transfer-Encoding: chunked · headers only, body held back</text>
+                <line x1="978" y1="338" x2="254" y2="338" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="372" class="svg-sub">+0.245 s</text>
+                <rect x="258" y="358" width="26" height="16" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="264" y="370" class="svg-sub" style="fill:#252525">#3</text>
+                <text x="296" y="370" class="svg-sub" style="fill:#252525">POST …/start · no body (#1 is busy with the wait)</text>
+                <line x1="252" y1="378" x2="976" y2="378" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="400" class="svg-sub">204 No Content</text>
+                <line x1="978" y1="406" x2="254" y2="406" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="444" class="svg-sub">+1.709 s</text>
+                <text x="132" y="438" class="svg-sub" style="fill:#252525">exit⏎</text>
+                <line x1="126" y1="450" x2="246" y2="450" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+                <rect x="258" y="430" width="26" height="16" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="264" y="442" class="svg-sub" style="fill:#252525">#2</text>
+                <text x="296" y="442" class="svg-sub" style="fill:#252525">raw stdin, 5 bytes: e x i t \r (no HTTP framing)</text>
+                <line x1="252" y1="450" x2="976" y2="450" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="484" class="svg-sub">+1.810 s</text>
+                <rect x="258" y="470" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="264" y="482" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="296" y="482" class="svg-sub">wait body arrives as one chunk: exit status 0</text>
+                <line x1="978" y1="490" x2="254" y2="490" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+                <line x1="248" y1="502" x2="128" y2="502" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="132" y="518" class="svg-sub" style="fill:#252525">$? = 0</text>
+
+                <!-- legend -->
+                <line x1="16" y1="560" x2="46" y2="560" stroke="#252525" stroke-width="2"/>
+                <text x="54" y="564" class="svg-sub">request</text>
+                <line x1="126" y1="560" x2="156" y2="560" stroke="#3c6f97" stroke-width="1.3"/>
+                <text x="164" y="564" class="svg-sub">response or raw bytes</text>
+                <rect x="330" y="552" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="336" y="564" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="364" y="564" class="svg-sub">connection number</text>
+                <text x="16" y="588" class="svg-note">All server bytes are the mock's; the "/ # " prompt it sent at +0.244 s is a mock invention and is omitted here.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Attach and wait are open before start is sent, so the client cannot miss output or the exit. The
+              real CLI 29.8.2 against a mock daemon: client bytes are real, server bytes invented
+              <span class="recon">measured here</span>. A real daemon sends nothing on the attach stream until the
+              process runs, and its wait body is <code>{"StatusCode":0}</code>, not the mock's
+              <code>{"Error": null, "StatusCode": 0}</code>, because <code>Error</code> is omitempty
+              (<code>moby/api/types/container/wait_response.go</code>:13) <span class="src">from the code</span>.
+            </p>
+          </figure>
+
+          <h3>Ping, create, and the pull you didn't ask for</h3>
+          <p>
+            The ping comes first because flag parsing depends on the daemon's OS: <code>runRun</code> calls
+            <code>Ping</code> and passes <code>serverInfo.OSType</code> into <code>parse</code>
+            (<code>run.go</code>:104-109). The client hits the unversioned <code>/_ping</code> with HEAD, reads
+            <code>API-Version</code>, and lowers its own maximum, <code>MaxAPIVersion = "1.56"</code>, to the
+            server's if that is lower; below <code>MinAPIVersion = "1.40"</code> it refuses
+            (<code>moby/client/client.go</code>:111, 115). Every later path carries the prefix
+            <code>/v1.56/</code> <span class="src">from the code</span>. Over a Unix socket the
+            <code>Host</code> header is the placeholder <code>api.moby.localhost</code>, and the user agent is
+            <code>Docker-Client/29.8.2 (linux)</code> <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The create body is the whole container config. With <code>-it</code> it says
+            <code>"Tty":true,"OpenStdin":true,"StdinOnce":true</code>; the CLI sets <code>StdinOnce</code>
+            whenever stdin is both open and attached (<code>opts.go</code>:729-732). The terminal size rides
+            along as <code>HostConfig.ConsoleSize</code> (<code>create.go</code>:327), so the pty can be sized
+            before any resize call <span class="src">from the code</span>. It was <code>[0,0]</code> in the
+            first trace, which ran without a real terminal size; after <code>stty rows 40 cols 120</code> it
+            was <code>[40,120]</code>, followed by <code>POST …/resize?h=40&amp;w=120</code> right after start
+            <span class="recon">measured here</span>. The pull is not part of create either. If create returns
+            NotFound and <code>--pull=missing</code> is in force, the CLI prints "Unable to find image", calls
+            <code>ImagePull</code> and retries create (<code>create.go</code>:338-358)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>Attach is a hijack; wait is a long-poll</h3>
+          <p>
+            Attach asks for <code>Connection: Upgrade</code> and <code>Upgrade: tcp</code>. The daemon takes
+            the socket away from Go's HTTP server and writes the status line itself,
+            <code>moby/daemon/server/router/container/container_routes.go</code>:1142, 1150-1159
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>		conn, _, err := hijacker.Hijack()
+…
+		if upgrade {
+			if multiplexed &amp;&amp; versions.GreaterThanOrEqualTo(httputils.VersionFromContext(ctx), "1.42") {
+				contentType = types.MediaTypeMultiplexedStream
+			}
+			// FIXME(thaJeztah): we should not ignore errors here; see https://github.com/moby/moby/pull/48359#discussion_r1725562802
+			fmt.Fprintf(conn, "HTTP/1.1 101 UPGRADED\r\nContent-Type: %v\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n", contentType)
+		} else {
+			// FIXME(thaJeztah): we should not ignore errors here; see https://github.com/moby/moby/pull/48359#discussion_r1725562802
+			fmt.Fprint(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n")
+		}</code></pre>
+          <p>
+            After that line the socket is raw bytes both ways. With a TTY there is no framing at all; without
+            one, output is multiplexed into 8-byte-header frames, which <a href="../network-and-lifecycle/#p4-bytes">Part 4</a>
+            takes apart. Errors after the hijack are hand-written HTTP too, and the FIXME above is still on
+            moby master (finding D10, class A, low) <span class="src">from the code</span>. Wait is the opposite
+            trick. <code>container_routes.go</code>:444-453 writes <code>200 OK</code> and flushes at once, then
+            blocks on <code>status := &lt;-waitC</code>, so the body is written only when the container exits.
+            The CLI waits with <code>condition=next-exit</code> (<code>removed</code> under <code>--rm</code>) and
+            maps any wait error to status 125 (<code>utils.go</code>:18-38). Start follows on a third
+            connection, because connection #1 is held by the pending wait. It takes no body and answers
+            <code>204</code> only after containerd has started the process (<code>container_routes.go</code>:283-309)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>The terminal side</h3>
+          <p>
+            With <code>-t</code> the CLI puts its own stdin and stdout into raw mode and wraps stdin in an escape
+            proxy whose default detach sequence is Ctrl-P Ctrl-Q, <code>defaultEscapeKeys = []byte{16, 17}</code>
+            (<code>hijack.go</code>:19) <span class="src">from the code</span>. Typing <code>a</code>,
+            <code>b</code>, Ctrl-P, Ctrl-Q sent only <code>ab</code> to the daemon, and the CLI exited 0
+            <span class="recon">measured here</span>. The daemon enforces the same keys again for TTY attaches
+            (<code>moby/daemon/internal/stream/attach.go</code>:14). There is a gap in the CLI's check:
+            <code>runContainer</code> falls back to <code>detachKeys</code> from <code>~/.docker/config.json</code>
+            but validates only the flag (<code>run.go</code>:143-149), so a bad config value fails after create
+            and attach and leaves a created container behind (finding D3, class A, still on cli master)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            When local stdin ends, the CLI half-closes the socket with <code>CloseWrite</code> rather than
+            closing it (<code>hijack.go</code>:194-196), so output keeps flowing. What the daemon does with that
+            end depends on the TTY. <code>StdinOnce</code> closes the container's stdin only when there is no
+            TTY; with <code>-it</code>, the end of client stdin closes this attach's stdout and stderr instead
+            and leaves the container's stdin open (<code>stream/attach.go</code>:69-80; finding D4, class D)
+            <span class="src">from the code</span>. Signals take a fifth path: with <code>--sig-proxy</code>
+            (default true) the CLI turns each caught signal into <code>POST /containers/{id}/kill?signal=NAME</code>,
+            and SIGWINCH into <code>POST …/resize</code> (<code>signals.go</code>:16-56, <code>tty.go</code>:80-106)
+            <span class="src">from the code</span>.
+          </p>

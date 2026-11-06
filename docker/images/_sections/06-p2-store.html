@@ -1,0 +1,195 @@
+          <h2 id="p2-store"><span class="secnum">{{S}}</span>Content store, snapshots and unpack</h2>
+          <p>
+            On a Docker 29 host using the containerd image store, a pulled image lives in three places. Blobs sit in
+            containerd's content store, named by digest. Unpacked layers sit in the overlayfs snapshotter, named by
+            ChainID. A bbolt database ties them together with labels that the garbage collector follows.
+            <code>dockerd</code> keeps all of its objects in the containerd namespace <code>moby</code>
+            (<code>moby/daemon/config/config.go:58</code>) <span class="src">from the code</span>.
+          </p>
+          <h3>Blobs land by rename</h3>
+          <p>
+            A committed blob lives at <code>&lt;root&gt;/blobs/&lt;alg&gt;/&lt;encoded&gt;</code>, which is exactly the OCI
+            image-layout rule: the content store is an image layout without an <code>index.json</code>. A write in
+            progress lives under <code>ingest/</code>, in a directory named by a hash of the ref string, not of the
+            content. <code>containerd/plugins/content/local/store.go:646-658</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>func (s *store) blobPath(dgst digest.Digest) (string, error) {
+	if err := dgst.Validate(); err != nil {
+		return "", fmt.Errorf("cannot calculate blob path from invalid digest: %v: %w", err, errdefs.ErrInvalidArgument)
+	}
+
+	return filepath.Join(s.root, "blobs", dgst.Algorithm().String(), dgst.Encoded()), nil
+}
+
+func (s *store) ingestRoot(ref string) string {
+	// we take a digest of the ref to keep the ingest paths constant length.
+	// Note that this is not the current or potential digest of incoming content.
+	dgst := digest.FromString(ref)
+	return filepath.Join(s.root, "ingest", dgst.Encoded())</code></pre>
+          <p>
+            The ingest directory holds <code>data</code>, <code>ref</code>, <code>startedat</code>,
+            <code>updatedat</code> and optionally <code>total</code>. Opening a writer for a digest that already exists
+            fails fast with <code>ErrAlreadyExists</code>; that is how a pull skips blobs it has. An interrupted ingest
+            resumes by re-reading <code>data</code> to rebuild the digester. Commit is fsync, stat, size check, digest
+            check, <code>os.Rename</code> into <code>blobs/</code>, fsync of the directory, optional fs-verity, and a
+            chmod that strips write bits (<code>writer.go:79-200</code>). A blob is never visible half-written
+            <span class="src">from the code</span>.
+          </p>
+          <h3>Labels are the reference graph</h3>
+          <p>
+            All metadata lives in one bbolt file, bucketed under <code>v1/&lt;namespace&gt;/</code> into <code>labels</code>,
+            <code>images</code>, <code>containers</code>, <code>snapshots</code>, <code>content</code>,
+            <code>sandboxes</code> and <code>leases</code>. The schema comment calls the bucket <code>image</code>; the
+            code says <code>images</code> (<code>core/metadata/buckets.go:65</code> vs <code>:150</code>, D33). Blob
+            files are shared across namespaces; only the metadata is namespaced. GC is a tri-colour mark from roots
+            over an explicit graph, then one sweep in a single write transaction. The edges are labels. During a pull
+            each parent blob is labelled with its children by role: <code>containerd.io/gc.ref.content.m.&lt;i&gt;</code>
+            for manifests, <code>.config</code>, <code>.l.&lt;i&gt;</code> for layers. After unpack, the config blob gets
+            <code>containerd.io/gc.ref.snapshot.overlayfs=&lt;top ChainID&gt;</code>
+            (<code>core/unpack/unpacker.go:751-765</code>), so the unpacked filesystem lives as long as the image record
+            does <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two leases cover the gaps. <code>dockerd</code> wraps every pull in a random-ID lease with an expiry, so
+            half-downloaded blobs survive a GC during the pull and become collectible if it is abandoned. Each
+            container's read-write snapshot is held by a lease whose ID is the container ID, because a container can be
+            removed and recreated with nothing else holding the snapshot in between
+            (<code>moby/daemon/containerd/image_snapshot.go:59-68</code>). Figure {{fig-content-store-layout}} puts the
+            three directories and the edges together.
+          </p>
+
+          <figure class="figure wide" id="fig-content-store-layout">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">alpine:latest in containerd's three stores, and the labels the GC follows</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 560" role="img" aria-label="Left, three directories under /var/lib/containerd: the content store with blobs and ingest, the bolt metadata database with images, content, snapshots and leases buckets, and the overlayfs snapshotter with metadata.db and numbered snapshot directories. Right, the GC graph: the image record points at the index blob, which points by gc.ref.content.m label at the manifest, which points at the config and the layer; the config points by gc.ref.snapshot.overlayfs at the snapshot named by the ChainID. Leases pin a pull in progress and each container's rw snapshot. Bottom, this host's root mount with 23 lowerdirs.">
+                <defs>
+                  <marker id="cs-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="cs-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">/VAR/LIB/CONTAINERD/</text>
+                <text x="560" y="26" class="svg-lane">GC GRAPH (NAMESPACE MOBY)</text>
+
+                <rect x="30" y="40" width="480" height="128" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="62" class="svg-step">io.containerd.content.v1.content/</text>
+                <text x="300" y="62" class="svg-note">path inferred</text>
+                <text x="54" y="84" class="svg-sub" style="white-space:pre">blobs/sha256/be2656061b53…   index</text>
+                <text x="54" y="100" class="svg-sub" style="white-space:pre">blobs/sha256/c26612752c78…   manifest</text>
+                <text x="54" y="116" class="svg-sub" style="white-space:pre">blobs/sha256/b92841763c5c…   config</text>
+                <text x="54" y="132" class="svg-sub" style="white-space:pre">blobs/sha256/7b229517ed22…   layer (gzip, kept)</text>
+                <text x="54" y="154" class="svg-sub">ingest/&lt;sha256(ref)&gt;/{data,ref,startedat,updatedat}</text>
+
+                <rect x="30" y="182" width="480" height="128" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="42" y="204" class="svg-step">io.containerd.metadata.v1.bolt/meta.db</text>
+                <text x="330" y="204" class="svg-note">path inferred</text>
+                <text x="54" y="226" class="svg-sub">v1/moby/images/docker.io/library/alpine:latest</text>
+                <text x="54" y="242" class="svg-sub" style="white-space:pre">v1/moby/content/blob/&lt;digest&gt;  + labels</text>
+                <text x="54" y="258" class="svg-sub">v1/moby/snapshots/overlayfs/&lt;key&gt;</text>
+                <text x="54" y="274" class="svg-sub">v1/moby/leases/&lt;id&gt;</text>
+                <text x="54" y="296" class="svg-note">one bbolt file; blobs shared, metadata namespaced</text>
+
+                <rect x="30" y="324" width="480" height="104" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="42" y="346" class="svg-step">io.containerd.snapshotter.v1.overlayfs/</text>
+                <text x="350" y="346" class="svg-note">measured</text>
+                <text x="54" y="368" class="svg-sub" style="white-space:pre">metadata.db      name (ChainID) → numeric id</text>
+                <text x="54" y="384" class="svg-sub" style="white-space:pre">snapshots/N/fs   unpacked layer = upperdir</text>
+                <text x="54" y="400" class="svg-sub">snapshots/N/work overlay workdir</text>
+                <text x="54" y="418" class="svg-note">N comes from bolt: global allocation order</text>
+
+                <rect x="560" y="40" width="200" height="50" rx="4" fill="#ffffff" stroke="#252525" stroke-width="1.2"/>
+                <text x="572" y="60" class="svg-step">image record (GC root)</text>
+                <text x="572" y="78" class="svg-sub">target → be2656061b53…</text>
+                <rect x="560" y="122" width="200" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="572" y="142" class="svg-step">index blob</text>
+                <text x="572" y="158" class="svg-sub">be2656061b53…</text>
+                <rect x="560" y="210" width="200" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="572" y="230" class="svg-step">manifest blob</text>
+                <text x="572" y="246" class="svg-sub">c26612752c78…</text>
+                <rect x="820" y="160" width="230" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="832" y="180" class="svg-step">config blob</text>
+                <text x="832" y="196" class="svg-sub">b92841763c5c…</text>
+                <rect x="820" y="256" width="230" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="832" y="276" class="svg-step">layer blob</text>
+                <text x="832" y="292" class="svg-sub">7b229517ed22…</text>
+                <rect x="820" y="350" width="230" height="60" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="832" y="370" class="svg-step">committed snapshot</text>
+                <text x="832" y="386" class="svg-sub">name = ChainID 75c137aedfb2…</text>
+                <text x="832" y="402" class="svg-sub">→ snapshots/N/fs</text>
+
+                <line x1="660" y1="92" x2="660" y2="118" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <line x1="660" y1="168" x2="660" y2="206" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <text x="652" y="192" text-anchor="end" class="svg-sub">gc.ref.content.m.&lt;i&gt;</text>
+                <path d="M762,226 L800,226 L800,182 L816,182" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <text x="842" y="226" class="svg-sub">gc.ref.content.config</text>
+                <path d="M762,240 L800,240 L800,278 L816,278" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <text x="842" y="244" class="svg-sub">gc.ref.content.l.0</text>
+                <path d="M1052,182 L1066,182 L1066,380 L1054,380" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <text x="880" y="332" class="svg-sub">gc.ref.snapshot.overlayfs</text>
+                <line x1="860" y1="302" x2="860" y2="346" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#cs-data)"/>
+                <text x="852" y="326" text-anchor="end" class="svg-note">unpack</text>
+
+                <rect x="560" y="300" width="230" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="572" y="320" class="svg-step">pull lease</text>
+                <text x="572" y="338" class="svg-sub">random id, gc.expire</text>
+                <rect x="560" y="372" width="230" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="572" y="392" class="svg-step">container lease</text>
+                <text x="572" y="410" class="svg-sub">id = container ID → rw snapshot</text>
+
+                <rect x="30" y="450" width="1020" height="94" rx="4" fill="#ffffff" stroke="#252525" stroke-width="1.2"/>
+                <text x="42" y="472" class="svg-lane">THIS HOST'S OWN ROOT, FROM /PROC/SELF/MOUNTINFO (MEASURED)</text>
+                <text x="42" y="494" class="svg-sub">overlay / · lowerdir=…/snapshots/600/fs:599:598:…:590:589:574:573:…:565:564 (23 dirs, top first)</text>
+                <text x="42" y="512" class="svg-sub">upperdir=…/snapshots/619/fs,workdir=…/snapshots/619/work</text>
+                <text x="42" y="532" class="svg-note">The jump from 589 to 574 shows the ids are allocated across all images on the node, not per image.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Dashed purple edges are GC references stored as labels; read from containerd v2.4.2. The content and
+              metadata paths follow the plugin <code>&lt;type&gt;.&lt;id&gt;</code> naming and are inferred; the
+              snapshotter directory and the mount line are measured on this host, which is itself a container built by
+              containerd's overlayfs snapshotter.
+            </p>
+          </figure>
+
+          <h3>Unpack: ChainIDs name the snapshots</h3>
+          <p>
+            The unpacker computes every ChainID up front from <code>rootfs.diff_ids</code> and refuses an image whose
+            layer count differs from its DiffID count. Each layer is extracted into an Active snapshot keyed
+            <code>extract-&lt;nanos&gt;-&lt;rand&gt; &lt;chainID&gt;</code>. If Prepare reports that the ChainID already
+            exists, extraction is skipped. That is deduplication across images: two images on the same base share the
+            base's snapshots (<code>unpacker.go:503-528</code>). Decompression is a chain of stream processors chosen
+            by media type, running until it reaches a plain tar. For gzip containerd shells out to <code>igzip</code> or
+            <code>unpigz</code> if either is on <code>PATH</code>. The plain tar is teed into a sha256 digester and
+            checked against the config as it lands. <code>core/unpack/unpacker.go:653-658</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>			if diff.Digest != diffIDs[i] {
+				cleanup.Do(ctx, abort)
+				status.err = fmt.Errorf("wrong diff id %q calculated on extraction %q, desc %q", diff.Digest, diffIDs[i], desc.Digest)
+				resCh &lt;- status
+				return
+			}</code></pre>
+          <p>
+            On Linux, when the target is one overlay mount and not in a user namespace, the applier does not mount at
+            all. It untars straight into the snapshot's <code>upperdir</code> with <code>OverlayConvertWhiteout</code>
+            (<code>core/diff/apply/apply_linux.go:34-73</code>). Commit then only records disk usage and flips
+            metadata; no data is copied, so the committed layer is the directory the extraction wrote into. The overlay
+            mount is built as in §03: parents' <code>fs</code> dirs joined by <code>:</code>, immediate parent first,
+            which matches the kernel's leftmost-is-top order. The snapshotter appends <code>index=off</code> when the
+            kernel has that parameter <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two costs follow. <code>dockerd</code> pulls with <code>WithUnpackFetchAllContent</code>, so every layer
+            blob is fetched and kept even when its snapshot exists, "so the pulled image can also be saved or pushed";
+            disk use is compressed plus uncompressed (<code>image_pull.go:228-237</code>, D25). And it never sets an
+            unpack limiter, so layers unpack one at a time, each Prepared on its parent's ChainID
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The box this was written on shows the result from inside. Files on its overlay root report the overlay's
+            device, 133, while the bind-mounted <code>/etc/hostname</code> reports 2049: a different filesystem laid
+            over the rootfs one file at a time, the per-file bind mount that Docker and Kubernetes place over a container's
+            root <span class="recon">measured here</span>.
+          </p>

@@ -1,0 +1,199 @@
+          <h2 id="p2-server"><span class="secnum">{{S}}</span>Push, and inside a registry</h2>
+          <p>
+            Push runs the pull backwards: blobs first, manifest last. containerd's pusher HEADs each blob and treats a
+            200 as <code>ErrAlreadyExists</code>, which is client-side layer deduplication. It then tries a cross-repo
+            mount from a repository named in the blob's <code>containerd.io/distribution.source.&lt;host&gt;</code>
+            label, written at pull time, and falls back to a normal upload if the mount gets a 401. The upload is one
+            POST for a session and one streamed <code>PUT &lt;location&gt;?digest=</code>, with the comment
+            <code>// TODO: Support chunked upload</code> at <code>containerd/core/remotes/docker/pusher.go:316</code>.
+            If the <code>Location</code> moves to another host, the pusher drops the authorizer for that hop
+            <span class="src">from the code</span>.
+          </p>
+          <h3>The reference server, measured</h3>
+          <p>
+            I ran distribution v3.1.2's release binary on <code>127.0.0.1:5055</code> and pushed alpine's amd64 image
+            by hand, including the chunked path containerd never uses
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>HEAD  /v2/lab/alpine/blobs/sha256:7b2295…        404   not there yet
+POST  /v2/lab/alpine/blobs/uploads/               202   Range: 0-0   Docker-Upload-Uuid: 01a1693a-8dbb-…
+PATCH &lt;location&gt;  bytes 0-1926553                 202   Range: 0-1926553
+PATCH &lt;location&gt;  Content-Range: 10-20            416   {"code":"RANGE_INVALID","message":"invalid content range"}
+GET   &lt;location&gt;                                  204   Range: 0-1926553
+PUT   &lt;location&gt;&amp;digest=sha256:7b2295…  (rest)   201   Docker-Content-Digest: sha256:7b2295…
+POST  …/uploads/?digest=sha256:b92841…  (body)    202   Range: 0-0   body ignored; PUT again
+PUT   /v2/lab/alpine/manifests/3.24               201   Docker-Content-Digest: sha256:c26612752c78…
+POST  /v2/lab/other/blobs/uploads/?mount=…&amp;from=lab/alpine   201   mounted</code></pre>
+          <p>
+            An empty session answers <code>Range: 0-0</code>, which under the spec's inclusive ranges
+            claims byte 0 arrived (D40). The 416 carries <code>RANGE_INVALID</code>, a code absent from the spec's
+            table (D41). The single-POST upload is ignored, which the spec permits (D39). And the manifest PUT returned
+            Hub's digest: stored byte-exact, the same bytes have the same name on any registry.
+          </p>
+          <p>
+            The server keeps no session table. The <code>Location</code> carries <code>_state</code>, signed in
+            <code>distribution/registry/handlers/hmac.go:64-73</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>func (secret hmacKey) packUploadState(lus blobUploadState) (string, error) {
+	mac := hmac.New(sha256.New, []byte(secret))
+	p, err := json.Marshal(lus)
+	if err != nil {
+		return "", err
+	}
+
+	mac.Write(p)
+
+	return base64.URLEncoding.EncodeToString(append(mac.Sum(nil), p...)), nil</code></pre>
+          <p>
+            Decoded, the first <code>_state</code> is 155 bytes: a 32-byte HMAC, then the JSON
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>{"Name":"lab/alpine","UUID":"01a1693a-8dbb-7340-9a86-b8806bf53f4d","Offset":0,
+ "StartedAt":"2026-10-23T14:46:47.483213373Z"}</code></pre>
+          <p>
+            Without <code>http.secret</code> each process invents its own key,
+            so behind a load balancer the next PATCH fails on another replica (D49).
+            On disk, the bytes accumulate in <code>_uploads/&lt;uuid&gt;/data</code> beside 108-byte resumable-hash
+            snapshots. Committed, the registry is one global <code>blobs/sha256/&lt;2 hex&gt;/&lt;hex&gt;/data</code> store
+            plus per-repository trees of <code>link</code> files. Every link is 71 bytes: <code>sha256:</code> and 64 hex
+            characters.
+          </p>
+          <h3>Accept is enforced here</h3>
+          <p>
+            distribution parses <code>Accept</code> into four booleans, ignoring q-values, and refuses OCI content the
+            client did not name. <code>distribution/registry/handlers/manifests.go:171-178</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>if manifestType == ociSchema &amp;&amp; !supports[ociSchema] {
+	imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithMessage("OCI manifest found, but accept header does not support OCI manifests"))
+	return
+}</code></pre>
+          <p>
+            So <code>*/*</code>, or no Accept, gets a 404 for an OCI manifest. Hub and ghcr ignore Accept entirely.
+            The spec's own <code>content-negotiation.md</code> is still a schema1-era TODO (D46). Figure
+            {{fig-accept-matrix}} sets them side by side, including one path the guard misses.
+          </p>
+
+          <figure class="figure wide" id="fig-accept-matrix">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What each registry returned for each Accept header (status and type served)</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Accept sent</th><th>Hub alpine:latest (OCI index)</th><th>ghcr busybox:1.36 (Docker list)</th><th>local, OCI manifest tag</th><th>local, Docker list tag</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Docker schema2 manifest</td><td>200 OCI index</td><td>200 Docker list</td><td class="hl-red" style="background: var(--red-soft)">404 MANIFEST_UNKNOWN</td><td class="hl-orange" style="background: var(--orange-soft)">200 <strong>OCI manifest</strong> (list downgrade)</td></tr>
+                  <tr><td>OCI manifest</td><td>200 OCI index</td><td>200 Docker list</td><td class="hl-green" style="background: var(--green-soft)">200 OCI manifest</td><td>200 OCI manifest (child substituted)</td></tr>
+                  <tr><td>Docker manifest list</td><td>200 OCI index</td><td>200 Docker list (sent with index + schema2)</td><td>not tried</td><td class="hl-green" style="background: var(--green-soft)">200 Docker list</td></tr>
+                  <tr><td><code>*/*</code></td><td>200 OCI index</td><td>not tried</td><td class="hl-red" style="background: var(--red-soft)">404 MANIFEST_UNKNOWN</td><td>not tried</td></tr>
+                  <tr><td>none</td><td>200 OCI index</td><td>not tried</td><td class="hl-red" style="background: var(--red-soft)">404 MANIFEST_UNKNOWN</td><td>not tried</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Measured here on 23 October 2026; "local" is distribution v3.1.2. Hub also returned its index for OCI
+              index and <code>application/json</code>. The orange cell is the downgrade path: a list fetched by a
+              schema2-only client is replaced by its linux/amd64 child, and the guard rejects only schema2 children,
+              so an OCI manifest reaches a client that said it cannot read one. The log line calls it "schema1" (D36).
+            </p>
+          </figure>
+
+          <p>
+            v3.1.2 registers seven routes and none is referrers; upstream <code>main</code> still has seven, with
+            referrers in open PR #4828 (D38). Tag listing sends a <code>Link</code> whenever a page is full, including
+            the last page, which costs a client one empty round trip (D50) <span class="recon">measured here</span>.
+          </p>
+          <h3>Garbage collection can delete a mounted blob</h3>
+          <p>
+            Deletion is two steps. <code>DELETE /manifests/&lt;digest&gt;</code> removes the revision link and untags
+            every tag pointing at it, without checking whether a list in the same repository still references it. The
+            blob data stays until an offline <code>registry garbage-collect</code>. That marks each manifest in each
+            repository's <code>_manifests/revisions</code> and recurses into a child only if the child still exists as
+            a revision. <code>distribution/registry/storage/garbagecollect.go:228-234</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>		if ingester(descriptor.Digest) {
+			continue
+		}
+
+		if ok, _ := manifestService.Exists(ctx, descriptor.Digest); ok {
+			err := markManifestReferences(descriptor.Digest, manifestService, ctx, ingester)</code></pre>
+          <p>
+            Then it deletes every unmarked blob and every unmarked <code>_layers</code> link. Figure
+            {{fig-registry-gc}} shows what that did in the lab.
+          </p>
+
+          <figure class="figure wide" id="fig-registry-gc">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">distribution v3.1.2 offline GC: what was marked, what was deleted, what was left dangling</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 420" role="img" aria-label="Two repositories and the global blob store. lab/alpine has tag multi pointing at a Docker manifest list d13decfd, whose child c26612752c78 lost its revision link to an earlier DELETE. lab/other has only a mounted layer link to 7b229517. GC marked the list and the child blob but did not follow the child, so it deleted the config b92841763c5c and the layer 7b229517, leaving lab/other's link dangling and the list pointing at a 404 child.">
+                <defs>
+                  <marker id="gc-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="gc-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ad4b43"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">REPOSITORIES (LINK FILES)</text>
+                <text x="640" y="26" class="svg-lane">GLOBAL BLOB STORE</text>
+
+                <rect x="30" y="40" width="440" height="200" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="62" class="svg-step">lab/alpine</text>
+                <text x="54" y="86" class="svg-sub">_manifests/tags/multi/current/link</text>
+                <text x="54" y="106" class="svg-sub">_manifests/revisions/sha256/d13decfd01f5…/link</text>
+                <text x="54" y="130" class="svg-sub" style="fill:#ad4b43">revisions/…/c26612752c78…  (removed by DELETE)</text>
+                <line x1="54" y1="126" x2="392" y2="126" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="54" y="156" class="svg-sub" style="fill:#ad4b43">_layers/…/7b229517ed22…/link   deleted by GC</text>
+                <line x1="54" y1="152" x2="378" y2="152" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="54" y="176" class="svg-sub" style="fill:#ad4b43">_layers/…/b92841763c5c…/link   deleted by GC</text>
+                <line x1="54" y1="172" x2="378" y2="172" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="42" y="216" class="svg-note">tag edge deleted first; 3.23, 3.24, latest went with the manifest</text>
+
+                <rect x="30" y="260" width="440" height="80" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="42" y="282" class="svg-step">lab/other</text>
+                <text x="54" y="304" class="svg-sub">_layers/sha256/7b229517ed22…/link   survives</text>
+                <text x="54" y="326" class="svg-note">no manifests, so nothing here marks anything</text>
+
+                <rect x="640" y="44" width="410" height="48" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="652" y="64" class="svg-step">d13decfd01f5… · Docker manifest list</text>
+                <text x="652" y="82" class="svg-sub">marked (revision exists)</text>
+                <rect x="640" y="122" width="410" height="48" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="652" y="142" class="svg-step">c26612752c78… · OCI manifest</text>
+                <text x="652" y="160" class="svg-sub">marked as a blob, but not followed</text>
+                <rect x="640" y="212" width="410" height="48" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="652" y="232" class="svg-step">b92841763c5c… · config</text>
+                <text x="652" y="250" class="svg-sub">unmarked → deleted</text>
+                <line x1="652" y1="228" x2="840" y2="228" stroke="#ad4b43" stroke-width="1.2"/>
+                <rect x="640" y="290" width="410" height="48" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="652" y="310" class="svg-step">7b229517ed22… · layer</text>
+                <text x="652" y="328" class="svg-sub">unmarked → deleted</text>
+                <line x1="652" y1="306" x2="820" y2="306" stroke="#ad4b43" stroke-width="1.2"/>
+
+                <line x1="472" y1="98" x2="636" y2="68" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#gc-data)"/>
+                <line x1="1000" y1="94" x2="1000" y2="118" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#gc-data)"/>
+                <text x="1008" y="110" class="svg-sub">child</text>
+                <path d="M1052,150 L1066,150 L1066,236 L1054,236" fill="none" stroke="#ad4b43" stroke-width="1.4" stroke-dasharray="4 3"/>
+                <path d="M1066,236 L1066,314 L1054,314" fill="none" stroke="#ad4b43" stroke-width="1.4" stroke-dasharray="4 3"/>
+                <text x="880" y="196" class="svg-note">no revision → recursion skipped</text>
+                <line x1="472" y1="304" x2="636" y2="314" stroke="#ad4b43" stroke-width="1.6" marker-end="url(#gc-bad)"/>
+                <text x="486" y="290" class="svg-sub">HEAD → 404 BLOB_UNKNOWN</text>
+
+                <text x="30" y="378" class="svg-sub">GC output: "2 blobs marked, 2 blobs and 0 manifests eligible for deletion"</text>
+                <text x="30" y="400" class="svg-note">Afterwards: GET multi → 200 list; GET its child by digest → 404 MANIFEST_UNKNOWN; HEAD lab/other's layer → 404.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured here with distribution v3.1.2. Green blobs were marked, red ones deleted; struck-through links
+              were removed. The dashed red edges are references GC never visited because the child manifest had no
+              revision link left. The GC commands were typed by hand and not saved as a script.
+            </p>
+          </figure>
+
+          <p>
+            Two holes result (D37). <code>lab/other</code> links to a blob that no longer exists: a repository whose
+            only claim is a mount is invisible to the mark phase. And the still-tagged list points at a child that 404s
+            <span class="recon">measured here</span>. Both follow from the mark rule above.
+          </p>

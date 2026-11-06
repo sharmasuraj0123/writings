@@ -1,0 +1,184 @@
+          <h2 id="p1-lede"><span class="secnum">{{S}}</span>A process and five programs</h2>
+          <p class="lede">
+            A container is an ordinary Linux process. Docker is a relay of five separate programs: the
+            <code>docker</code> CLI, <code>dockerd</code>, <code>containerd</code>, one
+            <code>containerd-shim-runc-v2</code> per container, and a short-lived <code>runc</code>. They agree on
+            names made of sha256 hashes and on one JSON spec. They ask the kernel to narrow one process's view of
+            the machine, and then most of them get out of the way. This part follows a single
+            <code>docker run -it alpine sh</code> from the keystroke to the running shell and back to its exit
+            code. Its claim is that the run path is choreography with a hold point in the middle: the CLI makes
+            five calls, create only writes JSON, start rebuilds the spec, runc builds namespaces before Go even
+            boots, and the new process waits on a FIFO while dockerd plugs in its network.
+          </p>
+          <p>
+            Start with the end state. On a systemd host with a system containerd, one running
+            <code>docker run -it alpine sh</code> leaves this process tree: <code>systemd</code> is the parent of
+            <code>dockerd</code>, of <code>containerd</code>, and of a
+            <code>containerd-shim-runc-v2</code> started as <code>-namespace moby -id &lt;id&gt;</code> <code>-address /run/containerd/containerd.sock</code>,
+            and the shim is the parent of <code>sh</code>, which is PID 1 inside the container. No
+            <code>runc</code> process remains. No process links dockerd to the container; only named FIFOs do <span class="src">from the code</span>. That tree is an inference from the code, not an
+            observation: no container could run on the research box, so nobody ran <code>pstree</code> on one
+            <span class="recon">reconstruction</span>. §08 reads the one real container that was available, the
+            sandbox itself.
+          </p>
+
+          <figure class="figure wide" id="fig-pid-tree">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One running <code>docker run -it alpine sh</code>: who is whose parent, and what crosses each boundary</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 610" role="img" aria-label="Process tree of one running container. systemd is the parent of dockerd, containerd and the containerd-shim-runc-v2 process. The shim is the parent of sh, the container's PID 1, and briefly of runc. Edges are labelled with the transport used across each boundary: HTTP on the Docker socket, gRPC to containerd, ttrpc between containerd and the shim, fork and exec to runc, FIFOs between dockerd and the shim, and a pty between the shim and sh. A right-hand column says whether each process can die while sh keeps running.">
+                <defs>
+                  <marker id="fig-pid-tree-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-pid-tree-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-pid-tree-fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="24" class="svg-lane">PROCESS TREE</text>
+                <text x="500" y="24" class="svg-lane">WHAT CROSSES THE BOUNDARY</text>
+                <text x="884" y="24" class="svg-lane">IF IT DIES</text>
+
+                <!-- tree lines -->
+                <line x1="50" y1="84" x2="50" y2="322" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="50" y1="142" x2="70" y2="142" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="50" y1="222" x2="70" y2="222" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="50" y1="322" x2="70" y2="322" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="90" y1="344" x2="90" y2="542" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="90" y1="402" x2="110" y2="402" stroke="#b8b8b1" stroke-width="1.5" stroke-dasharray="4 3"/>
+                <line x1="90" y1="472" x2="110" y2="472" stroke="#b8b8b1" stroke-width="1.5" stroke-dasharray="4 3"/>
+                <line x1="90" y1="542" x2="150" y2="542" stroke="#b8b8b1" stroke-width="1.5"/>
+
+                <!-- boxes -->
+                <rect x="30" y="40" width="200" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="42" y="58" class="svg-step">systemd (pid 1)</text>
+                <text x="42" y="75" class="svg-sub">adopts orphans</text>
+
+                <rect x="260" y="40" width="210" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="272" y="58" class="svg-step">docker (the CLI)</text>
+                <text x="272" y="75" class="svg-sub">in your terminal</text>
+
+                <rect x="70" y="120" width="400" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="82" y="138" class="svg-step">dockerd</text>
+                <text x="82" y="155" class="svg-sub">not an ancestor of sh</text>
+
+                <rect x="70" y="200" width="400" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="82" y="218" class="svg-step">containerd</text>
+                <text x="82" y="235" class="svg-sub">system service (or run by dockerd)</text>
+
+                <rect x="70" y="300" width="400" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="82" y="318" class="svg-step">containerd-shim-runc-v2</text>
+                <text x="82" y="335" class="svg-sub">-namespace moby -id &lt;id&gt; · subreaper</text>
+
+                <rect x="110" y="380" width="300" height="44" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 3"/>
+                <text x="122" y="398" class="svg-step">runc create, runc start</text>
+                <text x="122" y="415" class="svg-sub">short-lived; exits</text>
+
+                <rect x="110" y="450" width="230" height="44" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 3"/>
+                <text x="122" y="468" class="svg-step">docker-init (tini)</text>
+                <text x="122" y="485" class="svg-sub">only with --init</text>
+
+                <rect x="150" y="520" width="320" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="162" y="538" class="svg-step">sh (container PID 1)</text>
+                <text x="162" y="555" class="svg-sub">pty slave on fd 0, 1, 2</text>
+
+                <text x="96" y="292" class="svg-note">parent: nearest subreaper</text>
+
+                <!-- edges -->
+                <line x1="365" y1="84" x2="365" y2="118" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-pid-tree-data)"/>
+                <line x1="365" y1="164" x2="365" y2="198" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-pid-tree-ctl)"/>
+                <line x1="345" y1="244" x2="345" y2="298" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-pid-tree-ctl)"/>
+                <line x1="395" y1="298" x2="395" y2="246" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-pid-tree-fx)"/>
+                <path d="M470,150 L482,150 L482,330 L472,330" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-pid-tree-data)" marker-start="url(#fig-pid-tree-data)"/>
+                <line x1="300" y1="344" x2="300" y2="378" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-pid-tree-ctl)"/>
+                <line x1="440" y1="344" x2="440" y2="518" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-pid-tree-data)" marker-start="url(#fig-pid-tree-data)"/>
+                <line x1="380" y1="424" x2="380" y2="518" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-pid-tree-fx)"/>
+
+                <!-- boundary labels -->
+                <text x="500" y="98" class="svg-step">HTTP/1.1 on /var/run/docker.sock</text>
+                <text x="500" y="113" class="svg-sub">attach hijacks it: Upgrade: tcp</text>
+                <text x="500" y="178" class="svg-step">gRPC (HTTP/2) on containerd.sock</text>
+                <text x="500" y="193" class="svg-sub">namespace "moby" in metadata</text>
+                <text x="500" y="258" class="svg-step">ttrpc down: /run/containerd/s/&lt;sha256&gt;</text>
+                <text x="500" y="276" class="svg-sub" style="fill:#765b98">ttrpc up: Events.Forward, containerd.sock.ttrpc</text>
+                <text x="500" y="318" class="svg-step">FIFOs to dockerd</text>
+                <text x="500" y="333" class="svg-sub">&lt;id&gt;-stdin, &lt;id&gt;-stdout</text>
+                <text x="500" y="392" class="svg-step">fork/exec, config.json on disk</text>
+                <text x="500" y="407" class="svg-sub">console socket (SCM_RIGHTS), exec.fifo</text>
+                <text x="500" y="472" class="svg-sub" style="fill:#765b98">runc init execve()s into sh: same pid</text>
+                <text x="500" y="538" class="svg-step">pty</text>
+                <text x="500" y="553" class="svg-sub">the shim holds the master</text>
+
+                <!-- right stripe -->
+                <rect x="878" y="40" width="184" height="44" rx="3" fill="#dfede5"/>
+                <text x="888" y="66" class="svg-sub" style="fill:#367f59">sh keeps running</text>
+                <rect x="878" y="120" width="184" height="44" rx="3" fill="#dfede5"/>
+                <text x="888" y="146" class="svg-sub" style="fill:#367f59">sh keeps running</text>
+                <rect x="878" y="200" width="184" height="44" rx="3" fill="#dfede5"/>
+                <text x="888" y="226" class="svg-sub" style="fill:#367f59">sh keeps running</text>
+                <rect x="878" y="300" width="184" height="44" rx="3" fill="#f7e3c8"/>
+                <text x="888" y="318" class="svg-sub" style="fill:#252525">sh's parent: reaps it,</text>
+                <text x="888" y="333" class="svg-sub" style="fill:#252525">records its exit</text>
+                <rect x="878" y="380" width="184" height="44" rx="3" fill="#f7f7f5"/>
+                <text x="888" y="406" class="svg-sub">gone before sh runs</text>
+                <rect x="878" y="520" width="184" height="44" rx="3" fill="#f7f7f5"/>
+                <text x="888" y="546" class="svg-sub" style="fill:#252525">the container itself</text>
+
+                <!-- legend -->
+                <line x1="30" y1="592" x2="60" y2="592" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="68" y="596" class="svg-sub">bytes</text>
+                <line x1="130" y1="592" x2="160" y2="592" stroke="#252525" stroke-width="2.2"/>
+                <text x="168" y="596" class="svg-sub">calls</text>
+                <line x1="230" y1="592" x2="260" y2="592" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <text x="268" y="596" class="svg-sub">events, effects</text>
+                <line x1="410" y1="592" x2="440" y2="592" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="448" y="596" class="svg-sub">parent → child (dashed: transient or optional)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Only the shim stays the container's parent. dockerd and containerd are siblings of the shim, not
+              ancestors of <code>sh</code>, so either can die and the shell keeps running; the only thing tying
+              dockerd to the container is a pair of FIFOs. Drawn from the code <span class="src">from the code</span>; the tree was not observed on a live host
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            Figure {{fig-pid-tree}} labels each edge with its transport. The CLI speaks HTTP/1.1 to dockerd on a
+            Unix socket, and turns that socket into a raw byte pipe for attach. dockerd speaks gRPC to containerd
+            in the namespace <code>moby</code>. containerd calls the shim over ttrpc on a socket whose name is a
+            sha256, and the shim calls back up on a second ttrpc socket to publish events. The shim runs runc with
+            plain fork and exec, a <code>config.json</code> on disk and a Unix socket that carries the pty's
+            master file descriptor <span class="src">from the code</span>.
+          </p>
+          <p>
+            The shape explains the most useful property of the design. The shim's <code>start</code> step
+            re-executes itself as a long-lived server in its own process group and exits, so the server is
+            orphaned and adopted by the nearest subreaper
+            (<code>containerd/cmd/containerd-shim-runc-v2/manager/manager_linux.go</code>:84-114). The shim then marks itself a child
+            subreaper with <code>prctl(PR_SET_CHILD_SUBREAPER, 1)</code>, so when <code>runc create</code> exits
+            the container's init is reparented to the shim, which later reaps it with <code>wait4</code>
+            (<code>containerd/pkg/shim/shim_linux.go</code>:29-30; <code>containerd/pkg/sys/reaper/reaper_unix.go</code>:258-266). Container processes are therefore children of the shim, not of dockerd or
+            containerd. Killing dockerd does not kill them. A containerd that dockerd itself supervises dies with
+            dockerd, because it is started with <code>Pdeathsig: SIGKILL</code>
+            (<code>moby/daemon/internal/containerd/server/supervisor/utils_linux.go</code>:10), but the shims run in
+            their own process groups and survive that too (<code>manager_linux.go</code>:110-111)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            It was not always this way. Docker 1.11.0 (13 April 2016) was the first release to run containers
+            through containerd and runc, and it shipped four Linux binaries: <code>docker</code>,
+            <code>docker-containerd</code>, <code>docker-containerd-shim</code> and <code>docker-runc</code>.
+            Containers kept running across a daemon shutdown only from 1.12.0 (28 July 2016), which added
+            <code>--live-restore</code>, per the changelog in moby's <code>v1.13.0</code> tag
+            <span class="src">from the code</span>.
+            <a href="../network-and-lifecycle/#p4-history">Part 4</a> tells that history.
+          </p>
+          <p>
+            The rest of this part walks the tree top to bottom and back up. §02 is the CLI's five calls. §03 is
+            what dockerd does at create and at start. §04 is containerd and the shim. §05 is runc's
+            <code>init</code>, where the namespaces are actually made. §06 is the FIFO that separates create from
+            start. §07 is the exit climbing back up, and what survives a dockerd restart. §08 reads a real
+            container from the inside. The image that <code>alpine</code> names is
+            <a href="../images/#p2-lede">Part 2</a>'s subject; the network that §06 plugs in is
+            <a href="../network-and-lifecycle/#p4-network">Part 4</a>'s.
+          </p>

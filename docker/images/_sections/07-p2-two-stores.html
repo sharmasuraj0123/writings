@@ -1,0 +1,92 @@
+          <h2 id="p2-two-stores"><span class="secnum">{{S}}</span>Two image stores, two meanings of "image ID"</h2>
+          <p>
+            Docker 29 ships two image stores and picks one at daemon start. On Linux the default is containerd's store,
+            the one §06 described (<code>moby/daemon/image_store_choice.go:105-108</code>). But if the data root
+            already holds a non-empty prior graphdriver directory other than <code>vfs</code>, the choice flips to
+            <code>graphdriver-prior</code>, and the host stays on overlay2 (<code>:130-134</code>, register D24).
+            Setting <code>storage-driver</code> or <code>$DOCKER_DRIVER</code> also selects the graphdriver
+            <span class="src">from the code</span>. Engine 29.0.0 (10 November 2025) made the containerd store the
+            default for fresh installs; it had been experimental since 24.0.0. So an upgraded host and a fresh one,
+            running the same binary, store images differently.
+          </p>
+          <p>
+            The feature flag has a quiet asymmetry. Docker's storage docs show only
+            <code>"containerd-snapshotter": true</code>, which the code now answers with a warning that it is the
+            default. <code>false</code> is the explicit opt-out, <code>imageStoreChoiceGraphdriverExplicit</code>
+            (<code>image_store_choice.go:115-123</code>, D35). <code>userns-remap</code> disables the containerd store,
+            and fails startup if it was explicitly enabled, because BuildKit breaks with that combination
+            (<code>moby/daemon/command/daemon_linux.go:28-40</code>, moby#47377, D26).
+          </p>
+          <h3>Same pull, two IDs</h3>
+          <p>
+            In the containerd store, the "ID" that <code>docker images</code> and <code>inspect</code> show is the
+            digest of the target descriptor, the index or manifest the tag points at
+            (<code>moby/daemon/containerd/image_list.go:439</code>: <code>ID: target.Digest.String()</code>). In the
+            legacy store it is <code>digest.FromBytes(config)</code>, written to
+            <code>image/&lt;driver&gt;/imagedb/content/sha256/&lt;id&gt;</code>
+            (<code>moby/daemon/internal/image/fs.go:112-126</code>), which is the OCI ImageID
+            <span class="src">from the code</span>. Applied to the measured digests, the same <code>docker pull
+            alpine</code> shows <code>be2656061b53</code> on a fresh 29.x host and <code>b92841763c5c</code> on an
+            upgraded one (D23) <span class="recon">reconstruction</span>. Scripts that compare image IDs across hosts
+            compare different things.
+          </p>
+
+          <figure class="figure wide" id="fig-two-stores">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The legacy overlay2 + layerdb store against the containerd store, row by row</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Question</th><th>overlay2 + layerdb (legacy)</th><th>containerd store</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Chosen when</td><td>a prior graphdriver dir exists (upgraded hosts); <code>storage-driver</code> set; flag <code>false</code>; <code>userns-remap</code>; Windows</td><td>fresh Linux install of 29.x, or flag <code>true</code></td></tr>
+                  <tr><td>Image ID</td><td class="hl-blue" style="background: var(--blue-soft)">sha256 of the config: <code>b92841763c5c</code></td><td class="hl-purple" style="background: var(--purple-soft)">digest of the index or manifest: <code>be2656061b53</code></td></tr>
+                  <tr><td>Layer directory name</td><td>random cache-id, unrelated to any digest</td><td>bolt-allocated number: <code>snapshots/N/</code></td></tr>
+                  <tr><td>Layer indexed by</td><td><code>layerdb/sha256/&lt;ChainID&gt;/</code></td><td>snapshot name = ChainID</td></tr>
+                  <tr><td>DiffID kept in</td><td>the layerdb <code>diff</code> file</td><td>the config, snapshot labels, and blob label <code>containerd.io/uncompressed</code></td></tr>
+                  <tr><td>Compressed blob kept?</td><td class="hl-red" style="background: var(--red-soft)">no; push must recompress, which can change layer digests</td><td class="hl-green" style="background: var(--green-soft)">yes; disk ≈ compressed + unpacked</td></tr>
+                  <tr><td>Original tar headers</td><td><code>tar-split.json.gz</code> regenerates a byte-identical tar</td><td>not needed: the original blob is kept</td></tr>
+                  <tr><td>Multi-platform index, attestations</td><td class="hl-red" style="background: var(--red-soft)">cannot hold them</td><td class="hl-green" style="background: var(--green-soft)">held</td></tr>
+                  <tr><td>Mount data per lower layer</td><td><code>l/</code> + 26 random chars + <code>:</code>, 28 bytes</td><td>absolute <code>fs</code> path; on this host 23 lowers take 1,756 bytes</td></tr>
+                  <tr><td>Container rootfs</td><td><code>&lt;id&gt;-init</code> layer + rw layer in overlay2</td><td>Prepare(containerID, <code>&lt;id&gt;-init</code>), leased by container ID</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Read from moby at <code>0367cbeb</code> and containerd v2.4.2; the two IDs and the 1,756-byte lowerdir are
+              measured values (alpine's digests, this host's mount table). Neither store was run here. The trade is
+              disk against fidelity: the legacy store saves the compressed blob's space and pays for it at push time.
+            </p>
+          </figure>
+
+          <h3>Twenty-six characters and a page</h3>
+          <p>
+            The legacy driver keeps each layer under <code>overlay2/&lt;cacheID&gt;/</code> with <code>diff/</code>,
+            <code>work/</code>, <code>merged/</code>, a <code>lower</code> file listing the chain, and a
+            <code>link</code> file holding a short name. The short names exist for the mount syscall, whose options must
+            fit in one page. <code>moby/daemon/graphdriver/overlay2/overlay.go:76-85</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	maxDepth      = 128
+
+	// idLength represents the number of random characters
+	// which can be used to create the unique link identifier
+	// for every layer. If this value is too long then the
+	// page size limit for the mount command may be exceeded.
+	// The idLength should be selected such that following equation
+	// is true (512 is a buffer for label metadata).
+	// ((idLength + len(linkDir) + 1) * maxDepth) &lt;= (pageSize - 512)
+	idLength = 26</code></pre>
+          <p>
+            The equation is tight: (26 + 1 + 1) × 128 = 3,584 = 4,096 − 512 exactly, and this host's
+            <code>getconf PAGESIZE</code> is 4,096 <span class="recon">measured here</span>. The links are used only on a
+            fallback. When the absolute-path options exceed <code>pageSize-1</code>, which happens far below 128 layers,
+            overlay2 rewrites them relative to its home and mounts through <code>mountFrom</code>, a re-exec that
+            chroots first. The 512-byte reserve must then also hold <code>index=off,</code>, <code>userxattr,</code>,
+            the relative upper and work paths and any SELinux label. Past that, <code>Get</code> fails with "cannot mount
+            layer, mount label too large"; there is no further fallback (<code>overlay.go:580-602</code>, D31)
+            <span class="src">from the code</span>.
+          </p>
