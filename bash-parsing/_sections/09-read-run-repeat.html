@@ -1,0 +1,325 @@
+          <h2 id="read-run-repeat"><span class="secnum">{{S}}</span>One unit at a time: reading, running, failing</h2>
+          <p class="lede">
+            bash never holds a tree for a whole script. <code>reader_loop</code>
+            parses one inputunit, executes it, disposes it and reads on. A unit is
+            one line, extended only as far as an open construct needs. That one
+            fact explains four behaviours: earlier lines run before a later syntax
+            error is found, PS2 is printed from inside the lexer, an error drops a
+            whole line, and <code>bash -c</code> returns 127 for a broken
+            <code>$( )</code>.
+          </p>
+
+          <h3>The loop</h3>
+          <p>
+            <code>reader_loop</code> sets a <code>setjmp</code> target, calls
+            <code>read_command</code>, takes <code>global_command</code>, runs
+            <code>execute_command</code>, then <code>dispose_command</code>, and
+            repeats until <code>EOF_Reached</code> (<code>bash/eval.c</code>:61-211).
+            <code>parse_command</code> calls <code>yyparse</code>
+            (<code>bash/eval.c</code>:338-423)
+            <span class="src">from the code</span>. The grammar decides how much one
+            call takes. <code>simple_list</code> admits no significant newline, so a
+            top-level unit ends at the end of its line. <code>&amp;&amp;</code> and
+            <code>||</code> may be followed by a newline; <code>;</code> and
+            <code>&amp;</code> may not (<code>bash/parse.y</code>:1334-1339,
+            1390-1405) <span class="src">from the code</span>.
+          </p>
+          <p>
+            <code>bash -n</code> is the same loop with one branch swapped. In
+            <code>bash/eval.c</code>:147-153, when <code>read_but_dont_execute</code>
+            is set in a non-interactive shell, the parsed unit goes straight to
+            <code>dispose_command</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>      if (read_command () == 0)
+	{
+	  if (interactive_shell == 0 &amp;&amp; read_but_dont_execute)
+	    {
+	      set_exit_status (last_command_exit_value);
+	      dispose_command (global_command);
+	      global_command = (COMMAND *)NULL;</code></pre>
+          <p>
+            <code>bash -c</code> takes another route to the same alternation. With
+            ONESHOT, <code>main</code> calls <code>run_one_command</code>, which calls
+            <code>parse_and_execute</code> on the string; that function loops
+            <code>parse_command</code> and <code>execute_command_internal</code>
+            (<code>bash/shell.c</code>:766-768, 1483; <code>bash/builtins/evalstring.c</code>:567-568)
+            <span class="src">from the code</span>. Figure {{fig-reader-loop}} draws both.
+          </p>
+
+          <h3>Lines run before the error is found</h3>
+          <p>
+            A four-line file (<code>echo line1</code>, <code>echo line2</code>,
+            <code>if then</code>, <code>echo line4</code>) prints
+            <code>line1</code> and <code>line2</code>, then
+            "line 3: syntax error near unexpected token `then'", and exits 2.
+            Line 4 is never parsed. One line is all or nothing:
+          </p>
+<pre><code>$ /usr/bin/bash -c 'echo a; fi; echo b'
+/usr/bin/bash: -c: line 1: syntax error near unexpected token `fi'
+/usr/bin/bash: -c: line 1: `echo a; fi; echo b'</code></pre>
+          <p>
+            <code>a</code> never prints <span class="recon">measured here</span>
+            (<code>/usr/bin/bash</code> 5.3.9). The non-interactive parse error sets
+            <code>EOF_Reached</code> (<code>bash/eval.c</code>:200-205)
+            <span class="src">from the code</span>. POSIX Issue 8 states this model normatively:
+            a complete_command "shall be executed before the next complete_command is
+            tokenized and parsed" (XCU §2.3). The rationale defends it: "It makes it
+            possible to create self-extracting tarballs" (XRAT §C.2.3, Defect 1055)
+            <span class="src">from the docs</span>. brush parses the whole file
+            first and refuses to run any of it (<code>lab/results/tricky.txt</code>)
+            <span class="recon">measured here</span>; §12 has the details.
+          </p>
+
+          <h3>Running the example</h3>
+          <p>
+            Trace (a) shows what happens between the parse and the dispose
+            (<code>lab/results/trace-a.txt</code>, lines 360-375), from an
+            instrumented bash@9c46586.
+            <code>execute_command_internal</code> switches on
+            <code>cm_connection</code> and calls <code>execute_connection</code> for
+            <code>&amp;&amp;</code>. The left side runs through
+            <code>execute_command</code> with <code>CMD_IGNORE_RETURN</code> set
+            (<code>bash/execute_cmd.c</code>:2943). A second
+            <code>execute_connection</code> for <code>'|'</code> calls
+            <code>execute_pipeline</code>, which makes one pipe per element:
+            <code>sort</code> gets <code>pipe_out=4</code>, <code>head</code>
+            <code>pipe_in=3</code>. In a pipeline, <code>execute_simple_command</code>
+            forks before <code>expand_words</code>. Its comment
+            (<code>bash/execute_cmd.c</code>:4524-4529) says this "keeps assignment
+            statements from affecting the parent shell's environment when they
+            should not" <span class="src">from the code</span>. The
+            <code>expand_words</code> lines carry child pids 263969 and 263970, not
+            the shell's 263968. The child sets <code>CMD_NO_FORK</code>, so
+            <code>execute_disk_command</code> execs in place with
+            <code>cmdflags=0x48</code>. <code>echo done</code> runs as a builtin in
+            pid 263968 <span class="recon">measured here</span>.
+          </p>
+
+          <h3>PS2 comes from the lexer</h3>
+          <p>
+            An interactive shell prompts only at a command boundary when
+            <code>SHOULD_PROMPT()</code> holds (<code>bash/parse.y</code>:3057-3073),
+            and <code>prompt_again</code> points later lines at PS2
+            (<code>bash/parse.y</code>:6143-6183) <span class="src">from the code</span>.
+            <code>lab/scripts/trace/pty_interactive.py</code> drives a pty with
+            <code>--noediting</code>. After <code>for i in 1 2</code> and a newline,
+            the LR stack in <code>lab/results/trace-interactive.txt</code> reads:
+          </p>
+<pre><code>Stack now 0 4 66 151 218 255 295 318
+Reading a token
+
+LAB PROMPT print_prompt() called from shell_getc, current_prompt_string=PS2</code></pre>
+          <p>
+            State 318 is the <code>for_command</code> item with the dot just before
+            <code>DO</code>. The lexer printed the prompt while fetching bytes for the
+            next token <span class="recon">measured here</span>.
+            <code>yyparse</code> never returned.
+          </p>
+
+          <h3>Errors</h3>
+          <p>
+            <code>yyerror</code> reports unless <code>PST_NOERROR</code> is set, then
+            calls <code>reset_parser</code>, which plants
+            <code>token_to_read = '\n'</code> so the rule <code>error '\n'</code>
+            can match (<code>bash/parse.y</code>:6723-6730, 3493-3539). That rule
+            accepts only in an interactive shell outside
+            <code>parse_and_execute</code>; otherwise it aborts (<code>bash/parse.y</code>:469-515). The status is
+            <code>EX_BADUSAGE</code> 2, or <code>EX_BADSYNTAX</code> 257 inside a
+            builtin running <code>parse_and_execute</code>
+            (<code>bash/parse.y</code>:6842; <code>bash/shell.h</code>:56, 70)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>The 127</h3>
+          <p>
+            <code>lab/scripts/trace/exit127.sh</code> runs each text under
+            <code>-c</code> and as a file. Results in
+            <code>lab/results/trace-exit127-matrix.txt</code> are identical on
+            5.3.9, the pinned build and the trace build
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>echo $(for)       -c:127  file:2
+for)              -c:2    file:2
+: ${x?unset}      -c:127  file:1
+echo $((1+))      -c:1    file:1</code></pre>
+          <p>
+            The nested parse in <code>parse_comsub</code> fails with the status already 2 and,
+            in a non-interactive shell, calls <code>jump_to_top_level (FORCE_EOF)</code>
+            (<code>bash/parse.y</code>:4588-4597). Each <code>parse_and_execute</code>
+            level catches it, runs its unwind frame and rethrows
+            (<code>bash/builtins/evalstring.c</code>:395-402). Under <code>-c</code>
+            the catcher is <code>run_one_command</code>
+            (<code>bash/shell.c</code>:1457-1483, the preamble and default case
+            trimmed) <span class="src">from the code</span>:
+          </p>
+<pre><code>  code = setjmp_nosigs (top_level);
+
+  if (code != NOT_JUMPED)
+    {
+      …
+      switch (code)
+	{
+	  /* Some kind of throw to top_level has occurred. */
+	case FORCE_EOF:
+	  return last_command_exit_value = 127;
+	case ERREXIT:
+	case EXITPROG:
+	case EXITBLTIN:
+	  return last_command_exit_value;
+	case DISCARD:
+	  return last_command_exit_value = 1;</code></pre>
+          <p>
+            Any <code>FORCE_EOF</code> becomes a literal 127. For a script,
+            <code>reader_loop</code> takes the same jump at
+            <code>bash/eval.c</code>:104-109, sets <code>EOF_Reached</code> and keeps
+            the 2. <code>run_wordexp</code> does the
+            same (<code>bash/shell.c</code>:1381-1396). A plain <code>-c</code>
+            syntax error never longjmps: <code>parse_and_execute</code> sets
+            <code>EX_BADUSAGE</code> and breaks (<code>bash/builtins/evalstring.c</code>:584-599)
+            <span class="src">from the code</span>. <code>${x?}</code> throws
+            <code>FORCE_EOF</code> from <code>subst.c</code> (the exact site was not
+            traced); <code>$((1+))</code> returns an expansion error that
+            <code>bash/subst.c</code>:4296 turns into <code>DISCARD</code>, hence 1
+            <span class="src">from the code</span>. The manual promises only that bash
+            "exits with a non-zero value" on a syntax error and reserves 127 for a
+            command not found (<code>bash/doc/bash.1</code>:5927-5928, 5943-5945)
+            <span class="src">from the docs</span>. Whether the mapping is deliberate is open.
+          </p>
+
+          <figure class="figure wide" id="fig-reader-loop">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One unit per turn of reader_loop, and where a failed $( ) lands under -c</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 520" width="100%" role="img" aria-label="Left: the reader_loop cycle, seven boxes from reader_loop with setjmp through read_command, parse_command, yyparse, global_command, execute_command and dispose_command, with a return arrow. Beside it a four-line script: lines 1 and 2 ran, line 3 is a syntax error, line 4 is never read. Below, the bash -n variant replaces execute with dispose. Right: the longjmp path for bash -c 'echo $(for)': parse_comsub fails, jump_to_top_level FORCE_EOF, parse_and_execute rethrows, run_one_command returns 127; for a script reader_loop keeps 2. Below, four rows of the measured exit-status matrix.">
+                <defs>
+                  <marker id="fig-reader-loop-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-reader-loop-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                  <marker id="fig-reader-loop-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+
+                <!-- LEFT: the loop -->
+                <text x="40" y="30" class="svg-lane">THE LOOP · eval.c:61-211</text>
+                <g>
+                  <rect x="40" y="46" width="210" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <text x="52" y="68" class="svg-step">reader_loop · setjmp</text>
+                  <rect x="40" y="96" width="210" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="52" y="118" class="svg-step">read_command</text>
+                  <rect x="40" y="146" width="210" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="52" y="168" class="svg-step">parse_command</text>
+                  <rect x="40" y="196" width="210" height="34" rx="5" fill="#ece6f3" stroke="#765b98"/>
+                  <text x="52" y="218" class="svg-step">yyparse · one unit</text>
+                  <rect x="40" y="246" width="210" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="52" y="268" class="svg-step">global_command</text>
+                  <rect x="40" y="296" width="210" height="34" rx="5" fill="#dfede5" stroke="#367f59"/>
+                  <text x="52" y="318" class="svg-step">execute_command</text>
+                  <rect x="40" y="346" width="210" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="52" y="368" class="svg-step">dispose_command</text>
+                </g>
+                <g fill="none" stroke="#252525" stroke-width="2.2">
+                  <path d="M145 80 L145 94" marker-end="url(#fig-reader-loop-ink)"/>
+                  <path d="M145 130 L145 144" marker-end="url(#fig-reader-loop-ink)"/>
+                  <path d="M145 180 L145 194" marker-end="url(#fig-reader-loop-ink)"/>
+                  <path d="M145 230 L145 244" marker-end="url(#fig-reader-loop-ink)"/>
+                  <path d="M145 280 L145 294" marker-end="url(#fig-reader-loop-ink)"/>
+                  <path d="M145 330 L145 344" marker-end="url(#fig-reader-loop-ink)"/>
+                  <path d="M40 363 L26 363 L26 113 L38 113" marker-end="url(#fig-reader-loop-ink)"/>
+                </g>
+                <text x="16" y="262" class="svg-note" transform="rotate(-90 16 262)">repeat</text>
+
+                <!-- -n variant -->
+                <rect x="40" y="400" width="210" height="62" rx="5" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="52" y="420" class="svg-step">bash -n</text>
+                <text x="52" y="438" class="svg-sub">execute skipped:</text>
+                <text x="52" y="454" class="svg-sub">dispose only (147-153)</text>
+
+                <!-- script panel -->
+                <text x="290" y="30" class="svg-lane">SCRIPT · ONE LINE PER TURN</text>
+                <rect x="290" y="46" width="240" height="160" rx="5" fill="#f7f7f5" stroke="#deded9"/>
+                <rect x="296" y="56" width="228" height="30" rx="3" fill="#dfede5"/>
+                <text x="304" y="76" class="svg-sub">1 echo line1</text>
+                <text x="440" y="76" class="svg-sub" fill="#367f59">ran</text>
+                <rect x="296" y="92" width="228" height="30" rx="3" fill="#dfede5"/>
+                <text x="304" y="112" class="svg-sub">2 echo line2</text>
+                <text x="440" y="112" class="svg-sub" fill="#367f59">ran</text>
+                <rect x="296" y="128" width="228" height="30" rx="3" fill="#f3dfdc"/>
+                <text x="304" y="148" class="svg-sub">3 if then</text>
+                <text x="440" y="148" class="svg-sub" fill="#ad4b43">error, rc 2</text>
+                <rect x="296" y="164" width="228" height="30" rx="3" fill="#ffffff" stroke="#deded9"/>
+                <text x="304" y="184" class="svg-sub">4 echo line4</text>
+                <text x="440" y="184" class="svg-sub" fill="#252525">never parsed</text>
+                <path d="M290 113 L254 113" fill="none" stroke="#3c6f97" stroke-width="1.1" marker-end="url(#fig-reader-loop-blue)"/>
+                <text x="290" y="232" class="svg-sub">bash -c 'echo a; fi; echo b'</text>
+                <text x="290" y="250" class="svg-sub">prints only the error</text>
+                <text x="290" y="290" class="svg-sub">bash -c: run_one_command</text>
+                <text x="290" y="308" class="svg-sub">→ parse_and_execute: the</text>
+                <text x="290" y="326" class="svg-sub">same alternation on a string</text>
+
+                <!-- divider -->
+                <line x1="560" y1="20" x2="560" y2="500" stroke="#deded9"/>
+
+                <!-- RIGHT: longjmp map -->
+                <text x="590" y="30" class="svg-lane">LONGJMP · bash -c 'echo $(for)'</text>
+                <rect x="590" y="46" width="250" height="48" rx="5" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="602" y="66" class="svg-step">parse_comsub</text>
+                <text x="602" y="84" class="svg-sub">nested yyparse fails, rc 2</text>
+                <rect x="590" y="116" width="250" height="48" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="602" y="136" class="svg-step">jump_to_top_level</text>
+                <text x="602" y="154" class="svg-sub">(FORCE_EOF) parse.y:4596</text>
+                <rect x="590" y="186" width="250" height="48" rx="5" fill="#ece6f3" stroke="#765b98"/>
+                <text x="602" y="206" class="svg-step">parse_and_execute</text>
+                <text x="602" y="224" class="svg-sub">catch, unwind, rethrow</text>
+                <rect x="590" y="256" width="250" height="48" rx="5" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="602" y="276" class="svg-step">run_one_command (-c)</text>
+                <text x="602" y="294" class="svg-sub">case FORCE_EOF: … = 127</text>
+                <rect x="870" y="256" width="230" height="48" rx="5" fill="#dfede5" stroke="#367f59"/>
+                <text x="882" y="276" class="svg-step">reader_loop (file)</text>
+                <text x="882" y="294" class="svg-sub">EOF_Reached; keeps 2</text>
+                <g fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="6 4">
+                  <path d="M715 94 L715 114" marker-end="url(#fig-reader-loop-purple)"/>
+                  <path d="M715 164 L715 184" marker-end="url(#fig-reader-loop-purple)"/>
+                  <path d="M715 234 L715 254" marker-end="url(#fig-reader-loop-purple)"/>
+                  <path d="M840 140 L985 140 L985 254" marker-end="url(#fig-reader-loop-purple)"/>
+                </g>
+                <text x="860" y="132" class="svg-note">script path</text>
+                <text x="882" y="322" class="svg-sub">eval.c:104-109</text>
+                <text x="602" y="322" class="svg-sub">shell.c:1457-1483</text>
+
+                <!-- matrix -->
+                <text x="590" y="356" class="svg-lane">MEASURED · trace-exit127-matrix.txt</text>
+                <rect x="590" y="366" width="510" height="130" rx="5" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="602" y="388" class="svg-lane">input</text>
+                <text x="900" y="388" class="svg-lane">-c</text>
+                <text x="990" y="388" class="svg-lane">file</text>
+                <line x1="596" y1="396" x2="1094" y2="396" stroke="#deded9"/>
+                <text x="602" y="416" class="svg-sub">echo $(for)</text>
+                <text x="900" y="416" class="svg-sub" fill="#d98226">127</text>
+                <text x="990" y="416" class="svg-sub">2</text>
+                <text x="602" y="440" class="svg-sub">for)</text>
+                <text x="900" y="440" class="svg-sub">2</text>
+                <text x="990" y="440" class="svg-sub">2</text>
+                <text x="602" y="464" class="svg-sub">: ${x?unset}</text>
+                <text x="900" y="464" class="svg-sub" fill="#d98226">127</text>
+                <text x="990" y="464" class="svg-sub">1</text>
+                <text x="602" y="488" class="svg-sub">echo $((1+))   (DISCARD)</text>
+                <text x="900" y="488" class="svg-sub">1</text>
+                <text x="990" y="488" class="svg-sub">1</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Nothing above the current unit exists as a tree, and a failed nested
+              parse leaves by longjmp, not by return. The loop, the <code>-n</code>
+              branch and the jump targets are read from <code>bash/eval.c</code>,
+              <code>shell.c</code>, <code>parse.y</code> and
+              <code>builtins/evalstring.c</code> at 9c46586
+              <span class="src">from the code</span>. The script column was run with
+              <code>/usr/bin/bash</code> 5.3.9; the matrix rows are from
+              <code>lab/scripts/trace/exit127.sh</code>
+              <span class="recon">measured here</span>. Thick black is control flow,
+              dashed purple a longjmp, thin blue one line of input. Blue fill: the
+              loop's setjmp entry; purple fill: a parse in progress (yyparse,
+              parse_and_execute). Green: ran, or the status kept; red: the failure; orange: a 127, and the <code>-n</code>
+              variant.
+            </p>
+          </figure>

@@ -1,0 +1,1195 @@
+          <h2 id="disagreement-and-cost"><span class="secnum">{{S}}</span>Where they disagree, and what it costs</h2>
+          <p class="lede">
+            On 148 tricky inputs the parsers disagree where a parser must decide
+            <em>when</em> to parse. Late textual parsing makes <code>bash -n</code>
+            accept what static parsers reject. A lexer that reads run-time state
+            makes it reject what runs. Here-documents diverge most. Cost follows
+            the same architecture: parse-one-run-one stays flat, whole-file trees
+            grow linearly, a linter pays two orders of magnitude.
+          </p>
+
+          <h3>The experiment</h3>
+          <p>
+            <code>lab/scripts/run_e1.py</code> runs each file once through ten
+            parse-only columns, <code>env -i</code>, 10 s timeout.
+            Accept is rc 0 for bash, dash, brush and osh <code>-n</code> and
+            <code>shfmt -ln bash</code>; ShellCheck rejects on any error-level
+            SC1000–1999, tree-sitter on any ERROR or MISSING node. A
+            <code>bash-exec</code> column runs the file: A ran, E run-time error, R
+            parse error. One bit per parser: two can accept and build different
+            trees <span class="recon">measured here</span>. All lab numbers come
+            from one shared 2-vCPU VM; differences under about 20% are noise.
+          </p>
+          <div class="measured">
+            <div><div class="n">148</div><div class="k">tricky inputs</div></div>
+            <div><div class="n">79</div><div class="k">unanimous: 71 accept, 8 reject</div></div>
+            <div><div class="n">8</div><div class="k">genuine <code>bash -n</code> vs run disagreements</div></div>
+            <div><div class="n">123</div><div class="k">accepted by <code>bash -n</code></div></div>
+          </div>
+          <p>
+            All eight unanimous rejects are context-free token errors, such as a
+            lone <code>;</code> or <code>{ echo a }</code>. Of 148,
+            <code>bash -n</code> accepts 123, dash 101, shfmt 119 (pin 121),
+            tree-sitter 110, OSH 117, ShellCheck 116, brush 121 (pin 123); the run
+            gets through 126 without a parse error. Against <code>bash -n</code>:
+            dash disagrees on 30, tree-sitter 29, ShellCheck 21, shfmt 20 (pin 18),
+            OSH 20, brush 18 (pin 16), bash 5.3.9 on none
+            <span class="recon">measured here</span>
+            (<code>lab/results/e1-summary.txt</code>).
+          </p>
+
+          <h3>Late parsing: <code>bash -n</code> accepts what fails</h3>
+          <p>
+            <code>(( 1 + ))</code> and <code>$(( 1 + ))</code> pass
+            <code>bash -n</code>, dash and brush, fail statically in shfmt, OSH,
+            ShellCheck and tree-sitter, and fail in bash at run time. <code>${x y}</code> passes
+            <code>bash -n</code>, then fails with "bad substitution".
+            <code>x=`if`</code> passes and fails when the run re-parses the body.
+            <code>eval 'if'</code> passes <code>-n</code> in bash, dash, OSH and
+            brush and fails in all four at run time <span class="recon">measured here</span>.
+            Each error sits in text bash stored unparsed (§07, §10, §11)
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>Run-time lexing: <code>bash -n</code> rejects what runs</h3>
+          <p>
+            <code>alias cond='if true; then'</code> followed by
+            <code>cond echo y; fi</code> prints <code>y</code> when run. Every
+            <code>-n</code> rejects it at <code>fi</code>, because none runs the
+            <code>alias</code> builtin (§05); tree-sitter accepts, having no
+            reserved words. <code>shopt -s extglob</code> and, on the next line,
+            <code>echo @(a|b)</code> runs, but <code>bash -n</code> fails at
+            <code>(</code>: the lexer reads <code>extended_glob</code> now (§03).
+            shfmt, OSH, ShellCheck and brush accept extglob regardless
+            <span class="recon">measured here</span>. These four rows (al03, al04,
+            eg02, eg04), the four above (ar06, ar07, pe05, qu14) and a NUL-byte
+            row make 9 where <code>bash -n</code> and the run
+            differ. The NUL row, mi03, is a scoring artifact: both
+            exit 126 with the same message. Eight are genuine.
+          </p>
+
+          <h3>Here-documents</h3>
+          <p>
+            Here-doc rows are 12 of the 69 non-unanimous inputs, the largest group.
+            An unterminated body is a warning in bash and silent in dash; shfmt
+            3.14.1, OSH, brush, ShellCheck and tree-sitter reject it. POSIX allows
+            both (XCU §2.7.4, quoted in §06). A body ended by
+            <code>EOF)</code> inside <code>$( )</code> works in bash with a warning
+            (§06); dash, shfmt, OSH, brush and ShellCheck reject it. Seventeen
+            here-docs on one line stop bash with "maximum here-document count
+            exceeded"; no one else has the limit, and tree-sitter rejects sixteen
+            too, since its grammar keeps the body inside one redirect node (§06).
+            Only shfmt and OSH reject <code>&lt;&lt;$X</code>
+            <span class="recon">measured here</span>.
+          </p>
+
+          <h3><code>((</code> and line ends</h3>
+          <p>
+            <code>((echo a); echo b)</code> is two subshells to bash, dash, OSH and
+            brush; shfmt, ShellCheck and tree-sitter commit to arithmetic and fail
+            (§08, §12). An <code>&amp;</code>, a backslash-newline and an
+            <code>&amp;</code> make <code>&amp;&amp;</code> in bash and dash, which
+            remove continuations below the tokenizer (§02); everyone else rejects
+            it, except brush's pinned parser. A CRLF script fails in bash, dash, OSH, brush and
+            ShellCheck, since <code>fi</code> plus a carriage return is not
+            <code>fi</code>; shfmt and tree-sitter accept it
+            <span class="recon">measured here</span>. Versions move bits: shfmt's
+            release and pin differ on two runaway here-docs (hd05, hd10), brush's on
+            lc02 and qu08. Figure {{fig-disagreement}} has all 69 rows.
+          </p>
+
+          <figure class="figure wide" id="fig-disagreement">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The 69 inputs on which the parsers do not all agree, one bit per parser</p>
+            </div>
+            <div class="figure-body plain">
+<svg viewBox="0 0 1120 528" width="100%" role="img" aria-label="A heat strip in three blocks of rows. Each row is one of the 69 inputs on which the ten parse-only columns disagree, labelled by short id and grouped by prefix: al, ar, ca, cm, db, eg in the first block; fn, hd, lc in the second; mi, pe, ps, qu, rw in the third. Eleven columns: bash pinned -n, bash 5.3.9 -n, dash, shfmt 3.14.1, shfmt at the pin, tree-sitter, osh, shellcheck, brush 0.4.0, brush-parser at the pin, and the bash-exec reference. Pale green cells accept, red cells reject, orange cells in the bash-exec column are run-time errors (ar06, ar07, pe05, mi03). Nine rows are outlined where bash-exec differs from bash -n: al03, al04, ar06, ar07, eg02, eg04, mi03 (dashed, a scoring artifact), pe05, qu14. A key on the right repeats the disagreement counts: dash 30, tree-sitter 29, shellcheck 21, osh 20, shfmt 20 (pin 18), brush 18 (pin 16), bash 5.3.9 0, and the row counts per prefix, hd 12 the largest.">
+                <text class="svg-sub" x="60.5" y="120" transform="rotate(-90 60.5 120)">bash@pin -n</text>
+                <text class="svg-sub" x="77.5" y="120" transform="rotate(-90 77.5 120)">bash 5.3.9 -n</text>
+                <text class="svg-sub" x="94.5" y="120" transform="rotate(-90 94.5 120)">dash -n</text>
+                <text class="svg-sub" x="111.5" y="120" transform="rotate(-90 111.5 120)">shfmt 3.14.1</text>
+                <text class="svg-sub" x="128.5" y="120" transform="rotate(-90 128.5 120)">shfmt@pin</text>
+                <text class="svg-sub" x="145.5" y="120" transform="rotate(-90 145.5 120)">tree-sitter</text>
+                <text class="svg-sub" x="162.5" y="120" transform="rotate(-90 162.5 120)">osh -n</text>
+                <text class="svg-sub" x="179.5" y="120" transform="rotate(-90 179.5 120)">shellcheck</text>
+                <text class="svg-sub" x="196.5" y="120" transform="rotate(-90 196.5 120)">brush 0.4.0</text>
+                <text class="svg-sub" x="213.5" y="120" transform="rotate(-90 213.5 120)">brush@pin</text>
+                <text class="svg-sub" x="237.5" y="120" transform="rotate(-90 237.5 120)">bash-exec</text>
+                <text class="svg-sub" x="44" y="137.5" text-anchor="end">al03</text>
+                <rect x="50" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="67" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="84" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="118" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="135" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="169" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="186" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="203" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="227" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="14" y="126.5" width="230" height="14" fill="none" stroke="#252525" stroke-width="1.4"/>
+                <text class="svg-sub" x="44" y="151.5" text-anchor="end">al04</text>
+                <rect x="50" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="67" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="84" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="118" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="135" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="169" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="186" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="203" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="227" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="14" y="140.5" width="230" height="14" fill="none" stroke="#252525" stroke-width="1.4"/>
+                <text class="svg-sub" x="44" y="173.5" text-anchor="end">ar01</text>
+                <rect x="50" y="164" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="164" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="164" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="101" y="164" width="14" height="11" fill="#ad4b43"/>
+                <rect x="118" y="164" width="14" height="11" fill="#ad4b43"/>
+                <rect x="135" y="164" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="164" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="164" width="14" height="11" fill="#ad4b43"/>
+                <rect x="186" y="164" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="164" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="164" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="187.5" text-anchor="end">ar04</text>
+                <rect x="50" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="178" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="178" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="201.5" text-anchor="end">ar05</text>
+                <rect x="50" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="192" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="192" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="215.5" text-anchor="end">ar06</text>
+                <rect x="50" y="206" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="206" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="206" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="101" y="206" width="14" height="11" fill="#ad4b43"/>
+                <rect x="118" y="206" width="14" height="11" fill="#ad4b43"/>
+                <rect x="135" y="206" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="206" width="14" height="11" fill="#ad4b43"/>
+                <rect x="169" y="206" width="14" height="11" fill="#ad4b43"/>
+                <rect x="186" y="206" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="206" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="206" width="14" height="11" fill="#d98226"/>
+                <rect x="14" y="204.5" width="230" height="14" fill="none" stroke="#252525" stroke-width="1.4"/>
+                <text class="svg-sub" x="44" y="229.5" text-anchor="end">ar07</text>
+                <rect x="50" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="101" y="220" width="14" height="11" fill="#ad4b43"/>
+                <rect x="118" y="220" width="14" height="11" fill="#ad4b43"/>
+                <rect x="135" y="220" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="220" width="14" height="11" fill="#ad4b43"/>
+                <rect x="169" y="220" width="14" height="11" fill="#ad4b43"/>
+                <rect x="186" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="220" width="14" height="11" fill="#d98226"/>
+                <rect x="14" y="218.5" width="230" height="14" fill="none" stroke="#252525" stroke-width="1.4"/>
+                <text class="svg-sub" x="44" y="243.5" text-anchor="end">ar08</text>
+                <rect x="50" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="234" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="234" width="14" height="11" fill="#ad4b43"/>
+                <rect x="118" y="234" width="14" height="11" fill="#ad4b43"/>
+                <rect x="135" y="234" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="234" width="14" height="11" fill="#ad4b43"/>
+                <rect x="169" y="234" width="14" height="11" fill="#ad4b43"/>
+                <rect x="186" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="265.5" text-anchor="end">ca01</text>
+                <rect x="50" y="256" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="256" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="256" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="101" y="256" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="256" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="256" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="256" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="256" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="256" width="14" height="11" fill="#ad4b43"/>
+                <rect x="203" y="256" width="14" height="11" fill="#ad4b43"/>
+                <rect x="227" y="256" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="279.5" text-anchor="end">ca03</text>
+                <rect x="50" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="270" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="270" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="293.5" text-anchor="end">ca04</text>
+                <rect x="50" y="284" width="14" height="11" fill="#ad4b43"/>
+                <rect x="67" y="284" width="14" height="11" fill="#ad4b43"/>
+                <rect x="84" y="284" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="284" width="14" height="11" fill="#ad4b43"/>
+                <rect x="118" y="284" width="14" height="11" fill="#ad4b43"/>
+                <rect x="135" y="284" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="284" width="14" height="11" fill="#ad4b43"/>
+                <rect x="169" y="284" width="14" height="11" fill="#ad4b43"/>
+                <rect x="186" y="284" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="284" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="284" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="44" y="307.5" text-anchor="end">ca08</text>
+                <rect x="50" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="101" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="298" width="14" height="11" fill="#ad4b43"/>
+                <rect x="203" y="298" width="14" height="11" fill="#ad4b43"/>
+                <rect x="227" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="329.5" text-anchor="end">cm05</text>
+                <rect x="50" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="320" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="320" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="343.5" text-anchor="end">cm06</text>
+                <rect x="50" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="101" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="334" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="334" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="365.5" text-anchor="end">db01</text>
+                <rect x="50" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="356" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="356" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="379.5" text-anchor="end">db02</text>
+                <rect x="50" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="370" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="370" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="393.5" text-anchor="end">db06</text>
+                <rect x="50" y="384" width="14" height="11" fill="#ad4b43"/>
+                <rect x="67" y="384" width="14" height="11" fill="#ad4b43"/>
+                <rect x="84" y="384" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="101" y="384" width="14" height="11" fill="#ad4b43"/>
+                <rect x="118" y="384" width="14" height="11" fill="#ad4b43"/>
+                <rect x="135" y="384" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="384" width="14" height="11" fill="#ad4b43"/>
+                <rect x="169" y="384" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="384" width="14" height="11" fill="#ad4b43"/>
+                <rect x="203" y="384" width="14" height="11" fill="#ad4b43"/>
+                <rect x="227" y="384" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="44" y="407.5" text-anchor="end">db08</text>
+                <rect x="50" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="398" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="398" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="421.5" text-anchor="end">db10</text>
+                <rect x="50" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="412" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="44" y="443.5" text-anchor="end">eg01</text>
+                <rect x="50" y="434" width="14" height="11" fill="#ad4b43"/>
+                <rect x="67" y="434" width="14" height="11" fill="#ad4b43"/>
+                <rect x="84" y="434" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="434" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="434" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="434" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="434" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="434" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="434" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="434" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="434" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="44" y="457.5" text-anchor="end">eg02</text>
+                <rect x="50" y="448" width="14" height="11" fill="#ad4b43"/>
+                <rect x="67" y="448" width="14" height="11" fill="#ad4b43"/>
+                <rect x="84" y="448" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="448" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="448" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="448" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="448" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="448" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="448" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="448" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="448" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="14" y="446.5" width="230" height="14" fill="none" stroke="#252525" stroke-width="1.4"/>
+                <text class="svg-sub" x="44" y="471.5" text-anchor="end">eg03</text>
+                <rect x="50" y="462" width="14" height="11" fill="#ad4b43"/>
+                <rect x="67" y="462" width="14" height="11" fill="#ad4b43"/>
+                <rect x="84" y="462" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="462" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="462" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="462" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="462" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="462" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="462" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="462" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="462" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="44" y="485.5" text-anchor="end">eg04</text>
+                <rect x="50" y="476" width="14" height="11" fill="#ad4b43"/>
+                <rect x="67" y="476" width="14" height="11" fill="#ad4b43"/>
+                <rect x="84" y="476" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="476" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="476" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="476" width="14" height="11" fill="#ad4b43"/>
+                <rect x="152" y="476" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="476" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="476" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="476" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="476" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="14" y="474.5" width="230" height="14" fill="none" stroke="#252525" stroke-width="1.4"/>
+                <text class="svg-sub" x="44" y="499.5" text-anchor="end">eg05</text>
+                <rect x="50" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="67" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="84" y="490" width="14" height="11" fill="#ad4b43"/>
+                <rect x="101" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="118" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="135" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="152" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="169" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="186" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="203" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="227" y="490" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="330.5" y="120" transform="rotate(-90 330.5 120)">bash@pin -n</text>
+                <text class="svg-sub" x="347.5" y="120" transform="rotate(-90 347.5 120)">bash 5.3.9 -n</text>
+                <text class="svg-sub" x="364.5" y="120" transform="rotate(-90 364.5 120)">dash -n</text>
+                <text class="svg-sub" x="381.5" y="120" transform="rotate(-90 381.5 120)">shfmt 3.14.1</text>
+                <text class="svg-sub" x="398.5" y="120" transform="rotate(-90 398.5 120)">shfmt@pin</text>
+                <text class="svg-sub" x="415.5" y="120" transform="rotate(-90 415.5 120)">tree-sitter</text>
+                <text class="svg-sub" x="432.5" y="120" transform="rotate(-90 432.5 120)">osh -n</text>
+                <text class="svg-sub" x="449.5" y="120" transform="rotate(-90 449.5 120)">shellcheck</text>
+                <text class="svg-sub" x="466.5" y="120" transform="rotate(-90 466.5 120)">brush 0.4.0</text>
+                <text class="svg-sub" x="483.5" y="120" transform="rotate(-90 483.5 120)">brush@pin</text>
+                <text class="svg-sub" x="507.5" y="120" transform="rotate(-90 507.5 120)">bash-exec</text>
+                <text class="svg-sub" x="314" y="137.5" text-anchor="end">fn02</text>
+                <rect x="320" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="371" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="422" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="151.5" text-anchor="end">fn03</text>
+                <rect x="320" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="371" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="422" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="165.5" text-anchor="end">fn05</text>
+                <rect x="320" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="337" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="354" y="156" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="156" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="156" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="439" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="473" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="497" y="156" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="314" y="179.5" text-anchor="end">fn07</text>
+                <rect x="320" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="170" width="14" height="11" fill="#ad4b43"/>
+                <rect x="371" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="422" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="193.5" text-anchor="end">fn08</text>
+                <rect x="320" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="422" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="184" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="207.5" text-anchor="end">fn09</text>
+                <rect x="320" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="198" width="14" height="11" fill="#ad4b43"/>
+                <rect x="371" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="198" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="198" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="229.5" text-anchor="end">hd02</text>
+                <rect x="320" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="220" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="220" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="243.5" text-anchor="end">hd03</text>
+                <rect x="320" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="234" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="234" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="257.5" text-anchor="end">hd05</text>
+                <rect x="320" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="248" width="14" height="11" fill="#ad4b43"/>
+                <rect x="388" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="422" y="248" width="14" height="11" fill="#ad4b43"/>
+                <rect x="439" y="248" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="248" width="14" height="11" fill="#ad4b43"/>
+                <rect x="473" y="248" width="14" height="11" fill="#ad4b43"/>
+                <rect x="497" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="271.5" text-anchor="end">hd07</text>
+                <rect x="320" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="422" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="262" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="285.5" text-anchor="end">hd09</text>
+                <rect x="320" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="276" width="14" height="11" fill="#ad4b43"/>
+                <rect x="371" y="276" width="14" height="11" fill="#ad4b43"/>
+                <rect x="388" y="276" width="14" height="11" fill="#ad4b43"/>
+                <rect x="405" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="422" y="276" width="14" height="11" fill="#ad4b43"/>
+                <rect x="439" y="276" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="276" width="14" height="11" fill="#ad4b43"/>
+                <rect x="473" y="276" width="14" height="11" fill="#ad4b43"/>
+                <rect x="497" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="299.5" text-anchor="end">hd10</text>
+                <rect x="320" y="290" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="290" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="290" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="290" width="14" height="11" fill="#ad4b43"/>
+                <rect x="388" y="290" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="290" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="290" width="14" height="11" fill="#ad4b43"/>
+                <rect x="439" y="290" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="290" width="14" height="11" fill="#ad4b43"/>
+                <rect x="473" y="290" width="14" height="11" fill="#ad4b43"/>
+                <rect x="497" y="290" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="313.5" text-anchor="end">hd13</text>
+                <rect x="320" y="304" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="304" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="304" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="304" width="14" height="11" fill="#ad4b43"/>
+                <rect x="388" y="304" width="14" height="11" fill="#ad4b43"/>
+                <rect x="405" y="304" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="422" y="304" width="14" height="11" fill="#ad4b43"/>
+                <rect x="439" y="304" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="304" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="304" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="304" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="327.5" text-anchor="end">hd16</text>
+                <rect x="320" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="318" width="14" height="11" fill="#ad4b43"/>
+                <rect x="371" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="422" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="318" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="341.5" text-anchor="end">hd17</text>
+                <rect x="320" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="332" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="332" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="355.5" text-anchor="end">hd19</text>
+                <rect x="320" y="346" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="346" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="346" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="346" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="346" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="346" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="346" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="346" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="346" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="346" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="346" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="369.5" text-anchor="end">hd20</text>
+                <rect x="320" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="360" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="360" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="383.5" text-anchor="end">hd21</text>
+                <rect x="320" y="374" width="14" height="11" fill="#ad4b43"/>
+                <rect x="337" y="374" width="14" height="11" fill="#ad4b43"/>
+                <rect x="354" y="374" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="374" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="374" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="374" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="374" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="374" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="456" y="374" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="473" y="374" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="374" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="314" y="405.5" text-anchor="end">lc02</text>
+                <rect x="320" y="396" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="396" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="396" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="396" width="14" height="11" fill="#ad4b43"/>
+                <rect x="388" y="396" width="14" height="11" fill="#ad4b43"/>
+                <rect x="405" y="396" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="396" width="14" height="11" fill="#ad4b43"/>
+                <rect x="439" y="396" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="396" width="14" height="11" fill="#ad4b43"/>
+                <rect x="473" y="396" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="497" y="396" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="314" y="419.5" text-anchor="end">lc04</text>
+                <rect x="320" y="410" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="337" y="410" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="354" y="410" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="371" y="410" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="388" y="410" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="405" y="410" width="14" height="11" fill="#ad4b43"/>
+                <rect x="422" y="410" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="439" y="410" width="14" height="11" fill="#ad4b43"/>
+                <rect x="456" y="410" width="14" height="11" fill="#ad4b43"/>
+                <rect x="473" y="410" width="14" height="11" fill="#ad4b43"/>
+                <rect x="497" y="410" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="600.5" y="120" transform="rotate(-90 600.5 120)">bash@pin -n</text>
+                <text class="svg-sub" x="617.5" y="120" transform="rotate(-90 617.5 120)">bash 5.3.9 -n</text>
+                <text class="svg-sub" x="634.5" y="120" transform="rotate(-90 634.5 120)">dash -n</text>
+                <text class="svg-sub" x="651.5" y="120" transform="rotate(-90 651.5 120)">shfmt 3.14.1</text>
+                <text class="svg-sub" x="668.5" y="120" transform="rotate(-90 668.5 120)">shfmt@pin</text>
+                <text class="svg-sub" x="685.5" y="120" transform="rotate(-90 685.5 120)">tree-sitter</text>
+                <text class="svg-sub" x="702.5" y="120" transform="rotate(-90 702.5 120)">osh -n</text>
+                <text class="svg-sub" x="719.5" y="120" transform="rotate(-90 719.5 120)">shellcheck</text>
+                <text class="svg-sub" x="736.5" y="120" transform="rotate(-90 736.5 120)">brush 0.4.0</text>
+                <text class="svg-sub" x="753.5" y="120" transform="rotate(-90 753.5 120)">brush@pin</text>
+                <text class="svg-sub" x="777.5" y="120" transform="rotate(-90 777.5 120)">bash-exec</text>
+                <text class="svg-sub" x="584" y="137.5" text-anchor="end">mi03</text>
+                <rect x="590" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="607" y="128" width="14" height="11" fill="#ad4b43"/>
+                <rect x="624" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="641" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="128" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="128" width="14" height="11" fill="#d98226"/>
+                <rect x="554" y="126.5" width="230" height="14" fill="none" stroke="#252525" stroke-width="1.4" stroke-dasharray="3 2"/>
+                <text class="svg-note" x="789" y="137.5">artifact</text>
+                <text class="svg-sub" x="584" y="151.5" text-anchor="end">mi04</text>
+                <rect x="590" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="607" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="624" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="142" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="726" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="743" y="142" width="14" height="11" fill="#ad4b43"/>
+                <rect x="767" y="142" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="584" y="165.5" text-anchor="end">mi08</text>
+                <rect x="590" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="607" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="624" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="658" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="675" y="156" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="726" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="743" y="156" width="14" height="11" fill="#ad4b43"/>
+                <rect x="767" y="156" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="584" y="179.5" text-anchor="end">mi13</text>
+                <rect x="590" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="641" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="170" width="14" height="11" fill="#ad4b43"/>
+                <rect x="692" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="170" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="193.5" text-anchor="end">mi14</text>
+                <rect x="590" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="184" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="184" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="207.5" text-anchor="end">mi17</text>
+                <rect x="590" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="198" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="198" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="198" width="14" height="11" fill="#ad4b43"/>
+                <rect x="743" y="198" width="14" height="11" fill="#ad4b43"/>
+                <rect x="767" y="198" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="221.5" text-anchor="end">mi18</text>
+                <rect x="590" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="641" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="212" width="14" height="11" fill="#ad4b43"/>
+                <rect x="692" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="212" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="235.5" text-anchor="end">mi19</text>
+                <rect x="590" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="641" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="226" width="14" height="11" fill="#ad4b43"/>
+                <rect x="692" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="226" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="257.5" text-anchor="end">pe05</text>
+                <rect x="590" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="641" y="248" width="14" height="11" fill="#ad4b43"/>
+                <rect x="658" y="248" width="14" height="11" fill="#ad4b43"/>
+                <rect x="675" y="248" width="14" height="11" fill="#ad4b43"/>
+                <rect x="692" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="248" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="248" width="14" height="11" fill="#d98226"/>
+                <rect x="554" y="246.5" width="230" height="14" fill="none" stroke="#252525" stroke-width="1.4"/>
+                <text class="svg-sub" x="584" y="271.5" text-anchor="end">pe10</text>
+                <rect x="590" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="641" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="262" width="14" height="11" fill="#ad4b43"/>
+                <rect x="692" y="262" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="262" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="285.5" text-anchor="end">pe11</text>
+                <rect x="590" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="641" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="276" width="14" height="11" fill="#ad4b43"/>
+                <rect x="692" y="276" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="276" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="307.5" text-anchor="end">ps01</text>
+                <rect x="590" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="298" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="298" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="321.5" text-anchor="end">ps02</text>
+                <rect x="590" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="312" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="312" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="335.5" text-anchor="end">ps04</text>
+                <rect x="590" y="326" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="326" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="326" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="326" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="326" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="326" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="326" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="326" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="326" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="326" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="326" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="349.5" text-anchor="end">ps06</text>
+                <rect x="590" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="340" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="340" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="371.5" text-anchor="end">qu08</text>
+                <rect x="590" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="641" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="362" width="14" height="11" fill="#ad4b43"/>
+                <rect x="743" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="362" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="385.5" text-anchor="end">qu14</text>
+                <rect x="590" y="376" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="376" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="376" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="376" width="14" height="11" fill="#ad4b43"/>
+                <rect x="658" y="376" width="14" height="11" fill="#ad4b43"/>
+                <rect x="675" y="376" width="14" height="11" fill="#ad4b43"/>
+                <rect x="692" y="376" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="376" width="14" height="11" fill="#ad4b43"/>
+                <rect x="726" y="376" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="376" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="376" width="14" height="11" fill="#ad4b43"/>
+                <rect x="554" y="374.5" width="230" height="14" fill="none" stroke="#252525" stroke-width="1.4"/>
+                <text class="svg-sub" x="584" y="399.5" text-anchor="end">qu15</text>
+                <rect x="590" y="390" width="14" height="11" fill="#ad4b43"/>
+                <rect x="607" y="390" width="14" height="11" fill="#ad4b43"/>
+                <rect x="624" y="390" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="390" width="14" height="11" fill="#ad4b43"/>
+                <rect x="658" y="390" width="14" height="11" fill="#ad4b43"/>
+                <rect x="675" y="390" width="14" height="11" fill="#ad4b43"/>
+                <rect x="692" y="390" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="390" width="14" height="11" fill="#ad4b43"/>
+                <rect x="726" y="390" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="390" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="390" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="584" y="421.5" text-anchor="end">rw04</text>
+                <rect x="590" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="641" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="412" width="14" height="11" fill="#ad4b43"/>
+                <rect x="743" y="412" width="14" height="11" fill="#ad4b43"/>
+                <rect x="767" y="412" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="435.5" text-anchor="end">rw06</text>
+                <rect x="590" y="426" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="426" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="426" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="426" width="14" height="11" fill="#ad4b43"/>
+                <rect x="658" y="426" width="14" height="11" fill="#ad4b43"/>
+                <rect x="675" y="426" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="426" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="426" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="426" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="426" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="426" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="449.5" text-anchor="end">rw07</text>
+                <rect x="590" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="440" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="440" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="463.5" text-anchor="end">rw09</text>
+                <rect x="590" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="607" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="624" y="454" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="658" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="675" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="726" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="743" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="767" y="454" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="584" y="477.5" text-anchor="end">rw10</text>
+                <rect x="590" y="468" width="14" height="11" fill="#ad4b43"/>
+                <rect x="607" y="468" width="14" height="11" fill="#ad4b43"/>
+                <rect x="624" y="468" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="468" width="14" height="11" fill="#ad4b43"/>
+                <rect x="658" y="468" width="14" height="11" fill="#ad4b43"/>
+                <rect x="675" y="468" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="468" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="468" width="14" height="11" fill="#ad4b43"/>
+                <rect x="726" y="468" width="14" height="11" fill="#ad4b43"/>
+                <rect x="743" y="468" width="14" height="11" fill="#ad4b43"/>
+                <rect x="767" y="468" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="584" y="491.5" text-anchor="end">rw11</text>
+                <rect x="590" y="482" width="14" height="11" fill="#ad4b43"/>
+                <rect x="607" y="482" width="14" height="11" fill="#ad4b43"/>
+                <rect x="624" y="482" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="482" width="14" height="11" fill="#ad4b43"/>
+                <rect x="658" y="482" width="14" height="11" fill="#ad4b43"/>
+                <rect x="675" y="482" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="482" width="14" height="11" fill="#ad4b43"/>
+                <rect x="709" y="482" width="14" height="11" fill="#ad4b43"/>
+                <rect x="726" y="482" width="14" height="11" fill="#ad4b43"/>
+                <rect x="743" y="482" width="14" height="11" fill="#ad4b43"/>
+                <rect x="767" y="482" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="584" y="505.5" text-anchor="end">rw13</text>
+                <rect x="590" y="496" width="14" height="11" fill="#ad4b43"/>
+                <rect x="607" y="496" width="14" height="11" fill="#ad4b43"/>
+                <rect x="624" y="496" width="14" height="11" fill="#ad4b43"/>
+                <rect x="641" y="496" width="14" height="11" fill="#ad4b43"/>
+                <rect x="658" y="496" width="14" height="11" fill="#ad4b43"/>
+                <rect x="675" y="496" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="692" y="496" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <rect x="709" y="496" width="14" height="11" fill="#ad4b43"/>
+                <rect x="726" y="496" width="14" height="11" fill="#ad4b43"/>
+                <rect x="743" y="496" width="14" height="11" fill="#ad4b43"/>
+                <rect x="767" y="496" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-lane" x="850" y="114">Key</text>
+                <rect x="850" y="132" width="14" height="11" fill="#dfede5" stroke="#367f59" stroke-width="0.6"/>
+                <text class="svg-sub" x="872" y="141.5">accepted (rc 0, no error node)</text>
+                <rect x="850" y="152" width="14" height="11" fill="#ad4b43"/>
+                <text class="svg-sub" x="872" y="161.5">rejected (parse error)</text>
+                <rect x="850" y="172" width="14" height="11" fill="#d98226"/>
+                <text class="svg-sub" x="872" y="181.5">bash-exec: run-time error (E)</text>
+                <rect x="850" y="192" width="14" height="11" fill="none" stroke="#252525" stroke-width="1.4"/>
+                <text class="svg-sub" x="872" y="201.5">bash -n and the run disagree</text>
+                <rect x="850" y="212" width="14" height="11" fill="none" stroke="#252525" stroke-width="1.4" stroke-dasharray="3 2"/>
+                <text class="svg-sub" x="872" y="221.5">mi03: same message both ways</text>
+                <text class="svg-lane" x="850" y="248">Disagree with bash -n</text>
+                <text class="svg-sub" x="850" y="268">dash 30 · tree-sitter 29</text>
+                <text class="svg-sub" x="850" y="285">shellcheck 21 · osh 20</text>
+                <text class="svg-sub" x="850" y="302">shfmt 20 (pin 18)</text>
+                <text class="svg-sub" x="850" y="319">brush 18 (pin 16)</text>
+                <text class="svg-sub" x="850" y="336">bash 5.3.9 0 · run 9 (8 real)</text>
+                <text class="svg-lane" x="850" y="367">Rows by prefix</text>
+                <text class="svg-sub" x="850" y="387">hd 12 · mi 8 · rw 7 · ar 6</text>
+                <text class="svg-sub" x="850" y="404">fn 6 · db 5 · eg 5 · ca 4</text>
+                <text class="svg-sub" x="850" y="421">ps 4 · pe 3 · qu 3 · al 2</text>
+                <text class="svg-sub" x="850" y="438">cm 2 · lc 2</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Generated from <code>lab/results/e1-matrix.csv</code> by script
+              (<code>run_e1.py</code>, <code>e1_matrix.py</code>)
+              <span class="recon">measured here</span>. Green accepts, red rejects,
+              orange a run-time error in the reference run. Outlined rows:
+              <code>bash -n</code> and the run disagree.
+            </p>
+          </figure>
+
+          <h3>Speed and memory follow the architecture</h3>
+          <p>
+            <code>lab/scripts/run_e2.py</code>: one warm-up, five timed runs,
+            medians in <code>lab/results/e2-summary.csv</code>. On
+            a 100,000-line script dash takes 0.0537 s and bash 0.1863 s, so dash is
+            3.5x faster (0.1863 / 0.0537); bash 5.3.9 is within noise. Figure {{fig-speed-memory}}(a) has
+            the rest. Startup-corrected, on bash's
+            24,753-line <code>configure</code>: dash 1.52 M lines/s, bash 746 k,
+            shfmt 375 k, OSH 194 k, brush 190 k, tree-sitter 60 k, ShellCheck 1.3 k
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Memory separates the designs (<code>run_e2_rss.py</code>,
+            <code>e2-rss.csv</code>).
+            <code>bash -n</code> peaks at 3.6–5.5 MiB and <code>dash -n</code> at
+            1.7–2.5 MiB on every input. From 10k to 100k lines brush grows from 30.2
+            to 241.9 MiB, OSH 19.0 to 144.6, tree-sitter 18.6 to 105.3, shfmt 11.7
+            to 82.3: about 2.5, 1.5, 1.1 and 0.8 KiB per line (241.9 MiB / 100,000
+            = 2.48 KiB) <span class="recon">measured here</span>. Flat is §09's
+            loop, each command disposed before the next is read; sloped is a tree
+            held for the whole file <span class="recon">reconstruction</span>.
+            ShellCheck reaches 1,855 MiB, about 19 KiB per line: 654x slower than
+            <code>bash -n</code> (121.7977 / 0.1863) with 386x the memory (1,855 / 4.8)
+            <span class="recon">measured here</span>; with no parse-only mode, that
+            prices its checks too <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            <code>lab/scripts/e4_incremental.py</code> (median of 7) prices an
+            editor. tree-sitter parses a 4,992-line file with 192 here-docs in about
+            97 ms. A one-byte edit in a body or a word reparses in about 2 ms, 48x
+            faster. Breaking a here-doc tag costs 16–23 ms, and the changed range
+            runs to EOF. tree-sitter then reports one ERROR and keeps 101 of
+            192 bodies; bash reads to EOF as the body and fails on an unclosed
+            <code>{</code> <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-speed-memory">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Time, memory and incremental reparse, grouped by how each parser holds the script</p>
+            </div>
+            <div class="figure-body plain">
+<svg viewBox="0 0 1120 660" width="100%" role="img" aria-label="Three panels. (a) Horizontal bars on a log axis from 0.01 to 1000 seconds, the median time to parse a 100,000-line script: dash -n 0.0537 s, bash pinned -n 0.1863, bash 5.3.9 -n 0.1893 (green, one command at a time), shfmt parse and print 0.3733, brush -n 0.8652, osh -n 1.5202, tree-sitter CLI 1.7632 (blue, whole-file tree), shellcheck full lint 121.7977 (purple, linter, about 654 times bash -n). (b) Peak memory against script length at 10k, 30k and 100k lines: brush 30.2, 77.1, 241.9 MiB; osh 19.0, 44.8, 144.6; tree-sitter 18.6, 37.7, 105.3; shfmt 11.7, 27.2, 82.3, rising lines; bash 3.8, 4.0, 4.8 and dash 1.7, 1.7, 1.9, flat along the axis; a box notes shellcheck off the scale at 186.8, 568.5 and 1,855 MiB. (c) tree-sitter incremental reparse of a 4,992-line file with 192 here-documents: full parse 96.6 ms; a byte in a body 2.057 ms and a byte in a word 1.879 ms (green, about 48 times faster); breaking the opening tag 22.906 ms and the closing tag 15.909 ms (red, 3.1 and 4.7 times faster), with the changed range running to end of file and 101 of 192 bodies kept.">
+                <text class="svg-lane" x="20" y="24">(a) Parse 100,000 lines: median wall time, log scale</text>
+                <line x1="210" y1="40" x2="210" y2="244" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="210" y="260" text-anchor="middle">0.01 s</text>
+                <line x1="370" y1="40" x2="370" y2="244" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="370" y="260" text-anchor="middle">0.1 s</text>
+                <line x1="530" y1="40" x2="530" y2="244" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="530" y="260" text-anchor="middle">1 s</text>
+                <line x1="690" y1="40" x2="690" y2="244" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="690" y="260" text-anchor="middle">10 s</text>
+                <line x1="850" y1="40" x2="850" y2="244" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="850" y="260" text-anchor="middle">100 s</text>
+                <line x1="1010" y1="40" x2="1010" y2="244" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="1010" y="260" text-anchor="middle">1000 s</text>
+                <text class="svg-step" x="200" y="57" text-anchor="end">dash -n</text>
+                <rect x="210" y="46" width="116.8" height="15" fill="#367f59"/>
+                <text class="svg-sub" x="332.8" y="58">0.0537 s · bash -n is 3.5× this</text>
+                <text class="svg-step" x="200" y="82" text-anchor="end">bash@pin -n</text>
+                <rect x="210" y="71" width="203.2" height="15" fill="#367f59"/>
+                <text class="svg-sub" x="419.2" y="83">0.1863 s</text>
+                <text class="svg-step" x="200" y="107" text-anchor="end">bash 5.3.9 -n</text>
+                <rect x="210" y="96" width="204.3" height="15" fill="#367f59"/>
+                <text class="svg-sub" x="420.3" y="108">0.1893 s</text>
+                <text class="svg-step" x="200" y="132" text-anchor="end">shfmt (parse+print)</text>
+                <rect x="210" y="121" width="251.5" height="15" fill="#3c6f97"/>
+                <text class="svg-sub" x="467.5" y="133">0.3733 s</text>
+                <text class="svg-step" x="200" y="157" text-anchor="end">brush -n</text>
+                <rect x="210" y="146" width="309.9" height="15" fill="#3c6f97"/>
+                <text class="svg-sub" x="525.9" y="158">0.8652 s</text>
+                <text class="svg-step" x="200" y="182" text-anchor="end">osh -n</text>
+                <rect x="210" y="171" width="349.1" height="15" fill="#3c6f97"/>
+                <text class="svg-sub" x="565.1" y="183">1.5202 s</text>
+                <text class="svg-step" x="200" y="207" text-anchor="end">tree-sitter CLI</text>
+                <rect x="210" y="196" width="359.4" height="15" fill="#3c6f97"/>
+                <text class="svg-sub" x="575.4" y="208">1.7632 s</text>
+                <text class="svg-step" x="200" y="232" text-anchor="end">shellcheck (full lint)</text>
+                <rect x="210" y="221" width="653.7" height="15" fill="#765b98"/>
+                <text class="svg-sub" x="869.7" y="233">121.7977 s · ≈654× bash -n</text>
+                <rect x="700" y="46" width="14" height="11" fill="#367f59"/>
+                <text class="svg-sub" x="722" y="56">one command at a time: parse, run, dispose</text>
+                <rect x="700" y="66" width="14" height="11" fill="#3c6f97"/>
+                <text class="svg-sub" x="722" y="76">whole-file tree, kept until the end</text>
+                <rect x="700" y="86" width="14" height="11" fill="#765b98"/>
+                <text class="svg-sub" x="722" y="96">linter: whole-file tree plus every check</text>
+                <line x1="20" y1="300" x2="1100" y2="300" stroke="#b8b8b1" stroke-width="1"/>
+                <text class="svg-lane" x="20" y="328">(b) Peak RSS (MiB) by script length</text>
+                <line x1="70" y1="620.0" x2="370" y2="620.0" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="64" y="624.0" text-anchor="end">0</text>
+                <line x1="70" y1="574.0" x2="370" y2="574.0" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="64" y="578.0" text-anchor="end">50</text>
+                <line x1="70" y1="528.0" x2="370" y2="528.0" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="64" y="532.0" text-anchor="end">100</text>
+                <line x1="70" y1="482.0" x2="370" y2="482.0" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="64" y="486.0" text-anchor="end">150</text>
+                <line x1="70" y1="436.0" x2="370" y2="436.0" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="64" y="440.0" text-anchor="end">200</text>
+                <line x1="70" y1="390.0" x2="370" y2="390.0" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="64" y="394.0" text-anchor="end">250</text>
+                <text class="svg-sub" x="70.0" y="636" text-anchor="middle">0</text>
+                <text class="svg-sub" x="145.0" y="636" text-anchor="middle">25k</text>
+                <text class="svg-sub" x="220.0" y="636" text-anchor="middle">50k</text>
+                <text class="svg-sub" x="295.0" y="636" text-anchor="middle">75k</text>
+                <text class="svg-sub" x="370.0" y="636" text-anchor="middle">100k lines</text>
+                <line x1="70" y1="620" x2="370" y2="620" stroke="#252525" stroke-width="1"/>
+                <polyline points="100.0,592.2 159.9,549.1 370.0,397.5" fill="none" stroke="#3c6f97" stroke-width="1.6"/>
+                <circle cx="100.0" cy="592.2" r="2.6" fill="#3c6f97"/>
+                <circle cx="159.9" cy="549.1" r="2.6" fill="#3c6f97"/>
+                <circle cx="370.0" cy="397.5" r="2.6" fill="#3c6f97"/>
+                <text class="svg-sub" x="378" y="401.5">brush 30.2/77.1/241.9 · 2.5 KiB/line</text>
+                <polyline points="100.0,602.5 159.9,578.8 370.0,487.0" fill="none" stroke="#3c6f97" stroke-width="1.6"/>
+                <circle cx="100.0" cy="602.5" r="2.6" fill="#3c6f97"/>
+                <circle cx="159.9" cy="578.8" r="2.6" fill="#3c6f97"/>
+                <circle cx="370.0" cy="487.0" r="2.6" fill="#3c6f97"/>
+                <text class="svg-sub" x="378" y="491.0">osh 19.0/44.8/144.6 · 1.5 KiB/line</text>
+                <polyline points="100.0,602.9 159.9,585.3 370.0,523.1" fill="none" stroke="#3c6f97" stroke-width="1.6"/>
+                <circle cx="100.0" cy="602.9" r="2.6" fill="#3c6f97"/>
+                <circle cx="159.9" cy="585.3" r="2.6" fill="#3c6f97"/>
+                <circle cx="370.0" cy="523.1" r="2.6" fill="#3c6f97"/>
+                <text class="svg-sub" x="378" y="527.1">tree-sitter 18.6/37.7/105.3 · 1.1 KiB/line</text>
+                <polyline points="100.0,609.2 159.9,595.0 370.0,544.3" fill="none" stroke="#3c6f97" stroke-width="1.6"/>
+                <circle cx="100.0" cy="609.2" r="2.6" fill="#3c6f97"/>
+                <circle cx="159.9" cy="595.0" r="2.6" fill="#3c6f97"/>
+                <circle cx="370.0" cy="544.3" r="2.6" fill="#3c6f97"/>
+                <text class="svg-sub" x="378" y="548.3">shfmt 11.7/27.2/82.3 · 0.8 KiB/line</text>
+                <polyline points="100.0,616.5 159.9,616.3 370.0,615.6" fill="none" stroke="#367f59" stroke-width="1.6"/>
+                <circle cx="100.0" cy="616.5" r="2.6" fill="#367f59"/>
+                <circle cx="159.9" cy="616.3" r="2.6" fill="#367f59"/>
+                <circle cx="370.0" cy="615.6" r="2.6" fill="#367f59"/>
+                <polyline points="100.0,618.4 159.9,618.4 370.0,618.3" fill="none" stroke="#367f59" stroke-width="1.6"/>
+                <circle cx="100.0" cy="618.4" r="2.6" fill="#367f59"/>
+                <circle cx="159.9" cy="618.4" r="2.6" fill="#367f59"/>
+                <circle cx="370.0" cy="618.3" r="2.6" fill="#367f59"/>
+                <text class="svg-sub" x="378" y="612.0">bash 3.8–4.8 · dash 1.7–1.9: flat</text>
+                <rect x="80" y="366" width="232" height="56" fill="#ece6f3" stroke="#765b98" stroke-width="0.8"/>
+                <text class="svg-sub" x="90" y="384">shellcheck, off this scale:</text>
+                <text class="svg-sub" x="90" y="400">186.8 / 568.5 / 1,855 MiB</text>
+                <text class="svg-sub" x="90" y="416">≈19 KiB/line · ≈386× bash at 100k</text>
+                <line x1="660" y1="316" x2="660" y2="650" stroke="#b8b8b1" stroke-width="1"/>
+                <text class="svg-lane" x="680" y="328">(c) tree-sitter reparse, 4,992 lines, 192 here-docs</text>
+                <line x1="870.0" y1="350" x2="870.0" y2="500" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="870.0" y="516" text-anchor="middle">0</text>
+                <line x1="915.0" y1="350" x2="915.0" y2="500" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="915.0" y="516" text-anchor="middle">25</text>
+                <line x1="960.0" y1="350" x2="960.0" y2="500" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="960.0" y="516" text-anchor="middle">50</text>
+                <line x1="1005.0" y1="350" x2="1005.0" y2="500" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="1005.0" y="516" text-anchor="middle">75</text>
+                <line x1="1050.0" y1="350" x2="1050.0" y2="500" stroke="#deded9" stroke-width="1"/>
+                <text class="svg-sub" x="1050.0" y="516" text-anchor="middle">100 ms</text>
+                <text class="svg-step" x="860" y="365" text-anchor="end">full parse (base)</text>
+                <rect x="870" y="354" width="173.9" height="15" fill="#3c6f97"/>
+                <text class="svg-sub" x="1049.9" y="366">96.635 ms</text>
+                <text class="svg-step" x="860" y="395" text-anchor="end">C: a byte in a body</text>
+                <rect x="870" y="384" width="3.7" height="15" fill="#367f59"/>
+                <text class="svg-sub" x="879.7" y="396">2.057 ms · 47.6×</text>
+                <text class="svg-step" x="860" y="425" text-anchor="end">D: a byte in a word</text>
+                <rect x="870" y="414" width="3.4" height="15" fill="#367f59"/>
+                <text class="svg-sub" x="879.4" y="426">1.879 ms · 48.5×</text>
+                <text class="svg-step" x="860" y="455" text-anchor="end">A: break opening tag</text>
+                <rect x="870" y="444" width="41.2" height="15" fill="#ad4b43"/>
+                <text class="svg-sub" x="917.2" y="456">22.906 ms · 3.1×</text>
+                <text class="svg-step" x="860" y="485" text-anchor="end">B: break closing tag</text>
+                <rect x="870" y="474" width="28.6" height="15" fill="#ad4b43"/>
+                <text class="svg-sub" x="904.6" y="486">15.909 ms · 4.7×</text>
+                <text class="svg-note" x="680" y="540">A, B: one ERROR; changed rows 2601-4993, to EOF;</text>
+                <text class="svg-note" x="680" y="557">101 of 192 bodies kept. bash on edit A reads</text>
+                <text class="svg-note" x="680" y="574">lines 2621-4992 as the body, then fails on the</text>
+                <text class="svg-note" x="680" y="591">unclosed { from line 2601.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              (a) <code>e2-summary.csv</code>; ShellCheck 3 runs, no warm-up.
+              (b) <code>e2-rss.csv</code>, one run per point via a C wrapper that
+              floors at 1.5 MiB. (c) <code>e4.jsonl</code>; speed-ups against each
+              edit's own full parse. Green: one command at a time; blue: whole-file
+              tree; purple: linter; in (c) green edits are benign, red break a tag.
+              shfmt includes printing, brush and OSH interpreter startup; release
+              binaries (shfmt v3.14.1, brush 0.4.0, Oils 0.38.0, ShellCheck v0.11.0);
+              spread up to 2x <span class="recon">measured here</span>. The grouping
+              is mine <span class="recon">reconstruction</span>.
+            </p>
+          </figure>

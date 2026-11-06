@@ -1,0 +1,388 @@
+          <h2 id="lexer-state"><span class="secnum">{{S}}</span>The lexer that knows where the parser is</h2>
+          <p class="lede">
+            Bison pulls bash's tokens one at a time from inside
+            <code>yyparse</code>. Each decision the lexer makes depends on
+            state that the lexer and the grammar actions both write. State
+            flows in both directions, and the grammar can stay small because
+            this channel exists.
+          </p>
+
+          <h3>yylex is a wrapper with a memory</h3>
+          <p>
+            The function Bison calls is short. It is
+            <code>bash/parse.y</code>:3054-3094 <span class="src">from the code</span>,
+            with the 9-line mailbox check and the 5-line <code>YYERRCODE</code> block marked …, and two comments trimmed:
+          </p>
+<pre><code>static int
+yylex (void)
+{
+  if (interactive &amp;&amp; (current_token == 0 || current_token == '\n'))
+    {
+      …
+      if (token_to_read == 0 &amp;&amp; SHOULD_PROMPT ())
+	prompt_again (0);
+    }
+
+  two_tokens_ago = token_before_that;
+  token_before_that = last_read_token;
+  last_read_token = current_token;
+  current_token = read_token (READ);
+
+  if ((parser_state &amp; PST_EOFTOKEN) &amp;&amp; current_token == shell_eof_token)
+    {
+      return (current_token);
+    }
+
+  if (current_token &lt; 0)
+    …
+  return (current_token);
+}</code></pre>
+          <p>
+            It prompts at a command boundary, shifts a three-token history
+            and calls <code>read_token</code>. The history also
+            moves in <code>push_token</code>, whose only caller is
+            <code>bash/builtins/evalfile.c</code>:333, a fake newline after a
+            sourced file that ends at EOF. <code>parse_compound_assignment</code>
+            calls <code>read_token</code> without shifting at all
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            <code>read_token</code> checks one slot before any input
+            (<code>bash/parse.y</code>:3569-3580):
+          </p>
+<pre><code>if (token_to_read) { result = token_to_read; …
+      token_to_read = 0; … return (result); }</code></pre>
+          <p>
+            The slot carries <code>'\n'</code> after an error or after a bare
+            <code>time</code>, <code>COND_END</code> after a
+            <code>[[ … ]]</code>, and the synthetic <code>DOLPAREN</code> and
+            <code>DOLBRACE</code> tokens that open nested parses (§07)
+            <span class="src">from the code</span>. Operators are hand-coded
+            <code>if</code>/<code>switch</code> blocks with one or two
+            characters of lookahead, for <code>&lt;&lt;-</code>,
+            <code>&lt;&lt;&lt;</code>, <code>&amp;&gt;&gt;</code> and
+            <code>;;&amp;</code> (<code>bash/parse.y</code>:3688-3762).
+            <code>other_token_alist</code> (2389-2425) exists only
+            to name tokens in error messages. Character classes come from
+            the generated <code>sh_syntaxtab</code>; the metacharacters are
+            <code>()&lt;&gt;;&amp;|</code> (<code>bash/syntax.h</code>:29-32,
+            73-75). <code>#</code> starts a comment only at the start of a
+            token: <code>bash -c 'echo a#b #c'</code> prints
+            <code>a#b</code> <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Three stores of context</h3>
+          <p>
+            First, the token history. Second, counters:
+            <code>open_brace_count</code>, <code>esacs_needed_count</code>,
+            <code>expecting_in_token</code>, and the 256-deep
+            <code>compoundcmd_lineno</code> stack
+            (<code>MAX_COMPOUND_NEST</code>, <code>bash/parse.y</code>:344-359).
+            Grammar actions read it for the start line of <code>for</code>,
+            <code>select</code> and <code>case</code> commands
+            (<code>bash/parse.y</code>:895-1049); the EOF error reads it to name the open construct in "unexpected end of file from `while' command on line 1"
+            (6892-6902) <span class="src">from the code</span>. Third,
+            <code>parser_state</code>: one <code>int</code> holding 28
+            <code>PST_*</code> flags, five of them commented unused
+            (<code>bash/parser.h</code>:29-56). bash's own DEBUG printer,
+            <code>dump_pflags</code>, tests 27 of the 28; it skips
+            <code>PST_FORCMD</code> <span class="src">from the code</span>.
+            Flags outlive their code: 11 of 16 <code>LEX_*</code> flags are
+            dead leftovers of the pre-2021 scanner for command substitutions (comsubs, bash's own abbreviation for <code>$( )</code>), present only in
+            their <code>#define</code> and the debug printer
+            (<code>bash/parse.y</code>:3835-3850) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Both sides write these stores. The lexer sets flags while
+            recognising text. <code>;;</code>, <code>;&amp;</code> and
+            <code>;;&amp;</code> set <code>PST_CASEPAT</code>
+            (<code>bash/parse.y</code>:3709-3718, 3757-3761). A
+            <code>(</code> outside a pattern list or <code>[[</code>, not after
+            a <code>WORD</code>, sets <code>PST_SUBSHELL</code> and pushes
+            <code>compoundcmd_top</code>. A <code>)</code> after
+            <code>WORD (</code> sets <code>PST_ALLOWOPNBRC</code>, so the next
+            <code>{</code> opens a function body
+            (<code>bash/parse.y</code>:3765-3791). Keyword matches set
+            <code>PST_CASESTMT</code> and <code>PST_CONDCMD</code> (§04)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The grammar writes back. <code>make_simple_command</code> sets
+            <code>PST_REDIRLIST</code> when it starts a fresh command and
+            clears it when the first word arrives
+            (<code>bash/make_cmd.c</code>:480-490). The lexer reads that bit to
+            decide whether a word after a leading redirection is in command
+            position. Loop actions pop <code>compoundcmd_top</code>, which the
+            lexer pushed (<code>bash/parse.y</code>:904-905). The
+            <code>timespec</code> actions plant <code>token_to_read</code>
+            (<code>bash/parse.y</code>:1436-1442). A grep for
+            <code>parser_state |=</code>, <code>&amp;=</code> and
+            <code>=</code> outside the generated <code>y.tab.c</code> finds 74
+            sites: 71 in <code>parse.y</code>, 3 in <code>make_cmd.c</code>
+            <span class="recon">measured here</span>.
+            On error <code>reset_parser</code> zeroes
+            <code>parser_state</code> and the counters, frees the line and plants
+            <code>token_to_read = '\n'</code> (<code>bash/parse.y</code>:3494-3539)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Ramey describes the channel from the parser's side: "the parser has to tell it something
+            about how far it has progressed parsing a command"
+            (aosabook.org/en/v1/bash.html, §3.4) <span class="src">from the docs</span>.
+            Figure {{fig-feedback-loop}} draws the loop.
+          </p>
+
+          <figure class="figure wide" id="fig-feedback-loop">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One loop, two writers: the lexer and the grammar share the state that classifies the next word</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 580" width="100%" role="img" aria-label="Three columns. On the left, the lexer: read_token and read_token_word in parse.y, with three sub-parsers inside it. On the right, the parser: yyparse, the Bison automaton, with grammar actions and make_cmd.c helpers. In the middle, a cylinder of shared state: the three-token history, parser_state with 28 PST bits, counters, the compoundcmd_lineno stack and the token_to_read slot. A thick black edge shows yyparse calling yylex once per token; a thin blue edge carries tokens back. Dashed purple edges show both sides writing and reading the shared state. A run-time globals box feeds the lexer from above. Two panels list what each side writes, and a red bar shows reset_parser zeroing everything on error.">
+                <defs>
+                  <marker id="fig-feedback-loop-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-feedback-loop-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-feedback-loop-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+
+                <!-- run-time globals -->
+                <rect x="10" y="6" width="236" height="56" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+                <text x="22" y="23" class="svg-lane">RUN-TIME GLOBALS</text>
+                <text x="22" y="39" class="svg-sub">extended_glob · posixly_correct</text>
+                <text x="22" y="53" class="svg-sub">expand_aliases</text>
+                <path d="M120 62 L120 78" fill="none" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#fig-feedback-loop-blue)"/>
+
+                <!-- control edge: yyparse calls yylex -->
+                <path d="M950 80 L950 42 L300 42 L300 78" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-feedback-loop-ink)"/>
+                <text x="625" y="34" text-anchor="middle" class="svg-sub">yyparse calls yylex() → read_token(READ), once per token</text>
+
+                <!-- lexer box -->
+                <rect x="20" y="80" width="300" height="190" rx="8" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="34" y="100" class="svg-lane">LEXER · PARSE.Y</text>
+                <text x="34" y="122" class="svg-step">read_token, read_token_word</text>
+                <text x="34" y="142" class="svg-sub">shell_getc → operator if/switch</text>
+                <text x="34" y="158" class="svg-sub">word end → classify (§04)</text>
+                <text x="34" y="174" class="svg-sub">alias hit → RE_READ_TOKEN (§05)</text>
+                <rect x="34" y="186" width="272" height="74" rx="5" fill="#ffffff" stroke="#3c6f97"/>
+                <text x="44" y="203" class="svg-lane">SUB-PARSERS IN THE LEXER</text>
+                <text x="44" y="221" class="svg-sub">parse_cond_command → COND_CMD</text>
+                <text x="44" y="237" class="svg-sub">parse_dparen → ARITH_CMD</text>
+                <text x="44" y="253" class="svg-sub">parse_comsub → nested yyparse (§07)</text>
+
+                <!-- shared state cylinder -->
+                <path d="M420 96 A140 14 0 0 1 700 96 L700 262 A140 14 0 0 1 420 262 Z" fill="#ece6f3" stroke="#765b98" stroke-width="1.5"/>
+                <path d="M420 96 A140 14 0 0 0 700 96" fill="none" stroke="#765b98" stroke-width="1.5"/>
+                <text x="560" y="130" text-anchor="middle" class="svg-lane">SHARED STATE</text>
+                <text x="560" y="150" text-anchor="middle" class="svg-sub">two_tokens_ago ← token_before_that</text>
+                <text x="560" y="164" text-anchor="middle" class="svg-sub">← last_read_token ← current_token</text>
+                <text x="560" y="186" text-anchor="middle" class="svg-sub">parser_state: 28 PST_* bits, 5 unused</text>
+                <text x="560" y="206" text-anchor="middle" class="svg-sub">open_brace_count · esacs_needed_count</text>
+                <text x="560" y="220" text-anchor="middle" class="svg-sub">expecting_in_token</text>
+                <text x="560" y="234" text-anchor="middle" class="svg-sub">compoundcmd_lineno[256], compoundcmd_top</text>
+                <text x="560" y="254" text-anchor="middle" class="svg-sub">token_to_read: a one-token slot</text>
+
+                <!-- state edges, lexer side -->
+                <path d="M320 132 L418 132" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-feedback-loop-purple)"/>
+                <text x="369" y="125" text-anchor="middle" class="svg-sub">writes</text>
+                <path d="M420 196 L322 196" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-feedback-loop-purple)"/>
+                <text x="369" y="189" text-anchor="middle" class="svg-sub">reads</text>
+
+                <!-- state edges, parser side -->
+                <path d="M800 132 L702 132" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-feedback-loop-purple)"/>
+                <text x="751" y="125" text-anchor="middle" class="svg-sub">writes</text>
+                <path d="M700 196 L798 196" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-feedback-loop-purple)"/>
+                <text x="751" y="189" text-anchor="middle" class="svg-sub">reads</text>
+
+                <!-- parser box -->
+                <rect x="800" y="80" width="300" height="190" rx="8" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="814" y="100" class="svg-lane">PARSER · Y.TAB.C + ACTIONS</text>
+                <text x="814" y="122" class="svg-step">yyparse: Bison LALR(1) automaton</text>
+                <text x="814" y="142" class="svg-sub">LR stacks are locals of yyparse</text>
+                <text x="814" y="158" class="svg-sub">actions build the COMMAND tree (§08)</text>
+                <text x="814" y="174" class="svg-sub">make_cmd.c: make_simple_command …</text>
+                <text x="814" y="200" class="svg-note">reads compoundcmd_lineno to put</text>
+                <text x="814" y="215" class="svg-note">a start line on for, select, case</text>
+
+                <!-- data edge: tokens up -->
+                <path d="M170 270 L170 310 L950 310 L950 272" fill="none" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#fig-feedback-loop-blue)"/>
+                <text x="560" y="302" text-anchor="middle" class="svg-sub">tokens up: WORD, ASSIGNMENT_WORD, NUMBER, operators, keywords</text>
+                <text x="560" y="327" text-anchor="middle" class="svg-sub">COND_CMD carries a finished COMMAND; ARITH_CMD a word list</text>
+
+                <!-- lexer writes panel -->
+                <rect x="20" y="344" width="530" height="166" rx="6" fill="#f7f7f5" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="34" y="364" class="svg-lane">THE LEXER WRITES</text>
+                <text x="34" y="384" class="svg-sub">;;  ;&amp;  ;;&amp;  → set PST_CASEPAT</text>
+                <text x="34" y="402" class="svg-sub">the IN of a case → PST_CASEPAT, esacs_needed_count++</text>
+                <text x="34" y="420" class="svg-sub">the pattern's ) → clear PST_CASEPAT</text>
+                <text x="34" y="438" class="svg-sub">( → PST_SUBSHELL, push compoundcmd_top</text>
+                <text x="34" y="456" class="svg-sub">) after WORD ( → PST_ALLOWOPNBRC: the next { is a body</text>
+                <text x="34" y="474" class="svg-sub">case · esac · [[ · ]] → PST_CASESTMT, PST_CONDCMD</text>
+                <text x="34" y="492" class="svg-sub">[[…]] → token_to_read = COND_END;  $( → DOLPAREN</text>
+
+                <!-- grammar writes panel -->
+                <rect x="570" y="344" width="530" height="166" rx="6" fill="#f7f7f5" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="584" y="364" class="svg-lane">GRAMMAR ACTIONS WRITE</text>
+                <text x="584" y="384" class="svg-sub">make_simple_command (make_cmd.c:480-490):</text>
+                <text x="584" y="402" class="svg-sub">  set PST_REDIRLIST at a fresh command,</text>
+                <text x="584" y="420" class="svg-sub">  clear it when the first word arrives</text>
+                <text x="584" y="438" class="svg-sub">loop actions: compoundcmd_top-- (pop)</text>
+                <text x="584" y="456" class="svg-sub">timespec actions: token_to_read = '\n', ';' or '&amp;'</text>
+                <text x="584" y="474" class="svg-sub">inputunit accept inside $( ): set PST_EOFTOKEN again</text>
+
+                <!-- error bar -->
+                <rect x="20" y="526" width="1080" height="40" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.5"/>
+                <text x="34" y="550" class="svg-lane">ON ERROR</text>
+                <text x="130" y="550" class="svg-sub">reset_parser (parse.y:3494-3539): parser_state = 0, counters = 0, line freed, token_to_read = '\n'</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The lexer carries the context the grammar would otherwise need
+              productions for. Blue is the lexer, green the parser, purple
+              shared state, orange inputs set by earlier commands, red the
+              error reset. Thick black is the call, thin blue tokens, dashed
+              purple state reads and writes. Labels are read from
+              <code>bash/parse.y</code>, <code>parser.h</code> and
+              <code>make_cmd.c</code> at 9c46586
+              <span class="src">from the code</span>; ARITH_CMD's word list is
+              the <code>%token</code> type at <code>bash/parse.y</code>:396.
+              The layout is a <span class="recon">reconstruction</span>: in
+              the code these are C statics touched from interleaved frames.
+            </p>
+          </figure>
+
+          <h3>Watching the bits move</h3>
+          <p>
+            The running example needs none of this. Its trace prints
+            <code>parser_state=0x0</code> at all 19 <code>yylex</code>
+            returns, 18 tokens plus <code>yacc_EOF</code>
+            (<code>lab/results/trace-a.txt</code>)
+            <span class="recon">measured here</span>. The token history alone
+            classifies it; <code>PST_REDIRLIST</code> is set and cleared inside
+            one <code>make_simple_command</code> call, between two trace
+            lines.
+          </p>
+          <p>
+            A <code>case</code> makes the flags visible. Trace (c) prints the
+            state after each token of <code>$(case x in x) echo y;; esac)</code>
+            (<code>lab/results/trace-c.txt</code>). The three comsub bits,
+            0x408040, are constant. <code>CASE</code> adds
+            <code>PST_CASESTMT</code> (0x4080c0). <code>IN</code> adds
+            <code>PST_CASEPAT</code> (0x4080c1). The pattern's <code>)</code>
+            clears it, <code>;;</code> sets it again, and <code>ESAC</code>
+            clears both <span class="recon">measured here</span>. Figure
+            {{fig-pst-strip}} plots the eleven columns.
+          </p>
+
+          <figure class="figure" id="fig-pst-strip">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title"><code>parser_state</code> after each token of a <code>case</code> inside <code>$( )</code></p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 340" width="100%" role="img" aria-label="Strip chart with eleven token columns: DOLPAREN, CASE, WORD, IN, WORD, close paren, WORD, WORD, SEMI_SEMI, ESAC, close paren. Five rows of flags. PST_CASEPAT (0x1) is set under IN, the following WORD, and SEMI_SEMI. PST_CASESTMT (0x80) is set from CASE through SEMI_SEMI. PST_CMDSUBST, PST_EOFTOKEN and PST_NOEXPAND are set in every column. The value row reads 0x408040, 0x4080c0, 0x4080c0, 0x4080c1, 0x4080c1, 0x4080c0, 0x4080c0, 0x4080c0, 0x4080c1, 0x408040, 0x408040. A grey footnote lists the five unused flags.">
+                <!-- column headers: x = 215 + 70*i, centre +35 -->
+                <text x="20" y="28" class="svg-lane">TOKEN</text>
+                <text x="20" y="46" class="svg-lane">TEXT</text>
+                <g class="svg-sub" text-anchor="middle">
+                  <text x="250" y="28">DOLPAREN</text><text x="250" y="46">(slot)</text>
+                  <text x="320" y="28">CASE</text><text x="320" y="46">case</text>
+                  <text x="390" y="28">WORD</text><text x="390" y="46">x</text>
+                  <text x="460" y="28">IN</text><text x="460" y="46">in</text>
+                  <text x="530" y="28">WORD</text><text x="530" y="46">x</text>
+                  <text x="600" y="28">')'</text><text x="600" y="46">)</text>
+                  <text x="670" y="28">WORD</text><text x="670" y="46">echo</text>
+                  <text x="740" y="28">WORD</text><text x="740" y="46">y</text>
+                  <text x="810" y="28">SEMI_SEMI</text><text x="810" y="46">;;</text>
+                  <text x="880" y="28">ESAC</text><text x="880" y="46">esac</text>
+                  <text x="950" y="28">')'</text><text x="950" y="46">)</text>
+                </g>
+                <line x1="20" y1="58" x2="985" y2="58" stroke="#deded9"/>
+
+                <!-- row labels -->
+                <text x="20" y="84" class="svg-sub">PST_CASEPAT 0x1</text>
+                <text x="20" y="112" class="svg-sub">PST_CASESTMT 0x80</text>
+                <text x="20" y="140" class="svg-sub">PST_CMDSUBST 0x40</text>
+                <text x="20" y="168" class="svg-sub">PST_EOFTOKEN 0x8000</text>
+                <text x="20" y="196" class="svg-sub">PST_NOEXPAND 0x400000</text>
+
+                <!-- grid of cells: clear cells -->
+                <g fill="#f7f7f5" stroke="#deded9">
+                  <rect x="218" y="68" width="64" height="22" rx="3"/><rect x="288" y="68" width="64" height="22" rx="3"/><rect x="358" y="68" width="64" height="22" rx="3"/>
+                  <rect x="568" y="68" width="64" height="22" rx="3"/><rect x="638" y="68" width="64" height="22" rx="3"/><rect x="708" y="68" width="64" height="22" rx="3"/>
+                  <rect x="848" y="68" width="64" height="22" rx="3"/><rect x="918" y="68" width="64" height="22" rx="3"/>
+                  <rect x="218" y="96" width="64" height="22" rx="3"/><rect x="848" y="96" width="64" height="22" rx="3"/><rect x="918" y="96" width="64" height="22" rx="3"/>
+                </g>
+                <!-- flipping bits: orange -->
+                <g fill="#f7e3c8" stroke="#d98226">
+                  <rect x="428" y="68" width="64" height="22" rx="3"/><rect x="498" y="68" width="64" height="22" rx="3"/><rect x="778" y="68" width="64" height="22" rx="3"/>
+                  <rect x="288" y="96" width="64" height="22" rx="3"/><rect x="358" y="96" width="64" height="22" rx="3"/><rect x="428" y="96" width="64" height="22" rx="3"/>
+                  <rect x="498" y="96" width="64" height="22" rx="3"/><rect x="568" y="96" width="64" height="22" rx="3"/><rect x="638" y="96" width="64" height="22" rx="3"/>
+                  <rect x="708" y="96" width="64" height="22" rx="3"/><rect x="778" y="96" width="64" height="22" rx="3"/>
+                </g>
+                <!-- constant comsub bits: blue bands -->
+                <g fill="#e0ebf2" stroke="#3c6f97">
+                  <rect x="218" y="124" width="764" height="22" rx="3"/>
+                  <rect x="218" y="152" width="764" height="22" rx="3"/>
+                  <rect x="218" y="180" width="764" height="22" rx="3"/>
+                </g>
+                <text x="600" y="139" text-anchor="middle" class="svg-sub">set by parse_comsub before the nested yyparse (§07)</text>
+                <text x="600" y="167" text-anchor="middle" class="svg-sub">yylex returns ')' as shell_eof_token</text>
+                <text x="600" y="195" text-anchor="middle" class="svg-sub">parser.h: “don't expand anything in read_token_word”</text>
+
+                <!-- value row -->
+                <line x1="20" y1="214" x2="985" y2="214" stroke="#deded9"/>
+                <text x="20" y="236" class="svg-lane">PARSER_STATE</text>
+                <g class="svg-sub" text-anchor="middle" style="fill:#252525">
+                  <text x="250" y="236">0x408040</text><text x="320" y="236">0x4080c0</text><text x="390" y="236">0x4080c0</text>
+                  <text x="460" y="236">0x4080c1</text><text x="530" y="236">0x4080c1</text><text x="600" y="236">0x4080c0</text>
+                  <text x="670" y="236">0x4080c0</text><text x="740" y="236">0x4080c0</text><text x="810" y="236">0x4080c1</text>
+                  <text x="880" y="236">0x408040</text><text x="950" y="236">0x408040</text>
+                </g>
+
+                <!-- who flipped it -->
+                <text x="20" y="266" class="svg-note">CASE: CHECK_FOR_RESERVED_WORD sets CASESTMT · IN: special_case_tokens sets CASEPAT ·</text>
+                <text x="20" y="282" class="svg-note">pattern ')': read_token clears CASEPAT · ';;': read_token sets it · ESAC: CHECK_FOR_RESERVED_WORD clears both</text>
+
+                <!-- unused flags -->
+                <rect x="20" y="298" width="962" height="30" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="32" y="318" class="svg-sub">never set, commented unused: NEEDCLOSBRC 0x8 · DBLPAREN 0x10 · ARITHFOR 0x400 · ALEXPAND 0x800 · FORCMD 0x8000000</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Two bits do the work in a <code>case</code>; three hold for the
+              whole nested parse. Values are copied from the <code>LAB
+              LEX</code> lines of <code>lab/results/trace-c.txt</code>, printed
+              after each token by an instrumented bash@9c46586
+              <span class="recon">measured here</span>. Bit values are from
+              <code>bash/parser.h</code>:29-56 and the notes below the values
+              from <code>bash/parse.y</code> <span class="src">from the code</span>.
+              Orange: a bit that flips inside the <code>case</code>. Blue: held
+              for the whole comsub. Grey: clear.
+            </p>
+          </figure>
+
+          <h3>State the parser never sees</h3>
+          <p>
+            The lexer also reads globals that only executing a command can
+            change. With extglob, <code>@(</code> is lexed as the start of one
+            pattern word, but only if <code>extended_glob</code> is on at the
+            moment the word is read (<code>bash/parse.y</code>:5464-5466)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>#ifdef EXTENDED_GLOB
+      /* Parse a ksh-style extended pattern matching specification. */
+      if MBTEST(extended_glob &amp;&amp; PATTERN_CHAR (character))</code></pre>
+          <p>
+            bash parses a whole line before running it (§09), so on one line
+            <code>shopt</code> runs too late: that is the syntax error near
+            <code>(</code> shown in §01. On two lines the script runs and prints <code>@(a|b)</code>; no
+            file matches. <code>bash -n</code>
+            rejects even the two-line form with rc=2, because
+            <code>-n</code> never executes <code>shopt</code>;
+            <code>bash -O extglob -n</code> accepts it
+            (<code>lab/results/tricky.txt</code>; reproduced with
+            <code>/usr/bin/bash</code> 5.3.9)
+            <span class="recon">measured here</span>. A syntax check that
+            does not run the script cannot know which language the script is
+            written in <span class="recon">reconstruction</span>.
+          </p>

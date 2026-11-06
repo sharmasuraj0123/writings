@@ -1,0 +1,353 @@
+          <h2 id="expansion"><span class="secnum">{{S}}</span>Expansion is a second parser</h2>
+          <p class="lede">
+            <code>yyparse</code> stops at words. A WORD_DESC reaches the executor
+            spelled as it was in the source, quotes and dollar signs intact.
+            <code>subst.c</code> parses each word again, character by character, every
+            time the command runs. It is a second tokenizer with its own matchers for
+            <code>${ }</code> and <code>$( )</code>, and it carries quoting through
+            splitting and globbing as marker bytes inside the string. Quote removal is
+            a function that strips them.
+          </p>
+
+          <h3>Where, and in what order</h3>
+          <p>
+            <code>execute_simple_command</code> calls
+            <code>expand_words</code> on each execution
+            (<code>bash/execute_cmd.c</code>:4605-4617). The work happens in
+            <code>expand_word_list_internal</code>, and its order is fixed in code
+            (<code>bash/subst.c</code>:13219-13279): copy the list; separate the leading
+            assignments; brace expansion; <code>shell_expand_word_list</code>, which is
+            one pass of tilde, parameter, arithmetic, command and process substitution
+            followed by splitting; then <code>glob_expand_word_list</code>, or
+            <code>dequote_list</code> when globbing is off; the assignments last
+            <span class="src">from the code</span>. The manual lists the same stages
+            (<code>bash/doc/bash.1</code>:3372-3384). POSIX has no brace step and says
+            quote removal "shall always be performed last" (XCU §2.6). AOSA calls the
+            expansions "a small pipeline unto themselves" (§3.5.5)
+            <span class="src">from the docs</span>.
+          </p>
+          <p>
+            In the running example, <code>expand_words</code> receives
+            <code>[LC_ALL=C] [sort] [-u]</code> and returns <code>[sort] [-u]</code>
+            (<code>lab/results/trace-a.txt</code>, lines 367-368)
+            <span class="recon">measured here</span>. The assignment is held back and
+            performed after the other words expand, into the temporary environment
+            because a command word remains (<code>bash/subst.c</code>:13270-13273)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>A tokenizer that runs at execution</h3>
+          <p>
+            <code>expand_word_internal</code> (<code>bash/subst.c</code>:11229) is a
+            <code>switch</code> on each character: <code>'\0'</code>,
+            <code>CTLESC</code>, <code>&lt;</code> and <code>&gt;</code>,
+            <code>[</code>, <code>=</code>, <code>:</code>, <code>~</code>,
+            <code>$</code>, backquote, backslash, double and single quote, space
+            (cases at 11331-11933). It returns a list of zero, one or many words
+            <span class="src">from the code</span>. The lexer only brace-matched
+            <code>${…}</code> (<code>bash/parse.y</code>:5506-5513). The operators
+            inside are parsed here: <code>parameter_brace_expand</code> calls
+            <code>extract_dollar_brace_string</code>, a third <code>}</code> matcher
+            beside the lexer's (<code>bash/subst.c</code>:9865-9893, 10150)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Brace expansion runs first. The manual says it "is strictly textual"
+            (<code>bash/doc/bash.1</code>:3444-3450) <span class="src">from the docs</span>.
+            The code is not. <code>brace_gobbler</code> lexes quotes, and on
+            <code>$(</code> it calls <code>extract_command_subst</code>, which reaches
+            the yacc parser through <code>xparse_dolparen</code>, to skip over the
+            substitution (<code>bash/braces.c</code>:679-760)
+            <span class="src">from the code</span>. The code wins, and both sides of
+            that are visible:
+          </p>
+<pre><code>$ echo {a,$(echo x,y)}
+a x,y
+$ n=3; echo {1..$n}
+{1..3}</code></pre>
+          <p>
+            The comma inside <code>$( )</code> is not a separator, so the result is
+            two words. <code>{1..$n}</code> is not a sequence, because
+            <code>$n</code> is still text when braces run
+            <span class="recon">measured here</span> (<code>/usr/bin/bash</code> 5.3.9).
+          </p>
+
+          <h3>Quoting as bytes</h3>
+          <p>
+            Two marker bytes carry quoting: <code>CTLESC</code> <code>\001</code>
+            protects the character after it, and <code>CTLNUL</code>
+            <code>\177</code> marks a quoted empty string
+            (<code>bash/syntax.h</code>:101-102). <code>quote_string</code> prefixes
+            every character with <code>CTLESC</code>; <code>dequote_string</code>
+            inverts it (<code>bash/subst.c</code>:4773-4845). Data cannot pose as a
+            marker, because the lexer escapes a literal <code>\001</code> or
+            <code>\177</code> with an extra <code>CTLESC</code>
+            (<code>bash/parse.y</code>:5694-5700) <span class="src">from the code</span>.
+          </p>
+          <p>
+            <code>lab/scripts/ctlesc_trace.sh</code> builds a copy of the pinned bash
+            that dumps word bytes at four points. It runs in a directory holding the
+            files <code>Xa b</code>, <code>Ya b</code> and <code>Xa bc</code>. For
+            <code>"$x"*'a b'$(echo c)</code> with <code>x=X</code>,
+            <code>lab/results/ctlesc-trace.txt</code> shows
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>  [1 expand_word_internal] flags=0x0 &lt;^AX*^Aa^A ^Abc&gt;
+  [2 after split/qnull] flags=0x0 &lt;^AX*^Aa^A ^Abc&gt;
+  [3 glob pattern] &lt;X*a bc&gt;
+  [4 final argv] flags=0x0 &lt;Xa bc&gt;</code></pre>
+          <p>
+            The quoted <code>X</code> and every byte of <code>'a b'</code> are
+            protected. The <code>*</code> and the substitution output <code>c</code>
+            are raw. Figure {{fig-ctlesc}} lays the bytes out. A word is split only if
+            something expanded and <code>W_NOSPLIT</code> is clear
+            (<code>bash/subst.c</code>:13110-13124). <code>string_extract_verbatim</code>
+            skips each <code>CTLESC</code> together with its character
+            (<code>bash/subst.c</code>:1187-1194), so the quoted space never
+            separates <span class="src">from the code</span>. With
+            <code>IFS=:</code>, <code>x=a::b</code> splits into 3 fields. The empty
+            middle one is a <code>CTLNUL</code> word with flags
+            <code>0x40002</code> <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <code>lib/glob</code> knows nothing about <code>CTLESC</code>: a grep of
+            <code>lib/glob/*.c</code> finds no occurrence
+            <span class="recon">measured here</span>, and its quoting character is
+            the backslash (<code>bash/lib/glob/glob.c</code>:431-447). The
+            translation happens in <code>quote_string_for_globbing</code>
+            (<code>bash/pathexp.c</code>:245-272, four comments trimmed)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>      else if (pathname[i] == CTLESC)
+	{
+convert_to_backslash:
+	  cc = pathname[i+1];
+
+	  if ((qflags &amp; QGLOB_FILENAME) &amp;&amp; pathname[i+1] == '/')
+	    continue;
+
+	  if (cc != CTLESC &amp;&amp; (qflags &amp; QGLOB_REGEXP) &amp;&amp; ere_char (cc) == 0)
+	    continue;
+
+	  if (cc != CTLESC &amp;&amp; (qflags &amp; QGLOB_REGEXP) == 0 &amp;&amp; glob_quote_char (pathname+i+1) == 0)
+	    continue;
+
+	  if (cc != CTLESC &amp;&amp; locale_utf8locale &amp;&amp; UTF8_SINGLEBYTE (cc) == 0)
+	    continue;	/* probably don't need to check for UTF-8 locale */
+
+	  temp[j++] = '\\';
+	  i++;</code></pre>
+          <p>
+            A <code>CTLESC</code> becomes a backslash only before a glob-special
+            character. <code>X</code>, <code>a</code>, space and <code>b</code> are
+            not, so the pattern is <code>X*a bc</code> and it matches the file
+            <code>Xa bc</code>. Quote removal is <code>dequote_string</code>, called
+            inside <code>glob_expand_word_list</code> for a word that does not glob,
+            or by <code>dequote_list</code> (<code>bash/subst.c</code>:12642-12677,
+            13261-13268) <span class="src">from the code</span>. Results are never
+            re-tokenized:
+          </p>
+<pre><code>$ x="echo hi; echo there"; $x
+hi; echo there</code></pre>
+
+          <h3>What comes back from $( )</h3>
+          <p>
+            <code>read_comsub</code> reads in 4096-byte chunks
+            (<code>COMSUB_PIPEBUF</code>), drops NUL bytes with one warning,
+            "command substitution: ignored null byte in input"
+            (<code>bash/subst.c</code>:6640-6805). <code>comsub_shouldquote</code>
+            quotes every byte inside double quotes, but outside them only the marker
+            bytes (and a space when IFS is null), so unquoted output still splits and
+            globs (<code>bash/subst.c</code>:6643-6662)
+            <span class="src">from the code</span>. <code>$(&lt;file)</code> is a
+            special case. <code>command_substitute</code> parses the text to a COMMAND
+            and checks its shape with <code>can_optimize_cat_file</code> (one input
+            redirect, no words). If it passes, the parent reads the file without
+            forking (<code>bash/subst.c</code>:7160-7168;
+            <code>bash/builtins/evalstring.c</code>:199-208)
+            <span class="src">from the code</span>. The side effect shows, with
+            <code>f0.txt</code> holding <code>hi</code>:
+          </p>
+<pre><code>$ n=0; x=$(&lt;f$((n++)).txt); echo "x=$x n=$n"
+x=hi n=1
+$ n=0; x=$(cat f$((n++)).txt); echo "x=$x n=$n"
+x=hi n=0</code></pre>
+          <p>
+            With <code>cat</code>, the increment happens in the forked child.
+            <code>${ cmd; }</code> runs in the current shell through
+            <code>parse_and_execute</code> (<code>bash/subst.c</code>:6925-7138), so
+            <code>v=1; : ${ v=2; }; echo $v</code> prints 2, while
+            <code>: $(v=3)</code> leaves it alone
+            <span class="recon">measured here</span> (both blocks:
+            <code>/usr/bin/bash</code> 5.3.9).
+          </p>
+          <p>
+            Other parsers move this work into the tree. mvdan/sh's Word is a list of
+            9 WordPart kinds, so expansion walks typed nodes
+            (<code>sh/syntax/nodes.go</code>:564-575), and OSH parses
+            <code>${…}</code> into a typed <code>BracedVarSub</code>
+            (<code>oils/frontend/syntax.asdl</code>:165-173). brush keeps a Word as raw
+            text and runs a second PEG (parsing expression grammar: ordered alternatives, tried in turn with backtracking) over it at expansion
+            (<code>brush/brush-parser/src/ast.rs</code>:2008-2016)
+            <span class="src">from the code</span>; §12 compares them.
+          </p>
+
+          <figure class="figure wide" id="fig-ctlesc">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One word through the stages: quoting travels as CTLESC bytes</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 560" width="100%" role="img" aria-label="Top: five expansion stages in code order with the sub-parser each calls: brace expansion (brace_gobbler, extract_command_subst, xparse_dolparen); one left-to-right scan in expand_word_internal (tilde, param_expand, parameter_brace_expand, expr.c, command_substitute, process substitution); word_split if something expanded and W_NOSPLIT is clear; glob_expand_word_list or dequote; leading assignments last. Bottom: byte rows for the word quote dollar x quote star quote a space b quote dollar paren echo c paren with x=X. After expand_word_internal the bytes are CTLESC X star CTLESC a CTLESC space CTLESC b c. Splitting leaves it unchanged. The glob pattern is X star a space b c. argv is Xa bc.">
+                <defs>
+                  <marker id="fig-ctlesc-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-ctlesc-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+
+                <!-- stage order -->
+                <text x="20" y="26" class="svg-lane">STAGE ORDER · subst.c:13219-13279</text>
+                <g>
+                  <rect x="20" y="40" width="190" height="112" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="32" y="60" class="svg-num">1</text><text x="46" y="60" class="svg-step">brace expansion</text>
+                  <text x="32" y="82" class="svg-sub">brace_gobbler →</text>
+                  <text x="32" y="98" class="svg-sub">extract_command_subst</text>
+                  <text x="32" y="114" class="svg-sub">→ xparse_dolparen</text>
+                  <text x="32" y="130" class="svg-sub">(yacc, to skip $( ))</text>
+
+                  <rect x="230" y="40" width="250" height="112" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <text x="242" y="60" class="svg-num">2</text><text x="256" y="60" class="svg-step">one left-to-right scan</text>
+                  <text x="242" y="82" class="svg-sub">expand_word_internal:</text>
+                  <text x="242" y="98" class="svg-sub">tilde, param_expand,</text>
+                  <text x="242" y="114" class="svg-sub">parameter_brace_expand,</text>
+                  <text x="242" y="130" class="svg-sub">expr.c, command_substitute,</text>
+                  <text x="242" y="146" class="svg-sub">process substitution</text>
+
+                  <rect x="500" y="40" width="200" height="112" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="512" y="60" class="svg-num">3</text><text x="526" y="60" class="svg-step">word_split</text>
+                  <text x="512" y="82" class="svg-sub">only if something</text>
+                  <text x="512" y="98" class="svg-sub">expanded and</text>
+                  <text x="512" y="114" class="svg-sub">W_NOSPLIT is clear</text>
+
+                  <rect x="720" y="40" width="210" height="112" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="732" y="60" class="svg-num">4</text><text x="746" y="60" class="svg-step">glob or dequote</text>
+                  <text x="732" y="82" class="svg-sub">glob_expand_word_list</text>
+                  <text x="732" y="98" class="svg-sub">→ glob_filename, or</text>
+                  <text x="732" y="114" class="svg-sub">dequote_string /</text>
+                  <text x="732" y="130" class="svg-sub">dequote_list</text>
+
+                  <rect x="950" y="40" width="150" height="112" rx="6" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="962" y="60" class="svg-num">5</text><text x="976" y="60" class="svg-step">assign</text>
+                  <text x="962" y="82" class="svg-sub">leading ones,</text>
+                  <text x="962" y="98" class="svg-sub">last: temp env</text>
+                  <text x="962" y="114" class="svg-sub">or variables</text>
+                </g>
+                <g fill="none" stroke="#252525" stroke-width="2.2">
+                  <path d="M210 96 L228 96" marker-end="url(#fig-ctlesc-ink)"/>
+                  <path d="M480 96 L498 96" marker-end="url(#fig-ctlesc-ink)"/>
+                  <path d="M700 96 L718 96" marker-end="url(#fig-ctlesc-ink)"/>
+                  <path d="M930 96 L948 96" marker-end="url(#fig-ctlesc-ink)"/>
+                </g>
+
+                <!-- byte rows -->
+                <text x="20" y="190" class="svg-lane">BYTES · ctlesc-trace.txt · x=X</text>
+
+                <!-- row 1: source word -->
+                <text x="20" y="222" class="svg-step">source word</text>
+                <text x="20" y="238" class="svg-sub">as the lexer stored it</text>
+                <g class="svg-sub" text-anchor="middle">
+                  <g fill="#f7f7f5" stroke="#b8b8b1">
+                    <rect x="270" y="206" width="32" height="36"/><rect x="302" y="206" width="32" height="36"/><rect x="334" y="206" width="32" height="36"/><rect x="366" y="206" width="32" height="36"/><rect x="398" y="206" width="32" height="36"/><rect x="430" y="206" width="32" height="36"/><rect x="462" y="206" width="32" height="36"/><rect x="494" y="206" width="32" height="36"/><rect x="526" y="206" width="32" height="36"/><rect x="558" y="206" width="32" height="36"/><rect x="590" y="206" width="32" height="36"/><rect x="622" y="206" width="32" height="36"/><rect x="654" y="206" width="32" height="36"/><rect x="686" y="206" width="32" height="36"/><rect x="718" y="206" width="32" height="36"/><rect x="750" y="206" width="32" height="36"/><rect x="782" y="206" width="32" height="36"/><rect x="814" y="206" width="32" height="36"/><rect x="846" y="206" width="32" height="36"/>
+                  </g>
+                  <text x="286" y="229">"</text><text x="318" y="229">$</text><text x="350" y="229">x</text><text x="382" y="229">"</text><text x="414" y="229">*</text><text x="446" y="229">'</text><text x="478" y="229">a</text><text x="510" y="229">␠</text><text x="542" y="229">b</text><text x="574" y="229">'</text><text x="606" y="229">$</text><text x="638" y="229">(</text><text x="670" y="229">e</text><text x="702" y="229">c</text><text x="734" y="229">h</text><text x="766" y="229">o</text><text x="798" y="229">␠</text><text x="830" y="229">c</text><text x="862" y="229">)</text>
+                </g>
+                <text x="892" y="222" class="svg-sub">19 bytes, quotes</text>
+                <text x="892" y="238" class="svg-sub">and $ intact</text>
+
+                <!-- row 2: after expand_word_internal -->
+                <text x="20" y="288" class="svg-step">expand_word_internal</text>
+                <text x="20" y="304" class="svg-sub">the one scan</text>
+                <g class="svg-sub" text-anchor="middle">
+                  <rect x="270" y="272" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="302" y="272" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="334" y="272" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="366" y="272" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="398" y="272" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="430" y="272" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="462" y="272" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="494" y="272" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="526" y="272" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="558" y="272" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <text x="286" y="295">^A</text><text x="318" y="295">X</text><text x="350" y="295">*</text><text x="382" y="295">^A</text><text x="414" y="295">a</text><text x="446" y="295">^A</text><text x="478" y="295">␠</text><text x="510" y="295">^A</text><text x="542" y="295">b</text><text x="574" y="295">c</text>
+                </g>
+                <text x="610" y="288" class="svg-sub">* raw (unquoted); c raw (comsub output,</text>
+                <text x="610" y="304" class="svg-sub">read_comsub quotes only marker bytes here)</text>
+
+                <!-- row 3: after split -->
+                <text x="20" y="354" class="svg-step">word_split</text>
+                <text x="20" y="370" class="svg-sub">unchanged: one field</text>
+                <g class="svg-sub" text-anchor="middle">
+                  <rect x="270" y="338" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="302" y="338" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="334" y="338" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="366" y="338" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="398" y="338" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="430" y="338" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="462" y="338" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="494" y="338" width="32" height="36" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="526" y="338" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <rect x="558" y="338" width="32" height="36" fill="#ffffff" stroke="#b8b8b1"/>
+                  <text x="286" y="361">^A</text><text x="318" y="361">X</text><text x="350" y="361">*</text><text x="382" y="361">^A</text><text x="414" y="361">a</text><text x="446" y="361">^A</text><text x="478" y="361">␠</text><text x="510" y="361">^A</text><text x="542" y="361">b</text><text x="574" y="361">c</text>
+                </g>
+                <text x="610" y="354" class="svg-sub">string_extract_verbatim skips ^A plus its</text>
+                <text x="610" y="370" class="svg-sub">byte: the quoted space cannot separate</text>
+
+                <!-- row 4: glob pattern -->
+                <text x="20" y="420" class="svg-step">glob pattern</text>
+                <text x="20" y="436" class="svg-sub">to glob_filename</text>
+                <g class="svg-sub" text-anchor="middle">
+                  <g fill="#ffffff" stroke="#b8b8b1">
+                    <rect x="270" y="404" width="32" height="36"/><rect x="302" y="404" width="32" height="36"/><rect x="334" y="404" width="32" height="36"/><rect x="366" y="404" width="32" height="36"/><rect x="398" y="404" width="32" height="36"/><rect x="430" y="404" width="32" height="36"/>
+                  </g>
+                  <text x="286" y="427">X</text><text x="318" y="427">*</text><text x="350" y="427">a</text><text x="382" y="427">␠</text><text x="414" y="427">b</text><text x="446" y="427">c</text>
+                </g>
+                <text x="482" y="420" class="svg-sub">quote_string_for_globbing: no ^A sits before a</text>
+                <text x="482" y="436" class="svg-sub">glob-special byte, so no backslash is written</text>
+
+                <!-- row 5: argv -->
+                <text x="20" y="486" class="svg-step">argv</text>
+                <text x="20" y="502" class="svg-sub">one word</text>
+                <rect x="270" y="470" width="96" height="36" fill="#dfede5" stroke="#367f59"/>
+                <text x="318" y="493" class="svg-sub" text-anchor="middle">Xa bc</text>
+                <text x="386" y="486" class="svg-sub">glob matched the file "Xa bc" in the trace directory</text>
+                <text x="386" y="502" class="svg-sub">(it also held "Xa b" and "Ya b")</text>
+
+                <!-- data arrows -->
+                <g fill="none" stroke="#3c6f97" stroke-width="1.1">
+                  <path d="M254 242 L254 270" marker-end="url(#fig-ctlesc-blue)"/>
+                  <path d="M254 308 L254 336" marker-end="url(#fig-ctlesc-blue)"/>
+                  <path d="M254 374 L254 402" marker-end="url(#fig-ctlesc-blue)"/>
+                  <path d="M254 440 L254 468" marker-end="url(#fig-ctlesc-blue)"/>
+                </g>
+
+                <!-- legend -->
+                <rect x="270" y="526" width="18" height="18" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="296" y="540" class="svg-sub">^A = CTLESC \001</text>
+                <rect x="450" y="526" width="18" height="18" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="476" y="540" class="svg-sub">raw byte</text>
+                <text x="580" y="540" class="svg-sub">␠ = space · ^? = CTLNUL \177 (not in this word)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Quoting survives splitting and globbing because it is part of the
+              string. The four byte rows after the source are copied from
+              <code>lab/results/ctlesc-trace.txt</code>, produced by
+              <code>lab/scripts/ctlesc_trace.sh</code> on an instrumented
+              bash@9c46586 <span class="recon">measured here</span>. The stage order
+              and the sub-parser each stage calls are read from
+              <code>bash/subst.c</code>, <code>braces.c</code> and
+              <code>pathexp.c</code> <span class="src">from the code</span>. Orange
+              cells are <code>CTLESC</code> bytes, white cells raw bytes, green the
+              final argument; the blue box is the stage that re-tokenizes the word. Thick black is stage order; thin blue the word passed
+              from one stage to the next.
+            </p>
+          </figure>

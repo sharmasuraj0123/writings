@@ -1,0 +1,289 @@
+          <h2 id="aliases"><span class="secnum">{{S}}</span>Aliases are text pushed back into the lexer</h2>
+          <p class="lede">
+            bash expands an alias by pushing its value back into the lexer's
+            input and lexing it again as source text. So an alias can hold half
+            an <code>if</code>, an unclosed quote or a lone <code>{</code>, an
+            alias defined on a line misses that line, and no other parser
+            reproduces bash exactly.
+          </p>
+          <p>
+            Ramey: "The bash parser implements aliasing
+            completely in the lexical phase, though the parser has to inform the
+            analyzer when alias expansion is permitted" (aosabook.org/en/v1/bash.html, §3.4)
+            <span class="src">from the docs</span>.
+          </p>
+
+          <h3>Push, re-read, pop</h3>
+          <p>
+            The check runs at every word end (§04). <code>alias_expand_token</code> is
+            <code>bash/parse.y</code>:3248-3282, with the 8-line
+            <code>OLD_ALIAS_HACK</code> comment block marked …
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>static int
+alias_expand_token (const char *tokstr)
+{
+  char *expanded;
+  alias_t *ap;
+
+  if ((parser_state &amp; PST_ALEXPNEXT) || assignment_acceptable (last_read_token))
+    {
+      ap = find_alias (tokstr);
+
+      /* Currently expanding this token. */
+      if (ap &amp;&amp; (ap-&gt;flags &amp; AL_BEINGEXPANDED))
+	return (NO_EXPANSION);
+      …
+      expanded = ap ? mk_alexpansion (ap-&gt;value) : (char *)NULL;
+
+      if (expanded)
+	{
+	  push_string (expanded, ap-&gt;flags &amp; AL_EXPANDNEXT, ap);
+	  return (RE_READ_TOKEN);
+	}
+      else
+	/* This is an eligible token that does not have an expansion. */
+	return (NO_EXPANSION);</code></pre>
+          <p>
+            <code>push_string</code> saves <code>shell_input_line</code> and its
+            index on <code>pushed_string_list</code>, marks the alias
+            <code>AL_BEINGEXPANDED</code> and makes the value the current line
+            (<code>bash/parse.y</code>:2018-2076). <code>RE_READ_TOKEN</code>
+            restarts <code>read_token</code>; the parser never sees the alias name.
+            At the end of the text <code>shell_getc</code> returns one synthetic
+            space and sets <code>PST_ENDALIAS</code>, but only if the last
+            character is not a blank, newline or metacharacter and no quote is
+            open. The next call pops (<code>bash/parse.y</code>:2783-2840). The
+            space keeps the alias in use while its last word is checked, so
+            <code>alias echo=echo</code> does not recurse
+            <span class="src">from the code</span>. POSIX §2.3.1 allows it: the
+            shell "may behave as if an additional &lt;space&gt;"
+            <span class="src">from the docs</span>. A value ending in a space or
+            tab gets <code>AL_EXPANDNEXT</code> at definition
+            (<code>bash/alias.c</code>:141-146); <code>pop_string</code> turns it
+            into <code>PST_ALEXPNEXT</code>, so the next word is checked too
+            (<code>bash/parse.y</code>:2096-2099) <span class="src">from the code</span>. Figure {{fig-alias-push}}
+            follows the chain.
+          </p>
+
+          <figure class="figure" id="fig-alias-push">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Lexing <code>s ll x</code>: alias values become stacked input lines</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 640" width="100%" role="img" aria-label="Eight steps left to right. Three rows show the input frames: the real shell_input_line at the bottom, pushed_string_list frames above it. s is read and its value 'sudo_ ' pushed; sudo_ is read and 'echo SUDO ' pushed; echo and SUDO are emitted; both frames pop without a synthetic space because both values end in a blank, which sets PST_ALEXPNEXT; ll is then expanded and 'echo LL' pushed; echo and LL are emitted, a synthetic space ends LL; the frame pops and x is read. The token row reads echo SUDO echo LL x. A lower panel shows why alias hi=...; hi on one line fails: the whole line is lexed and parsed before the alias command runs.">
+                <defs>
+                  <marker id="fig-alias-push-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-alias-push-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+
+                <!-- time arrow -->
+                <path d="M120 14 L990 14" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-alias-push-ink)"/>
+                <text x="10" y="18" class="svg-lane">STEP →</text>
+
+                <!-- step headers -->
+                <g>
+                  <text x="124" y="40" class="svg-num">1</text><text x="136" y="40" class="svg-step">read s</text>
+                  <text x="234" y="40" class="svg-num">2</text><text x="246" y="40" class="svg-step">push</text>
+                  <text x="344" y="40" class="svg-num">3</text><text x="356" y="40" class="svg-step">read sudo_</text>
+                  <text x="454" y="40" class="svg-num">4</text><text x="466" y="40" class="svg-step">echo, SUDO</text>
+                  <text x="564" y="40" class="svg-num">5</text><text x="576" y="40" class="svg-step">pop, pop</text>
+                  <text x="674" y="40" class="svg-num">6</text><text x="686" y="40" class="svg-step">read ll</text>
+                  <text x="784" y="40" class="svg-num">7</text><text x="796" y="40" class="svg-step">echo, LL</text>
+                  <text x="894" y="40" class="svg-num">8</text><text x="906" y="40" class="svg-step">pop, read x</text>
+                </g>
+
+                <!-- row labels -->
+                <text x="10" y="80" class="svg-lane">FRAME 2</text>
+                <text x="10" y="94" class="svg-sub">pushed_string</text>
+                <text x="10" y="134" class="svg-lane">FRAME 1</text>
+                <text x="10" y="148" class="svg-sub">pushed_string</text>
+                <text x="10" y="188" class="svg-lane">FRAME 0</text>
+                <text x="10" y="202" class="svg-sub">real line</text>
+
+                <!-- frame 0: real line, live throughout -->
+                <rect x="120" y="170" width="874" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="122" y="172" width="104" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="132" y="195" class="svg-sub"><tspan font-weight="700" fill="#d98226">s</tspan> ll x⏎</text>
+                <text x="682" y="195" class="svg-sub">s <tspan font-weight="700" fill="#d98226">ll</tspan> x⏎</text>
+                <rect x="892" y="172" width="100" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="902" y="195" class="svg-sub">s ll <tspan font-weight="700" fill="#d98226">x</tspan>⏎</text>
+                <rect x="672" y="172" width="104" height="36" rx="4" fill="none" stroke="#3c6f97"/>
+
+                <!-- frame 1: 'sudo_ ' cols 2-5, then 'echo LL' cols 6-7 -->
+                <rect x="230" y="116" width="434" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="232" y="118" width="104" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="240" y="141" class="svg-sub">'sudo_ '</text>
+                <text x="350" y="141" class="svg-sub">'<tspan font-weight="700" fill="#d98226">sudo_</tspan> '</text>
+                <text x="570" y="141" class="svg-sub">' ' ends</text>
+                <rect x="670" y="116" width="216" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="672" y="118" width="104" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="680" y="141" class="svg-sub">'echo LL'</text>
+                <text x="790" y="141" class="svg-sub"><tspan font-weight="700" fill="#d98226">echo LL</tspan><tspan fill="#d98226">␠</tspan></text>
+
+                <!-- frame 2: 'echo SUDO ' cols 3-4 -->
+                <rect x="340" y="62" width="214" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="342" y="64" width="104" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="348" y="87" class="svg-sub">'echo SUDO '</text>
+                <text x="456" y="87" class="svg-sub">'<tspan font-weight="700" fill="#d98226">echo SUDO</tspan> '</text>
+
+                <!-- push arrows (control) -->
+                <path d="M178 170 L240 156" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-alias-push-ink)"/>
+                <path d="M394 116 L394 102" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-alias-push-ink)"/>
+                <path d="M724 170 L724 156" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-alias-push-ink)"/>
+
+                <!-- tokens -->
+                <text x="10" y="238" class="svg-lane">TOKENS</text>
+                <text x="10" y="252" class="svg-sub">to yyparse</text>
+                <path d="M498 102 L498 222" fill="none" stroke="#3c6f97" stroke-width="1.1" marker-end="url(#fig-alias-push-blue)"/>
+                <path d="M830 156 L830 222" fill="none" stroke="#3c6f97" stroke-width="1.1" marker-end="url(#fig-alias-push-blue)"/>
+                <path d="M940 210 L940 222" fill="none" stroke="#3c6f97" stroke-width="1.1" marker-end="url(#fig-alias-push-blue)"/>
+                <rect x="452" y="226" width="104" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="504" y="246" text-anchor="middle" class="svg-sub">echo  SUDO</text>
+                <rect x="782" y="226" width="104" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="834" y="246" text-anchor="middle" class="svg-sub">echo  LL</text>
+                <rect x="892" y="226" width="100" height="30" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="942" y="246" text-anchor="middle" class="svg-sub">x  '\n'</text>
+
+                <!-- state bars -->
+                <text x="10" y="290" class="svg-lane">STATE</text>
+                <path d="M564 286 L774 286" fill="none" stroke="#765b98" stroke-width="2" stroke-dasharray="5 4"/>
+                <text x="570" y="302" class="svg-sub" fill="#765b98">PST_ALEXPNEXT</text>
+                <path d="M840 286 L940 286" fill="none" stroke="#765b98" stroke-width="2" stroke-dasharray="5 4"/>
+                <text x="842" y="302" class="svg-sub" fill="#765b98">PST_ENDALIAS</text>
+                <path d="M234 316 L664 316" fill="none" stroke="#765b98" stroke-width="2" stroke-dasharray="5 4"/>
+                <text x="240" y="332" class="svg-sub" fill="#765b98">s: AL_BEINGEXPANDED until its frame pops</text>
+
+                <!-- notes per step -->
+                <text x="124" y="364" class="svg-sub">command</text>
+                <text x="124" y="378" class="svg-sub">position:</text>
+                <text x="124" y="392" class="svg-sub">alias hit</text>
+                <text x="234" y="364" class="svg-sub">RE_READ_TOKEN;</text>
+                <text x="234" y="378" class="svg-sub">parser sees</text>
+                <text x="234" y="392" class="svg-sub">nothing</text>
+                <text x="344" y="364" class="svg-sub">still command</text>
+                <text x="344" y="378" class="svg-sub">position: hit,</text>
+                <text x="344" y="392" class="svg-sub">push again</text>
+                <text x="454" y="364" class="svg-sub">two WORDs;</text>
+                <text x="454" y="378" class="svg-sub">SUDO is not</text>
+                <text x="454" y="392" class="svg-sub">checked</text>
+                <text x="564" y="364" class="svg-sub">values end in</text>
+                <text x="564" y="378" class="svg-sub">a blank: no</text>
+                <text x="564" y="392" class="svg-sub">extra space;</text>
+                <text x="564" y="406" class="svg-sub">AL_EXPANDNEXT</text>
+                <text x="674" y="364" class="svg-sub">not command</text>
+                <text x="674" y="378" class="svg-sub">position, but</text>
+                <text x="674" y="392" class="svg-sub">ALEXPNEXT: hit</text>
+                <text x="784" y="364" class="svg-sub">ends on 'L':</text>
+                <text x="784" y="378" class="svg-sub">synthetic ␠</text>
+                <text x="784" y="392" class="svg-sub">delimits LL</text>
+                <text x="894" y="364" class="svg-sub">back on the</text>
+                <text x="894" y="378" class="svg-sub">real line,</text>
+                <text x="894" y="392" class="svg-sub">then '\n'</text>
+
+                
+                <text x="124" y="436" class="svg-note">Run: echo receives SUDO echo LL x and prints "SUDO echo LL x".</text>
+
+                <!-- side panel -->
+                <rect x="10" y="456" width="980" height="176" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="26" y="478" class="svg-lane">WHY alias hi=…; hi ON ONE LINE MISSES</text>
+                <rect x="26" y="490" width="300" height="128" rx="6" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="38" y="510" class="svg-step">1 · lex and parse the whole line</text>
+                <text x="38" y="530" class="svg-sub">alias hi="echo ALIASED"; hi there⏎</text>
+                <text x="38" y="550" class="svg-sub">hi is read as a plain WORD:</text>
+                <text x="38" y="566" class="svg-sub">the alias table has no hi yet</text>
+                <text x="38" y="590" class="svg-note">one inputunit per yyparse (§09)</text>
+                <path d="M326 554 L354 554" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-alias-push-ink)"/>
+                <rect x="356" y="490" width="300" height="128" rx="6" fill="#ece6f3" stroke="#765b98"/>
+                <text x="368" y="510" class="svg-step">2 · execute the tree</text>
+                <text x="368" y="530" class="svg-sub">alias builtin adds hi</text>
+                <text x="368" y="550" class="svg-sub">then runs WORD hi:</text>
+                <text x="368" y="566" class="svg-sub">hi: command not found, 127</text>
+                <text x="368" y="590" class="svg-note">tokens already read are not re-lexed</text>
+                <path d="M656 554 L684 554" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-alias-push-ink)"/>
+                <rect x="686" y="490" width="290" height="128" rx="6" fill="#dfede5" stroke="#367f59"/>
+                <text x="698" y="510" class="svg-step">3 · read the next line</text>
+                <text x="698" y="530" class="svg-sub">hi there⏎</text>
+                <text x="698" y="550" class="svg-sub">hi now in the table: push,</text>
+                <text x="698" y="566" class="svg-sub">re-read → ALIASED there</text>
+                <text x="698" y="590" class="svg-note">the change lands at a unit boundary</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              An alias becomes a new input line, not a new token. Blue: the frame
+              being read (current word orange); green: tokens to
+              <code>yyparse</code>. Thick black is a push or time, thin blue
+              tokens, dashed purple flags. The rules are read from
+              <code>bash/parse.y</code>:2018-2099, 2783-2840, 3248-3282 and
+              <code>bash/alias.c</code>:141-146 <span class="src">from the code</span>;
+              the order is derived, not traced
+              <span class="recon">reconstruction</span>. Outputs from
+              <code>/usr/bin/bash</code> 5.3.9 <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>What re-lexing text allows</h3>
+          <p>
+            Run with <code>bash -c</code> 5.3.9 and
+            <code>shopt -s expand_aliases</code>; ⏎ is a newline
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>alias hi="echo ALIASED"; hi there         → hi: command not found   (127)
+alias hi="echo ALIASED" ⏎ hi there        → ALIASED there
+alias q="echo \"open" ⏎ q close"          → open close
+alias begin="if true; then" ⏎ begin echo inside; fi   → inside
+alias LEFT="{" ⏎ LEFT echo one; echo two; }           → one, two
+g() { hi; } ⏎ alias hi="echo LATE" ⏎ g    → hi: command not found
+alias if=echo ⏎ if hello                  → hello
+eval "alias e3=\"echo e3-ran\"; e3"       → e3: command not found   (127)</code></pre>
+          <p>
+            Pushed text is classified like source, so the <code>if</code> in <code>begin</code> is a keyword. In E1
+            (<code>lab/results/e1-matrix.csv</code>, row al03) <code>bash -n</code>,
+            dash, shfmt, OSH, ShellCheck and brush all reject the same alias (named <code>cond</code> there),
+            since <code>-n</code> never runs the <code>alias</code> line; tree-sitter
+            accepts only because it has no reserved words. On <code>LEFT</code>
+            OSH exits 2; ShellCheck v0.11.0 reports SC1089
+            <span class="recon">measured here</span>. <code>g</code> shows a
+            function body binding at definition. <code>alias if=echo</code> works only in default
+            mode, where aliases are checked before reserved words; <code>bash --posix</code> and dash keep the keyword, and posix bash
+            fails with "unexpected end of file from `if'". <code>command_token_position</code> counts
+            <code>PST_REDIRLIST</code> as command position unless the last token
+            was a redirection operator (<code>bash/parse.y</code>:3144-3164)
+            <span class="src">from the code</span>, so
+            <code>&gt;/dev/stderr ll x</code> prints <code>LL x</code> and
+            <code>echo ok &gt; ll</code> writes a file named <code>ll</code>
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The same-line miss is the parse loop: one
+            <code>inputunit</code>, the grammar's start symbol and one
+            complete command (§08), is lexed and parsed before any of it runs
+            (§09), and <code>eval</code> parses its string the same way. POSIX's
+            execute-before-tokenize rule (XCU §2.3, quoted in §01) means alias
+            changes take effect no later than the end of the current complete
+            command (§2.3.1). POSIX 2024
+            says "it is unspecified whether the TOKEN is subject to
+            alias substitution" for reserved words; Issue 7 forbade it in
+            grammatical context <span class="src">from the docs</span>. bashref
+            says aliases expand "when a command is read"
+            (<code>bash/doc/bashref.texi</code>:8580-8588). That is incomplete:
+            inside <code>$( )</code> default mode defers to the child, posix mode
+            expands at read time (§07) <span class="src">from the code</span>.
+            (<code>alias_expand()</code> in <code>bash/alias.c</code> is readline's.)
+          </p>
+          <p>
+            The others move aliases elsewhere. OSH, after parsing a simple
+            command, builds a string and parses it with a new parser
+            (<code>oils/osh/cmd_parse.py</code>:1018-1150). That is its one
+            runtime-to-parser channel, and it cannot do <code>{</code> or
+            <code>for … do</code> aliases. mvdan/sh expands per word in its
+            interpreter and rejects values containing <code>;</code>
+            (<code>sh/interp/runner.go</code>:505-521). brush expands at run time,
+            "a total hack" (#57) per its comment
+            (<code>brush/brush-core/src/interp.rs</code>:1243). ShellCheck does not
+            expand and tree-sitter-bash has no aliases
+            <span class="src">from the code</span>; only ShellCheck warns, with
+            SC2262, that the alias "can't be defined and used in the same parsing
+            unit" <span class="recon">measured here</span>.
+          </p>

@@ -1,0 +1,300 @@
+          <h2 id="tokenize-first"><span class="secnum">{{S}}</span>A language you cannot tokenize first</h2>
+          <p class="lede">
+            Most languages lex the file, then parse the tokens. A
+            Bourne-family shell cannot. GNU bash keeps a Bison LALR(1) grammar
+            anyway and pays for it: a lexer that reads parser state, a
+            recursive parse inside words, a second parser at expansion time,
+            and a loop that parses one line and runs it before reading the next.
+          </p>
+          <p>
+            Two terms first. Bison is GNU's yacc: it compiles a grammar into
+            tables, and the generated function <code>yyparse</code> pulls one
+            token at a time from a lexer, either <em>shifting</em> it onto a
+            stack of numbered states or <em>reducing</em> the top of the stack
+            to a grammar rule's left-hand side. LALR(1) names the table
+            construction: each step is chosen from the current state and one
+            token of lookahead. Nothing in that model lets the lexer know which
+            state the parser is in, and a shell lexer needs exactly that
+            <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            With <code>/usr/bin/bash</code> 5.3.9 <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ bash -c 'for for in for; do for=for; done; echo $for'
+for</code></pre>
+          <p>
+            One spelling is a reserved word, a loop variable, a list item and
+            an assignment; Chet Ramey's bash chapter in <em>The Architecture of
+            Open Source Applications</em> (AOSA, vol. 1, §3.4) uses the example
+            <span class="src">from the docs</span>. The instrumented build
+            lexes the loop as
+            (<code>lab/results/trace-b.txt</code>)
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>FOR WORD IN WORD ';' DO ASSIGNMENT_WORD ';' DONE</code></pre>
+          <p>
+            Only position separates them.
+          </p>
+
+          <h3>Four places the split breaks</h3>
+          <p>
+            <strong>Keyword status depends on position.</strong> "Further
+            distinction on TOKEN is context-dependent" (XCU §2.10.1; XCU is the
+            Shell and Utilities volume of POSIX 1003.1-2024, XRAT its
+            rationale), and nine
+            numbered rules in §2.10.2, from command name to function body,
+            tell the lexer which reading the parser wants. The rationale
+            defines rule 1 by "the LR(1) lookahead set" (XRAT §C.2.10)
+            <span class="src">from the docs</span>.
+          </p>
+          <p>
+            <strong>Here-document bodies are not tokens.</strong> XCU §2.3
+            makes them a second major mode: the lines "immediately following
+            the next NEWLINE token form the body". They "do not appear in the
+            grammar directly" (XRAT) <span class="src">from the docs</span>.
+          </p>
+          <p>
+            <strong>Finding a word's end takes nested parsing.</strong> §2.3
+            rule 5: on <code>$(</code>, <code>${</code> or a backquote "the
+            shell shall recursively process them in the manner specified for
+            the construct that is found" <span class="src">from the docs</span>.
+            Calling that a recursive parser is this research's inference from
+            §2.6.3 <span class="recon">reconstruction</span>; bash makes it
+            literal (§07).
+          </p>
+          <p>
+            <strong>Parsing and running interleave.</strong> "The
+            complete_command shall be executed before the next complete_command
+            is tokenized and parsed" (XCU §2.3)
+            <span class="src">from the docs</span>. What runs changes what the
+            lexer accepts: an alias rewrites later lines, and
+            <code>extglob</code> is read at run time, so on the same line it
+            arrives too late <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ bash -c 'shopt -s extglob; echo @(a|b)'
+bash: -c: line 1: syntax error near unexpected token `('
+bash: -c: line 1: `shopt -s extglob; echo @(a|b)'</code></pre>
+
+          <h3>What bash's maintainer says</h3>
+          <p>
+            Chet Ramey, AOSA §3.4: the parser "is derived from an early version
+            of the Posix grammar, and is, as far as I know, the only
+            Bourne-style shell parser implemented using Yacc or Bison", and
+            needs "a lot of cooperation between the parser and the lexical
+            analyzer". §3.7.2, "What I Would Have Done Differently": "Were I
+            starting bash from scratch, I probably would have written a parser
+            by hand." <span class="src">from the docs</span>. The hedge stays:
+            it is the only source for the "only yacc shell" claim.
+          </p>
+
+          <h3>The running example</h3>
+<pre><code>LC_ALL=C sort -u &lt;in.txt 2&gt;/dev/null | head -n 3 &gt; out &amp;&amp; echo done</code></pre>
+          <p>
+            The instrumented build lexes this line into 18 tokens with
+            <code>parser_state</code> 0 throughout and returns a tree of
+            <code>COMMAND</code> structs, <code>&amp;&amp;</code> over
+            <code>|</code> over three simple commands
+            (<code>lab/results/trace-a.txt</code>)
+            <span class="recon">measured here</span>. Two tokens need more than
+            their characters: <code>LC_ALL=C</code> is an
+            <code>ASSIGNMENT_WORD</code> (flags 0x14) because it is in command
+            position, and <code>2</code> is a <code>NUMBER</code> because
+            <code>&gt;</code> follows; the <code>3</code> stays a
+            <code>WORD</code>. The post follows this line from bytes (§02) to
+            fork (§09) and expansion (§10). Figure {{fig-one-line}} is the map.
+          </p>
+
+          <figure class="figure wide" id="fig-one-line">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One line, top to bottom: bytes, the 18 measured tokens, the COMMAND tree</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 500" width="100%" role="img" aria-label="Left rail of five layers: shell_getc line buffer (section 02), read_token and read_token_word (sections 03 and 04), yyparse (section 08), the COMMAND tree, and execute then expand_words (sections 09 and 10). On the right, the source line LC_ALL=C sort -u &lt;in.txt 2&gt;/dev/null | head -n 3 &gt; out &amp;&amp; echo done, then 18 token boxes under the bytes they cover. Operators are green, ASSIGNMENT_WORD and NUMBER are orange, plain WORDs are blue. Below, the tree: a connection node for &amp;&amp; whose left child is a connection node for the pipe, over simple commands sort and head; its right child is the simple command echo done.">
+                <defs>
+                  <marker id="fig-one-line-arr-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-one-line-arr-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                </defs>
+
+                <!-- left rail -->
+                <rect x="8" y="34" width="166" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="18" y="51" class="svg-lane">shell_getc</text>
+                <text x="18" y="66" class="svg-sub">line buffer · §02</text>
+                <rect x="8" y="82" width="166" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="18" y="99" class="svg-lane">read_token</text>
+                <text x="18" y="114" class="svg-sub">_word · §03–§04</text>
+                <rect x="8" y="176" width="166" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="18" y="193" class="svg-lane">yyparse</text>
+                <text x="18" y="208" class="svg-sub">Bison LALR(1) · §08</text>
+                <rect x="8" y="270" width="166" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="18" y="287" class="svg-lane">COMMAND</text>
+                <text x="18" y="302" class="svg-sub">tree · §08</text>
+                <rect x="8" y="440" width="166" height="40" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="18" y="457" class="svg-lane">execute</text>
+                <text x="18" y="472" class="svg-sub">§09 · expand §10</text>
+                <path d="M91 74 L91 80" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-one-line-arr-ink)"/>
+                <path d="M91 122 L91 174" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-one-line-arr-ink)"/>
+                <path d="M91 216 L91 268" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-one-line-arr-ink)"/>
+                <path d="M91 310 L91 438" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-one-line-arr-ink)"/>
+
+                <!-- source bytes -->
+                <text x="196" y="22" class="svg-lane">the bytes (one physical line, one shell_getc refill)</text>
+                <text x="196" y="56" class="svg-sub" style="font-size:14px" textLength="906" lengthAdjust="spacing">LC_ALL=C sort -u &lt;in.txt 2&gt;/dev/null | head -n 3 &gt; out &amp;&amp; echo done</text>
+
+                <!-- token row (positions computed from byte offsets) -->
+<path d="M249 62 L255 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="196" y="80" width="118" height="42" rx="5" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+<text x="255" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">LC_ALL=C</text>
+<text x="255" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">ASSIGNMENT_WORD</text>
+<path d="M342 62 L337 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="318" y="80" width="39" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="337" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">sort</text>
+<text x="337" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M402 62 L380 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="361" y="80" width="39" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="380" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">-u</text>
+<text x="380" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M429 62 L420 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="404" y="80" width="32" height="42" rx="5" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+<text x="420" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">&lt;</text>
+<text x="420" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">'&lt;'</text>
+<path d="M476 62 L466 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="440" y="80" width="53" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="466" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">in.txt</text>
+<text x="466" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M536 62 L523 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="497" y="80" width="53" height="42" rx="5" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+<text x="523" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">2</text>
+<text x="523" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">NUMBER</text>
+<path d="M549 62 L570 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="554" y="80" width="32" height="42" rx="5" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+<text x="570" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">&gt;</text>
+<text x="570" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">'&gt;'</text>
+<path d="M616 62 L627 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="590" y="80" width="75" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="627" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">/dev/null</text>
+<text x="627" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M689 62 L685 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="669" y="80" width="32" height="42" rx="5" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+<text x="685" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">|</text>
+<text x="685" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">'|'</text>
+<path d="M742 62 L724 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="705" y="80" width="39" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="724" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">head</text>
+<text x="724" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M795 62 L767 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="748" y="80" width="39" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="767" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">-n</text>
+<text x="767" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M829 62 L810 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="790" y="80" width="39" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="810" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">3</text>
+<text x="810" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M856 62 L849 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="833" y="80" width="32" height="42" rx="5" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+<text x="849" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">&gt;</text>
+<text x="849" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">'&gt;'</text>
+<path d="M896 62 L889 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="869" y="80" width="39" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="889" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">out</text>
+<text x="889" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M949 62 L942 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="912" y="80" width="60" height="42" rx="5" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+<text x="942" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">&amp;&amp;</text>
+<text x="942" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">AND_AND</text>
+<path d="M1016 62 L996 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="976" y="80" width="39" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="996" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">echo</text>
+<text x="996" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M1076 62 L1039 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="1019" y="80" width="39" height="42" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+<text x="1039" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">done</text>
+<text x="1039" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">WORD</text>
+<path d="M1102 62 L1081 80" fill="none" stroke="#3c6f97" stroke-width="1"/>
+<rect x="1062" y="80" width="39" height="42" rx="5" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+<text x="1081" y="97" text-anchor="middle" class="svg-sub" style="font-size:13px;fill:#252525">⏎</text>
+<text x="1081" y="114" text-anchor="middle" class="svg-sub" style="font-size:11px">'\n'</text>
+
+                <!-- notes on the two orange tokens -->
+                <path d="M255 122 L255 140" fill="none" stroke="#d98226" stroke-width="1.5" stroke-dasharray="4 3"/>
+                <text x="196" y="154" class="svg-sub">flags 0x14 = W_ASSIGNMENT|W_NOSPLIT: command position</text>
+                <path d="M523 122 L640 140" fill="none" stroke="#d98226" stroke-width="1.5" stroke-dasharray="4 3"/>
+                <text x="640" y="154" class="svg-sub">NUMBER only because '&gt;' follows; the 3 stays WORD</text>
+                <text x="196" y="172" class="svg-note">parser_state = 0x0 for all 18 tokens; yacc_EOF comes in the next yyparse</text>
+
+                <!-- tokens to tree -->
+                <path d="M650 180 L650 214" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#fig-one-line-arr-blue)"/>
+                <text x="662" y="202" class="svg-sub">tokens shifted and reduced by yyparse</text>
+
+                <!-- tree -->
+                <rect x="560" y="218" width="180" height="44" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.5"/>
+                <text x="650" y="237" text-anchor="middle" class="svg-step">CONNECTION</text>
+                <text x="650" y="254" text-anchor="middle" class="svg-sub">connector AND_AND (&amp;&amp;)</text>
+
+                <rect x="380" y="292" width="180" height="44" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.5"/>
+                <text x="470" y="311" text-anchor="middle" class="svg-step">CONNECTION</text>
+                <text x="470" y="328" text-anchor="middle" class="svg-sub">connector '|'</text>
+
+                <rect x="860" y="292" width="200" height="62" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.5"/>
+                <text x="960" y="311" text-anchor="middle" class="svg-step">SIMPLE echo</text>
+                <text x="960" y="328" text-anchor="middle" class="svg-sub">words: echo done</text>
+                <text x="960" y="344" text-anchor="middle" class="svg-sub">builtin, runs in the parent</text>
+
+                <rect x="196" y="366" width="290" height="66" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.5"/>
+                <text x="341" y="384" text-anchor="middle" class="svg-step">SIMPLE sort</text>
+                <text x="341" y="401" text-anchor="middle" class="svg-sub">words: LC_ALL=C (0x14) sort -u</text>
+                <text x="341" y="418" text-anchor="middle" class="svg-sub">&lt;in.txt (fd 0) · 2&gt;/dev/null (fd 2)</text>
+
+                <rect x="506" y="366" width="230" height="66" rx="6" fill="#f7f7f5" stroke="#252525" stroke-width="1.5"/>
+                <text x="621" y="384" text-anchor="middle" class="svg-step">SIMPLE head</text>
+                <text x="621" y="401" text-anchor="middle" class="svg-sub">words: head -n 3</text>
+                <text x="621" y="418" text-anchor="middle" class="svg-sub">&gt;out (fd 1)</text>
+
+                <path d="M610 262 L500 292" fill="none" stroke="#b8b8b1" stroke-width="1.5"/>
+                <path d="M690 262 L930 292" fill="none" stroke="#b8b8b1" stroke-width="1.5"/>
+                <path d="M440 336 L360 366" fill="none" stroke="#b8b8b1" stroke-width="1.5"/>
+                <path d="M500 336 L600 366" fill="none" stroke="#b8b8b1" stroke-width="1.5"/>
+
+                <!-- what happens next -->
+                <rect x="196" y="446" width="906" height="34" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="210" y="468" class="svg-sub">§09 walks the tree and forks · §10 expand_words parses each word again</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Tokens, word flags, <code>parser_state</code> and tree are
+              measured by the instrumented pinned build
+              (<code>lab/results/trace-a.txt</code>). Green: decided by the
+              characters alone. Orange: decided by context, command position for
+              <code>LC_ALL=C</code>, the next character for <code>2</code>. Blue:
+              a plain <code>WORD</code>. Thin blue lines are data, the thick black
+              rail is the order the layers run, grey lines are tree edges. Layout
+              and the rail's section labels are drawn, not measured.
+            </p>
+          </figure>
+
+          <p>
+            A second example returns in §03, §06 and §07: a here-document on
+            the same line as a <code>$(case …)</code>
+            (<code>lab/results/trace-c.txt</code>), the input that makes
+            <code>parser_state</code> move.
+          </p>
+
+          <h3>The map</h3>
+          <p>
+            §02–§07 are the lexer and what it absorbs: input layer, parser
+            state, word classification, aliases, here-documents, the recursive
+            parse behind <code>$( )</code>. §08–§09 are the grammar, the tree
+            and the parse-one-run-one loop. §10–§11 are the parsers that run
+            later, on words and on data. §12–§13 set six other designs beside
+            bash: dash (hand-written recursive descent in C), mvdan/sh (Go; its
+            formatter binary is shfmt), Oils' OSH (Python with lexer modes),
+            ShellCheck (a Haskell linter built from parser combinators),
+            tree-sitter-bash (a generated parser for editors) and brush (Rust,
+            a parsing expression grammar). They are measured on 148 tricky
+            inputs and a 100,000-line script. §14
+            is the list of decisions a new shell parser forces, and maps them
+            back to the four breaks above. Afterwards you
+            should be able to predict when bash parses each part of a line,
+            read <code>parse.y</code> without getting lost, and recognise the
+            other designs by their costs.
+          </p>

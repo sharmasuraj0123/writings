@@ -1,0 +1,231 @@
+          <h2 id="writing-your-own"><span class="secnum">{{S}}</span>Writing your own</h2>
+          <p class="lede">
+            The implementations amount to a decision list, and each decision has a
+            measured cost. What you build fixes most answers. A shell that executes
+            must match bash's late parsing and its one-command loop. A formatter,
+            linter or editor wants a typed tree of the whole file, and pays in
+            memory and in the inputs where bash defers
+            <span class="recon">reconstruction</span>. Figure {{fig-decision-table}}
+            is the list; each paragraph below cites the evidence.
+          </p>
+
+          <figure class="figure" id="fig-decision-table">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Eight decisions, who chose what, and what it cost on the corpus</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Decision</th><th>Options seen</th><th>Who chose what</th><th>Measured consequence</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>1. When sub-languages parse</td><td>eager typed tree; late, as text</td><td>eager: OSH, mvdan, tree-sitter, ShellCheck. Late: bash backquotes, <code>${ }</code>, <code>$(( ))</code>; brush</td><td>ar06/ar07 pass <code>bash -n</code>, fail at run; ar01 rejected by shfmt, ShellCheck, tree-sitter (OSH accepts); ar08 also by OSH and dash; pe05</td></tr>
+                  <tr><td>2. Who owns lexer context</td><td>shared globals; parser-set field; mode argument; valid-symbol mask; ordered choice</td><td>bash, V7; dash, mvdan; OSH; tree-sitter; brush, ShellCheck</td><td>lc02 accepted only by bash, dash, brush@pin; ca01/ca08 break brush's paren counting</td></tr>
+                  <tr><td>3. Here-docs</td><td>FIFO drained at the next newline; body inside the redirect node</td><td>FIFO: bash, dash, mvdan, OSH, ShellCheck, brush. Node: tree-sitter</td><td>hd02/hd03 ERROR in tree-sitter; hd10 (unterminated): bash warns, five implementations reject</td></tr>
+                  <tr><td>4. <code>((</code> and <code>$((</code></td><td>bounded lookahead; backtracking; refusal</td><td>OSH (<code>((</code> only); brush, ShellCheck; mvdan</td><td>ar01: R in shfmt, ShellCheck, tree-sitter. ar08: only bash and brush accept</td></tr>
+                  <tr><td>5. Aliases</td><td>text push-back; re-parse a built string; word-level; none</td><td>bash; OSH; mvdan interp, brush; tree-sitter, ShellCheck</td><td>al03/al04 run in bash, rejected by every <code>-n</code></td></tr>
+                  <tr><td>6. Unit of parsing</td><td>one complete command; whole file</td><td>bash, dash, OSH run command by command; brush and all tools parse the file</td><td>brush refuses a file whose error follows <code>exit 0</code>; RSS flat vs 0.8–2.5 KiB/line</td></tr>
+                  <tr><td>7. Positions and printer</td><td>re-printer; formatter; lossless tree</td><td>bash <code>print_cmd.c</code>; shfmt; OSH</td><td>bash printer idempotent on 118 of 118; shfmt on 110 of 111</td></tr>
+                  <tr><td>8. Differential tests</td><td>bash as oracle; several shells; annotated spec</td><td>brush; mvdan; OSH</td><td>3,209 cases (718 known_failure); 4 shells; 223 files, 3,968 cases</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Options and choices are read in the checkouts and dossiers
+              <span class="src">from the code</span>; row ids and numbers are E1,
+              E2 and E3 lab results <span class="recon">measured here</span>. The
+              eight-way framing is mine <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            <strong>1. Decide when each sub-language is parsed.</strong> Eager typed
+            trees catch <code>$(( 1 + ))</code> statically; <code>bash -n</code>
+            does not (§13). But POSIX says <code>$((</code> is a command
+            substitution when arithmetic cannot parse it (XCU §2.6.3)
+            <span class="src">from the docs</span>, and only bash and brush accept G72
+            below, which bash runs as <code>hi there</code>; dash, shfmt, OSH, ShellCheck and
+            tree-sitter reject it <span class="recon">measured here</span>. Parse eagerly for a
+            tool, but keep each substitution's source text so a fallback stays
+            possible (§07) <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            <strong>2. Decide who owns lexer context, and make it explicit.</strong>
+            bash's lexer and grammar actions share globals (§03). OSH passes the
+            mode into <code>Read(lex_mode)</code> and the lexer stores none
+            (<code>oils/frontend/lexer.py</code>:336-363); mvdan's parser sets
+            <code>p.quote</code>; tree-sitter's scanner receives a
+            <code>valid_symbols</code> mask <span class="src">from the code</span>.
+            Any of these lets a test drive the lexer directly
+            <span class="recon">reconstruction</span>. It is also the coupling
+            behind Ramey's hand-written-parser regret, quoted in §01.
+          </p>
+          <p>
+            <strong>3. Model here-docs as a FIFO drained at the next newline
+            token.</strong> Every working implementation converged on it (§06,
+            §12). Oils got there after retracting a tree walk (§06). tree-sitter keeps
+            the body inside one redirect node, so two bodies on one line, G46,
+            are an ERROR <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <strong>4. Handle <code>((</code> and <code>$((</code> on
+            purpose.</strong> OSH scans the rest of the line with
+            <code>LookAheadDParens</code> for <code>((</code>; brush backtracks by
+            ordered choice (<code>brush/brush-parser/src/parser/peg.rs</code>:97-130)
+            <span class="src">from the code</span>. Or refuse, and document it, as
+            mvdan's README does, to keep streaming over an <code>io.Reader</code>
+            (§12).
+          </p>
+          <p>
+            <strong>5. Choose an alias policy.</strong> Compatibility needs text
+            pushed back inside the lexer: <code>push_string</code> saves the current
+            line and makes the alias text the line (<code>bash/parse.y</code>:2018-2076)
+            <span class="src">from the code</span>. OSH re-parses a built string and
+            cannot do <code>{</code> aliases; brush substitutes at run time, by its
+            own comment a hack (§12). Approximate,
+            and list the failures (§05).
+          </p>
+          <p>
+            <strong>6. If you execute, parse one complete command at a time.</strong>
+            POSIX requires it (XCU §2.3, quoted in §09), and it is
+            what lets an alias or <code>shopt</code> on one line change how the
+            next is lexed (§03, §05) <span class="recon">reconstruction</span>. Memory stays flat (§13). brush
+            parses whole files, so it forces extglob on "because we parse the
+            entire script with the same settings"
+            (<code>brush-core/src/shell.rs</code>:241-244)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            <strong>7. Keep source positions and a printer.</strong> A printer
+            gives idempotence tests: bash's is idempotent on all 118 printable
+            inputs, shfmt on 110 of 111 <span class="recon">measured here</span>.
+            It also shows what the tree drops (§08). OSH goes further: "the source
+            text can be reconstructed byte-for-byte from this tree"
+            (<code>oils/frontend/syntax.asdl</code>:1-4)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            <strong>8. Test differentially against real bash.</strong> brush runs
+            3,209 YAML cases with bash as oracle, 718 marked
+            <code>known_failure</code>. mvdan's syntax tests "confirm parses against
+            bash 5.3, dash, mksh R59, and zsh 5.9" (<code>sh/CLAUDE.md</code>:65)
+            <span class="src">from the docs</span>.
+            OSH's spec suite has 223 files and 3,968 cases, and at least one
+            BUG-bash annotation is stale for 5.3.9
+            (<code>oils/spec/alias.test.sh</code>:467-478)
+            <span class="recon">measured here</span>. Re-run the oracle.
+          </p>
+
+          <h3>A build order</h3>
+          <p>
+            The decisions fix a shape. Here is one buildable order for a parser
+            meant to execute scripts and also serve tools, assembled from the
+            mechanisms above; each step names what it copies
+            <span class="recon">reconstruction</span>.
+          </p>
+          <ol>
+            <li><strong>A line reader with a push-back stack.</strong> Hand out
+              one physical line at a time, delete backslash-newline before any
+              token exists, and serve pushed strings before the next refill, as
+              bash's <code>pushed_string_list</code> does for alias text (§02,
+              §05). Record line and column per byte now; positions added later
+              touch every token.</li>
+            <li><strong>A lexer that stores no mode.</strong> The caller passes
+              the mode and gets one token with its span, as in OSH's
+              <code>Read(lex_mode)</code>. Start with modes for command words,
+              double-quoted text, arithmetic, here-doc bodies, case patterns and
+              <code>[[ ]]</code>; OSH has 22 at <code>efaa863</code>, so expect the
+              list to grow (§12). Operators are longest match with up to two
+              characters of lookahead, for <code>&lt;&lt;-</code>,
+              <code>&lt;&lt;&lt;</code>, <code>&amp;&gt;&gt;</code> and
+              <code>;;&amp;</code> (§03).</li>
+            <li><strong>A recursive-descent command parser.</strong> One function
+              per POSIX level, <code>and_or</code>, <code>pipeline</code>,
+              <code>command</code>, <code>simple_command</code> (XCU §2.10.2), as
+              in dash. The parser decides keyword status: a keyword is a plain
+              word it interprets only where a keyword may stand, mvdan/sh's
+              <code>gotStmtPipe</code> and the effect of dash's
+              <code>checkkwd</code> (§12). Assignments, <code>NUMBER</code> and
+              <code>{fd}</code> are tests on the word and the character after it
+              (§04).</li>
+            <li><strong>A here-doc queue.</strong> On <code>&lt;&lt;</code>, append
+              a record with the delimiter and whether any of it was quoted. When
+              the lexer is about to return a newline token, read every pending
+              body raw, in order, ending each on an exact delimiter line (§06).
+              Decide now what an unterminated body is: bash warns, five of the six
+              others reject (§13).</li>
+            <li><strong>A word parser that recurses.</strong> A word is a list of
+              typed parts: literal, quoted, parameter, <code>${…}</code>,
+              <code>$( )</code>, <code>$(( ))</code>, backquote. On
+              <code>$(</code>, call the command parser on the same lexer with
+              <code>)</code> as its end token, as OSH does, instead of saving
+              globals the way <code>save_parser_state</code> must (§07, §12). On
+              <code>$((</code>, try arithmetic and, if it fails, rewind and parse
+              a command substitution, as XCU §2.6.3 asks and G72 tests. The rewind
+              needs the input buffered back to <code>$((</code>; mvdan/sh refuses
+              the case to stay streaming. Keep every part's source span.</li>
+            <li><strong>A driver with two loops.</strong> To execute: parse one
+              complete command, run it, free it, read on, so an alias or
+              <code>shopt -s extglob</code> takes effect on the next line and
+              memory stays flat (§09, §13). For tools: the same call looped to
+              end of file, collecting the list; then aliases need a policy (§05)
+              and extglob can be forced on, as brush does.</li>
+            <li><strong>A printer and two oracles.</strong> Print any tree back to
+              source and check that printing the re-parse gives the same text,
+              as E3 did for bash (§08). Diff accept/reject against
+              <code>bash -n</code> and against a real run, as E1 did; the two
+              disagree on eight inputs (§13). Start from the ten below.</li>
+          </ol>
+
+          <h3>Test inputs to start with</h3>
+          <p>
+            Ten gallery inputs, each with what <code>/usr/bin/bash</code> 5.3.9
+            does <span class="recon">measured here</span>; ⏎ marks a newline:
+          </p>
+<pre><code>for for in for; do for=for; done; echo $for          # G1:   for
+echo 2&gt;/dev/null x; echo 2 &gt;/dev/null; echo a2&gt;/dev/null; echo end
+                                                     # G12:  x, end
+echo a &amp;\⏎&amp; echo b                                   # G24:  a, b
+shopt -s expand_aliases; alias hi="echo ALIASED"⏎hi there
+                                                     # G35:  ALIASED there
+cat &lt;&lt;A; cat &lt;&lt;B⏎one⏎A⏎two⏎B                         # G46:  one, two
+x=$(cat &lt;&lt;EOF⏎hi⏎EOF)⏎echo "[$x]"                    # G54:  warning, [hi]
+echo $((echo hi); (echo there))                      # G72:  hi there
+((echo a); echo b)                                   # G74:  a, b
+bash -c 'echo a; fi; echo b'                         # G85:  error only, rc 2
+x='a[$(echo PWNED &gt;&amp;2)]'; echo $((x))                # G129: PWNED, 0</code></pre>
+
+          <p>
+            Ramey's other regret applies to anyone who ships: "I would have
+            introduced something like formal bash compatibility levels earlier"
+            (AOSA §3.7.2) <span class="src">from the docs</span>. bash's levels
+            reach into the parser. At <code>BASH_COMPAT</code> 51 or lower,
+            <code>parse_comsub</code> forces extglob on while it scans
+            <code>$( )</code> (<code>bash/parse.y</code>:4538-4542;
+            <code>bash/COMPAT</code>:583-590) <span class="src">from the code</span>.
+            Version parser behaviour from the first release
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>The four breaks, answered</h3>
+          <p>
+            §01 named four places where "lex the file, then parse the tokens"
+            breaks. Each is one of the decisions above. Keyword status by
+            position is decision 2: bash answers it with shared globals written
+            from 74 sites (§03); the others use a parser-set field, a mode
+            argument, a valid-symbol mask or backtracking. Here-doc bodies as a
+            second mode are decision 3, and every implementation but one
+            converged on the same queue. Nested parsing to find a word's end is
+            decisions 1 and 4: bash parses a <code>$( )</code> up to three times
+            and keeps only text (§07); the typed-tree parsers parse it once and
+            lose the <code>$((</code> fallback that G72 needs. Parsing
+            interleaved with running is decision 6: the flat 3.6–5.5 MiB of
+            <code>bash -n</code> and the same-line alias miss are one fact seen
+            twice (§09, §13). Most of the 69 disagreement rows in Figure
+            {{fig-disagreement}} are a place where another parser answered one
+            of these four questions differently
+            <span class="recon">reconstruction</span>. So a new shell parser
+            picks its four answers first, from what it is for, and its parsing
+            algorithm second.
+          </p>

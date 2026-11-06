@@ -1,0 +1,308 @@
+          <h2 id="parsers-on-data"><span class="secnum">{{S}}</span>Parsers that run on data: arithmetic, [[ ]], eval, imports</h2>
+          <p class="lede">
+            Some of bash's parsers run on run-time strings, not on the script.
+            <code>expr.c</code> parses a variable's value as an expression, and a
+            subscript inside that value gets full word expansion: data becomes code.
+            <code>eval</code>, <code>source</code>, traps and function import share one
+            parse-one-run-one loop. Shellshock was that loop run on environment text.
+          </p>
+
+          <h3>Arithmetic evaluates while it parses</h3>
+          <p>
+            <code>expr.c</code> is recursive descent with one C function per precedence
+            level, <code>expcomma</code> down to <code>exp0</code>
+            (<code>bash/expr.c</code>:214-229), over <code>intmax_t</code> with "no
+            checking for overflow" (21-23). It builds no tree. Each level returns a
+            value. A skipped operand is still parsed, under a file-static
+            <code>noeval</code> counter that suppresses assignment, lookup and division
+            by zero (179, 630-703) <span class="src">from the code</span>.
+          </p>
+<pre><code>$ echo $(( 0 &amp;&amp; 1/0 ))
+0
+$ echo $(( 2 ** 3 ** 2 )) $(( -2 ** 2 ))
+512 4</code></pre>
+          <p>
+            <code>**</code> is right-associative and binds looser than unary minus
+            <span class="recon">measured here</span> (<code>/usr/bin/bash</code> 5.3.9).
+            When <code>readtok</code> meets a name not followed by <code>=</code>, it
+            calls <code>expr_streval</code>, which fetches the value and parses it
+            (<code>bash/expr.c</code>:1227-1241; 13 lines omitted):
+          </p>
+<pre><code>  value = (e == ']') ? get_array_value (tok, aflag, &amp;es) : get_variable_value (v);
+  ...
+  tval = (value &amp;&amp; *value) ? subexpr (value) : 0;</code></pre>
+          <p>
+            Recursion stops at <code>MAX_EXPR_RECURSION_LEVEL</code>, 1024 (101-104)
+            <span class="src">from the code</span>. The value itself is not
+            word-expanded <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ x=x; echo $((x))
+bash: x: expression recursion level exceeded (error token is "x")
+$ c='$(echo 3)'; echo $((c))
+bash: $(echo 3): arithmetic syntax error: operand expected (error token is "$(echo 3)")</code></pre>
+          <p>
+            A subscript inside the value is. <code>array_expand_index</code> calls
+            <code>expand_arith_string</code>, full word expansion, before
+            <code>evalexp</code> (<code>bash/arrayfunc.c</code>:1366-1376)
+            <span class="src">from the code</span>. Figure {{fig-data-to-code}} follows
+            the path.
+          </p>
+
+          <figure class="figure wide" id="fig-data-to-code">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">How a variable's value reaches fork, and the two gates that do not close it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 670" width="100%" role="img" aria-label="Call path for echo $((x)) with x set to a[$(echo PWNED >&amp;2)]. Top row, left to right: expansion of the arithmetic text, evalexp, readtok, expr_streval fetching the value, subexpr parsing the value, nested readtok seeing an array reference. Second row, right to left: array_value_internal, array_expand_index, expand_arith_string, expand_word_internal and command_substitute, then a red box where the child forks and prints PWNED, then back in evalexp the result 0. Gate 1, expand_array_subscript, sits before evalexp and handles only subscripts written in the expression text. Gate 2, AV_NOEXPAND, sits before expand_arith_string and is set only when array_expand_once is on and the caller passed EXP_EXPANDED, which at the default compat level only let does. Inset: Shellshock before bash43-025, any variable whose value starts with () { was glued to its name and run with SEVAL_NONINT and SEVAL_NOHIST, so trailing echo VULN ran; today only BASH_FUNC_name%% variables are imported, with SEVAL_FUNCDEF and SEVAL_ONECMD and a three-part check.">
+                <defs>
+                  <marker id="fig-data-to-code-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                </defs>
+                <text x="15" y="26" class="svg-lane">1 · THE CALL PATH FOR  echo $((x))  WITH  x='a[$(echo PWNED &gt;&amp;2)]'</text>
+                <!-- row 1 -->
+                <rect x="15" y="40" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="25" y="60" class="svg-step">expand $(( ))</text>
+                <text x="25" y="80" class="svg-sub">the arithmetic text</text>
+                <text x="25" y="95" class="svg-sub">is word-expanded</text>
+                <text x="25" y="110" class="svg-sub">first; here just "x"</text>
+                <rect x="201" y="40" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="211" y="60" class="svg-step">evalexp</text>
+                <text x="211" y="80" class="svg-sub">expcomma … exp0</text>
+                <text x="211" y="95" class="svg-sub">one function per</text>
+                <text x="211" y="110" class="svg-sub">precedence level</text>
+                <rect x="387" y="40" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="397" y="60" class="svg-step">readtok</text>
+                <text x="397" y="80" class="svg-sub">x is a name; next</text>
+                <text x="397" y="95" class="svg-sub">token is not '='</text>
+                <text x="397" y="110" class="svg-sub">→ expr_streval</text>
+                <rect x="573" y="40" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="583" y="60" class="svg-step">expr_streval</text>
+                <text x="583" y="80" class="svg-sub">value of x:</text>
+                <text x="583" y="95" class="svg-sub">a[$(echo PWNED</text>
+                <text x="583" y="110" class="svg-sub">  &gt;&amp;2)]</text>
+                <rect x="759" y="40" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="769" y="60" class="svg-step">subexpr(value)</text>
+                <text x="769" y="80" class="svg-sub">the value is parsed</text>
+                <text x="769" y="95" class="svg-sub">as a new expression</text>
+                <text x="769" y="110" class="svg-sub">depth cap 1024</text>
+                <rect x="945" y="40" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="955" y="60" class="svg-step">readtok, nested</text>
+                <text x="955" y="80" class="svg-sub">a[…] is an array</text>
+                <text x="955" y="95" class="svg-sub">reference</text>
+                <text x="955" y="110" class="svg-sub">→ get_array_value</text>
+                <path d="M177 84 L197 84" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M363 84 L383 84" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M549 84 L569 84" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M735 84 L755 84" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M921 84 L941 84" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <!-- gate 1 on E -> evalexp -->
+                <rect x="183" y="64" width="6" height="40" fill="#d98226"/>
+                <text x="180" y="146" class="svg-num">GATE 1</text>
+                <rect x="15" y="154" width="530" height="58" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="25" y="172" class="svg-sub">expand_array_subscript (5.2+, subst.c:11102-11150): a subscript</text>
+                <text x="25" y="187" class="svg-sub">written in the expression text is expanded once, backslash-quoted.</text>
+                <text x="25" y="202" class="svg-sub">stops: $(( a[$k] )) at compat 53 · never sees: subscripts in values</text>
+                <!-- down to row 2 -->
+                <path d="M1025 130 L1025 226" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <!-- row 2, right to left -->
+                <rect x="945" y="230" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="955" y="250" class="svg-step">array_value_internal</text>
+                <text x="955" y="270" class="svg-sub">subscript text:</text>
+                <text x="955" y="285" class="svg-sub">$(echo PWNED</text>
+                <text x="955" y="300" class="svg-sub">  &gt;&amp;2)</text>
+                <rect x="759" y="230" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="769" y="250" class="svg-step">array_expand_index</text>
+                <text x="769" y="270" class="svg-sub">arrayfunc.c:1366</text>
+                <text x="769" y="285" class="svg-sub">AV_NOEXPAND clear,</text>
+                <text x="769" y="300" class="svg-sub">so expand first</text>
+                <rect x="573" y="230" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="583" y="250" class="svg-step">expand_arith_string</text>
+                <text x="583" y="270" class="svg-sub">full word expansion</text>
+                <text x="583" y="285" class="svg-sub">of the subscript</text>
+                <text x="583" y="300" class="svg-sub">subst.c:3981</text>
+                <rect x="387" y="230" width="160" height="88" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="397" y="250" class="svg-step">expand_word_internal</text>
+                <text x="397" y="270" class="svg-sub">$( found (§10)</text>
+                <text x="397" y="285" class="svg-sub">→ param_expand</text>
+                <text x="397" y="300" class="svg-sub">→ command_substitute</text>
+                <rect x="201" y="230" width="160" height="88" rx="6" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.8"/>
+                <text x="211" y="250" class="svg-step">fork; child parses</text>
+                <text x="211" y="270" class="svg-sub">parse_and_execute</text>
+                <text x="211" y="285" class="svg-sub">runs echo PWNED</text>
+                <text x="211" y="300" class="svg-sub" fill="#ad4b43">PWNED on stderr</text>
+                <rect x="15" y="230" width="160" height="88" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="25" y="250" class="svg-step">back in evalexp</text>
+                <text x="25" y="270" class="svg-sub">output is empty;</text>
+                <text x="25" y="285" class="svg-sub">echo $((x))</text>
+                <text x="25" y="300" class="svg-sub">prints 0</text>
+                <path d="M943 274 L923 274" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M757 274 L737 274" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M571 274 L551 274" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M385 274 L365 274" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M199 274 L179 274" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-data-to-code-ink)"/>
+                <!-- gate 2 on array_expand_index -> expand_arith_string -->
+                <rect x="743" y="254" width="6" height="40" fill="#d98226"/>
+                <text x="728" y="336" class="svg-num">GATE 2</text>
+                <rect x="440" y="344" width="665" height="58" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="450" y="362" class="svg-sub">AV_NOEXPAND (shopt -s array_expand_once): set only if the caller passed</text>
+                <text x="450" y="377" class="svg-sub">EXP_EXPANDED (expr.c:425, 1171); at compat 53 only let does (let.def:102).</text>
+                <text x="450" y="392" class="svg-sub">stops: let y=x · does not stop: $((x)), (( )), [[ -eq ]], declare -i</text>
+                <!-- inset -->
+                <line x1="15" y1="424" x2="1105" y2="424" stroke="#deded9" stroke-width="1"/>
+                <text x="15" y="450" class="svg-lane">2 · SHELLSHOCK: THE SAME LOOP, RUN ON ENVIRONMENT TEXT</text>
+                <text x="15" y="474" class="svg-lane">BEFORE BASH43-025</text>
+                <rect x="15" y="484" width="525" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="25" y="505" class="svg-sub">env x='() { :;}; echo VULN'   (any variable name)</text>
+                <rect x="15" y="530" width="525" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="25" y="551" class="svg-sub">value starts "() {" → glue "x " → "x () { :;}; echo VULN"</text>
+                <rect x="15" y="576" width="525" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="25" y="597" class="svg-sub">parse_and_execute (…, SEVAL_NONINT|SEVAL_NOHIST)</text>
+                <rect x="15" y="622" width="525" height="34" rx="5" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.5"/>
+                <text x="25" y="643" class="svg-sub" fill="#ad4b43">the loop defines x, then parses and runs echo VULN</text>
+                <text x="580" y="474" class="svg-lane">TODAY (9c46586; 5.3.9 MEASURED)</text>
+                <rect x="580" y="484" width="525" height="34" rx="5" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="590" y="505" class="svg-sub">only BASH_FUNC_x%%='() {…' is imported; x=… stays a string</text>
+                <rect x="580" y="530" width="525" height="34" rx="5" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="590" y="551" class="svg-sub">glue "x " → parse_and_execute (…|SEVAL_FUNCDEF|SEVAL_ONECMD)</text>
+                <rect x="580" y="576" width="525" height="34" rx="5" fill="#f7e3c8" stroke="#d98226" stroke-width="1.5"/>
+                <text x="590" y="597" class="svg-sub">cm_function_def? parser_remaining_input() empty? name same?</text>
+                <rect x="580" y="622" width="525" height="34" rx="5" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="590" y="643" class="svg-sub" fill="#367f59">all three: define x, run nothing · else "ignoring function …"</text>
+                <path d="M277 518 L277 528" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M277 564 L277 574" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M277 610 L277 620" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M842 518 L842 528" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M842 564 L842 574" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-data-to-code-ink)"/>
+                <path d="M842 610 L842 620" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-data-to-code-ink)"/>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Blue is parsing or evaluation inside bash, orange a defence, red a command
+              that runs, green the safe outcome; thick black arrows are calls in order.
+              Path and gates are read from <code>bash/expr.c</code>,
+              <code>bash/arrayfunc.c</code> and <code>bash/subst.c</code> at 9c46586;
+              PWNED, the 0 and both gate outcomes are measured with
+              <code>/usr/bin/bash</code> 5.3.9. Inset: left from the bash43-025 patch,
+              right from <code>bash/variables.c</code>:399-424 and
+              <code>bash/builtins/evalstring.c</code>:465-478.
+            </p>
+          </figure>
+
+          <h3>One string, many doors</h3>
+          <p>
+            With <code>x='a[$(echo PWNED &gt;&amp;2)]'</code>, each cell is a run of
+            <code>/usr/bin/bash</code> 5.3.9 <span class="recon">measured here</span>.
+          </p>
+          <table>
+            <thead><tr><th>Construct</th><th>Runs the command?</th></tr></thead>
+            <tbody>
+              <tr><td><code>echo $((x))</code>, <code>(( x == 0 ))</code></td><td>yes</td></tr>
+              <tr><td><code>[[ $x -eq 0 ]]</code>, <code>[[ -v $x ]]</code></td><td>yes</td></tr>
+              <tr><td><code>let y=x</code>; <code>declare -i n; n=$x</code></td><td>yes</td></tr>
+              <tr><td><code>printf -v "$x"</code>, <code>read "$x"</code>, <code>${!x}</code></td><td>yes</td></tr>
+              <tr><td><code>unset "$x"</code></td><td>no while <code>a</code> is unset or associative (changed in 5.2, <code>bash/NEWS</code>:233-235); yes once <code>a</code> is an indexed array</td></tr>
+              <tr><td><code>test "$x" -eq 0</code></td><td>no: "integer expected"</td></tr>
+              <tr><td><code>shopt -s array_expand_once</code>, then <code>$((x))</code></td><td>yes</td></tr>
+              <tr><td><code>shopt -s array_expand_once</code>, then <code>let y=x</code></td><td>no: syntax error</td></tr>
+              <tr><td><code>k='$(echo PWNED &gt;&amp;2)'; echo $(( a[$k] ))</code></td><td>no: syntax error</td></tr>
+              <tr><td>the same with <code>BASH_COMPAT=51</code></td><td>yes</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Two defences exist, and neither covers the value path. Since 5.2,
+            <code>expand_array_subscript</code> expands a subscript written in the
+            expression once and backslash-quotes the result
+            (<code>bash/subst.c</code>:11102-11150, 11393-11405). The option
+            <code>array_expand_once</code> sets <code>AV_NOEXPAND</code> only when the
+            caller passed <code>EXP_EXPANDED</code> (<code>bash/expr.c</code>:425, 1171),
+            and at the default compat level only <code>let</code> passes it
+            (<code>bash/builtins/let.def</code>:102) <span class="src">from the code</span>.
+            The manual says it "suppresses multiple evaluation of associative and
+            indexed array subscripts during arithmetic expression evaluation"
+            (<code>bash/doc/bash.1</code>:11843-11851) <span class="src">from the docs</span>.
+            The code wins. <code>test</code> demands a plain integer first
+            (<code>bash/test.c</code>:357-379). OSH disallows command substitution in
+            dynamic arithmetic by default (<code>oils/doc/known-differences.md</code>:41-60)
+            <span class="src">from the docs</span>; brush fails to parse the value
+            <span class="recon">measured here</span>.
+          </p>
+
+          <h3>[[ ]] at run time</h3>
+          <p>
+            <code>cond_expand_word</code> never splits. It dequotes the left side and
+            passes the right side of
+            <code>==</code> or <code>=~</code> through
+            <code>quote_string_for_globbing</code>, so quoted parts become escaped
+            literals (<code>bash/subst.c</code>:4077-4124). Pattern matching forces
+            <code>extended_glob = 1</code> around the call
+            (<code>bash/execute_cmd.c</code>:4109-4111) <span class="src">from the code</span>.
+          </p>
+<pre><code>$ x="a*"; [[ abc == $x ]] &amp;&amp; echo match; [[ abc == "$x" ]] || echo no-match
+match
+no-match
+$ set -x; [[ $x == "$x"* ]]
++ [[ a* == a\** ]]</code></pre>
+          <p>
+            The trace shows the pattern as the matcher sees it: a literal
+            <code>a*</code>, then a live <code>*</code> <span class="recon">measured here</span>.
+          </p>
+
+          <h3>One loop for every string</h3>
+          <p>
+            <code>parse_and_execute</code> parses one command, runs it and repeats (<code>bash/builtins/evalstring.c</code>:359,
+            451, 567-569). <code>-c</code>, <code>eval</code>, <code>source</code>,
+            traps, <code>PROMPT_COMMAND</code>, comsub children and function import
+            differ only in <code>SEVAL_*</code> flags
+            (<code>bash/builtins/common.h</code>:44-55) <span class="src">from the code</span>.
+            The consequences are §09's rules applied to strings. An alias defined
+            inside an <code>eval</code> string misses the rest of that line, exit
+            127, as in §05's last row; split by a newline, the string prints
+            <code>e3-ran</code>. A trap string is parsed only when it fires
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ trap "echo ok; if" EXIT; echo defined
+defined
+bash: exit trap: line 2: syntax error: unexpected end of file from `if' command on line 1</code></pre>
+          <p>
+            The definition succeeds; the syntax error surfaces at exit.
+          </p>
+
+          <h3>Shellshock: the loop run on environment text</h3>
+          <p>
+            Before 2014 the importer pasted <code>name </code> onto any environment value
+            starting <code>() {</code> and called <code>parse_and_execute</code> with
+            <code>SEVAL_NONINT|SEVAL_NOHIST</code>. The loop did its job: it ran the
+            definition, then whatever followed it. Three patches closed it
+            (ftp.gnu.org/gnu/bash/bash-4.3-patches/): bash43-025 added
+            <code>SEVAL_FUNCDEF|SEVAL_ONECMD</code>, bash43-027 moved imports into
+            <code>BASH_FUNC_name%%</code> variables, and bash43-030 added the remaining-input
+            test <span class="src">from the docs</span>. Today the parser is the
+            validator, before anything runs
+            (<code>bash/builtins/evalstring.c</code>:465-478, a five-line comment trimmed):
+          </p>
+<pre><code>	      if (flags &amp; SEVAL_FUNCDEF)
+		{
+		  char *x;
+
+		  if (command-&gt;type != cm_function_def ||
+		      ((x = parser_remaining_input ()) &amp;&amp; *x) ||
+		      (STREQ (from_file, command-&gt;value.Function_def-&gt;name-&gt;word) == 0))
+		    {
+		      internal_warning (_("%s: ignoring function definition attempt"), from_file);</code></pre>
+          <p>
+            <code>parser_remaining_input</code> returns the unread tail of
+            <code>shell_input_line</code> (<code>bash/parse.y</code>:2976-2983)
+            <span class="src">from the code</span>. On 5.3.9 the classic probe prints only
+            <code>probe-done</code> <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ env 'x=() { :;}; echo VULN' bash -c 'echo probe-done'
+probe-done</code></pre>
+          <p>
+            The value it parses is not the user's text: <code>export -f</code> writes bash's
+            re-printed body (<code>bash/variables.c</code>:4720-4746), two spaces after
+            the brace, so the importer parses printer output
+            <span class="recon">measured here</span>. POSIX left exported functions out: "There are numerous security problems
+            associated with functions appearing in the environment" (XRAT §C.2.9.5)
+            <span class="src">from the docs</span>. Bash kept <code>export -f</code>; it
+            still works.
+          </p>

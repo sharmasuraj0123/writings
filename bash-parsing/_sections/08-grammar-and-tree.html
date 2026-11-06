@@ -1,0 +1,638 @@
+          <h2 id="grammar-and-tree"><span class="secnum">{{S}}</span>The Bison grammar and the COMMAND tree</h2>
+          <p class="lede">
+            With the context work done in the lexer, the grammar that remains
+            is small and has no unresolved conflicts. Precedence declarations,
+            not one nonterminal per level, decide the shape of lists and
+            pipelines. The tree is a C tagged union whose words are still
+            unparsed text, and a printer turns any tree back into source,
+            showing what the tree dropped.
+          </p>
+
+          <h3>The tables</h3>
+          <p>
+            The checked-in <code>y.tab.c</code> is GNU Bison 3.8.2 output with
+            <code>YYNTOKENS</code> 63, <code>YYNNTS</code> 40,
+            <code>YYNRULES</code> 180 (counting <code>$accept</code>) and
+            <code>YYNSTATES</code> 358 (<code>bash/y.tab.c</code>:1037-1048)
+            <span class="src">from the code</span>. The 63 terminals are 3
+            specials, 11 character literals and 49 names: 48 on
+            <code>%token</code> lines plus <code>yacc_EOF</code>, which enters
+            only through <code>%left</code> (<code>bash/parse.y</code>:389-406,
+            430) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Reading those numbers needs three terms. A <em>state</em> is a set of
+            <em>items</em>: rules with a dot marking how much of the right-hand
+            side is already on the stack. The table maps each state and
+            lookahead token to shift, reduce by a numbered rule, or error. A
+            <em>shift/reduce conflict</em> is a state where one lookahead
+            allows both. Bison compares the rule's precedence with the token's,
+            as declared by <code>%left</code> or <code>%right</code>; on a tie
+            the associativity decides, and where either has no precedence "the
+            default is to shift" and the conflict is reported (Bison 3.8.2
+            manual, §5.2 "Shift/Reduce Conflicts", §5.3.5 "How Precedence
+            Works") <span class="src">from the docs</span>.
+          </p>
+          <p>
+            <code>lab/scripts/e3_bison.sh</code> rebuilt the parser with bison
+            3.8.2 in 0.53 s, one run on the shared 2-vCPU lab VM. The result
+            differs from the shipped file in 0 lines outside
+            <code>#line</code> directives. Bison reports no unresolved
+            conflicts, and 45 shift/reduce conflicts resolved by
+            <code>%left</code>/<code>%right</code>
+            (<code>lab/results/e3-bison.txt</code>) <span class="recon">measured here</span>.
+            So bash-2.0's "all 66 shift-reduce conflicts are gone"
+            (<code>bash/NEWS</code>:2728-2729) means unresolved ones
+            <span class="src">from the docs</span>.
+          </p>
+
+          <h3>Precedence instead of levels</h3>
+          <p>
+            Three lines of <code>bash/parse.y</code>, 428-432, settle every
+            list and pipeline <span class="src">from the code</span>:
+          </p>
+<pre><code>%start inputunit
+
+%left '&amp;' ';' '\n' yacc_EOF
+%left AND_AND OR_OR
+%right '|' BAR_AND</code></pre>
+          <p>
+            The list rules are ambiguous binary recursions. The top-level ones,
+            as numbered in Bison's report (<code>lab/build/e3/parse.output</code>,
+            Grammar section), are <span class="recon">measured here</span>:
+          </p>
+<pre><code>  163 simple_list1: simple_list1 AND_AND newline_list simple_list1
+  164             | simple_list1 OR_OR newline_list simple_list1
+  165             | simple_list1 '&amp;' simple_list1
+  166             | simple_list1 ';' simple_list1
+  167             | pipeline_command</code></pre>
+          <p>
+            <code>list1</code> inside compound commands has the same shape
+            (<code>bash/parse.y</code>:1286-1306). Between two operators on one
+            <code>%left</code> line Bison reduces, so lists come out left-heavy; the
+            printer's comment says "the parser builds lists to be left-side
+            heavy" (<code>bash/print_cmd.c</code>:330-334). <code>%right
+            '|'</code> makes pipelines right-nested, and
+            <code>execute_pipeline</code> walks down <code>-&gt;second</code>
+            (<code>bash/execute_cmd.c</code>:2641-2642, 2716)
+            <span class="src">from the code</span>. POSIX spends a nonterminal
+            per level (<code>and_or</code>, <code>pipeline</code>,
+            <code>pipe_sequence</code>) and splits a simple command into
+            <code>cmd_prefix</code>, <code>cmd_word</code> and
+            <code>cmd_suffix</code> (XCU §2.10.2) <span class="src">from the docs</span>.
+            bash lets any word, assignment or redirection appear anywhere:
+            <code>&gt;pre echo x</code> prints back as <code>echo x &gt;
+            pre</code> <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The trace of the running example shows the automaton at work. A
+            command-initial <code>WORD</code> enters state 13, which holds two
+            items, so the parser reads one more token before reducing
+            (<code>lab/build/e3/parse.output</code>, State 13, lookahead list
+            trimmed to …) <span class="recon">measured here</span>:
+          </p>
+<pre><code>   55 simple_command_element: WORD •  [THEN, ELSE, …, '|', '&gt;', '&lt;', '}', ')']
+  101 function_def: WORD • '(' ')' newline_list function_body
+
+    '('  shift, and go to state 85
+    $default  reduce using rule 55 (simple_command_element)</code></pre>
+          <p>
+            With the lookahead <code>AND_AND</code> in state 237, rule 173,
+            the <code>|</code> rule, reduces before
+            <code>&amp;&amp;</code> is shifted, which puts <code>&amp;&amp;</code>
+            above <code>|</code>. The line's parse takes 18 shifts and 42
+            reductions (19 and 43 with the next <code>yyparse</code>'s
+            <code>yacc_EOF</code>), with the stack at most 7 states deep. Rule 1 ends the
+            parse with <code>YYACCEPT</code>, and <code>$end</code> is never
+            shifted (<code>lab/results/trace-a.txt</code>)
+            <span class="recon">measured here</span>. Figure {{fig-precedence}}
+            puts the ladder beside the shapes.
+          </p>
+
+          <figure class="figure wide" id="fig-precedence">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Six nonterminals and three precedence lines decide every list and pipeline shape</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 560" width="100%" role="img" aria-label="Left: the nonterminal ladder of bash&#x27;s grammar from inputunit through simple_list, simple_list1, pipeline_command, pipeline and command down to simple_command, shell_command with 11 alternatives, function_def and coproc. Beside it, three precedence bands: %left &amp; ; newline yacc_EOF and %left AND_AND OR_OR at the simple_list1 level, %right | BAR_AND at the pipeline level. Right: five small trees. a; b; c is left-heavy. a | b | c is right-nested. a | b &amp;&amp; c, the running example, puts &amp;&amp; above | because rule 173 reduces in state 237 on lookahead AND_AND. a; b &amp; c is grouped by yacc as (a; b) &amp; c and rewritten by connect_async_list to a; (b &amp; c). [[ a || b || c ]] nests to the right through the lexer&#x27;s recursive descent.">
+                <defs>
+                  <marker id="fig-precedence-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-precedence-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-precedence-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">NONTERMINAL LADDER (parse.y)</text>
+                <rect x="20" y="38" width="250" height="44" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="30" y="56" class="svg-step">inputunit</text>
+                <text x="30" y="73" class="svg-sub">rules 1-8: list, comsub, funsub, ...</text>
+                <rect x="20" y="102" width="250" height="44" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="30" y="120" class="svg-step">simple_list</text>
+                <text x="30" y="137" class="svg-sub">simple_list1 [ '&amp;' | ';' ]</text>
+                <rect x="20" y="166" width="250" height="44" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="30" y="184" class="svg-step">simple_list1</text>
+                <text x="30" y="201" class="svg-sub">x &amp;&amp; x · x || x · x &amp; x · x ; x</text>
+                <rect x="20" y="230" width="250" height="44" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="30" y="248" class="svg-step">pipeline_command</text>
+                <text x="30" y="265" class="svg-sub">[ ! | time ] pipeline</text>
+                <rect x="20" y="294" width="250" height="44" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="30" y="312" class="svg-step">pipeline</text>
+                <text x="30" y="329" class="svg-sub">x | x · x |&amp; x · command</text>
+                <rect x="20" y="358" width="250" height="44" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="30" y="376" class="svg-step">command</text>
+                <text x="30" y="393" class="svg-sub">rules 62-66</text>
+                <path d="M60 82 L60 102" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M60 146 L60 166" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M60 210 L60 230" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M60 274 L60 294" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M60 338 L60 358" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <rect x="20" y="428" width="122" height="44" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="28" y="446" class="svg-step">simple_command</text>
+                <text x="28" y="463" class="svg-sub">any element order</text>
+                <rect x="148" y="428" width="122" height="44" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="156" y="446" class="svg-step">shell_command</text>
+                <text x="156" y="463" class="svg-sub">11 alternatives</text>
+                <rect x="20" y="480" width="122" height="44" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="28" y="498" class="svg-step">function_def</text>
+                <text x="28" y="515" class="svg-sub">WORD ( ) body</text>
+                <rect x="148" y="480" width="122" height="44" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="156" y="498" class="svg-step">coproc</text>
+                <text x="156" y="515" class="svg-sub">COPROC ...</text>
+                <path d="M60 402 L60 428" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M60 418 L188 418 L188 428" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <rect x="290" y="98" width="236" height="116" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="300" y="116" class="svg-sub" fill="#252525" font-weight="700">%left '&amp;' ';' '\n' yacc_EOF</text>
+                <text x="300" y="132" class="svg-sub">lowest: '&amp;' ';' in rules 161-166</text>
+                <text x="300" y="146" class="svg-sub">and list1 '\n' in compound lists</text>
+                <rect x="304" y="158" width="208" height="50" rx="6" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="314" y="176" class="svg-sub" fill="#252525" font-weight="700">%left AND_AND OR_OR</text>
+                <text x="314" y="192" class="svg-sub">binds tighter than ; and &amp;</text>
+                <rect x="290" y="290" width="236" height="52" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="300" y="310" class="svg-sub" fill="#252525" font-weight="700">%right '|' BAR_AND</text>
+                <text x="300" y="327" class="svg-sub">highest; rules 173-174</text>
+                <text x="290" y="378" class="svg-note">lower on the page binds tighter</text>
+                <text x="290" y="394" class="svg-note">%left: left-heavy; %right: right-nested</text>
+                <path d="M552 20 L552 540" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="580" y="22" class="svg-lane">TREE SHAPES THEY PRODUCE</text>
+                <text x="580" y="60" class="svg-step">a; b; c</text>
+                <text x="580" y="78" class="svg-sub">%left ';' -&gt; left-heavy</text>
+                <text x="580" y="92" class="svg-sub">"lists to be left-side heavy"</text>
+                <path d="M910 70 L866 80" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M866 100 L844.0 112" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="844.0" y="124" class="svg-sub" text-anchor="middle" fill="#252525">a</text>
+                <path d="M866 100 L888.0 112" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="888.0" y="124" class="svg-sub" text-anchor="middle" fill="#252525">b</text>
+                <rect x="851.0" y="80" width="30" height="20" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="866" y="94" class="svg-sub" text-anchor="middle" fill="#252525">;</text>
+                <path d="M910 70 L954 82" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="954" y="94" class="svg-sub" text-anchor="middle" fill="#252525">c</text>
+                <rect x="895.0" y="50" width="30" height="20" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="910" y="64" class="svg-sub" text-anchor="middle" fill="#252525">;</text>
+                <path d="M572 136 L1104 136" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="580" y="160" class="svg-step">a | b | c</text>
+                <text x="580" y="178" class="svg-sub">%right '|' -&gt; right-nested</text>
+                <text x="580" y="192" class="svg-sub">execute_pipeline walks</text>
+                <text x="580" y="206" class="svg-sub">-&gt;second</text>
+                <path d="M910 170 L866 182" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="866" y="194" class="svg-sub" text-anchor="middle" fill="#252525">a</text>
+                <path d="M910 170 L954 180" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M954 200 L932.0 212" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="932.0" y="224" class="svg-sub" text-anchor="middle" fill="#252525">b</text>
+                <path d="M954 200 L976.0 212" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="976.0" y="224" class="svg-sub" text-anchor="middle" fill="#252525">c</text>
+                <rect x="939.0" y="180" width="30" height="20" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="954" y="194" class="svg-sub" text-anchor="middle" fill="#252525">|</text>
+                <rect x="895.0" y="150" width="30" height="20" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="910" y="164" class="svg-sub" text-anchor="middle" fill="#252525">|</text>
+                <path d="M572 236 L1104 236" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="580" y="260" class="svg-step">a | b &amp;&amp; c  (running example)</text>
+                <text x="580" y="278" class="svg-sub">state 237, lookahead AND_AND:</text>
+                <text x="580" y="292" class="svg-sub">rule 173 reduces the pipeline</text>
+                <text x="580" y="306" class="svg-sub">first (measured, trace-a)</text>
+                <path d="M910 270 L866 280" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M866 300 L844.0 312" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="844.0" y="324" class="svg-sub" text-anchor="middle" fill="#252525">a</text>
+                <path d="M866 300 L888.0 312" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="888.0" y="324" class="svg-sub" text-anchor="middle" fill="#252525">b</text>
+                <rect x="851.0" y="280" width="30" height="20" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="866" y="294" class="svg-sub" text-anchor="middle" fill="#252525">|</text>
+                <path d="M910 270 L954 282" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="954" y="294" class="svg-sub" text-anchor="middle" fill="#252525">c</text>
+                <rect x="895.0" y="250" width="30" height="20" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="910" y="264" class="svg-sub" text-anchor="middle" fill="#252525">&amp;&amp;</text>
+                <path d="M572 336 L1104 336" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="580" y="360" class="svg-step">a; b &amp; c</text>
+                <text x="580" y="378" class="svg-sub">yacc groups (a; b) &amp; c (red);</text>
+                <text x="580" y="392" class="svg-sub">connect_async_list rotates &amp;</text>
+                <text x="580" y="406" class="svg-sub">onto the last ; element (green)</text>
+                <path d="M860 370 L824 380" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M824 400 L806.0 412" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="806.0" y="424" class="svg-sub" text-anchor="middle" fill="#252525">a</text>
+                <path d="M824 400 L842.0 412" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="842.0" y="424" class="svg-sub" text-anchor="middle" fill="#252525">b</text>
+                <rect x="809.0" y="380" width="30" height="20" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="824" y="394" class="svg-sub" text-anchor="middle" fill="#252525">;</text>
+                <path d="M860 370 L896 382" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="896" y="394" class="svg-sub" text-anchor="middle" fill="#252525">c</text>
+                <rect x="845.0" y="350" width="30" height="20" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="860" y="364" class="svg-sub" text-anchor="middle" fill="#252525">&amp;</text>
+                <path d="M1040 370 L1004 382" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="1004" y="394" class="svg-sub" text-anchor="middle" fill="#252525">a</text>
+                <path d="M1040 370 L1076 380" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M1076 400 L1058.0 412" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="1058.0" y="424" class="svg-sub" text-anchor="middle" fill="#252525">b</text>
+                <path d="M1076 400 L1094.0 412" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="1094.0" y="424" class="svg-sub" text-anchor="middle" fill="#252525">c</text>
+                <rect x="1061.0" y="380" width="30" height="20" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="1076" y="394" class="svg-sub" text-anchor="middle" fill="#252525">&amp;</text>
+                <rect x="1025.0" y="350" width="30" height="20" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="1040" y="364" class="svg-sub" text-anchor="middle" fill="#252525">;</text>
+                <path d="M915 374 L975 374" fill="none" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-precedence-ink)"/>
+                <path d="M572 436 L1104 436" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="580" y="460" class="svg-step">[[ a || b || c ]]</text>
+                <text x="580" y="478" class="svg-sub">COND_COM, built by recursive</text>
+                <text x="580" y="492" class="svg-sub">descent inside read_token;</text>
+                <text x="580" y="506" class="svg-sub">a bare word becomes -n word</text>
+                <path d="M910 470 L866 482" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="866" y="494" class="svg-sub" text-anchor="middle" fill="#252525">-n a</text>
+                <path d="M910 470 L954 480" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <path d="M954 500 L932.0 512" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="932.0" y="524" class="svg-sub" text-anchor="middle" fill="#252525">-n b</text>
+                <path d="M954 500 L976.0 512" fill="none" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="976.0" y="524" class="svg-sub" text-anchor="middle" fill="#252525">-n c</text>
+                <rect x="939.0" y="480" width="30" height="20" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="954" y="494" class="svg-sub" text-anchor="middle" fill="#252525">||</text>
+                <rect x="895.0" y="450" width="30" height="20" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="910" y="464" class="svg-sub" text-anchor="middle" fill="#252525">||</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Lists lean left, pipelines lean right, and <code>&amp;</code> is
+              moved after parsing. Left: the nonterminal ladder and rule numbers
+              from <code>lab/build/e3/parse.output</code>; bands are the
+              <code>%left</code>/<code>%right</code> lines of
+              <code>bash/parse.y</code>:428-432 <span class="src">from the code</span>.
+              Right: tree nodes are CONNECTIONs (blue) or COND_COM nodes
+              (purple). The running example's reduction is from
+              <code>lab/results/trace-a.txt</code> <span class="recon">measured here</span>.
+              The other shapes, including yacc's grouping (red) and
+              <code>connect_async_list</code>'s rewrite (green), are worked out
+              from the rules, <code>bash/make_cmd.c</code>:820-862 and
+              <code>cond_or</code> (<code>bash/parse.y</code>:5037-5049)
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <h3>Fix-ups in the actions</h3>
+          <p>
+            yacc groups <code>a; b &amp;</code> as <code>(a; b) &amp;</code>.
+            <code>connect_async_list</code> walks down the <code>;</code>
+            chain and moves the <code>&amp;</code> onto its last element: "This
+            function takes the `&amp;' and applies it to the last command in
+            the list" (<code>bash/make_cmd.c</code>:820-862)
+            <span class="src">from the code</span>. In <code>sleep 0.5; echo A
+            &amp; echo B</code> the sleep stays in the foreground, about 537 ms
+            in the grammar dossier's run and 518 ms in a rerun of <code>/usr/bin/bash -c</code> here
+            <span class="recon">measured here</span>. <code>!</code> toggles
+            <code>CMD_INVERT_RETURN</code> with XOR, so <code>! !</code>
+            cancels (<code>bash/parse.y</code>:1408-1421); <code>! ! true; echo
+            $?</code> prints 0 <span class="recon">measured here</span>.
+            <code>|&amp;</code> becomes a <code>2&gt;&amp;1</code> REDIRECT on
+            the left command and a plain <code>'|'</code> connection
+            (<code>bash/parse.y</code>:1473-1496) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two constructs bypass the grammar. <code>[[ … ]]</code> is a
+            recursive-descent parser inside <code>read_token</code> that hands
+            Bison one <code>COND_CMD</code> token holding a finished tree: "we
+            slip a mini recursive-descent parser in here"
+            (<code>bash/parse.y</code>:3582-3602, 5251) <span class="src">from the code</span>.
+            <code>((…))</code> is one <code>ARITH_CMD</code> only if its
+            matching <code>)</code> is followed by <code>)</code>. Otherwise its
+            text is pushed back as nested subshells
+            (<code>bash/parse.y</code>:4901-5008), so <code>((echo a); echo
+            b)</code> prints <code>a</code> and <code>b</code>
+            <span class="recon">measured here</span>. §11 covers how
+            <code>[[ ]]</code> is evaluated.
+          </p>
+
+          <h3>The tree</h3>
+          <p>
+            Every node is a <code>COMMAND</code> with five fields:
+            <code>type</code>, <code>flags</code>, <code>line</code>,
+            <code>redirects</code> and <code>value</code>, a union over 15
+            command types (<code>bash/command.h</code>:71-73, 197-226). The constructor is
+            <code>bash/make_cmd.c</code>:164-174 <span class="src">from the code</span>:
+          </p>
+<pre><code>make_command (enum command_type type, SIMPLE_COM *pointer)
+{
+  COMMAND *temp;
+
+  temp = (COMMAND *)xmalloc (sizeof (COMMAND));
+  temp-&gt;type = type;
+  temp-&gt;value.Simple = pointer;
+  temp-&gt;value.Simple-&gt;flags = temp-&gt;flags = 0;
+  temp-&gt;redirects = (REDIRECT *)NULL;
+  return (temp);
+}</code></pre>
+          <p>
+            Every payload goes in through <code>value.Simple</code>, and the
+            first int of whatever struct it points at is zeroed: a type pun.
+            <code>CONNECTION</code> starts with a dummy <code>int ignore</code>,
+            commented "Unused; simplifies make_command ().", to absorb that write
+            (<code>bash/command.h</code>:229-234). <code>make_command</code>
+            never sets <code>COMMAND.line</code> <span class="src">from the code</span>. The trace prints
+            it as -538976289, which is 0xdfdfdfdf, bash malloc's
+            <code>MEMSCRAMBLE</code> fill (<code>bash/lib/malloc/malloc.c</code>:892-894)
+            <span class="recon">measured here</span>. Whether anything reads it
+            is open.
+          </p>
+          <p>
+            A <code>CONNECTION</code> is binary, so a pipeline has no node type
+            of its own. A <code>SIMPLE_COM</code> holds one flat
+            <code>WORD_LIST</code> of assignments, name and arguments plus a
+            <code>REDIRECT</code> list, and a <code>WORD_DESC</code> is just
+            <code>{char *word; int flags}</code> (<code>bash/command.h</code>:131-140,
+            337-343). Left-recursive rules prepend, so both lists are built
+            backwards and reversed once: "It seems simpler to do this here the
+            one time" (<code>bash/make_cmd.c</code>:800-818)
+            <span class="src">from the code</span>. Figure {{fig-command-union}}
+            draws the running example's tree.
+          </p>
+
+          <figure class="figure wide" id="fig-command-union">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The running example as structs: two CONNECTIONs, three COMMANDs, words still text</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 840" width="100%" role="img" aria-label="Struct diagram of the running example&#x27;s tree. A COMMAND of type cm_connection, with line holding 0xdfdfdfdf because it is never set, points through value to a CONNECTION with connector AND_AND. Its second is a simple command echo done; its first is another COMMAND whose CONNECTION has connector |, with head -n 3 &gt; out as second and the sort command as first. The sort COMMAND points to a SIMPLE_COM whose words list holds three WORD_DESCs: LC_ALL=C with flags 0x14, sort and -u, and whose redirects list holds two REDIRECTs: redirector 0 r_input_direction in.txt and redirector 2 r_output_direction flags 0x241 /dev/null. Orange callouts explain the make_command type pun, the unset line field, the backwards-built lists and how |&amp;, ! and time are stored.">
+                <defs>
+                  <marker id="fig-command-union-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#252525"/></marker>
+                  <marker id="fig-command-union-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#3c6f97"/></marker>
+                  <marker id="fig-command-union-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#765b98"/></marker>
+                </defs>
+                <rect x="20" y="40" width="240" height="113" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="30" y="56" class="svg-lane">COMMAND</text>
+                <path d="M20 64 L260 64" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="30" y="77" class="svg-sub">type</text>
+                <text x="116" y="77" class="svg-sub" fill="#252525">cm_connection</text>
+                <path d="M20 81 L260 81" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="30" y="94" class="svg-sub">flags</text>
+                <text x="116" y="94" class="svg-sub" fill="#252525">0x0</text>
+                <path d="M20 98 L260 98" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="30" y="111" class="svg-sub">line</text>
+                <text x="116" y="111" class="svg-sub" fill="#ad4b43">0xdfdfdfdf</text>
+                <path d="M20 115 L260 115" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="30" y="128" class="svg-sub">redirects</text>
+                <text x="116" y="128" class="svg-sub" fill="#252525">NULL</text>
+                <path d="M20 132 L260 132" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="30" y="145" class="svg-sub">value</text>
+                <text x="116" y="145" class="svg-sub" fill="#252525">.Connection</text>
+                <circle cx="250" cy="141" r="3.2" fill="#3c6f97"/>
+                <rect x="300" y="40" width="240" height="96" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="310" y="56" class="svg-lane">CONNECTION</text>
+                <path d="M300 64 L540 64" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="310" y="77" class="svg-sub">ignore</text>
+                <text x="396" y="77" class="svg-sub" fill="#252525">unused</text>
+                <path d="M300 81 L540 81" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="310" y="94" class="svg-sub">first</text>
+                <circle cx="530" cy="90" r="3.2" fill="#3c6f97"/>
+                <path d="M300 98 L540 98" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="310" y="111" class="svg-sub">second</text>
+                <circle cx="530" cy="107" r="3.2" fill="#3c6f97"/>
+                <path d="M300 115 L540 115" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="310" y="128" class="svg-sub">connector</text>
+                <text x="396" y="128" class="svg-sub" fill="#252525">AND_AND (&amp;&amp;)</text>
+                <rect x="580" y="40" width="240" height="50" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="590" y="56" class="svg-lane">COMMAND · cm_simple</text>
+                <text x="590" y="72" class="svg-sub">words: echo · done</text>
+                <text x="590" y="87" class="svg-sub">redirects: NULL</text>
+                <rect x="860" y="40" width="240" height="86" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="870" y="56" class="svg-lane">MAKE_COMMAND (X37)</text>
+                <text x="870" y="72" class="svg-sub">stores every payload through</text>
+                <text x="870" y="86" class="svg-sub">value.Simple and zeroes its</text>
+                <text x="870" y="100" class="svg-sub">first int: CONNECTION.ignore</text>
+                <text x="870" y="114" class="svg-sub">exists to absorb that write</text>
+                <path d="M250 141 L272 141 L272 52 L297 52" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <path d="M530 107 L577 107" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <rect x="300" y="220" width="240" height="113" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="310" y="236" class="svg-lane">COMMAND</text>
+                <path d="M300 244 L540 244" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="310" y="257" class="svg-sub">type</text>
+                <text x="396" y="257" class="svg-sub" fill="#252525">cm_connection</text>
+                <path d="M300 261 L540 261" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="310" y="274" class="svg-sub">flags</text>
+                <text x="396" y="274" class="svg-sub" fill="#252525">0x0</text>
+                <path d="M300 278 L540 278" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="310" y="291" class="svg-sub">line</text>
+                <text x="396" y="291" class="svg-sub" fill="#ad4b43">0xdfdfdfdf</text>
+                <path d="M300 295 L540 295" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="310" y="308" class="svg-sub">redirects</text>
+                <text x="396" y="308" class="svg-sub" fill="#252525">NULL</text>
+                <path d="M300 312 L540 312" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="310" y="325" class="svg-sub">value</text>
+                <text x="396" y="325" class="svg-sub" fill="#252525">.Connection</text>
+                <circle cx="530" cy="321" r="3.2" fill="#3c6f97"/>
+                <rect x="580" y="220" width="240" height="96" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="590" y="236" class="svg-lane">CONNECTION</text>
+                <path d="M580 244 L820 244" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="590" y="257" class="svg-sub">ignore</text>
+                <text x="676" y="257" class="svg-sub" fill="#252525">unused</text>
+                <path d="M580 261 L820 261" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="590" y="274" class="svg-sub">first</text>
+                <circle cx="810" cy="270" r="3.2" fill="#3c6f97"/>
+                <path d="M580 278 L820 278" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="590" y="291" class="svg-sub">second</text>
+                <circle cx="810" cy="287" r="3.2" fill="#3c6f97"/>
+                <path d="M580 295 L820 295" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="590" y="308" class="svg-sub">connector</text>
+                <text x="676" y="308" class="svg-sub" fill="#252525">'|'</text>
+                <rect x="860" y="220" width="240" height="80" rx="6" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="870" y="236" class="svg-lane">COMMAND · cm_simple</text>
+                <text x="870" y="252" class="svg-sub">words: head · -n · 3</text>
+                <text x="870" y="267" class="svg-sub">REDIRECT: redirector 1,</text>
+                <text x="870" y="282" class="svg-sub">  r_output_direction,</text>
+                <text x="870" y="297" class="svg-sub">  flags 0x241, "out"</text>
+                <path d="M530 90 L544 90 L544 198 L420 198 L420 217" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <path d="M530 321 L552 321 L552 232 L577 232" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <path d="M810 287 L857 287" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <rect x="20" y="220" width="240" height="100" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="30" y="236" class="svg-lane">LINE: NEVER SET</text>
+                <text x="30" y="252" class="svg-sub">-538976289 in trace-a = 0xdfdfdfdf,</text>
+                <text x="30" y="266" class="svg-sub">bash malloc's MEMSCRAMBLE fill:</text>
+                <text x="30" y="280" class="svg-sub">make_command never sets</text>
+                <text x="30" y="294" class="svg-sub">COMMAND.line (whether anything</text>
+                <text x="30" y="308" class="svg-sub">reads it is open)</text>
+                <rect x="580" y="400" width="240" height="113" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="590" y="416" class="svg-lane">COMMAND</text>
+                <path d="M580 424 L820 424" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="590" y="437" class="svg-sub">type</text>
+                <text x="676" y="437" class="svg-sub" fill="#252525">cm_simple</text>
+                <path d="M580 441 L820 441" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="590" y="454" class="svg-sub">flags</text>
+                <text x="676" y="454" class="svg-sub" fill="#252525">0x0</text>
+                <path d="M580 458 L820 458" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="590" y="471" class="svg-sub">line</text>
+                <text x="676" y="471" class="svg-sub" fill="#ad4b43">0xdfdfdfdf</text>
+                <path d="M580 475 L820 475" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="590" y="488" class="svg-sub">redirects</text>
+                <text x="676" y="488" class="svg-sub" fill="#252525">NULL</text>
+                <path d="M580 492 L820 492" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="590" y="505" class="svg-sub">value</text>
+                <text x="676" y="505" class="svg-sub" fill="#252525">.Simple</text>
+                <circle cx="810" cy="501" r="3.2" fill="#3c6f97"/>
+                <rect x="860" y="400" width="240" height="96" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="870" y="416" class="svg-lane">SIMPLE_COM</text>
+                <path d="M860 424 L1100 424" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="870" y="437" class="svg-sub">flags</text>
+                <path d="M860 441 L1100 441" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="870" y="454" class="svg-sub">line</text>
+                <path d="M860 458 L1100 458" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="870" y="471" class="svg-sub">words</text>
+                <text x="956" y="471" class="svg-sub" fill="#252525">WORD_LIST *</text>
+                <circle cx="1090" cy="467" r="3.2" fill="#3c6f97"/>
+                <path d="M860 475 L1100 475" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="870" y="488" class="svg-sub">redirects</text>
+                <text x="956" y="488" class="svg-sub" fill="#252525">REDIRECT *</text>
+                <circle cx="1090" cy="484" r="3.2" fill="#3c6f97"/>
+                <path d="M810 270 L824 270 L824 378 L700 378 L700 397" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <path d="M810 501 L832 501 L832 412 L857 412" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <rect x="20" y="400" width="520" height="86" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="30" y="416" class="svg-lane">NO NODES FOR |&amp;, !, TIME</text>
+                <text x="30" y="432" class="svg-sub">|&amp; adds a 2&gt;&amp;1 REDIRECT to the left command at parse time;</text>
+                <text x="30" y="446" class="svg-sub">! and time set CMD_INVERT_RETURN / CMD_TIME_PIPELINE in the</text>
+                <text x="30" y="460" class="svg-sub">pipeline's COMMAND.flags (! toggles with XOR). Neither leaves</text>
+                <text x="30" y="474" class="svg-sub">a node: here every flags field is 0x0.</text>
+                <rect x="20" y="580" width="88" height="62" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="30" y="596" class="svg-lane">WORD_LIST</text>
+                <path d="M20 604 L108 604" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="30" y="617" class="svg-sub">next</text>
+                <circle cx="98" cy="613" r="3.2" fill="#3c6f97"/>
+                <path d="M20 621 L108 621" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="30" y="634" class="svg-sub">word</text>
+                <circle cx="98" cy="630" r="3.2" fill="#3c6f97"/>
+                <rect x="120" y="580" width="160" height="62" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="130" y="596" class="svg-lane">WORD_DESC</text>
+                <path d="M120 604 L280 604" stroke="#367f59" stroke-width="0.6" opacity="0.5"/>
+                <text x="130" y="617" class="svg-sub">word</text>
+                <text x="174" y="617" class="svg-sub" fill="#367f59">"LC_ALL=C"</text>
+                <path d="M120 621 L280 621" stroke="#367f59" stroke-width="0.6" opacity="0.5"/>
+                <text x="130" y="634" class="svg-sub">flags</text>
+                <text x="174" y="634" class="svg-sub" fill="#252525">0x14</text>
+                <path d="M98 630 L117 630" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <rect x="292" y="580" width="88" height="62" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="302" y="596" class="svg-lane">WORD_LIST</text>
+                <path d="M292 604 L380 604" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="302" y="617" class="svg-sub">next</text>
+                <circle cx="370" cy="613" r="3.2" fill="#3c6f97"/>
+                <path d="M292 621 L380 621" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="302" y="634" class="svg-sub">word</text>
+                <circle cx="370" cy="630" r="3.2" fill="#3c6f97"/>
+                <rect x="392" y="580" width="160" height="62" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="402" y="596" class="svg-lane">WORD_DESC</text>
+                <path d="M392 604 L552 604" stroke="#367f59" stroke-width="0.6" opacity="0.5"/>
+                <text x="402" y="617" class="svg-sub">word</text>
+                <text x="446" y="617" class="svg-sub" fill="#367f59">"sort"</text>
+                <path d="M392 621 L552 621" stroke="#367f59" stroke-width="0.6" opacity="0.5"/>
+                <text x="402" y="634" class="svg-sub">flags</text>
+                <text x="446" y="634" class="svg-sub" fill="#252525">0x0</text>
+                <path d="M370 630 L389 630" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <rect x="564" y="580" width="88" height="62" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="574" y="596" class="svg-lane">WORD_LIST</text>
+                <path d="M564 604 L652 604" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="574" y="617" class="svg-sub">next</text>
+                <path d="M564 621 L652 621" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="574" y="634" class="svg-sub">word</text>
+                <circle cx="642" cy="630" r="3.2" fill="#3c6f97"/>
+                <rect x="664" y="580" width="160" height="62" rx="6" fill="#dfede5" stroke="#367f59" stroke-width="1.5"/>
+                <text x="674" y="596" class="svg-lane">WORD_DESC</text>
+                <path d="M664 604 L824 604" stroke="#367f59" stroke-width="0.6" opacity="0.5"/>
+                <text x="674" y="617" class="svg-sub">word</text>
+                <text x="718" y="617" class="svg-sub" fill="#367f59">"-u"</text>
+                <path d="M664 621 L824 621" stroke="#367f59" stroke-width="0.6" opacity="0.5"/>
+                <text x="674" y="634" class="svg-sub">flags</text>
+                <text x="718" y="634" class="svg-sub" fill="#252525">0x0</text>
+                <path d="M642 630 L661 630" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <text x="130" y="660" class="svg-sub" fill="#367f59">W_ASSIGNMENT|W_NOSPLIT</text>
+                <path d="M98 613 L104 613 L104 570 L322 570 L322 577" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <path d="M370 613 L376 613 L376 570 L594 570 L594 577" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <path d="M1090 467 L1106 467 L1106 554 L50 554 L50 577" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <text x="60" y="548" class="svg-sub" fill="#3c6f97">words: one flat list, assignment, name and arguments alike</text>
+                <rect x="540" y="720" width="270" height="113" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="550" y="736" class="svg-lane">REDIRECT</text>
+                <path d="M540 744 L810 744" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="550" y="757" class="svg-sub">redirector</text>
+                <text x="636" y="757" class="svg-sub" fill="#252525">0</text>
+                <path d="M540 761 L810 761" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="550" y="774" class="svg-sub">instruction</text>
+                <text x="636" y="774" class="svg-sub" fill="#252525">r_input_direction</text>
+                <path d="M540 778 L810 778" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="550" y="791" class="svg-sub">flags</text>
+                <text x="636" y="791" class="svg-sub" fill="#252525">0x0</text>
+                <path d="M540 795 L810 795" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="550" y="808" class="svg-sub">redirectee</text>
+                <text x="636" y="808" class="svg-sub" fill="#367f59">"in.txt"</text>
+                <path d="M540 812 L810 812" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="550" y="825" class="svg-sub">next</text>
+                <circle cx="800" cy="821" r="3.2" fill="#3c6f97"/>
+                <rect x="840" y="720" width="270" height="113" rx="6" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="850" y="736" class="svg-lane">REDIRECT</text>
+                <path d="M840 744 L1110 744" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="850" y="757" class="svg-sub">redirector</text>
+                <text x="936" y="757" class="svg-sub" fill="#252525">2</text>
+                <path d="M840 761 L1110 761" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="850" y="774" class="svg-sub">instruction</text>
+                <text x="936" y="774" class="svg-sub" fill="#252525">r_output_direction</text>
+                <path d="M840 778 L1110 778" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="850" y="791" class="svg-sub">flags</text>
+                <text x="936" y="791" class="svg-sub" fill="#252525">0x241</text>
+                <path d="M840 795 L1110 795" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="850" y="808" class="svg-sub">redirectee</text>
+                <text x="936" y="808" class="svg-sub" fill="#367f59">"/dev/null"</text>
+                <path d="M840 812 L1110 812" stroke="#3c6f97" stroke-width="0.6" opacity="0.5"/>
+                <text x="850" y="825" class="svg-sub">next</text>
+                <text x="936" y="825" class="svg-sub" fill="#252525">NULL</text>
+                <path d="M1090 484 L1114 484 L1114 706 L675 706 L675 717" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <text x="684" y="700" class="svg-sub" fill="#3c6f97">redirects: one list, in source order after the flip</text>
+                <path d="M800 821 L837 821" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-command-union-blue)"/>
+                <rect x="830" y="580" width="280" height="100" rx="6" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="840" y="596" class="svg-lane">LISTS BUILT BACKWARDS</text>
+                <text x="840" y="612" class="svg-sub">make_simple_command prepends each</text>
+                <text x="840" y="626" class="svg-sub">element, so words and redirects are</text>
+                <text x="840" y="640" class="svg-sub">built backwards; clean_simple_command</text>
+                <text x="840" y="654" class="svg-sub">reverses both once: "It seems simpler</text>
+                <text x="840" y="668" class="svg-sub">to do this here the one time"</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The parser's output is pointers to text. Blue structs are tree
+              nodes, green holds source text the parser kept as-is, grey boxes
+              are collapsed nodes, orange notes explain code; red marks the
+              unset <code>line</code>. Thin blue arrows are pointers. Struct
+              layouts are from <code>bash/command.h</code> and
+              <code>bash/make_cmd.c</code> <span class="src">from the code</span>.
+              Field values (types, connectors, word flags 0x14, redirectors,
+              flags 0x241, line) are printed by the instrumented build in
+              <code>lab/results/trace-a.txt</code> <span class="recon">measured here</span>.
+              0x14 is <code>W_ASSIGNMENT|W_NOSPLIT</code>; 0x241 is not decoded here.
+            </p>
+          </figure>
+
+          <h3>The printer</h3>
+          <p>
+            <code>print_cmd.c</code> turns any tree back into text for
+            <code>declare -f</code>, <code>--pretty-print</code> and the comsub
+            word (§07). What it cannot print, the tree did not keep.
+            <code>elif</code> comes back as <code>else if … fi</code>,
+            <code>x |&amp; y</code> as <code>x 2&gt;&amp;1 | y</code>,
+            redirections move after the words, comments vanish, and <code>!
+            time -p</code> prints as <code>time -p !</code>, because both are
+            flag bits printed in a fixed order <span class="recon">measured here</span>
+            with <code>declare -f</code> and <code>--pretty-print</code> on
+            <code>/usr/bin/bash</code> 5.3.9. On all 118 corpus inputs it could
+            print, re-printing the printer's output gives the same text
+            (<code>lab/scripts/e3_roundtrip.py</code>,
+            <code>lab/results/e3-roundtrip-summary.txt</code>)
+            <span class="recon">measured here</span>. One-line parse units and
+            error recovery are §09.
+          </p>
