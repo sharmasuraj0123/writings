@@ -1,0 +1,123 @@
+          <h2 id="p1-loading"><span class="secnum">{{S}}</span>From a directory to a configs.Module</h2>
+          <p>
+            A module is a directory, and <code>configs.Parser</code> is what reads one. It wraps HCL's
+            <code>hclparse.Parser</code> and an afero filesystem, and the file name's suffix alone picks the syntax: a
+            name ending in <code>.json</code> goes to the JSON parser, everything else to native HCL
+            (<code>internal/configs/parser.go</code>:21-33, 79-84) <span class="src">from the code</span>. The parser keeps
+            every file's bytes so diagnostics can print source snippets, and a saved plan re-injects them later.
+            <code>LoadConfigDir</code> is short. <code>internal/configs/parser_config_dir.go</code>:48-64
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>func (p *Parser) LoadConfigDir(path string, opts ...Option) (*Module, hcl.Diagnostics) {
+	fileSet, diags := p.dirFileSet(path, opts...)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+
+	// Load the .tf configuration files
+	primary, fDiags := p.loadFiles(fileSet.Primary, false)
+	diags = diags.Extend(fDiags)
+
+	override, fDiags := p.loadFiles(fileSet.Override, true)
+	diags = diags.Extend(fDiags)
+
+	// Initialize the module
+	mod, modDiags := NewModule(primary, override)
+	mod.SourceDir = path
+	diags = diags.Extend(modDiags)</code></pre>
+          <p>
+            After this it attaches test, query and state-migration files if the caller asked for them.
+          </p>
+
+          <h3>Five categories, chosen by name</h3>
+          <p>
+            <code>dirFileSet</code> sorts the directory into five categories: primary (<code>.tf</code>,
+            <code>.tf.json</code>), override, tests (<code>.tftest.hcl</code>/<code>.json</code>), queries
+            (<code>.tfquery.hcl</code>/<code>.json</code>) and state migrations (<code>.tfmigrate.hcl</code>). Only primary
+            and override files always match; the others need an option from the command
+            (<code>parser_file_matcher.go</code>:18-24, 63-68, 138-158). An override file is any <code>.tf</code> or
+            <code>.tf.json</code> whose base name is exactly <code>override</code> or ends in <code>_override</code>.
+            Hidden files, vim <code>~</code> backups and emacs <code>#…#</code> autosaves are skipped silently, and
+            subdirectories are never scanned for configuration; only <code>tests/</code> is read, for test files
+            (<code>parser_config_dir.go</code>:339-343; <code>parser_file_matcher.go</code>:105-108, 172-243)
+            <span class="src">from the code</span>. A <code>.tf</code> file in a subfolder is simply not part of the
+            module unless a <code>module</code> block points at that folder.
+          </p>
+          <p>
+            Files are processed in directory-listing order, so when two files declare the same thing the first one wins
+            and the duplicate error names the later file (<code>parser_file_matcher.go</code>:95-133). The
+            <code>.tfmigrate.hcl</code> category is the odd one: its files describe a migration
+            <code>from { backend | state_store }</code>, they are validated for mutual exclusivity at load
+            (<code>parser_config_dir.go</code>:80-165), and no CHANGELOG mentions them, so their maturity is unknown.
+          </p>
+
+          <h3>The version check comes first, on purpose</h3>
+          <p>
+            Each file's <code>required_version</code> and <code>experiments</code> are sniffed with a partial schema
+            before the full decode (<code>parser_config.go</code>:98-111, 300-322). The ordering exists so that a
+            configuration written for a newer Terraform gets the error "this needs a newer Terraform" instead of a
+            confusing syntax error about a block the old binary has never heard of. The sniff is the first of three
+            places the rule is applied. The module installer drops every other diagnostic when the version
+            requirement fails, "as they may reflect language changes from future Terraform versions"
+            (<code>internal/initwd/module_install.go</code>:111-114). And <code>terraform init</code> loads the root
+            module early but holds its parse errors until after the core-version check over the whole tree.
+            <code>internal/command/init_run.go</code>:120-123 <span class="src">from the code</span>:
+          </p>
+<pre><code>	// There may be parsing errors in config loading but these will be shown later _after_
+	// checking for core version requirement errors. Not meeting the version requirement should
+	// be the first error displayed if that is an issue, but other operations are required
+	// before being able to check core version requirements.</code></pre>
+          <p>
+            Prerelease segments are not allowed in a <code>required_version</code> constraint, and a prerelease Terraform
+            build matches on its version core only (<code>module.go</code>:945-970). The practical reading: when
+            <code>init</code> complains about the Terraform version, fix that first; the other errors may be noise.
+          </p>
+
+          <h3>NewModule, and overrides that merge late</h3>
+          <p>
+            <code>configs.Module</code> is a set of maps keyed by name: variables, locals, outputs, module calls,
+            managed, data, ephemeral and list resources, actions and checks, plus one backend, state store or cloud
+            block and the provider requirements, including the deferred <code>ProviderRequirementExprs</code> that §08
+            evaluates (<code>module.go</code>:18-73). <code>NewModule</code> handles <code>required_providers</code> from
+            all primary files first, since only one is allowed per module, then override entries, then the rest of
+            each file; only one of <code>cloud</code>, <code>state_store</code> and <code>backend</code> may appear
+            (<code>module.go</code>:152-207, 244-324) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Override files are merged by <code>mergeFile</code>, and overriding something that has no base declaration is
+            an error ("Missing resource to override"). An override's <code>required_version</code> replaces the list
+            rather than extending it, and a <code>backend</code> in an override clears any <code>cloud</code> or
+            <code>state_store</code>. Bodies merge through <code>MergeBodies</code>, which returns a lazy
+            <code>mergeBody</code> that implements <code>hcl.Body</code> and merges only when someone asks for content
+            (<code>module_merge_body.go</code>:18-57). The merge is shallow. <code>module_merge_body.go</code>:95-115
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	overriddenBlockTypes := make(map[string]bool)
+	for _, block := range override.Blocks {
+		if block.Type == "dynamic" {
+			overriddenBlockTypes[block.Labels[0]] = true
+			continue
+		}
+		overriddenBlockTypes[block.Type] = true
+	}
+	for _, block := range base.Blocks {
+		// We skip over dynamic blocks whose type label is an overridden type
+		// but note that below we do still leave them as dynamic blocks in
+		// the result because expanding the dynamic blocks that are left is
+		// done much later during the core graph walks, where we can safely
+		// evaluate the expressions.
+		if block.Type == "dynamic" &amp;&amp; overriddenBlockTypes[block.Labels[0]] {
+			continue
+		}
+		if overriddenBlockTypes[block.Type] {
+			continue
+		}</code></pre>
+          <p>
+            One <code>ingress</code> block in an override file hides every <code>ingress</code> block in the base,
+            including <code>dynamic "ingress"</code> blocks. Override attributes replace same-named base attributes one by
+            one; blocks are replaced by type, never matched up and merged <span class="recon">reconstruction</span>.
+            Variable overrides keep per-attribute "set" flags (<code>DescriptionSet</code>, <code>SensitiveSet</code>,
+            <code>ConstSet</code>…) so an override changes only what it sets, and a module-call override may replace
+            <code>source</code>, <code>version</code>, <code>count</code>, <code>for_each</code> and
+            <code>providers</code> but not <code>depends_on</code> (<code>module_merge.go</code>:41-60, 183-220).
+          </p>

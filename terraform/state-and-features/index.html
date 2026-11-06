@@ -1,0 +1,3058 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Terraform v1.17.0 taken apart, part 3: the v4 state file, lineage and serial, locks per backend and the S3 default with no lock, workspaces and terraform_remote_state, moved/removed/import blocks, and the 1.5 to 1.17 features from check and terraform test to ephemeral values, query, actions, deferral, Stacks and Policy."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/terraform/state-and-features/" />
+    <meta property="og:title" content="State, refactoring and the feature arc" />
+    <meta property="og:description" content="Part 3 of a four-part Terraform teardown at v1.17.0 (018a99c8): state is one plaintext JSON document guarded by advisory locks; S3 with neither use_lockfile nor DynamoDB takes no lock; -lock-timeout defaults to one attempt; terraform_remote_state strips sensitivity; refactoring blocks run inside plan; almost every feature since 1.5 is a schema, a node and an RPC; -invoke silently turns a plan refresh-only; Policy fails open for plan and apply." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/terraform/state-and-features/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="State, refactoring and the feature arc" />
+    <meta name="twitter:description" content="Terraform v1.17.0 taken apart, part 3: the state file and its locks, refactoring blocks, and the 1.5 to 1.17 feature arc, read from the source and measured with no cloud credentials." />
+    <title>State, refactoring and the feature arc — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · One document per workspace</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#p3-state-file">01 · One document per workspace</a>
+        <a class="toc-parent" href="#p3-locks">02 · Locks, per backend</a>
+        <a class="toc-parent" href="#p3-workspaces-hcp">03 · Workspaces, remote state and HCP Terraform</a>
+        <a class="toc-parent" href="#p3-refactoring">04 · Refactoring in configuration</a>
+        <a class="toc-parent" href="#p3-arc">05 · A schema, a node, an RPC: 1.5 to 1.17</a>
+        <a class="toc-parent" href="#p3-secrets">06 · Ephemeral values and write-only arguments</a>
+        <a class="toc-parent" href="#p3-query-actions">07 · List resources and actions</a>
+        <a class="toc-parent" href="#p3-gates">08 · What is still gated</a>
+        <a class="toc-parent" href="#p3-sources">09 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#p3-state-file">01 · The state file</a>
+        <a href="#p3-locks">02 · Locks per backend</a>
+        <a href="#p3-workspaces-hcp">03 · Workspaces and HCP</a>
+        <a href="#p3-refactoring">04 · Refactoring blocks</a>
+        <a href="#p3-arc">05 · The 1.5 → 1.17 arc</a>
+        <a href="#p3-secrets">06 · Secrets by marks</a>
+        <a href="#p3-query-actions">07 · Query and actions</a>
+        <a href="#p3-gates">08 · What is still gated</a>
+        <a href="#p3-sources">09 · Sources</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Languages & Tools</p>
+        <h1>State, refactoring and the feature arc<span class="status-pill">Teardown</span></h1>
+        <p class="dek">
+          Terraform's record of what exists is one plaintext JSON document per workspace, and its consistency rests on advisory locks rather than compare-and-swap. This third part of a four-part teardown reads Terraform v1.17.0's state managers, the lock each backend builds from its own storage (and the S3 configuration that builds none), workspaces and remote state as non-boundaries, the refactoring blocks that moved state surgery into the plan, and the 1.5 to 1.17 feature arc: import, check, tests with mocks, provider functions, ephemeral values and write-only arguments, list resources, actions, and the surfaces that are still gated or run out of process.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 24 October 2026 · Subject: <code>terraform@018a99c8</code> (v1.17.0) · Part 3 of 4 · Read from the source; measured on this machine with no cloud credentials</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#p3-state-file">One document per workspace</a></li>
+          <li><a href="#p3-locks">Locks, per backend</a></li>
+          <li><a href="#p3-workspaces-hcp">Workspaces, remote state and HCP Terraform</a></li>
+          <li><a href="#p3-refactoring">Refactoring in configuration</a></li>
+          <li><a href="#p3-arc">A schema, a node, an RPC: 1.5 to 1.17</a></li>
+          <li><a href="#p3-secrets">Ephemeral values and write-only arguments</a></li>
+          <li><a href="#p3-query-actions">List resources and actions</a></li>
+          <li><a href="#p3-gates">What is still gated</a></li>
+          <li><a href="#p3-sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from hashicorp/terraform at <code>v1.17.0</code>
+              (<code>018a99c83c5d</code>, 21 October 2026), cited as a path and line range from the repository root.
+              Where a behaviour has changed since the tag, the upstream status is given against origin/main at
+              <code>a060ad5a1b</code> (23 October 2026). <span class="recon">measured here</span> marks output from the
+              v1.17.0 binary on a 2-vCPU Linux box with the providers random 3.9.1 and aws 6.70.0 from a shared plugin
+              cache. <strong>No cloud credentials existed.</strong> Nothing was applied to a cloud: the state experiments
+              used local state, a toy HTTP server and the built-in <code>terraform_data</code>; the AWS examples used fake
+              credentials (<code>AKIAFAKEFAKEFAKEFAKE</code> with the skip switches) or <code>mock_provider</code>. One
+              action example sent a request to AWS with the fake key, which was rejected; §09 lists every such request.
+              Timings depend on page cache and load and are given as ranges. <span class="recon">reconstruction</span>
+              marks a judgement drawn from those sources rather than read in one place. Findings carry their
+              status; none was reported upstream.
+            </p>
+            <p>
+              This is Part 3 of 4 of <a href="../">Terraform, taken apart</a>.
+              <a href="../language-and-front-end/">Part 1</a> covers the HCL language, values and how <code>init</code>
+              turns a directory into a configuration tree. <a href="../engine-and-providers/">Part 2</a> builds and walks
+              the plan graph, follows providers as child processes over gRPC and shows that apply re-plans.
+              <a href="../three-clouds/">Part 4</a> builds one project on AWS, GCP and Azure with no credentials, covers
+              the licence and the fork, and ends with the findings register.
+            </p>
+          </div>
+
+          <h2 id="p3-state-file"><span class="secnum">01</span>One document per workspace</h2>
+          <p class="lede">
+            Terraform is a compiler whose intermediate representation is a dependency graph and whose back end is somebody
+            else's process. Parts 1 and 2 followed one plan from bytes to provider calls. This part covers what lasts after
+            the run. Terraform's record of what exists is one JSON document per workspace. It is rewritten whole, it stores
+            secrets in plaintext, and two writers are kept apart only by an advisory lock that each backend builds from its
+            own storage. No write does a compare-and-swap. The second half of this part follows the features added from
+            v1.5 to v1.17. Almost every one is a small schema, a graph node and usually one new RPC, and the newest ones are
+            the least finished: gated behind experiments, sold through HCP, or run in a separate process.
+          </p>
+
+          <h3>The manager contract</h3>
+          <p>
+            Every place Terraform keeps state is reached through a <code>statemgr.Full</code>. That is three interfaces in
+            one: <code>Transient</code> (an in-memory snapshot, <code>State</code> and <code>WriteState</code>),
+            <code>Persistent</code> (<code>RefreshState</code>, <code>PersistState</code>, <code>GetRootOutputValues</code>)
+            and <code>Locker</code> (<code>Lock</code>, <code>Unlock</code>)
+            (<code>internal/states/statemgr/statemgr.go</code>:12-29; <code>persistent.go</code>:25-29)
+            <span class="src">from the code</span>. A transient snapshot lives only inside the process; a persistent one is
+            shared with other Terraform processes. The split lets a backend take a write after every resource but upload
+            less often (<code>transient.go</code>:11-14; <code>persistent.go</code>:19-21). <code>PersistState</code> even
+            takes the provider schemas as an argument, because HCP Terraform uploads a schema-aware JSON rendering beside
+            the raw snapshot (<code>persistent.go</code>:83-88).
+          </p>
+          <p>
+            The contract says what a persister owes other processes. <code>persistent.go</code>:77-81 states that a
+            Persister "must detect updates made by other processes that may be running concurrently and avoid destroying
+            those changes". The next interface relaxes it at once: a manager that also implements <code>Locker</code> need
+            only be concurrency-safe "within a single Terraform process", "under the assumption that the locking mechanism
+            effectively prevents multiple Terraform processes from reading and writing state concurrently"
+            (<code>locker.go</code>:28-34). The lock is also advisory by contract: "A Locker is not required to prevent
+            non-cooperating processes from concurrently modifying the state" (<code>locker.go</code>:41-47)
+            <span class="src">from the code</span>. So the guarantee is a lock that cooperating Terraform processes respect.
+            §02 shows what that lock is on each backend.
+          </p>
+
+          <h3>The v4 file</h3>
+          <p>
+            The document itself is version 4 JSON with seven top-level keys: <code>version</code> (hard-coded 4),
+            <code>terraform_version</code>, <code>serial</code>, <code>lineage</code>, <code>outputs</code>,
+            <code>resources</code> and <code>check_results</code> (<code>internal/states/statefile/version4.go</code>:668-675).
+            Resources and their instances are sorted with <code>sort.Stable</code> by module, mode, type and name, so two
+            equivalent states serialize identically and diffs stay small (<code>version4.go</code>:682-684). Each instance
+            records its <code>schema_version</code>, <code>attributes</code>, <code>sensitive_attributes</code>, identity
+            fields, <code>private</code> and <code>dependencies</code>; the struct also declares an <code>each</code> field
+            that the v4 writer never sets, and measured states have none (<code>version4.go</code>:694-722)
+            <span class="src">from the code</span>. The <code>dependencies</code> list matters later: destroy order is
+            computed from it, not from the current configuration (<a href="../engine-and-providers/#p2-plan-apply">Part 2</a>).
+          </p>
+          <p>
+            Sensitivity is metadata, not encryption. A lab apply with a sensitive variable, a
+            <code>random_password</code> and a sensitive output left all three in cleartext. The output <code>pw</code> sits
+            in the file as <code>"value": "xdcJMevxyoflqcL6"</code> next to <code>"sensitive": true</code>, and the variable's
+            value sits inside <code>terraform_data.app</code>'s <code>input</code>. <code>sensitive_attributes</code> is only a
+            list of paths, here <code>[input, secret]</code>. The provider-computed copy of the same value in
+            <code>output.secret</code> carries no path at all <span class="recon">measured here</span>. Why the mark does not
+            follow that copy is an open question. The practical rule: anyone who can read the state blob can read every
+            secret in it, so restrict reads of the state storage itself. HashiCorp's documentation
+            says to keep secrets out of state with ephemeral values and write-only arguments (§06).
+          </p>
+
+          <figure class="figure wide" id="fig-state-file">
+            <div class="figure-head">
+              <span class="figure-label">Figure 15</span>
+              <p class="figure-title">The state file, its two counters, and the only gate that checks them</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 470" role="img" aria-label="Left: an annotated v4 state file from a lab apply with lineage, serial 6, a sensitive output in cleartext, a terraform_data instance whose secret appears in cleartext in input and output with only the input path flagged, and its dependencies. Middle: serial counters; the local filesystem manager bumps serial on every differing write, reaching 4 after a fresh three-resource apply and 6 after the next apply, while a remote state uploaded once and reached serial 1. Right: the outcomes of CheckValidImport, used only by a non-forced state push, with the three measured error messages.">
+                <defs>
+                  <marker id="fig-state-file-black" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-state-file-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="10" y="22" class="svg-lane">TERRAFORM.TFSTATE (LAB E1, AFTER TWO APPLIES)</text>
+                <rect x="10" y="32" width="520" height="400" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="22" y="54" class="svg-sub" style="fill:#252525" xml:space="preserve">{</text>
+                <text x="22" y="74" class="svg-sub" style="fill:#252525" xml:space="preserve">  "version": 4,</text>
+                <text x="22" y="94" class="svg-sub" style="fill:#252525" xml:space="preserve">  "terraform_version": "1.17.0",</text>
+                <rect x="30" y="102" width="102" height="18" rx="3" fill="#ece6f3"/>
+                <text x="22" y="115" class="svg-sub" style="fill:#252525" xml:space="preserve">  "serial": 6,</text>
+                <rect x="30" y="123" width="276" height="18" rx="3" fill="#ece6f3"/>
+                <text x="22" y="136" class="svg-sub" style="fill:#252525" xml:space="preserve">  "lineage": "83ff9767-…-e40f5f293ebb",</text>
+                <text x="22" y="157" class="svg-sub" style="fill:#252525" xml:space="preserve">  "outputs": { "pw": {</text>
+                <rect x="42" y="165" width="208" height="18" rx="3" fill="#f3dfdc"/>
+                <text x="22" y="178" class="svg-sub" style="fill:#252525" xml:space="preserve">    "value": "xdcJMevxyoflqcL6",</text>
+                <text x="22" y="199" class="svg-sub" style="fill:#252525" xml:space="preserve">    "sensitive": true } },</text>
+                <text x="22" y="220" class="svg-sub" style="fill:#252525" xml:space="preserve">  "resources": [ …,</text>
+                <text x="22" y="241" class="svg-sub" style="fill:#252525" xml:space="preserve">    { "type": "terraform_data", "name": "app",</text>
+                <text x="22" y="262" class="svg-sub" style="fill:#252525" xml:space="preserve">      "instances": [{ "attributes": {</text>
+                <rect x="66" y="270" width="220" height="18" rx="3" fill="#f3dfdc"/>
+                <text x="22" y="283" class="svg-sub" style="fill:#252525" xml:space="preserve">        "input":  {"secret": "s3cret"},</text>
+                <rect x="66" y="291" width="220" height="18" rx="3" fill="#f3dfdc"/>
+                <text x="22" y="304" class="svg-sub" style="fill:#252525" xml:space="preserve">        "output": {"secret": "s3cret"} },</text>
+                <text x="22" y="325" class="svg-sub" style="fill:#252525" xml:space="preserve">        "sensitive_attributes":</text>
+                <text x="22" y="346" class="svg-sub" style="fill:#252525" xml:space="preserve">          [[input, secret]],</text>
+                <text x="22" y="367" class="svg-sub" style="fill:#252525" xml:space="preserve">        "dependencies": ["random_pet.name"]</text>
+                <text x="22" y="388" class="svg-sub" style="fill:#252525" xml:space="preserve">      }] } ],</text>
+                <text x="22" y="409" class="svg-sub" style="fill:#252525" xml:space="preserve">  "check_results": null }</text>
+                <text x="332" y="115" class="svg-note">bumped per write (local)</text>
+                <text x="332" y="136" class="svg-note">minted once, kept forever</text>
+                <text x="332" y="199" class="svg-note">cleartext; "sensitive" is a flag</text>
+                <text x="332" y="241" class="svg-note">sorted by module, mode, type, name</text>
+                <text x="332" y="304" class="svg-note">provider's copy: not flagged</text>
+                <text x="332" y="346" class="svg-note">a path list, not encryption</text>
+                <text x="332" y="388" class="svg-note">destroy order comes from here</text>
+                <text x="332" y="409" class="svg-note">"each": declared, never written</text>
+
+                <text x="552" y="22" class="svg-lane">WHAT SERIAL COUNTS</text>
+                <text x="552" y="48" class="svg-step">statemgr.Filesystem (local)</text>
+                <text x="552" y="66" class="svg-sub">one bump per differing WriteState</text>
+                <rect x="552" y="78" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="567" y="97" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="600" y="78" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="615" y="97" class="svg-sub" style="fill:#252525">2</text>
+                <rect x="648" y="78" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="663" y="97" class="svg-sub" style="fill:#252525">3</text>
+                <rect x="696" y="78" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="711" y="97" class="svg-sub" style="fill:#252525">4</text>
+                <text x="552" y="124" class="svg-sub">fresh apply, 3 resources: serial 4</text>
+                <rect x="552" y="136" width="40" height="28" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="567" y="155" class="svg-sub" style="fill:#252525">4</text>
+                <rect x="600" y="136" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="615" y="155" class="svg-sub" style="fill:#252525">5</text>
+                <rect x="648" y="136" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="663" y="155" class="svg-sub" style="fill:#252525">6</text>
+                <text x="552" y="182" class="svg-sub">one changed input: 4 → 6; .backup = 4</text>
+
+                <text x="552" y="222" class="svg-step">remote.State (toy HTTP server)</text>
+                <text x="552" y="240" class="svg-sub">one bump per persist that differs</text>
+                <rect x="552" y="252" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="567" y="271" class="svg-sub" style="fill:#252525">1</text>
+                <text x="604" y="271" class="svg-sub">GET LOCK GET GET POST UNLOCK</text>
+                <text x="552" y="298" class="svg-sub">1-resource apply: one upload, serial 1</text>
+                <text x="552" y="330" class="svg-sub">persists: every 20 s, plus a final one</text>
+                <text x="552" y="348" class="svg-sub">no compare-and-swap on the remote serial</text>
+                <text x="552" y="392" class="svg-note">Neither counter is checked on an ordinary</text>
+                <text x="552" y="408" class="svg-note">write: the lock is the only exclusion.</text>
+
+                <text x="812" y="22" class="svg-lane">CHECKVALIDIMPORT</text>
+                <text x="812" y="40" class="svg-sub">new snapshot vs stored</text>
+                <rect x="812" y="52" width="258" height="26" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="822" y="69" class="svg-sub" style="fill:#252525">newer serial, same lineage: ok</text>
+                <rect x="812" y="84" width="258" height="26" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="822" y="101" class="svg-sub" style="fill:#252525">empty lineage (legacy): ok</text>
+                <rect x="812" y="116" width="258" height="26" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="822" y="133" class="svg-sub" style="fill:#252525">same serial, same content: ok</text>
+                <rect x="812" y="148" width="258" height="58" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="822" y="165" class="svg-sub" style="fill:#252525">older serial:</text>
+                <text x="822" y="182" class="svg-sub">cannot import state with serial 2</text>
+                <text x="822" y="198" class="svg-sub">over newer state with serial 6</text>
+                <rect x="812" y="212" width="258" height="58" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="822" y="229" class="svg-sub" style="fill:#252525">other lineage:</text>
+                <text x="822" y="246" class="svg-sub">cannot import state with lineage</text>
+                <text x="822" y="262" class="svg-sub">"00000000-…" over unrelated state</text>
+                <rect x="812" y="276" width="258" height="58" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="822" y="293" class="svg-sub" style="fill:#252525">same serial, other content:</text>
+                <text x="822" y="310" class="svg-sub">cannot overwrite existing state</text>
+                <text x="822" y="326" class="svg-sub">with serial 6 with a different state</text>
+                <rect x="812" y="346" width="258" height="64" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+                <text x="822" y="364" class="svg-sub" style="fill:#252525">used by: state push (no -force)</text>
+                <text x="822" y="381" class="svg-sub">skipped: state push -force,</text>
+                <text x="822" y="398" class="svg-sub">-migrate-state (always forced)</text>
+                <line x1="738" y1="92" x2="806" y2="92" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-state-file-purple)"/>
+                <text x="10" y="458" class="svg-note">Highlighted lines: purple are the two counters; red are values that were secret in configuration and are cleartext in the file.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The file is lab <code>e1</code>'s state after a fresh apply and a second apply with
+              <code>-var secret=s3cret</code>, trimmed; the serial runs and the three error strings are from the lab's applies
+              and <code>state push</code> attempts <span class="recon">measured here</span>. The remote run is one
+              resource against a 30-line HTTP server, so it is not the same apply as the local runs. Lineage and serial are
+              compared in only two places, a non-forced <code>state push</code> and the saved-plan check; everywhere else
+              the backend's lock does the work.
+            </p>
+          </figure>
+
+          <h3>Lineage, serial, and where they are checked</h3>
+          <p>
+            Two fields identify a snapshot. <code>lineage</code> is a random UUID minted once, when state is first recorded
+            at a location, and kept forever; <code>serial</code> counts snapshots within that lineage, and
+            <code>NewStateFile</code> starts at serial 0 (<code>statemgr/lineage.go</code>:12-23; <code>helper.go</code>:16-24).
+            <code>SnapshotMeta.Compare</code> sorts a pair into five relations: older, newer, equal, unrelated (different
+            lineage) and legacy (empty lineage) (<code>migrate.go</code>:137-175) <span class="src">from the code</span>. The
+            gate that uses them is <code>CheckValidImport</code>, at <code>internal/states/statemgr/migrate.go</code>:195-210:
+          </p>
+          <pre><code>	rel := new.Compare(existing)
+	switch rel {
+	case SnapshotNewer:
+		return nil // a newer snapshot is fine
+	case SnapshotLegacy:
+		return nil // anything goes for a legacy state
+	case SnapshotUnrelated:
+		return fmt.Errorf("cannot import state with lineage %q over unrelated state with lineage %q", new.Lineage, existing.Lineage)
+	case SnapshotEqual:
+		if statefile.StatesMarshalEqual(newFile.State, existingFile.State) {
+			// If lineage, serial, and state all match then this is fine.
+			return nil
+		}
+		return fmt.Errorf("cannot overwrite existing state with serial %d with a different state that has the same serial", new.Serial)
+	case SnapshotOlder:
+		return fmt.Errorf("cannot import state with serial %d over newer state with serial %d", new.Serial, existing.Serial)</code></pre>
+          <p>
+            This gate guards one door: a non-forced <code>terraform state push</code>. Both the filesystem manager and
+            <code>remote.State</code> run it only inside <code>WriteStateForMigration</code> when <code>force</code> is false
+            (<code>filesystem.go</code>:420; <code>internal/states/remote/state.go</code>:102). Backend migration always passes
+            true: <code>statemgr.Migrate</code> calls <code>WriteStateForMigration(s, true)</code> when both sides support
+            it, and otherwise a plain <code>WriteState</code> that loses lineage and serial altogether
+            (<code>migrate.go</code>:58-71). During <code>init -migrate-state</code> lineage is used only to skip copying a
+            state that is already identical (<code>internal/command/meta_backend_migrate.go</code>:352-361); the overwrite is
+            gated by a confirmation prompt, and <code>-force-copy</code> skips the prompt <span class="src">from the code</span>.
+            The other door is the saved plan: apply refuses "Saved plan is stale" when a new snapshot was persisted after the
+            plan was written (<a href="../engine-and-providers/#p2-plan-apply">Part 2</a>). Everything else, including every
+            write during an ordinary apply, goes through without a comparison.
+          </p>
+          <p>
+            The lab's <code>state push</code> run shows the gate at work on a local state at serial 6 with lineage
+            <code>211cc19e-…</code> <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform state push older.json        # serial set to 2
+Failed to write state: cannot import state with serial 2 over newer state with serial 6
+$ (lineage 0000…, serial 99) → cannot import state with lineage "00000000-…" over unrelated state with lineage "211cc19e-…"
+$ (serial 6, one instance dropped) → cannot overwrite existing state with serial 6 with a different state that has the same serial
+$ (serial 20, one instance dropped) → ok; stored serial 21
+$ terraform state push -force other.json  → stored lineage 00000000-…, serial 99</code></pre>
+          <p>
+            The pushed serial 20 landed as 21 because <code>state push</code> writes and persists again after the import,
+            and a changed write bumps the counter (<code>internal/command/state_push.go</code>:139-158). The forced push
+            stored serial 99 only because its content matched the current state; a verifier's re-run with different content
+            got 100. A forced push replaced the lineage outright. The practical consequence is short: <code>-force</code>
+            and <code>-migrate-state</code> are the two commands that can overwrite a teammate's newer state, and nothing
+            but a prompt (or nothing, with <code>-force-copy</code>) stands in the way.
+          </p>
+
+          <h3>Two write paths</h3>
+          <p>
+            The local manager and the remote one count differently. <code>Filesystem.WriteState</code> calls itself "an
+            incorrect implementation of Writer that actually also persists": every write seeks to 0, truncates and writes the
+            file in place, with a TODO to write a temporary file and rename it instead (<code>filesystem.go</code>:124-141,
+            191-196). Its <code>PersistState</code> is a no-op (<code>filesystem.go</code>:228-232). Serial goes up on every
+            write that differs from the snapshot first read (<code>filesystem.go</code>:204-210), so a fresh three-resource
+            apply ended at serial 4 and a later apply that changed one input went from 4 to 6. The <code>.backup</code> file is
+            written once, before the first changing write, and holds the snapshot the manager opened; a first-ever apply leaves
+            none <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <code>remote.State</code> keeps writes in memory and uploads in <code>PersistState</code>, at
+            <code>internal/states/remote/state.go</code>:176-185 and 205-213:
+          </p>
+          <pre><code>	if s.readState != nil {
+		lineageUnchanged := s.readLineage != "" &amp;&amp; s.lineage == s.readLineage
+		serialUnchanged := s.readSerial != 0 &amp;&amp; s.serial == s.readSerial
+		stateUnchanged := statefile.StatesMarshalEqual(s.state, s.readState)
+		if stateUnchanged &amp;&amp; lineageUnchanged &amp;&amp; serialUnchanged {
+			// If the state, lineage or serial haven't changed at all then we have nothing to do.
+			return nil
+		}
+		s.serial++
+	} else {
+	…
+	f := statefile.New(s.state, s.lineage, s.serial)
+
+	var buf bytes.Buffer
+	err := statefile.Write(f, &amp;buf)
+	if err != nil {
+		return err
+	}
+
+	diags := s.Client.Put(buf.Bytes())</code></pre>
+          <p>
+            There is no read of the remote's current serial before the <code>Put</code> <span class="src">from the code</span>.
+            The local backend's <code>StateHook</code> calls <code>WriteState</code> after every resource and
+            <code>PersistState</code> only when forced (on interrupt) or when at least 20 seconds have passed since the last
+            persist; <code>TF_STATE_PERSIST_INTERVAL</code> can raise that interval but not lower it
+            (<code>internal/backend/local/hook_state.go</code>:42-113; <code>persistent.go</code>:190-192). A one-resource
+            apply against a toy HTTP backend produced exactly one upload and serial 1
+            <span class="recon">measured here</span>. So a local serial counts writes and a remote serial counts persists;
+            comparing them across backends means nothing. <code>terraform state mv</code> and <code>rm</code> are one lock,
+            one write and one persist each, bumping serial by one; a cross-state <code>mv -state-out</code> is two
+            independent persists, so a failure between them leaves the object in both files
+            (<code>internal/command/state_mv.go</code>:100-162). Their timestamped backups have one-second resolution, and two
+            mutations in the same second share one file <span class="recon">measured here</span>.
+          </p>
+
+          <h2 id="p3-locks"><span class="secnum">02</span>Locks, per backend</h2>
+          <p class="lede">
+            A state lock is whatever atomic primitive the backend's storage happens to offer: a POSIX record lock, a
+            conditional object write, a blob lease, a database advisory lock. Core sees only a <code>Lock</code> method that
+            returns an ID or an error. Two defaults decide how that works in practice. <code>-lock-timeout</code> is zero, so
+            a held lock fails your command at once. And the S3 backend, configured with neither of its two lock options,
+            takes no lock at all and says nothing about it.
+          </p>
+
+          <h3>One attempt by default</h3>
+          <p>
+            A lock request carries a <code>LockInfo</code> with seven fields, <code>ID</code>, <code>Operation</code>,
+            <code>Info</code>, <code>Who</code>, <code>Version</code>, <code>Created</code> and <code>Path</code>; its ID comes
+            from <code>math/rand</code> in UUID shape, with a comment that it "doesn't need to be cryptographically secure"
+            (<code>internal/states/statemgr/locker.go</code>:118-172) <span class="src">from the code</span>. The retry loop is
+            <code>LockWithContext</code>, at <code>locker.go</code>:75-88 and 101-111 (the guard for an incomplete
+            <code>LockError</code> in between is left out):
+          </p>
+          <pre><code>func LockWithContext(ctx context.Context, s Locker, info *LockInfo) (string, error) {
+	delay := time.Second
+	maxDelay := 16 * time.Second
+	for {
+		id, err := s.Lock(info)
+		if err == nil {
+			return id, nil
+		}
+
+		le, ok := err.(*LockError)
+		if !ok {
+			// not a lock error, so we can't retry
+			return "", err
+		}
+	…
+		select {
+		case &lt;-ctx.Done():
+			// return the last lock error with the info
+			return "", err
+		case &lt;-time.After(delay):
+			if delay &lt; maxDelay {
+				delay *= 2
+			}
+		}
+	}
+}</code></pre>
+          <p>
+            Only a <code>*LockError</code> whose <code>Info</code> has an ID is retried; anything else fails immediately. The
+            wait starts at one second and doubles to a 16-second cap. Every state-touching command defaults
+            <code>-lock-timeout</code> to <code>0s</code>: plan, apply, refresh, init, <code>state mv</code>, <code>rm</code>,
+            <code>push</code> and <code>replace-provider</code> (<code>internal/command/arguments/extended.go</code>:270-271,
+            <code>init.go</code>:110-111 and the state command parsers) <span class="src">from the code</span>. With a zero
+            timeout the context is already done when the first <code>LockError</code> comes back, so there is exactly one
+            attempt (<code>internal/command/clistate/state.go</code>:109-138). The CLI prints "Acquiring state lock…" only if
+            the lock takes longer than its 400 ms <code>LockThreshold</code> (<code>clistate/state.go</code>:23).
+          </p>
+          <p>
+            Two processes against one local state show all of it. The lab ran a nine-second apply in the background, then
+            tried everything else against the held lock <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform apply -auto-approve &amp;        # holds the lock ~9 s
+$ cat .terraform.tfstate.lock.info
+{"ID":"b6aa29e9-…","Operation":"OperationTypeApply","Info":"","Who":"coder@…","Version":"1.17.0","Created":"2026-10-23T15:23:05.72…Z","Path":"terraform.tfstate"}
+$ time terraform plan          → Error acquiring the state lock / Error message: resource temporarily unavailable   (real 0.350s)
+$ terraform plan -lock=false   → Plan: 0 to add, 1 to change, 0 to destroy.
+$ terraform force-unlock -force &lt;ID&gt;  → Failed to unlock state: LocalState not locked
+$ terraform force-unlock &lt;ID&gt;         → Local state cannot be unlocked by another process
+$ TF_LOG=trace terraform plan -lock-timeout=20s → attempts at 43.224, 44.225, 46.226, 50.229
+                                                 → Plan: 1 to add, 0 to change, 1 to destroy.  (real 7.501s)</code></pre>
+          <p>
+            The immediate failure took 0.35 s here and 0.14 s on a verifier's re-run; that number moves with the box. The four
+            attempts with a 20-second timeout sit at +0, +1, +3 and +7 s, which is waits of 1, 2 and 4 s, and the plan got the
+            lock when the apply finished; a re-run saw the same shape. <code>-lock=false</code> really does bypass the lock:
+            <code>statemgr.LockDisabled</code> turns <code>Lock</code> and <code>Unlock</code> into no-ops and passes reads and
+            writes through (<code>internal/states/statemgr/lock.go</code>:13-48), and the bypassing plan completed while the
+            other process held the apply lock.
+          </p>
+          <p>
+            <code>plan</code> takes the lock too, with operation <code>OperationTypePlan</code>, so a teammate's long plan blocks
+            your apply, and with the default timeout your apply fails at once rather than waiting
+            <span class="recon">measured here</span> (the plan-locking run, against the toy HTTP backend, was not re-run by a
+            verifier). The practical setting is a non-zero <code>-lock-timeout</code> in CI, sized to your longest plan.
+          </p>
+
+          <h3>What each backend builds</h3>
+          <p>
+            <strong>local.</strong> A non-blocking POSIX <code>fcntl F_SETLK</code> on <code>terraform.tfstate</code> itself
+            (<code>LockFileEx</code> on Windows), plus a 0600 sidecar <code>.terraform.tfstate.lock.info</code> holding the
+            <code>LockInfo</code> (<code>internal/states/statemgr/filesystem_lock_unix.go</code>:15-41;
+            <code>filesystem.go</code>:487-529). The kernel lock dies with the process that holds it, and
+            <code>force-unlock</code> refuses local state either way: without <code>-force</code> it says the state "cannot be
+            unlocked by another process", and with it the new process finds it holds nothing, "LocalState not locked"
+            (<code>internal/command/unlock.go</code>:78-110; <code>filesystem.go</code>:345-351) <span class="src">from the code</span>.
+          </p>
+          <p>
+            <strong>s3.</strong> Two mechanisms, both opt-in. <code>use_lockfile</code> writes the <code>LockInfo</code> JSON to
+            <code>&lt;key&gt;.tflock</code> with a conditional <code>PutObject</code> carrying <code>If-None-Match: *</code>; on
+            a 412 Terraform reads the existing <code>.tflock</code> to name the holder (<code>s3/client.go</code>:346-404).
+            <code>dynamodb_table</code> does a <code>PutItem</code> with <code>attribute_not_exists(LockID)</code>, where
+            <code>LockID</code> is <code>&lt;bucket&gt;/&lt;key&gt;</code>, and keeps a <code>-md5</code> digest item that
+            drives a consistency loop retrying a mismatched <code>Get</code> every 2 s for up to 10 s
+            (<code>s3/client.go</code>:39, 57-125, 406-436). The matrix is at
+            <code>internal/backend/remote-state/s3/client.go</code>:285-288 and 327-340:
+          </p>
+          <pre><code>	// no file, no dynamodb
+	if !c.useLockFile &amp;&amp; c.ddbTable == "" {
+		return "", nil
+	}
+	…
+	// double locking: dynamodb + file (design decision: both must succeed)
+	log.Info("Attempting to lock remote state (S3 Native and DynamoDB)...")
+	if err := c.lockWithFile(ctx, info, log); err != nil {
+		return "", err
+	}
+
+	if err := c.lockWithDynamoDB(ctx, info); err != nil {
+		// Release the file lock if attempting to acquire the DynamoDB lock fails.
+		if unlockErr := c.unlockWithFile(ctx, info.ID, &amp;statemgr.LockError{}, log); unlockErr != nil {
+			return "", fmt.Errorf("failed to clean up file lock after DynamoDB lock error: %v; original error: %w", unlockErr, err)
+		}
+
+		return "", err
+	}</code></pre>
+          <p>
+            The first three lines are the finding: with neither option set, <code>Lock</code> returns an empty ID and no
+            error, so every command proceeds as if it held the lock <span class="src">from the code</span>. Nothing warns.
+            Native locking arrived in v1.10.0 alongside DynamoDB (code first committed on 1 September 2024, 8be88f76e) and was
+            declared GA in v1.11.0 (#36338), which deprecated the DynamoDB arguments. The deprecation warning comes from
+            <code>PrepareConfig</code>, so it appears at <code>init</code> and not at <code>validate</code>, which printed
+            "Success!" for a <code>dynamodb_table</code> backend <span class="recon">measured here</span> (not re-run by a
+            verifier). If you run S3 state, set <code>use_lockfile = true</code>. One open question sits under that advice:
+            whether S3-compatible stores such as MinIO, R2 or Ceph honour <code>If-None-Match</code>; if one does not,
+            <code>use_lockfile</code> may silently not lock there. Unlock in both modes reads the lock, compares the ID, then
+            deletes, and a TODO notes that the DynamoDB comparison is not atomic (<code>s3/client.go</code>:508-589).
+          </p>
+          <p>
+            <strong>gcs and azurerm.</strong> GCS creates <code>&lt;prefix&gt;/&lt;workspace&gt;.tflock</code> with a
+            <code>DoesNotExist</code> condition and uses the object's generation number as the lock ID; unlock is a delete
+            with <code>GenerationMatch</code> (<code>gcs/client.go</code>:96-139). azurerm takes an infinite blob lease
+            (<code>LeaseDuration: -1</code>) on the state blob itself, proposing the <code>LockInfo</code> ID as the lease ID,
+            and stores the info base64-encoded in blob metadata <code>terraformlockid</code>
+            (<code>azure/client.go</code>:25-27, 143-270) <span class="src">from the code</span>.
+          </p>
+          <p>
+            <strong>http.</strong> Locking happens only if <code>lock_address</code> is set, using configurable
+            <code>LOCK</code>/<code>UNLOCK</code> methods where 409 or 423 means "locked", and state writes carry the lock ID as
+            <code>?ID=…</code> (<code>http/client.go</code>:93-123, 205-243). <code>Unlock(id)</code> never sends
+            <code>id</code>: it replays this process's own lock JSON (<code>http/client.go</code>:126-143). A fresh
+            <code>force-unlock</code> process has no lock JSON, so the lab server received <code>UNLOCK body=b''</code>; a
+            bogus ID "succeeded"; and a force-unlock during a live apply let a second <code>plan</code> lock and unlock
+            while the apply was still running, after which the apply posted with its stale ID
+            <span class="recon">measured here</span>. Those runs were not re-run by a verifier; the code half is confirmed.
+            HashiCorp's locking page calls the lock ID "a nonce" that makes unlocks target the right lock; for HTTP the client
+            does not enforce that, and the server must.
+          </p>
+          <p>
+            <strong>The rest.</strong> <code>pg</code> uses <code>pg_try_advisory_lock</code>; <code>kubernetes</code> a
+            <code>coordination.k8s.io/v1</code> Lease whose holder identity is the lock ID; <code>oci</code> a conditional
+            <code>PutObject</code> with <code>IfNoneMatch: "*"</code>; <code>oss</code> a TableStore row
+            (<code>internal/backend/remote-state/{pg,kubernetes,oci,oss}</code>). Backends are compiled in, not plugins:
+            v1.17 ships 13 names plus the internal <code>cloud</code> (<code>internal/backend/init/init.go</code>:33-86).
+            <code>oci</code> is the newest. Its CHANGELOG line in v1.12.0 cites #34465, while the commit that added it is
+            #36872 (804e97021), and <code>git tag --contains</code> first lists v1.13.0 (CHANGELOG mistake, code, verified). A
+            generic <code>remote.State</code> whose client has no <code>Lock</code> at all also "succeeds" silently
+            (<code>internal/states/remote/state.go</code>:238-250).
+          </p>
+          <p>
+            <strong>HCP Terraform and <code>state_store</code>.</strong> The <code>cloud</code> backend's lock is a workspace
+            lock ("Locked by Terraform"), and its force-unlock ID is literally <code>&lt;org&gt;/&lt;workspace&gt;</code>
+            (<code>internal/cloud/state.go</code>:334-361, 452-520). Experimental pluggable state storage hands state to a
+            provider through eight tfplugin6 RPCs, including <code>LockState</code> and <code>UnlockState</code>, with chunks
+            negotiated at 8 MiB and capped at 128 MiB (<code>docs/plugin-protocol/tfplugin6.proto</code>:403-421;
+            <code>internal/backend/pluggable/chunks/chunks.go</code>:6-18). <code>LockState</code> carries only type, state ID
+            and operation, and the gRPC client returns a plain error, so <code>-lock-timeout</code> would never retry it
+            (<code>internal/states/remote/remote_grpc.go</code>:118-130). That consequence is inferred from code; testing it
+            needs an experimental build. The release binary rejects the block outright: "Blocks of type "state_store" are not
+            expected here." <span class="recon">measured here</span>
+          </p>
+
+          <figure class="figure wide" id="fig-locks">
+            <div class="figure-head">
+              <span class="figure-label">Figure 16</span>
+              <p class="figure-title">What a lock is, per backend, and how long a waiting command tries</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>backend</th><th>primitive</th><th>default</th><th>lock ID, force-unlock</th><th>workspace layout</th></tr></thead>
+                <tbody>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">local</td><td>non-blocking <code>fcntl F_SETLK</code> on the state file + 0600 <code>.lock.info</code> sidecar</td><td style="background: var(--green-soft)">on</td><td>refused: "Local state cannot be unlocked by another process"</td><td><code>terraform.tfstate.d/&lt;name&gt;/</code></td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">s3 + use_lockfile</td><td>conditional <code>PutObject</code> of <code>&lt;key&gt;.tflock</code>, <code>If-None-Match: *</code></td><td style="background: var(--orange-soft)">opt-in</td><td>ID read and compared, then deleted</td><td rowspan="3"><code>env:/&lt;name&gt;/&lt;key&gt;</code> (prefix configurable)</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">s3 + dynamodb_table</td><td><code>PutItem</code>, <code>attribute_not_exists(LockID)</code>; deprecated in v1.11</td><td style="background: var(--orange-soft)">opt-in</td><td>ID compared non-atomically (TODO)</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">s3, neither</td><td><strong>none</strong>: <code>Lock</code> returns <code>"", nil</code></td><td style="background: var(--red-soft)">no lock</td><td>nothing to unlock</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">gcs</td><td><code>.tflock</code> object created with <code>DoesNotExist</code></td><td style="background: var(--green-soft)">on</td><td>ID = object generation; <code>GenerationMatch</code> delete</td><td><code>&lt;prefix&gt;/&lt;name&gt;.tfstate</code></td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">azurerm</td><td>infinite blob lease on the state blob; info in metadata</td><td style="background: var(--green-soft)">on</td><td>lease ID = LockInfo ID; verified</td><td><code>&lt;key&gt;env:&lt;name&gt;</code></td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">http</td><td>configurable <code>LOCK</code> / <code>UNLOCK</code>; 409 or 423 = locked</td><td style="background: var(--orange-soft)">if <code>lock_address</code></td><td>unlock sends no ID; a bogus ID "succeeded"</td><td>no workspaces</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">pg, kubernetes, oci, oss</td><td>advisory lock; Lease; conditional <code>PutObject</code>; TableStore row</td><td>not stated</td><td>not described</td><td>not described</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">cloud (HCP)</td><td>workspace lock</td><td style="background: var(--green-soft)">on</td><td>ID is <code>&lt;org&gt;/&lt;workspace&gt;</code>; stays locked after a failed upload</td><td>HCP workspaces</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">state_store</td><td><code>LockState</code> / <code>UnlockState</code> RPCs to a provider</td><td style="background: var(--red-soft)">experimental build</td><td>provider-defined; plain errors, never retried</td><td>provider's <code>GetStates</code></td></tr>
+                </tbody>
+              </table>
+              <svg viewBox="0 0 1000 150" role="img" aria-label="Timeline of lock attempts. With the default lock timeout of zero there is a single attempt at time zero. With a timeout, attempts happen at 0, 1, 3 and 7 seconds as measured, then 15, 31 and 47 seconds as the delay reaches its 16 second cap." style="margin-top: 18px">
+                <text x="10" y="20" class="svg-lane">ATTEMPTS BY LOCKWITHCONTEXT, SECONDS AFTER THE FIRST</text>
+                <line x1="150" y1="58" x2="980" y2="58" stroke="#b8b8b1"/>
+                <line x1="150" y1="112" x2="980" y2="112" stroke="#b8b8b1"/>
+                <text x="10" y="62" class="svg-sub" style="fill:#252525">-lock-timeout=0</text>
+                <text x="10" y="116" class="svg-sub" style="fill:#252525">-lock-timeout=60s</text>
+                <circle cx="160" cy="58" r="7" fill="#ad4b43"/>
+                <text x="176" y="62" class="svg-sub">one attempt, then "Error acquiring the state lock"</text>
+                <circle cx="160" cy="112" r="7" fill="#3c6f97"/>
+                <circle cx="176" cy="112" r="7" fill="#3c6f97"/>
+                <circle cx="208" cy="112" r="7" fill="#3c6f97"/>
+                <circle cx="272" cy="112" r="7" fill="#3c6f97"/>
+                <circle cx="400" cy="112" r="7" fill="#f7f7f5" stroke="#3c6f97" stroke-width="1.5"/>
+                <circle cx="656" cy="112" r="7" fill="#f7f7f5" stroke="#3c6f97" stroke-width="1.5"/>
+                <circle cx="912" cy="112" r="7" fill="#f7f7f5" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="154" y="138" class="svg-sub">0</text>
+                <text x="202" y="138" class="svg-sub">3</text>
+                <text x="268" y="138" class="svg-sub">7</text>
+                <text x="392" y="138" class="svg-sub">15</text>
+                <text x="648" y="138" class="svg-sub">31</text>
+                <text x="904" y="138" class="svg-sub">47</text>
+                <text x="168" y="96" class="svg-note">measured: +0, +1, +3, +7</text>
+                <text x="420" y="96" class="svg-note">from the code: delay doubles to a 16 s cap, then stays</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Rows are read from <code>internal/backend/remote-state</code> and <code>internal/cloud</code> at v1.17.0
+              <span class="src">from the code</span>; the local and HTTP behaviour and the four filled attempts are
+              <span class="recon">measured here</span>, and the hollow attempts are computed from <code>locker.go</code>. Only
+              a <code>*LockError</code> that names a holder is retried, whatever the timeout. The red cells are the two ways
+              to have no working wait: an S3 backend with no lock option, and a provider store whose errors are not lock errors.
+            </p>
+          </figure>
+
+          <h2 id="p3-workspaces-hcp"><span class="secnum">03</span>Workspaces, remote state and HCP Terraform</h2>
+          <p class="lede">
+            Three features look like boundaries and are not. A CLI workspace is a second key in the same backend, reached with
+            the same credentials. <code>terraform_remote_state</code> reads another configuration's whole state and hands its
+            outputs over with the <code>sensitive</code> flag removed. And HCP Terraform, the one place that does isolate
+            workspaces, does it by turning the CLI into a client of a run service.
+          </p>
+
+          <h3>Workspaces are key mappings</h3>
+          <p>
+            The selected workspace comes from <code>TF_WORKSPACE</code> if set, else from <code>.terraform/environment</code>,
+            else <code>default</code>; a name must be non-empty and equal its own <code>url.PathEscape</code>
+            (<code>internal/command/meta.go</code>:765-835) <span class="src">from the code</span>. What a name maps to is up to
+            the backend. The local backend keeps <code>default</code> at <code>terraform.tfstate</code> and every other workspace
+            in <code>terraform.tfstate.d/&lt;name&gt;/terraform.tfstate</code>; its <code>Workspaces()</code> is
+            <code>default</code> plus the sorted subdirectories, and <code>DeleteWorkspace</code> is an
+            <code>os.RemoveAll</code> that refuses only <code>default</code> (<code>internal/backend/local/backend.go</code>:29-32,
+            199-258). S3 puts other workspaces at <code>&lt;workspace_key_prefix&gt;/&lt;name&gt;/&lt;key&gt;</code> with prefix
+            <code>env:</code>; GCS uses a flat <code>&lt;prefix&gt;/&lt;name&gt;.tfstate</code>; azurerm appends
+            <code>env:&lt;name&gt;</code> to the key; HTTP has no workspaces at all and answers <code>workspace new dev</code>
+            with "workspaces not supported". Creating an S3 workspace takes a lock, re-reads to avoid a race and writes an
+            empty state so the new name is listable (<code>s3/backend_state.go</code>:210-253).
+          </p>
+          <p>
+            The local backend's walk-through in the lab shows the shape <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform apply                    → ws = "ws=default"
+$ terraform workspace new staging    → Created and switched to workspace "staging"!
+$ terraform apply                    → ws = "ws=staging"
+$ terraform workspace new "bad/name" → The workspace name "bad/name" is not allowed. The name must contain only URL safe …
+$ TF_WORKSPACE=nope terraform output → Warning: No outputs found      (and terraform.tfstate.d/nope/ now exists)
+$ terraform workspace select default; terraform workspace delete staging → Error: Workspace is not empty … - terraform_data.env
+$ terraform workspace delete -force staging → Deleted workspace "staging"! WARNING: "staging" was non-empty.</code></pre>
+          <p>
+            Two lines bite. Asking for a workspace's state manager creates its directory, so a mistyped
+            <code>TF_WORKSPACE</code> in a pipeline does not fail; it reads an empty state and leaves a new workspace behind
+            that <code>workspace list</code> then shows (<code>local/backend.go</code>:260-289, 489-509). A
+            <code>plan</code> in that workspace would propose creating everything <span class="recon">reconstruction</span>. And <code>delete -force</code> deletes the
+            state of a non-empty workspace, so the real objects keep running with no record; it also releases the lock before
+            deleting, because some backends cannot delete a locked object, and a TODO notes the gap
+            (<code>internal/command/workspace_delete.go</code>:110-175). On origin/main the closing WARNING becomes a
+            diagnostic, "Workspace %q was non-empty". HashiCorp's CLI documentation says the same thing in its own words:
+            CLI workspaces are not an isolation mechanism, because they share one backend and one set of credentials, while
+            HCP workspaces behave like separate working directories. If two environments need different access, give them
+            different backends or different HCP workspaces.
+          </p>
+
+          <p>
+            The name rules have tightened release by release. v1.13 rejected an empty name in <code>workspace new</code> and
+            <code>delete</code> (#37267, #37275); since v1.16 an invalid name in <code>.terraform/environment</code> is an error
+            for every backend command (#38594), and <code>workspace list -json</code> (#38397) marks the current one
+            (<code>meta.go</code>:808-813; v1.16.0 CHANGELOG) <span class="src">from the code</span>. Inside configuration the
+            name is <code>terraform.workspace</code>, which is how the lab's <code>input = "ws=${terraform.workspace}"</code>
+            printed a different value per workspace. That interpolation is the usual way one configuration serves several
+            environments, and it is also the reason a typo in the name silently changes what the configuration means.
+          </p>
+
+          <h3>Remote state drops <code>sensitive</code></h3>
+          <p>
+            <code>data "terraform_remote_state"</code> lives in the built-in <code>terraform</code> provider. It instantiates a
+            full backend inside the consumer's process, refreshes the producer's entire snapshot and then exposes only the
+            root outputs (<code>internal/builtin/providers/terraform/data_source_state.go</code>:103-179). Two consequences
+            follow. The consumer needs read access to the whole producer state, which (§01) holds every secret in cleartext.
+            And the copy loses its marks, at <code>data_source_state.go</code>:143-146 and 172-176:
+          </p>
+          <pre><code>	if err := state.RefreshState(); err != nil {
+		diags = diags.Append(err)
+		return cty.NilVal, diags
+	}
+	…
+	for k, os := range remoteState.RootOutputValues {
+		outputs[k] = os.Value
+	}
+
+	newState["outputs"] = cty.ObjectVal(outputs)</code></pre>
+          <p>
+            The loop copies <code>os.Value</code> and never reads <code>os.Sensitive</code> <span class="src">from the code</span>.
+            In the lab, a producer with <code>output "token" { value = "s3cr3t"  sensitive = true }</code> printed
+            <code>token = &lt;sensitive&gt;</code> on apply. A consumer that read it through a local
+            <code>terraform_remote_state</code> and re-exported it as <code>output "token_is"</code> printed
+            <code>token_is = "s3cr3t"</code>, with no error about a sensitive value reaching a non-sensitive output
+            <span class="recon">measured here</span>. So a downstream configuration has to mark such outputs
+            <code>sensitive</code> again itself. <code>GetRootOutputValues</code> sits on the <code>Persistent</code> interface
+            so that an operations backend can grant output-only reads (<code>internal/states/statemgr/persistent.go</code>:31-38);
+            HCP's documentation describes the <code>tfe_outputs</code> data source, which needs only output-read permission.
+          </p>
+
+          <h3>HCP Terraform turns the CLI into a client</h3>
+          <p>
+            The <code>cloud</code> block takes <code>hostname</code> (default <code>app.terraform.io</code>),
+            <code>organization</code>, <code>token</code> and <code>workspaces { name | tags | project }</code>, with
+            environment fallbacks such as <code>TF_CLOUD_ORGANIZATION</code> and <code>TF_WORKSPACE</code>
+            (<code>internal/cloud/backend.go</code>:43, 145-180, 496-600). The package arrived in v1.1.0 as the successor to the
+            <code>remote</code> backend, which is still registered in v1.17 <span class="src">from the code</span>. With no
+            token, <code>init</code> stops at "Initializing HCP Terraform..." with "Error: Required token could not be found"
+            <span class="recon">measured here</span>; that is as far as this machine could go.
+          </p>
+          <p>
+            Unless the workspace uses local execution, <code>plan</code> and <code>apply</code> no longer run on your machine.
+            The CLI creates a configuration version, uploads the directory (honouring <code>.terraformignore</code>), creates a
+            run and streams its logs (<code>internal/cloud/backend.go</code>:918-935; <code>backend_common.go</code>:556-618).
+            A <code>plan</code> without <code>-out</code> is a speculative run; <code>plan -out</code> makes a saved-plan run;
+            <code>-refresh-only</code>, <code>-destroy</code> and <code>-minimal-refresh</code> map to run options
+            (<code>backend_plan.go</code>:126-175). The CLI renders a run in a fixed order: pre-plan tasks, plan, post-plan
+            tasks, cost estimate, Sentinel, then Terraform Policy evaluations (<code>backend_plan.go</code>:280-345).
+            HCP's run-states page puts the OPA check before cost estimation and Sentinel after it, so the docs and the CLI's
+            rendering disagree. The code half is verified; the web half was not re-checked.
+          </p>
+          <p>
+            The selector has two modes. With <code>workspaces { name = … }</code>, <code>TF_WORKSPACE</code> may only repeat
+            that name; with <code>tags</code>, which takes a string list or, preferred since v1.10 (#35937), a key-value map,
+            <code>TF_WORKSPACE</code> picks among the matching workspaces (<code>internal/cloud/backend.go</code>:538-600).
+            Around the run, HCP adds things the CLI cannot see or test: run tasks at four stages with advisory or mandatory
+            enforcement, a stored state version per run with rollback from the UI, and health assessments for drift on paid
+            tiers. Those come from HashiCorp's documentation, fetched on 23 October 2026, and were not exercised here.
+          </p>
+          <p>
+            Persisting to HCP uploads three things: the raw state, a schema-aware JSON rendering when schemas are available,
+            and the JSON outputs, with lineage, serial, an MD5 and the run ID (<code>internal/cloud/state.go</code>:164-331).
+            That is why <code>PersistState</code> takes schemas (§01), and why <code>state push</code> and
+            <code>state mv</code> load provider schemas first in cloud mode. Intermediate snapshots are off unless the API
+            returns an <code>X-Terraform-Snapshot-Interval</code> header; final snapshots always upload. One more choice is
+            deliberate. When the last state upload failed, the cloud manager does not unlock, at
+            <code>internal/cloud/state.go</code>:462-466: "If so, we will not unlock the workspace to prevent any changes from
+            being applied until the correct state is uploaded." A workspace stuck in "Locked by Terraform" after a network
+            failure may be guarding a state that never arrived, and force-unlocking it with <code>&lt;org&gt;/&lt;workspace&gt;</code>
+            should come after uploading the right state <span class="recon">reconstruction</span>.
+          </p>
+
+          <h2 id="p3-refactoring"><span class="secnum">04</span>Refactoring in configuration</h2>
+          <p class="lede">
+            <code>terraform state mv</code>, <code>rm</code> and <code>import</code> edit the record directly, one command at a
+            time, with nothing to review. Since v1.1 Terraform has been moving each of those edits into a block in the
+            configuration: <code>moved</code>, then <code>import</code> in v1.5, <code>removed</code> in v1.7. The blocks run
+            inside <code>plan</code>, show up in the plan like any change, and reach stored state only when that plan is
+            applied. That is the whole argument for them.
+          </p>
+
+          <h3>Surgery, and what it does not do</h3>
+          <p>
+            The <code>state</code> subcommands only edit records. In the lab, <code>state mv 'random_pet.a["x"]'
+            'random_pet.a["z"]'</code> on a <code>for_each</code> resource succeeded and bumped serial from 4 to 5; the next
+            <code>plan</code> then proposed to create <code>a["x"]</code> and destroy <code>a["z"]</code> "(because key ["z"] is
+            not in for_each map)" <span class="recon">measured here</span>. The configuration still said <code>x</code>, so the
+            move made the record disagree with it. <code>state rm</code> likewise leaves the object running and the next plan
+            re-creates it. Both have <code>-dry-run</code>, and both write a timestamped backup, but only for local state; remote
+            backends get none (<code>internal/command/state_meta.go</code>:29-97). Neither is reviewed by anyone before it lands.
+          </p>
+
+          <h3><code>moved</code>: applied to a copy, before the graph</h3>
+          <p>
+            Moves run at the very start of <code>planWalk</code>, before the plan graph exists, against a deep copy of the
+            prior state, at <code>internal/terraform/context_plan.go</code>:669-680 and 796-801:
+          </p>
+          <pre><code>func (c *Context) prePlanFindAndApplyMoves(config *configs.Config, prevRunState *states.State) ([]refactoring.MoveStatement, refactoring.MoveResults, tfdiags.Diagnostics) {
+	explicitMoveStmts := refactoring.FindMoveStatements(config)
+	implicitMoveStmts := refactoring.ImpliedMoveStatements(config, prevRunState, explicitMoveStmts)
+	var moveStmts []refactoring.MoveStatement
+	if stmtsLen := len(explicitMoveStmts) + len(implicitMoveStmts); stmtsLen &gt; 0 {
+		moveStmts = make([]refactoring.MoveStatement, 0, stmtsLen)
+		moveStmts = append(moveStmts, explicitMoveStmts...)
+		moveStmts = append(moveStmts, implicitMoveStmts...)
+	}
+	moveResults, diags := refactoring.ApplyMoves(moveStmts, prevRunState, c.plugins.ProviderFactories())
+	return moveStmts, moveResults, diags
+}
+…
+	prevRunState = prevRunState.DeepCopy() // don't modify the caller's object when we process the moves
+	moveStmts, moveResults, moveDiags := c.prePlanFindAndApplyMoves(config, prevRunState)
+	diags = diags.Append(moveDiags)
+	if moveDiags.HasErrors() {
+		return nil, nil, diags
+	}</code></pre>
+          <p>
+            Explicit <code>moved</code> blocks are joined by <em>implied</em> moves, which reproduce the pre-1.1 heuristic for
+            adding or removing <code>count</code>: <code>random_pet.single</code> becomes <code>random_pet.single[0]</code>, but
+            only for resources that no explicit statement mentions (<code>internal/refactoring/move_statement.go</code>:104-125).
+            <code>ApplyMoves</code> builds a small DAG of the statements, transitively reduces it and walks it in reverse
+            topological order; if the graph is invalid, no move is applied (<code>move_execute.go</code>:33-104, 217-240). A
+            move never clobbers: an object already at the destination blocks the move and wins
+            (<code>move_execute.go</code>:119-127). A move that touches instances excluded by <code>-target</code> is an error
+            that lists the extra <code>-target=</code> options needed (<code>context_plan.go</code>:682-748)
+            <span class="src">from the code</span>. Because the graph is built afterwards, everything downstream, including the
+            engine walk of <a href="../engine-and-providers/#p2-plan-graph">Part 2</a>, sees the post-move addresses.
+          </p>
+          <p>
+            Since v1.8 a move may change resource type. Core then calls the <em>target</em> provider's
+            <code>MoveResourceState</code> RPC to convert the object (<code>internal/refactoring/cross_provider_move.go</code>:59-200).
+            Terraform's own first cross-type move is <code>null_resource</code> to <code>terraform_data</code> (v1.9.0). random
+            3.9.1 implements none, so <code>moved { from = random_pet.new  to = random_string.new }</code> failed "Unable to Move
+            Resource State … does not include move resource state support" <span class="recon">measured here</span> (not
+            re-run by a verifier). HashiCorp's refactoring guide asks module authors to keep <code>moved</code> blocks forever
+            in shared modules, because a consumer that has not yet applied the move needs them.
+          </p>
+
+          <h3><code>removed</code> and the forget action</h3>
+          <p>
+            <code>removed</code> (v1.7, #34251) is the configuration form of <code>state rm</code>. Its CHANGELOG entry says
+            "Removing an object from state is a new type of action which is planned and applied like any other." The commit
+            added the plan action <code>Forget</code> and two apply nodes, <code>NodeForgetResourceInstance</code> for current
+            objects and <code>NodeForgetDeposedResourceInstanceObject</code> for deposed ones; both only drop the object from
+            state (<code>internal/plans/action.go</code>:16; <code>internal/terraform/node_resource_forget.go</code>:18). Read the
+            default carefully: <code>removed</code> means <strong>destroy</strong> unless it says
+            <code>lifecycle { destroy = false }</code> (<code>internal/configs/removed.go</code>:34-130)
+            <span class="src">from the code</span>. A <code>removed</code> block written to "stop managing" a resource without
+            that line will delete it. The block takes only destroy-time provisioners and <code>connection</code>, and
+            <code>destroy</code> is decoded with a nil evaluation context, so it must be a literal: <code>destroy = var.d</code>
+            fails "Variables not allowed" (<code>removed.go</code>:72-75), the same rule as every meta-argument
+            (<a href="../language-and-front-end/#p1-schema">Part 1</a>).
+          </p>
+          <p>
+            v1.16 (#38784) put <code>destroy = false</code> on ordinary <code>resource</code> blocks too, and routed every would-be
+            destroy of such a resource through forget. For an orphan the check is at
+            <code>internal/terraform/node_resource_plan_orphan.go</code>:147-160:
+          </p>
+          <pre><code>	if n.Config != nil &amp;&amp; n.Config.Managed != nil {
+		if n.Config.Managed.DestroySet &amp;&amp; !n.Config.Managed.Destroy {
+			forget = true
+		}
+	}
+
+	if !n.skipRefresh &amp;&amp; !forget {
+		// Refresh this instance even though it is going to be destroyed, in
+		// order to catch missing resources. If this is a normal plan,
+		// providers expect a Read request to remove missing resources from the
+		// plan before apply, and may not handle a missing resource during
+		// Delete correctly.  If this is a simple refresh, Terraform is
+		// expected to remove the missing resource from the state entirely
+		refreshedState, refreshDeferred, refreshDiags := n.refresh(ctx, states.NotDeposed, oldState, ctx.Deferrals().DeferralAllowed())</code></pre>
+          <p>
+            A forget also skips the refresh, so <code>ReadResource</code> is never called for an object about to be released.
+            Other paths go through <code>resourceLifecycleForget</code> (<code>node_resource_abstract_instance.go</code>:3487-3494).
+            In the lab, a <code>removed</code> block with <code>destroy = false</code> and a <code>count</code> shrink on a
+            <code>destroy = false</code> resource both planned <code>["forget"]</code>, with reasons
+            <code>delete_because_no_resource_config</code> and <code>delete_because_count_index</code>, "0 to destroy", and the
+            warning "Some objects will no longer be managed by Terraform" <span class="recon">measured here</span>. v1.17 adds
+            <code>ForgetThenCreate</code>, so <code>-replace</code> on such a resource plans <code>["forget","create"]</code> and
+            says "must be replaced, but the existing object will not be destroyed"; v1.16 had only
+            <code>CreateThenForget</code>, the create-before-destroy order (<code>plans/action.go</code>:16-18). On origin/main,
+            34210d4b5c rewrites forget handling as "forget removed objects by containment" with unchanged behaviour, and
+            dce44bddf9 "handle forget in combination with CBD nodes" may change the create-before-destroy bookkeeping.
+          </p>
+
+          <h3><code>import</code>: from literal IDs to identities</h3>
+          <p>
+            The <code>import</code> block started in v1.5.0 as "a configuration-driven, plannable action" with a literal
+            <code>id</code>. v1.6 allowed any expression known at plan time, v1.7 added <code>for_each</code>, v1.12 added
+            <code>identity</code> objects (#36703) and v1.16 lifted the root-module-only rule (#38352). At v1.17.0
+            <code>importBlockSchema</code> has five attributes, <code>provider</code>, <code>for_each</code>, <code>id</code>,
+            <code>to</code> (the only required one) and <code>identity</code>; <code>decodeImportBlock</code> requires exactly
+            one of <code>id</code> and <code>identity</code>, so that mistake is caught at load, before any provider starts
+            (<code>internal/configs/import.go</code>:96-137) <span class="src">from the code</span>. Both forms end in one RPC, at
+            <code>internal/terraform/node_resource_plan_instance.go</code>:855-868:
+          </p>
+          <pre><code>		if importTarget.Type().IsObjectType() {
+			// Identity-based import
+			resp = provider.ImportResourceState(providers.ImportResourceStateRequest{
+				TypeName:           addr.Resource.Resource.Type,
+				Identity:           importTarget,
+				ClientCapabilities: ctx.ClientCapabilities(),
+			})
+		} else {
+			// ID-based/string import
+			resp = provider.ImportResourceState(providers.ImportResourceStateRequest{
+				TypeName:           addr.Resource.Resource.Type,
+				ID:                 importTarget.AsString(),
+				ClientCapabilities: ctx.ClientCapabilities(),
+			})</code></pre>
+          <p>
+            An import plans like any change and can be replaced in the same plan. The lab imported two <code>random_id</code>s
+            with <code>for_each</code>; <code>"aGVsbG8"</code> is base64url for the five bytes "hello" and cannot fit
+            <code>byte_length = 4</code>, so the plan said <code>random_id.imported["b"] must be replaced</code> with "Warning:
+            this will destroy the imported resource", and "Plan: 2 to import, 1 to add, 0 to change, 1 to destroy."
+            <span class="recon">measured here</span>. Read the import lines of a plan as carefully as the destroy lines.
+          </p>
+          <p>
+            <code>plan -generate-config-out=PATH</code> writes resource blocks for imports that have none. It asks the provider
+            through <code>GenerateResourceConfig</code> (v1.14) when the provider advertises that capability, and otherwise
+            guesses from the imported state with <code>genconfig.ExtractLegacyConfigFromState</code>
+            (<code>node_resource_plan_instance.go</code>:1192-1209). random 3.9.1 does not, so the lab got
+            <code>keepers = null</code> and <code>prefix = null</code> lines. At v1.17.0, three years after import went GA, the
+            flag still prints "Warning: Config generation is experimental" whenever it writes a file
+            (<code>internal/backend/local/backend_plan.go</code>:281-286), and the warning is unchanged on main. Generating
+            config needs a target that is not expanded: a keyed <code>to</code> with no matching <code>for_each</code> resource
+            fails "The target resource does not use for_each."
+          </p>
+
+          <h3>All three in one plan</h3>
+          <p>
+            The lab combined a rename, a <code>count</code>-to-<code>for_each</code> conversion with two <code>moved</code>
+            blocks, a <code>removed</code> with <code>destroy = false</code>, a resource that gained <code>count = 1</code> with
+            no <code>moved</code> block, and an <code>import</code> <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform plan -out p.tfplan
+random_id.imp: Preparing import... [id=p-9hUg]
+  # random_id.imp will be imported
+ # random_pet.gone will no longer be managed by Terraform, but will not be destroyed
+  # random_pet.multi[0] has moved to random_pet.multi["a"]
+  # random_pet.old has moved to random_pet.new
+  # random_pet.single has moved to random_pet.single[0]        ← implied move
+Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.
+$ terraform state list            → still the OLD addresses, serial 6 (plan did not write)
+$ terraform state rm random_pet.single; terraform apply p.tfplan → Error: Saved plan is stale
+$ (restore state) terraform apply p.tfplan → Apply complete! Resources: 1 imported, 0 added, 0 changed, 0 destroyed.  serial 8</code></pre>
+          <p>
+            In <code>show -json</code> the moves appear as <code>previous_address</code> on a <code>no-op</code> change, the
+            removal as <code>["forget"]</code>, the import as <code>importing.id</code> on a <code>no-op</code>. Nothing reached
+            stored state until apply, and a <code>state rm</code> in between made the saved plan stale, which is the
+            lineage-and-serial gate of §01 doing its job. Figure 17 sets the two styles side by side.
+          </p>
+
+          <figure class="figure wide" id="fig-refactoring">
+            <div class="figure-head">
+              <span class="figure-label">Figure 17</span>
+              <p class="figure-title">Refactoring with <code>terraform state</code> versus refactoring blocks, and what <code>destroy = false</code> turns into</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th></th><th><code>state mv</code> / <code>rm</code> / <code>push</code></th><th><code>moved</code> / <code>removed</code> / <code>import</code></th></tr></thead>
+                <tbody>
+                  <tr><td>when it writes</td><td style="background: var(--red-soft)">immediately: one lock, one write, one persist per command</td><td style="background: var(--green-soft)">at apply, with the rest of the plan</td></tr>
+                  <tr><td>reviewed in a plan</td><td style="background: var(--red-soft)">no; <code>-dry-run</code> for <code>mv</code> and <code>rm</code></td><td style="background: var(--green-soft)">yes: <code>previous_address</code>, <code>forget</code>, <code>importing</code></td></tr>
+                  <tr><td>several edits at once</td><td>one per command; a cross-state <code>mv</code> is two persists</td><td>all statements in one plan; moves as a DAG on a deep copy</td></tr>
+                  <tr><td>backup</td><td>timestamped, local state only, one-second resolution</td><td>the normal state write path</td></tr>
+                  <tr><td>change of type</td><td>not covered here</td><td><code>moved</code> across types via <code>MoveResourceState</code> (v1.8)</td></tr>
+                  <tr><td>default that bites</td><td>the record and the config can disagree</td><td><code>removed</code> destroys unless <code>destroy = false</code></td></tr>
+                </tbody>
+              </table>
+              <table style="font-size: 13px; margin-top: 16px">
+                <thead><tr><th>a resource with <code>lifecycle { destroy = false }</code>, or a <code>removed</code> block with it</th><th>planned actions</th><th>refresh</th><th>since</th></tr></thead>
+                <tbody>
+                  <tr><td><code>removed { … destroy = false }</code></td><td style="background: var(--purple-soft)"><code>["forget"]</code>, reason <code>delete_because_no_resource_config</code></td><td>skipped</td><td>v1.7 (<code>removed</code>)</td></tr>
+                  <tr><td><code>count</code> shrinks</td><td style="background: var(--purple-soft)"><code>["forget"]</code>, reason <code>delete_because_count_index</code></td><td>skipped</td><td>v1.16</td></tr>
+                  <tr><td>resource block deleted (orphan)</td><td style="background: var(--purple-soft)">forget (<code>DestroySet &amp;&amp; !Destroy</code>)</td><td>skipped</td><td>v1.16</td></tr>
+                  <tr><td><code>-replace</code></td><td style="background: var(--purple-soft)"><code>["forget","create"]</code> (<code>ForgetThenCreate</code>)</td><td>not covered</td><td>v1.17</td></tr>
+                  <tr><td><code>-replace</code> with <code>create_before_destroy</code></td><td style="background: var(--purple-soft)"><code>["create","forget"]</code> (<code>CreateThenForget</code>)</td><td>not covered</td><td>v1.16</td></tr>
+                  <tr><td><code>removed</code> without <code>destroy = false</code></td><td style="background: var(--red-soft)"><code>["delete"]</code>: the default</td><td>not covered</td><td>v1.7</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              The top table is drawn from <code>internal/command/state_*.go</code> and <code>internal/refactoring</code>
+              <span class="src">from the code</span>; the first, second and fourth rows of the lower table are
+              <span class="recon">measured here</span>, and the orphan row and the skipped refreshes are read from
+              <code>node_resource_plan_orphan.go</code>. Purple marks an action that changes only the record. The blocks win
+              on review and on atomicity; the price is a default that destroys.
+            </p>
+          </figure>
+
+          <h2 id="p3-arc"><span class="secnum">05</span>A schema, a node, an RPC: 1.5 to 1.17</h2>
+          <p class="lede">
+            Thirteen minor releases run from v1.5.0 (12 June 2023) to v1.17.0 (21 October 2026). Almost every feature they
+            added follows one recipe: a small <code>hcl.BodySchema</code> and decoder in <code>internal/configs</code>, a graph
+            node or a change in node behaviour in <code>internal/terraform</code>, and usually one new RPC in the plugin
+            protocol. Each one is small in code and large in surface, because the language, the CLI, the test runner and the
+            protocol all have to agree on it. This section takes the features that are not about state or secrets; §06 to §08
+            take the rest.
+          </p>
+          <p>
+            The recipe follows from Part 1's first design choice. HCL parses without meaning and Terraform decodes each block
+            against a schema of its own (<a href="../language-and-front-end/#p1-schema">Part 1</a>), so a new block type costs a
+            schema and a decoder, not a grammar change. The engine runs whatever nodes the transformers add
+            (<a href="../engine-and-providers/#p2-plan-graph">Part 2</a>), so new behaviour is a node. And anything the provider
+            must do is an RPC. Figure 18 places the features on the release line; Figure 19, in §07, lists the schema, node and
+            RPC behind each one <span class="recon">reconstruction</span>.
+          </p>
+
+          <p>
+            Three examples show the shape. <code>check</code> is <code>checkBlockSchema</code> plus a
+            <code>nodeCheckAssert</code> and needs no RPC at all. Provider functions are a namespace in
+            <code>lang.Scope</code>, an unconfigured provider instance, and the <code>GetFunctions</code> and
+            <code>CallFunction</code> RPCs. Cross-type <code>moved</code> is a field on an existing block, a step in
+            <code>ApplyMoves</code>, and <code>MoveResourceState</code>. The pattern also explains how features fail: a
+            feature that is a node can be switched off by not adding the node (§07's actions in 1.13), and one that is an RPC
+            exists only for providers that implement it (§04's random 3.9.1 and cross-type moves).
+          </p>
+
+          <figure class="figure wide" id="fig-arc">
+            <div class="figure-head">
+              <span class="figure-label">Figure 18</span>
+              <p class="figure-title">1.5 → 1.17 in one strip: where each feature landed and how finished it is at v1.17.0</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 440" role="img" aria-label="A release timeline from Terraform 1.5 to 1.17 with five lanes: language, CLI, testing, protocol and HCP. Each feature is a dot coloured by its status at v1.17.0: green for generally available, orange for works but prints experimental, red for needs an experimental build, purple for an HCP product. Highlights: import and check in 1.5, test in 1.6, mocks and removed in 1.7, provider functions in 1.8, ephemeral values in 1.10, write-only in 1.11, identity in 1.12, query and actions in 1.14 after being gated in 1.13, const in 1.15, destroy false and store in 1.16, policy GA and minimal refresh in 1.17. Deferral and state store remain experimental-build only. HCP lists Stacks GA and search and actions public betas in September 2025 and a Policy public beta in July 2026.">
+                <text x="10" y="30" class="svg-lane">RELEASE</text>
+                <text x="10" y="92" class="svg-lane">LANGUAGE</text>
+                <text x="10" y="166" class="svg-lane">CLI</text>
+                <text x="10" y="240" class="svg-lane">TESTING</text>
+                <text x="10" y="298" class="svg-lane">PROTOCOL</text>
+                <text x="10" y="362" class="svg-lane">HCP</text>
+                <line x1="88" y1="56" x2="1076" y2="56" stroke="#b8b8b1"/>
+                <line x1="88" y1="134" x2="1076" y2="134" stroke="#deded9"/>
+                <line x1="88" y1="208" x2="1076" y2="208" stroke="#deded9"/>
+                <line x1="88" y1="266" x2="1076" y2="266" stroke="#deded9"/>
+                <line x1="88" y1="330" x2="1076" y2="330" stroke="#deded9"/>
+                <line x1="88" y1="394" x2="1076" y2="394" stroke="#b8b8b1"/>
+
+                <text x="92" y="26" class="svg-step">1.5</text><text x="92" y="44" class="svg-sub">2023-06</text>
+                <text x="168" y="26" class="svg-step">1.6</text><text x="168" y="44" class="svg-sub">2023-10</text>
+                <text x="244" y="26" class="svg-step">1.7</text><text x="244" y="44" class="svg-sub">2024-01</text>
+                <text x="320" y="26" class="svg-step">1.8</text><text x="320" y="44" class="svg-sub">2024-04</text>
+                <text x="396" y="26" class="svg-step">1.9</text><text x="396" y="44" class="svg-sub">2024-06</text>
+                <text x="472" y="26" class="svg-step">1.10</text><text x="472" y="44" class="svg-sub">2024-11</text>
+                <text x="548" y="26" class="svg-step">1.11</text><text x="548" y="44" class="svg-sub">2025-02</text>
+                <text x="624" y="26" class="svg-step">1.12</text><text x="624" y="44" class="svg-sub">2025-05</text>
+                <text x="700" y="26" class="svg-step">1.13</text><text x="700" y="44" class="svg-sub">2025-08</text>
+                <text x="776" y="26" class="svg-step">1.14</text><text x="776" y="44" class="svg-sub">2025-11</text>
+                <text x="852" y="26" class="svg-step">1.15</text><text x="852" y="44" class="svg-sub">2026-04</text>
+                <text x="928" y="26" class="svg-step">1.16</text><text x="928" y="44" class="svg-sub">2026-08</text>
+                <text x="1004" y="26" class="svg-step">1.17</text><text x="1004" y="44" class="svg-sub">2026-10</text>
+
+                <!-- language lane: rows at 78, 96, 114 -->
+                <circle cx="96" cy="74" r="4" fill="#367f59"/><text x="104" y="78" class="svg-sub" style="fill:#252525">import</text>
+                <circle cx="96" cy="92" r="4" fill="#367f59"/><text x="104" y="96" class="svg-sub" style="fill:#252525">check</text>
+                <circle cx="172" cy="74" r="4" fill="#367f59"/><text x="180" y="78" class="svg-sub" style="fill:#252525">id expr</text>
+                <circle cx="248" cy="74" r="4" fill="#367f59"/><text x="256" y="78" class="svg-sub" style="fill:#252525">removed</text>
+                <circle cx="248" cy="92" r="4" fill="#367f59"/><text x="256" y="96" class="svg-sub" style="fill:#252525">for_each</text>
+                <circle cx="324" cy="74" r="4" fill="#367f59"/><text x="332" y="78" class="svg-sub" style="fill:#252525">provider</text>
+                <text x="332" y="92" class="svg-sub" style="fill:#252525">funcs</text>
+                <circle cx="324" cy="110" r="4" fill="#367f59"/><text x="332" y="114" class="svg-sub" style="fill:#252525">x-type mv</text>
+                <circle cx="400" cy="74" r="4" fill="#367f59"/><text x="408" y="78" class="svg-sub" style="fill:#252525">x-object</text>
+                <text x="408" y="92" class="svg-sub" style="fill:#252525">validate</text>
+                <circle cx="476" cy="74" r="4" fill="#367f59"/><text x="484" y="78" class="svg-sub" style="fill:#252525">ephemeral</text>
+                <circle cx="628" cy="74" r="4" fill="#367f59"/><text x="636" y="78" class="svg-sub" style="fill:#252525">&amp;&amp; ||</text>
+                <circle cx="628" cy="92" r="4" fill="#367f59"/><text x="636" y="96" class="svg-sub" style="fill:#252525">identity</text>
+                <circle cx="704" cy="74" r="4" fill="#f7f7f5" stroke="#ad4b43" stroke-width="1.5"/><text x="712" y="78" class="svg-sub" style="fill:#252525">action</text>
+                <text x="712" y="92" class="svg-sub">dropped</text>
+                <circle cx="780" cy="74" r="4" fill="#367f59"/><text x="788" y="78" class="svg-sub" style="fill:#252525">action</text>
+                <circle cx="780" cy="92" r="4" fill="#367f59"/><text x="788" y="96" class="svg-sub" style="fill:#252525">list</text>
+                <circle cx="856" cy="74" r="4" fill="#367f59"/><text x="864" y="78" class="svg-sub" style="fill:#252525">const</text>
+                <circle cx="856" cy="92" r="4" fill="#367f59"/><text x="864" y="96" class="svg-sub" style="fill:#252525">convert</text>
+                <circle cx="856" cy="110" r="4" fill="#367f59"/><text x="864" y="114" class="svg-sub" style="fill:#252525">mod src</text>
+                <circle cx="932" cy="74" r="4" fill="#367f59"/><text x="940" y="78" class="svg-sub" style="fill:#252525">destroy=</text>
+                <text x="940" y="92" class="svg-sub" style="fill:#252525">false</text>
+                <circle cx="932" cy="110" r="4" fill="#367f59"/><text x="940" y="114" class="svg-sub" style="fill:#252525">store</text>
+                <circle cx="1008" cy="74" r="4" fill="#367f59"/><text x="1016" y="78" class="svg-sub" style="fill:#252525">provider</text>
+                <text x="1016" y="92" class="svg-sub" style="fill:#252525">req vars</text>
+
+                <!-- CLI lane: rows at 152, 170, 188 -->
+                <circle cx="96" cy="148" r="4" fill="#d98226"/><text x="104" y="152" class="svg-sub" style="fill:#252525">gen</text>
+                <text x="104" y="166" class="svg-sub" style="fill:#252525">config</text>
+                <circle cx="324" cy="148" r="4" fill="#ad4b43"/><text x="332" y="152" class="svg-sub" style="fill:#252525">deferral</text>
+                <text x="332" y="166" class="svg-sub">core only</text>
+                <circle cx="476" cy="148" r="4" fill="#367f59"/><text x="484" y="152" class="svg-sub" style="fill:#252525">s3 lock</text>
+                <text x="484" y="166" class="svg-sub">file</text>
+                <circle cx="704" cy="148" r="4" fill="#765b98"/><text x="712" y="152" class="svg-sub" style="fill:#252525">stacks</text>
+                <text x="712" y="166" class="svg-sub">shim</text>
+                <circle cx="780" cy="148" r="4" fill="#367f59"/><text x="788" y="152" class="svg-sub" style="fill:#252525">query</text>
+                <circle cx="780" cy="170" r="4" fill="#ad4b43"/><text x="788" y="174" class="svg-sub" style="fill:#252525">state</text>
+                <text x="788" y="188" class="svg-sub" style="fill:#252525">_store</text>
+                <circle cx="932" cy="148" r="4" fill="#367f59"/><text x="940" y="152" class="svg-sub" style="fill:#252525">mermaid</text>
+                <circle cx="1008" cy="148" r="4" fill="#367f59"/><text x="1016" y="152" class="svg-sub" style="fill:#252525">policy</text>
+                <circle cx="1008" cy="170" r="4" fill="#367f59"/><text x="1016" y="174" class="svg-sub" style="fill:#252525">minimal</text>
+                <text x="1016" y="188" class="svg-sub" style="fill:#252525">refresh</text>
+
+                <!-- testing lane: rows at 226, 244 -->
+                <circle cx="172" cy="222" r="4" fill="#367f59"/><text x="180" y="226" class="svg-sub" style="fill:#252525">test</text>
+                <circle cx="248" cy="222" r="4" fill="#367f59"/><text x="256" y="226" class="svg-sub" style="fill:#252525">mocks</text>
+                <circle cx="628" cy="222" r="4" fill="#367f59"/><text x="636" y="226" class="svg-sub" style="fill:#252525">parallel</text>
+                <circle cx="780" cy="222" r="4" fill="#ad4b43"/><text x="788" y="226" class="svg-sub" style="fill:#252525">skip_</text>
+                <text x="788" y="240" class="svg-sub" style="fill:#252525">cleanup</text>
+                <circle cx="1008" cy="222" r="4" fill="#367f59"/><text x="1016" y="226" class="svg-sub" style="fill:#252525">mock_eph</text>
+
+                <!-- protocol lane: rows at 284, 302, 320 -->
+                <circle cx="324" cy="280" r="4" fill="#367f59"/><text x="332" y="284" class="svg-sub" style="fill:#252525">CallFunc</text>
+                <circle cx="324" cy="298" r="4" fill="#367f59"/><text x="332" y="302" class="svg-sub" style="fill:#252525">MoveState</text>
+                <circle cx="476" cy="280" r="4" fill="#367f59"/><text x="484" y="284" class="svg-sub" style="fill:#252525">EphemRes</text>
+                <circle cx="552" cy="280" r="4" fill="#367f59"/><text x="560" y="284" class="svg-sub" style="fill:#252525">write-</text>
+                <text x="560" y="298" class="svg-sub" style="fill:#252525">only</text>
+                <circle cx="628" cy="280" r="4" fill="#367f59"/><text x="636" y="284" class="svg-sub" style="fill:#252525">identity</text>
+                <circle cx="780" cy="280" r="4" fill="#367f59"/><text x="788" y="284" class="svg-sub" style="fill:#252525">List</text>
+                <circle cx="780" cy="298" r="4" fill="#367f59"/><text x="788" y="302" class="svg-sub" style="fill:#252525">Action</text>
+                <circle cx="780" cy="316" r="4" fill="#367f59"/><text x="788" y="320" class="svg-sub" style="fill:#252525">GenConfig</text>
+
+                <!-- HCP lane: rows at 348, 366, 384 -->
+                <circle cx="740" cy="344" r="4" fill="#765b98"/><text x="748" y="348" class="svg-sub" style="fill:#252525">Stacks GA</text>
+                <circle cx="740" cy="362" r="4" fill="#765b98"/><text x="748" y="366" class="svg-sub" style="fill:#252525">search β</text>
+                <circle cx="740" cy="380" r="4" fill="#765b98"/><text x="748" y="384" class="svg-sub" style="fill:#252525">actions β</text>
+                <circle cx="912" cy="344" r="4" fill="#765b98"/><text x="920" y="348" class="svg-sub" style="fill:#252525">policy β</text>
+                <text x="920" y="362" class="svg-sub">2026-07</text>
+                <text x="660" y="362" class="svg-sub">2025-09</text>
+
+                <circle cx="96" cy="418" r="5" fill="#367f59"/><text x="106" y="422" class="svg-sub" style="fill:#252525">GA in the v1.17 CLI</text>
+                <circle cx="266" cy="418" r="5" fill="#d98226"/><text x="276" y="422" class="svg-sub" style="fill:#252525">works, prints "experimental"</text>
+                <circle cx="486" cy="418" r="5" fill="#ad4b43"/><text x="496" y="422" class="svg-sub" style="fill:#252525">experimental build only</text>
+                <circle cx="676" cy="418" r="5" fill="#765b98"/><text x="686" y="422" class="svg-sub" style="fill:#252525">HCP product</text>
+                <circle cx="806" cy="418" r="5" fill="#f7f7f5" stroke="#ad4b43" stroke-width="1.5"/><text x="816" y="422" class="svg-sub" style="fill:#252525">accepted, silently dropped</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Dates and statuses are from the CHANGELOGs v1.5.0 to v1.17.0 and the v1.17.0 tree
+              <span class="src">from the code</span>; the HCP dots are HashiCorp announcements. Three pairs disagree by surface:
+              Policy is GA in the CLI and still "beta" in HCP's docs, and search and actions shipped GA in the CLI two months
+              after HCP launched them as public betas. In 1.13 the root schema accepted <code>action</code> blocks while stable
+              builds decoded nothing from them. <code>const</code> (1.15) appears in no CHANGELOG at all.
+            </p>
+          </figure>
+
+          <h3><code>check</code>: preconditions that only warn</h3>
+          <p>
+            v1.5 added top-level <code>check</code> blocks with at least one <code>assert</code> and an optional scoped
+            <code>data</code> block. <code>checkBlockSchema</code> allows only those two block types; the decoder rejects a
+            second <code>data</code>, zero asserts, and <code>check</code> in override files
+            (<code>internal/configs/checks.go</code>). The node reuses the precondition machinery with a different severity, at
+            <code>internal/terraform/node_check.go</code>:153-173:
+          </p>
+          <pre><code>func (n *nodeCheckAssert) Execute(ctx EvalContext, _ walkOperation) tfdiags.Diagnostics {
+
+	// We only want to actually execute the checks during specific
+	// operations, such as plan and applies.
+	if n.executeChecks {
+		if status := ctx.Checks().ObjectCheckStatus(n.addr); status == checks.StatusFail || status == checks.StatusError {
+			// This check is already failing, so we won't try and evaluate it.
+			// This typically means there was an error in a data block within
+			// the check block.
+			return nil
+		}
+
+		return evalCheckRules(
+			addrs.CheckAssertion,
+			n.config.Asserts,
+			ctx,
+			n.addr,
+			EvalDataForNoInstanceKey,
+			tfdiags.Warning)
+
+	}</code></pre>
+          <pre><code>$ terraform apply -auto-approve
+Warning: Check block assertion failed … prod should run at least 2 replicas.
+Warning: Unable to find remote state … No stored state was found for the given workspace in the given backend.
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.     (exit=0)</code></pre>
+          <p>
+            A check-scoped data source is always planned as a read with reason <code>ResourceInstanceReadBecauseCheckNested</code>, re-read at
+            apply, and its errors are downgraded to warnings with <code>tfdiags.OverrideAll</code>
+            (<code>node_resource_abstract_instance.go</code>:2049-2101) <span class="src">from the code</span>. In the lab, one
+            failing assert plus a scoped <code>terraform_remote_state</code> pointing at a missing file produced two warnings,
+            "Check block assertion failed" and "Unable to find remote state", and "Apply complete!" with exit 0. The second
+            check's assertion was never reported, because its data source had already failed
+            <span class="recon">measured here</span>. A <code>check</code> never blocks; if a condition must stop an apply, write
+            it as a <code>precondition</code> or <code>postcondition</code>.
+          </p>
+
+          <h3><code>terraform test</code> and mocks</h3>
+          <p>
+            <code>terraform test</code> became GA in v1.6 with <code>run</code> blocks in <code>.tftest.hcl</code> files, and
+            v1.7 added <code>mock_provider</code>, <code>override_resource</code>, <code>override_data</code> and
+            <code>override_module</code>. At v1.17.0 a test file takes eight top-level block types plus one <code>test</code>
+            block, and a <code>run</code> takes <code>command</code>, <code>providers</code>, <code>expect_failures</code>,
+            <code>state_key</code>, <code>parallel</code> and more (<code>internal/configs/test_file.go</code>:1111-1187). The
+            mock is a wrapper, not a stub. Its comment at <code>internal/providers/mock.go</code>:21-22 says it "wraps an instance
+            of an actual provider so it can return the correct schema and validate the configuration accurately", and it
+            empties only the provider's own configuration schema. <code>CallFunction</code> and <code>ListResource</code> go
+            straight to the real provider (<code>mock.go</code>:410-416) <span class="src">from the code</span>. So the real
+            binary starts, provider functions run for real, and a <code>list</code> block in a test would make real cloud calls
+            (<a href="../engine-and-providers/#p2-processes">Part 2</a> counts the process).
+          </p>
+          <p>
+            The lab tested an AWS module with no AWS account: a bucket with <code>count</code>, an ephemeral
+            <code>random_password</code> feeding a write-only SSM parameter, and a cross-variable validation
+            <span class="recon">measured here</span>:
+          </p>
+          <pre><code>mock_provider "aws" {
+  override_during = plan
+  mock_resource "aws_s3_bucket" { defaults = { arn = "arn:aws:s3:::mocked" } }
+}
+mock_provider "random" {
+  mock_ephemeral "random_password" { defaults = { result = "not-a-real-secret" } }
+}
+run "prod_needs_two" {
+  command = plan
+  variables { env = "prod"  bucket_count = 1 }
+  expect_failures = [var.bucket_count]
+}</code></pre>
+          <pre><code>$ time flock ~/terraform-ref/lab/.cpu.lock terraform test -filter=tests/unit.tftest.hcl
+run "plan_uses_mocked_arn"... pass
+run "prod_needs_two"... pass
+run "apply_with_override"... pass
+Success! 3 passed, 0 failed.
+real 0m46.348s     # first, cold run; warm re-runs took 8.8 s and 10 s</code></pre>
+          <p>
+            The cost is the real aws binary starting for its schema; the first run paid for a cold page cache. Three edges
+            showed. Test <code>assert</code> blocks cannot read ephemeral resources, mocked or not ("Ephemeral resources cannot
+            be asserted"), so probe them through a <code>precondition</code>. Runs in one file share state, so a later
+            <code>override_resource</code> could not change an object an earlier run had already created. And mocks refuse
+            imports, while an identity import under <code>override_resource</code> fails Terraform's own "didn't return an
+            identity" check, still on origin/main (<a href="../three-clouds/#p4-tests-policy">Part 4</a> has the run). Some test
+            surface is experimental-build only: run-level <code>backend</code>, <code>skip_cleanup</code> (although the v1.16
+            CHANGELOG advertises an enhancement to it), and <code>terraform test cleanup</code>, which in a release build
+            silently runs <code>terraform test</code> instead.
+          </p>
+
+          <p>
+            The test runner kept growing after v1.7, one CHANGELOG line at a time: <code>-junit-xml</code> GA,
+            <code>override_during</code> and <code>state_key</code> in 1.11; parallel runs in 1.12; <code>variable</code>
+            blocks in test files in 1.13; <code>prevent_destroy</code> ignored during cleanup in 1.14; functions in mocks in
+            1.15; ephemeral mocks in 1.17 (CHANGELOGs v1.11.0 to v1.17.0). The practical reading of all of it: a mocked test
+            checks your module's logic against the provider's real schema and validation, offline. It is not isolation from
+            the provider binary, and it says nothing about whether the cloud accepts the plan.
+          </p>
+
+          <h3>Provider functions and cross-object validation</h3>
+          <p>
+            v1.8 (#34394) added <code>provider::NAME::FUNC()</code>, where <code>NAME</code> is the module's local provider name,
+            and exposed every built-in under <code>core::</code> as well (<code>internal/lang/functions.go</code>:117-136). The
+            functions run on a separate, unconfigured provider instance that <code>functionProvider</code> starts and caches
+            (<code>internal/terraform/eval_context_builtin.go</code>:558-600). No <code>provider</code> block or credentials are
+            needed: an outputs-only lab module with none evaluated <code>provider::aws::arn_parse</code>,
+            <code>google::region_from_zone</code>, <code>azurerm::parse_resource_id</code> and
+            <code>terraform::encode_tfvars</code>, in 12 s warm and 45 s on its first, cold run
+            <span class="recon">measured here</span>. Results are pinned: <code>FunctionResults</code> stores SHA-256 hashes of
+            provider, name, arguments and result in the plan and fails if apply gets a different answer
+            (<code>internal/lang/function_results.go</code>:18-31, 54-110).
+          </p>
+          <p>
+            The inventories are small. Cached schemas list four functions for aws 6.70.0 (<code>arn_build</code>,
+            <code>arn_parse</code>, <code>trim_iam_role_path</code>, <code>user_agent</code>), six for google 8.8.0, two for
+            azurerm 5.10.0 and none for random 3.9.1 <span class="recon">measured here</span>. Terraform's own
+            <code>encode_tfvars</code>, <code>decode_tfvars</code> and <code>encode_expr</code> (v1.8, #34718) come from the
+            built-in provider, and calling them needs <code>terraform = { source = "terraform.io/builtin/terraform" }</code> in
+            <code>required_providers</code>; without it the console answers "Unknown provider function". Because the instance
+            is unconfigured and per walk, each provider used for functions adds a process to the run.
+          </p>
+
+          <p>
+            v1.9 (#34955) let a variable's <code>validation</code> refer to other objects in the module. The mechanism is a node:
+            <code>nodeVariableValidation</code> returns everything its condition references except the variable itself
+            (<code>node_variable_validation.go</code>:18-43, 76-92), so <code>terraform graph -type=plan</code> showed
+            <code>var.max_size (validation)</code> with edges to <code>local.hard_cap (expand)</code> and
+            <code>var.min_size</code> <span class="recon">measured here</span>.
+            The diagnostic lists every value involved:
+          </p>
+          <pre><code>$ terraform plan
+│ local.hard_cap is 10 │ var.max_size is 2 │ var.min_size is 3
+max_size (2) must be between min_size (3) and 10.</code></pre>
+          <p>
+            Before v1.9 a rule could refer only to the variable itself; now the rule is an ordinary vertex that waits for
+            whatever it reads, and it fails during the walk like any other node. The experiment that introduced it,
+            <code>variable_validation_crossref</code>, is registered as concluded.
+          </p>
+
+          <h3>1.15 to 1.17</h3>
+          <p>
+            v1.15 shipped variables in module <code>source</code> and <code>version</code>, <code>deprecated</code> on variables
+            and outputs (decoded with a nil context, so literal only), typed outputs and <code>convert</code>. The switch that
+            makes the module sources work, <code>const = true</code> (4da132e63), is mentioned in no CHANGELOG from v1.5.0 to
+            v1.17.0. v1.17 extended const values to <code>required_providers</code>
+            (<a href="../language-and-front-end/#p1-init-graph">Part 1</a>), added <code>-minimal-refresh</code>
+            (<a href="../engine-and-providers/#p2-instance">Part 2</a> counts its RPCs) and <code>mock_ephemeral</code>, which
+            really substitutes the value: a precondition that the password equals "not-a-real-secret" passed under the mock and
+            failed on the real provider <span class="recon">measured here</span>. Under all of it, no language experiment is
+            current: all nine constants in <code>internal/experiments/experiment.go</code> are registered as concluded
+            <span class="src">from the code</span>. What remains experimental is not language but machinery, and §08 covers it.
+          </p>
+          <p>
+            The smaller lines of the arc are the ones that change daily use. v1.8 added <code>applyable</code> and
+            <code>complete</code> to plan JSON, so automation can tell a no-op plan from an incomplete one; v1.9 added
+            <code>templatestring</code>, <code>init -json</code> and multi-line console input; v1.16 added
+            <code>terraform graph -format=mermaid</code>, which prints <code>flowchart LR</code>, and
+            <code>console -scope=module.m</code>, which evaluates inside a child module <span class="recon">measured here</span>.
+            Deprecations move slowly: <code>-state</code> on plan, apply and refresh has been deprecated since v1.10 and at
+            v1.17.0 still only warns. One lab configuration exercised the 1.15 and 1.17 lines together: a <code>const</code>
+            variable in <code>required_providers.random.version</code> locked <code>constraints = "3.9.1"</code>,
+            <code>convert("42", number)</code> in a typed output planned <code>n = 42</code>, and both deprecation warnings fired.
+            The build floor moved too: v1.17.0 is built with Go 1.26.10.
+          </p>
+
+          <h2 id="p3-secrets"><span class="secnum">06</span>Ephemeral values and write-only arguments</h2>
+          <p class="lede">
+            §01 showed that state stores secrets in cleartext and that <code>sensitive</code> is only a display flag. v1.10 and
+            v1.11 answered with two mechanisms that keep a value out of plan and state altogether. Core enforces them with a
+            mark on the value and with checks on what providers send back. It does not scrub. A secret stays out of the files
+            because every path that would write it is refused, and the one path that is allowed to persist it does so on
+            purpose.
+          </p>
+
+          <h3>The ephemeral mark</h3>
+          <p>
+            v1.10.0 made ephemeral resources, ephemeral input variables and ephemeral outputs GA, together with the
+            <code>ephemeralasnull</code> function; the <code>ephemeral_values</code> experiment was concluded by #35636
+            <span class="src">from the code</span>. An ephemeral resource is not planned or stored. It is opened, possibly
+            renewed, and closed, in every walk that needs it. The protocol has four RPCs for that lifecycle:
+            <code>ValidateEphemeralResourceConfig</code>, <code>OpenEphemeralResource</code>, which may return a
+            <code>renew_at</code> time and opaque <code>private</code> bytes, <code>RenewEphemeralResource</code> and
+            <code>CloseEphemeralResource</code>, the last two receiving only the type name and those private bytes
+            (<code>docs/plugin-protocol/tfplugin6.proto</code>:821-856). Core runs a renewal goroutine per instance that re-arms
+            a timer to each <code>RenewAt</code>, and a dedicated <code>(close)</code> vertex sends the close before the provider
+            is killed (<code>internal/resources/ephemeral/ephemeral_resources.go</code>:242-278).
+          </p>
+          <p>
+            Opening is <code>ephemeralResourceOpen</code>. If the configuration is not wholly known, no RPC is made; core builds
+            a placeholder unknown and marks it (<code>internal/terraform/node_resource_ephemeral.go</code>:88-107). Otherwise it
+            calls the provider, checks the answer, and marks the whole result, at <code>node_resource_ephemeral.go</code>:166-189
+            (trimmed):
+          </p>
+          <pre><code>	resultVal := resp.Result.MarkWithPaths(configMarks)
+
+	errs := objchange.AssertPlanValid(schema.Body, cty.NullVal(schema.Body.ImpliedType()), configVal, resultVal)
+	for _, err := range errs {
+		diags = diags.Append(tfdiags.AttributeValue(
+			tfdiags.Error,
+			"Provider produced invalid ephemeral resource instance",
+	…
+	// We are going to wholesale mark the entire resource as ephemeral. This
+	// simplifies the model as any references to ephemeral resources can be
+	// considered as such. Any input values that don't need to be ephemeral can
+	// be referenced directly.
+	resultVal = resultVal.Mark(marks.Ephemeral)</code></pre>
+          <p>
+            From there the mark travels with the value through every operator, the same way <code>sensitive</code> does
+            (<a href="../language-and-front-end/#p1-values">Part 1</a>), and validation decides where it may land. One lab apply
+            with an <code>ephemeral "random_password"</code> made two <code>OpenEphemeralResource</code> and two
+            <code>CloseEphemeralResource</code> calls, one pair in the plan walk and one in the apply walk, and the CLI printed
+            "Opening..." and "Closing complete" in both phases <span class="recon">measured here</span>. A value that is opened
+            twice can differ between plan and apply; that is the point, and it is why an ephemeral value cannot be pinned in a
+            saved plan.
+          </p>
+
+          <p>
+            The order inside one walk is visible in a trace of a plan with the same resource: the provider is configured, then
+            <code>ValidateEphemeralResourceConfig</code> and <code>OpenEphemeralResource</code> run, and the <code>(close)</code> node sends <code>CloseEphemeralResource</code> before the provider process is stopped
+            <span class="recon">measured here</span>. The unknown-config branch matters in practice. If an ephemeral resource's
+            arguments depend on something that is only known after apply, nothing is opened at plan time, every consumer sees
+            an unknown, and the real value exists only during the apply walk <span class="recon">reconstruction</span>. Mocks follow the same lifecycle since v1.17:
+            <code>Mock.OpenEphemeralResource</code> fills the result from <code>mock_ephemeral</code> defaults, and renew and
+            close are no-ops (<code>internal/providers/mock.go</code>:371-408). Before v1.17 a mocked provider failed any
+            ephemeral resource with "No ephemeral resource types in mock providers".
+          </p>
+
+          <h3>Where the mark may go</h3>
+          <p>
+            Validation refuses the mark in any resource argument that is not write-only. The check walks up the attribute path,
+            so a value nested inside a write-only attribute passes, and anything else fails, at
+            <code>internal/terraform/node_resource_validate.go</code>:1012-1019:
+          </p>
+          <pre><code>		} else if !attr.WriteOnly {
+			diags = diags.Append(tfdiags.AttributeValue(
+				tfdiags.Error,
+				"Invalid use of ephemeral value",
+				fmt.Sprintf("Ephemeral values are not valid for %q, because it is not a write-only attribute and must be persisted to state.", strings.TrimPrefix(format.CtyPath(path), ".")),
+				path,
+			))
+		}</code></pre>
+          <p>
+            The other allowed places are provider configuration, input variables declared <code>ephemeral = true</code>,
+            and ephemeral outputs of child modules. A root module may not declare an ephemeral output: "Ephemeral outputs are not
+            allowed in context of a root module", unless <code>AllowRootEphemeralOutputs</code> is set, which only the Stacks and
+            test runtimes do (<code>internal/terraform/node_output.go</code>:423-431) <span class="src">from the code</span>. The
+            lab's guard-rail directory hit both errors: <code>terraform_data.input = ephemeral…</code> failed "Invalid use of
+            ephemeral value", and a root <code>output { ephemeral = true }</code> failed "Ephemeral output not allowed"
+            <span class="recon">measured here</span>. <code>terraform.applying</code> is itself an ephemeral boolean, true only
+            in the apply walk, so a root output derived from it fails unless wrapped in <code>ephemeralasnull</code>
+            (<code>internal/terraform/evaluate_data.go</code>:128-134). And a test <code>assert</code> cannot read an ephemeral
+            resource at all (§05).
+          </p>
+
+          <h3>Write-only: sent every time, never returned</h3>
+          <p>
+            v1.11.0 (#36031) added write-only attributes. They are a per-attribute flag in the provider schema,
+            <code>configschema.Attribute.WriteOnly</code>, shown as <code>"write_only": true</code> in
+            <code>providers schema -json</code> (field 10 in tfplugin5's schema message, 11 in tfplugin6's). The cached schemas
+            count 37 write-only attributes in aws 6.70.0, 31 in google 8.8.0, 8 in azurerm 5.10.0 and none in random 3.9.1,
+            for example <code>aws_db_instance.password_wo</code>, <code>google_sql_user.password_wo</code> and
+            <code>azurerm_key_vault_secret.value_wo</code> <span class="recon">measured here</span>.
+          </p>
+          <p>
+            "Write-only" does not mean "never sent". Core sends the configured value to the provider in every
+            <code>PlanResourceChange</code> and <code>ApplyResourceChange</code> config, because the provider needs it to do
+            its job. What core demands is that the value never comes back. After planning it runs, at
+            <code>internal/terraform/node_resource_abstract_instance.go</code>:1081-1093:
+          </p>
+          <pre><code>		// Providers are supposed to return null values for all write-only attributes
+		writeOnlyDiags := ephemeral.ValidateWriteOnlyAttributes(
+			"Provider produced invalid plan",
+			func(path cty.Path) string {
+				return fmt.Sprintf(
+					"Provider %q returned a value for the write-only attribute \"%s%s\" during planning. Write-only attributes cannot be read back from the provider. This is a bug in the provider, which should be reported in the provider's own issue tracker.",
+					n.ResolvedProvider, n.Addr, tfdiags.FormatCtyPath(path),
+				)
+			},
+			plannedNewVal,
+			schema.Body,
+		)
+		diags = diags.Append(writeOnlyDiags)</code></pre>
+          <p>
+            The same check runs at refresh, apply and import ("Provider produced invalid object"). Core nulls write-only values
+            itself, with <code>ephemeral.StripWriteOnlyAttributes</code>, keeping their marks, only where it fabricates an
+            object: test overrides, mock providers and Stacks stubs (<code>internal/lang/ephemeral/strip.go</code>:14-39)
+            <span class="src">from the code</span>. A provider built on the plugin framework also nulls every write-only
+            attribute in its planned state before returning it (<code>plugin-framework</code>
+            <code>internal/fwserver/server_planresourcechange.go</code>:179-189). HashiCorp's documentation describes the outcome, values kept
+            out of plan files and state; the code shows how it is reached. So the guarantee is two-sided and
+            checked, not scrubbed: a provider that echoed the password would fail the run rather than leak it into a file.
+          </p>
+          <p>
+            With fake AWS credentials and the network behind a dead proxy, an <code>aws_db_instance</code> with
+            <code>password_wo = var.db_password</code> planned <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform plan -var db_password=Sup3rS3cret-XYZ -out=p.bin
+  + password_wo                           = (write-only attribute)
+  + password_wo_version                   = 1
+$ unzip -p p.bin | grep -a -c Sup3rS3cret-XYZ          → 0
+$ terraform show -json p.bin | grep -c Sup3rS3cret-XYZ → 0
+$ terraform apply p.bin
+Error: No value for required variable … The ephemeral input variable "db_password" was set during the plan phase, and so must also be set during the apply phase.</code></pre>
+          <p>
+            The last line is the ephemeral-variable rule. A plan records only the <em>names</em> of ephemeral variables that
+            were set, in <code>Plan.ApplyTimeVariables</code>; the comment says their values "can change between plan and
+            apply, their "nullness" may not" (<code>internal/plans/plan.go</code>:58-67). Applying a saved plan therefore needs
+            the secret supplied again, and fails before any provider call without it. Because the stored value is null, the
+            provider cannot tell when a write-only argument changed; the convention is a companion
+            <code>*_wo_version</code> argument you increment to rotate, and its type is the provider's choice, a number in one
+            provider and a string in another. Write-only does not imply sensitive either: azurerm's
+            <code>administrator_password_wo</code> is not marked sensitive. <a href="../three-clouds/#p4-secrets">Part 4</a>
+            follows a canary password through six write-only arguments on three clouds and finds it in no file of the saved plan.
+          </p>
+
+          <h3>The deliberate exception</h3>
+          <p>
+            v1.16.0 (#38298) gave <code>terraform_data</code> a <code>store</code> block. Its <code>input</code> is write-only and
+            accepts ephemeral values; it is copied into a computed <code>output</code>, or into <code>sensitive_output</code>
+            when <code>sensitive = true</code>, and that copy <em>is</em> persisted; <code>version</code> gates refresh and
+            <code>replace</code> forces replacement (<code>internal/builtin/providers/terraform/resource_data.go</code>:32-56,
+            163-225) <span class="src">from the code</span>. Storing <code>ephemeral.random_password.db.result</code> left the
+            state with <code>"input": null</code> and <code>"sensitive_output": { "value": "hXfxVb2yzX1xm5B9", … }</code>
+            <span class="recon">measured here</span>. It is a way to make a generated secret durable across runs, not a way to
+            hide it: the value is back in the plaintext document of §01. Ephemeral resource types are still few: aws 6.70.0
+            has 11, google 8.8.0 six, azurerm 5.10.0 two and random 3.9.1 two (<code>random_bytes</code>,
+            <code>random_password</code>) <span class="recon">measured here</span>.
+          </p>
+
+          <h2 id="p3-query-actions"><span class="secnum">07</span>List resources and actions</h2>
+          <p class="lede">
+            v1.14 shipped two features that stretch the model. List resources let Terraform ask a cloud what exists and write
+            configuration to adopt it. Actions let a configuration run an imperative operation, such as invoking a Lambda
+            function, when a resource changes or on demand. Both were in the v1.13 code behind the experiments gate, both are
+            GA in the v1.17 CLI, and both are built from the same recipe as everything else: a schema, a node, and an RPC.
+            Their edges are rougher than the rest, and one of them is an internal error that the CLI lets users reach.
+          </p>
+
+          <h3>Query files and <code>ListResource</code></h3>
+          <p>
+            List resources live in their own file type. A <code>.tfquery.hcl</code> file may contain only <code>list</code>
+            blocks (two labels), <code>provider</code>, <code>locals</code> and <code>variable</code>
+            (<code>internal/configs/query_file.go</code>:219-237), and it is loaded only by <code>terraform query</code>:
+            <code>plan</code> and <code>validate</code> ignore it, and <code>validate -query</code> (v1.14, #37671) checks it
+            offline <span class="recon">measured here</span>. The loader's <code>default:</code> branch, "This block type is not
+            valid within a query file", is unreachable, because the schema has already rejected the block with HCL's generic
+            "Unsupported block type" (<code>query_file.go</code>:83-91). A <code>list</code> block decodes to a
+            <code>configs.Resource</code> with <code>Mode: addrs.ListResourceMode</code>; it takes <code>count</code>,
+            <code>for_each</code>, a mandatory <code>provider</code>, <code>include_resource</code> and <code>limit</code>, with
+            the filter in one nested <code>config</code> block (<code>query_file.go</code>:97-125, 153-214)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            <code>terraform query</code> is a plan operation with <code>Query = true</code>
+            (<code>internal/command/query.go</code>:84, 123-126). Per list instance, <code>listResourceExecute</code> requires a
+            wholly known configuration, calls <code>ValidateListResourceConfig</code>, then the streaming
+            <code>ListResource</code> RPC, at <code>internal/terraform/node_resource_plan_instance_query.go</code>:99-103 and
+            126-133:
+          </p>
+          <pre><code>	// if we are generating config, we implicitly set include_resource to true
+	if n.generateConfigPath != "" {
+		includeRscCty = cty.True
+		includeRsc = true
+	}
+	…
+	// If we get down here then our configuration is complete and we're ready
+	// to actually call the provider to list the data.
+	resp := provider.ListResource(providers.ListResourceRequest{
+		TypeName:              n.Config.Type,
+		Config:                unmarkedBlockVal,
+		Limit:                 limit,
+		IncludeResourceObject: includeRsc,
+	})</code></pre>
+          <p>
+            Core stops reading the stream at <code>limit</code> and requires a resource identity on every non-warning event
+            (<code>internal/plugin6/grpc_provider.go</code>:1360-1455). That is what <code>-generate-config-out</code> uses:
+            each result becomes an <code>import { identity = … }</code> block plus a <code>resource</code> block
+            (<code>node_resource_plan_instance.go</code>:1114-1152), with the resource body written by the provider's
+            <code>GenerateResourceConfig</code> where it has one. So bulk adoption stands on three releases: identity import
+            (1.12), provider-written config (1.14), and list resources (1.14). Figure 19 draws that chain under the table of
+            features <span class="src">from the code</span>.
+          </p>
+          <p>
+            The chain has a hard limit: it needs a real cloud. With fake AWS credentials, <code>terraform query -json</code>
+            emitted <code>list_start</code> and then failed inside <code>ListResource</code> with an EC2
+            <code>DescribeInstances</code> "401 … AuthFailure"; no file was written <span class="recon">measured here</span>
+            (not re-run by a verifier; the request is listed in §09). Only <code>validate -query</code> works offline. The
+            cached schemas count 259 list resource types in aws 6.70.0, 153 in google 8.8.0, 122 in azurerm 5.10.0 and none in
+            random. HashiConf 2025 launched HCP Terraform's "Terraform search" as a public beta for AWS and Azure; whether
+            <code>plans.QueryInstance</code> results are ever persisted is open, because <code>query</code> has no
+            <code>-out</code>.
+          </p>
+
+          <figure class="figure wide" id="fig-feature-recipe">
+            <div class="figure-head">
+              <span class="figure-label">Figure 19</span>
+              <p class="figure-title">Feature, schema, node, RPC: the recipe behind nine features, and the identity chain under query</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>feature</th><th>HCL</th><th><code>internal/configs</code></th><th><code>internal/terraform</code></th><th>RPC</th><th>since</th><th>at v1.17.0</th></tr></thead>
+                <tbody>
+                  <tr><td>import</td><td><code>import</code></td><td><code>importBlockSchema</code></td><td><code>importState</code> on the plan instance</td><td><code>ImportResourceState</code></td><td>1.5</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>check</td><td><code>check</code></td><td><code>checkBlockSchema</code></td><td><code>nodeCheckAssert</code>, warning severity</td><td>none new</td><td>1.5</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>test, mocks</td><td><code>.tftest.hcl</code></td><td><code>test_file.go</code>, <code>mock_provider.go</code></td><td>a graph over <code>run</code> blocks; <code>providers.Mock</code></td><td>none new</td><td>1.6, 1.7</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>provider functions</td><td><code>provider::n::f()</code></td><td>a scope namespace</td><td><code>functionProvider</code>, unconfigured</td><td><code>GetFunctions</code>, <code>CallFunction</code></td><td>1.8</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>ephemeral</td><td><code>ephemeral</code></td><td>ephemeral resource mode</td><td><code>ephemeralResourceOpen</code>, <code>(close)</code></td><td>Validate, Open, Renew, Close</td><td>1.10</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>write-only</td><td>an attribute flag</td><td><code>Attribute.WriteOnly</code></td><td><code>ValidateWriteOnlyAttributes</code></td><td>schema field 10 / 11</td><td>1.11</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>list, query</td><td><code>list</code> in <code>.tfquery.hcl</code></td><td><code>ListResourceMode</code></td><td><code>listResourceExecute</code></td><td><code>ListResource</code> (stream)</td><td>1.14</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>actions</td><td><code>action</code>, <code>action_trigger</code></td><td><code>configs.Action</code></td><td><code>invokeActions</code>, <code>invokeDestroyActions</code></td><td><code>PlanAction</code>, <code>InvokeAction</code> (stream)</td><td>1.14</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>policy</td><td><code>-policies</code> paths</td><td><code>validatePolicyPaths</code></td><td><code>policySubgraph</code>, runs after failures</td><td>a separate plugin, <code>policy.proto</code></td><td>1.16, 1.17</td><td style="background: var(--orange-soft)">GA in CLI, beta in HCP docs</td></tr>
+                </tbody>
+              </table>
+              <svg viewBox="0 0 1000 150" role="img" aria-label="The identity chain: provider identity schemas, then import blocks with identity in 1.12, then the ListResource stream returning identities, then GenerateResourceConfig in 1.14, then a generated import and resource pair. Counts: identity schemas aws 558, google 942, azurerm 196; list resource types aws 259, google 153, azurerm 122." style="margin-top: 18px">
+                <defs>
+                  <marker id="fig-feature-recipe-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="10" y="18" class="svg-lane">THE IDENTITY CHAIN UNDER TERRAFORM QUERY</text>
+                <rect x="10" y="32" width="176" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="54" class="svg-step">identity schema</text>
+                <text x="20" y="74" class="svg-sub">aws 558 · google 942</text>
+                <text x="20" y="90" class="svg-sub">azurerm 196</text>
+                <rect x="212" y="32" width="176" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="222" y="54" class="svg-step">import { identity }</text>
+                <text x="222" y="74" class="svg-sub">1.12, #36703</text>
+                <text x="222" y="90" class="svg-sub">ImportResourceState</text>
+                <rect x="414" y="32" width="176" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="424" y="54" class="svg-step">ListResource</text>
+                <text x="424" y="74" class="svg-sub">aws 259 · google 153</text>
+                <text x="424" y="90" class="svg-sub">azurerm 122 list types</text>
+                <rect x="616" y="32" width="176" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="626" y="54" class="svg-step">GenerateResourceConfig</text>
+                <text x="626" y="74" class="svg-sub">1.14, #37515</text>
+                <text x="626" y="90" class="svg-sub">else a state guess</text>
+                <rect x="818" y="32" width="172" height="70" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="828" y="54" class="svg-step">generated files</text>
+                <text x="828" y="74" class="svg-sub">import { identity }</text>
+                <text x="828" y="90" class="svg-sub">+ resource { … }</text>
+                <line x1="186" y1="67" x2="209" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-feature-recipe-blue)"/>
+                <line x1="388" y1="67" x2="411" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-feature-recipe-blue)"/>
+                <line x1="590" y1="67" x2="613" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-feature-recipe-blue)"/>
+                <line x1="792" y1="67" x2="815" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-feature-recipe-blue)"/>
+                <text x="10" y="132" class="svg-note">Every step but the first needs the provider to implement an RPC; every step from ListResource on needs a cloud that answers.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Names are read from the v1.17.0 tree <span class="src">from the code</span>; the schema counts come from
+              <code>providers schema -json</code> over the cached aws 6.70.0, google 8.8.0 and azurerm 5.10.0
+              <span class="recon">measured here</span>. Two rows add no RPC, and the policy row adds a whole second plugin
+              protocol instead (§08). The rest each cost one or more RPCs that a provider must implement before the feature
+              does anything for its resources.
+            </p>
+          </figure>
+
+          <h3>Actions</h3>
+          <p>
+            <code>action "TYPE" "NAME"</code> takes <code>count</code>, <code>for_each</code>, <code>provider</code> and at most
+            one <code>config</code> block, decoded to <code>configs.Action</code> and evaluated against the provider's action
+            schema (<code>internal/configs/action.go</code>:27-41, 224-318). A resource triggers it from
+            <code>lifecycle { action_trigger { … } }</code>, which requires <code>events</code> and <code>actions</code> and
+            takes an optional <code>condition</code> and <code>on_failure</code>; events are bare keywords
+            (<code>action.go</code>:115-222). v1.14.0 accepted only before and after create and update; destroy events and
+            <code>on_failure</code> arrived in v1.16 (#38668, #38722). <code>on_failure</code> defaults to <code>halt</code>,
+            because <code>ActionOnFailureHalt</code> is the enum's zero value (<code>action.go</code>:56-72)
+            <span class="src">from the code</span>. The cached schemas count 12 action types in aws 6.70.0, for example
+            <code>aws_lambda_invoke</code>, eight in azurerm and none in google <span class="recon">measured here</span>.
+          </p>
+          <p>
+            At plan time each triggered invocation costs one <code>ValidateActionConfig</code> and one <code>PlanAction</code>,
+            and the plan lists it under <code>action_invocations</code>. <code>InvokeAction</code> runs only at apply, with the
+            planned config unmarked, and streams <code>Progress</code> and <code>Completed</code> events into the UI hooks; a
+            response with no event stream is an error (<code>internal/terraform/action_trigger_instance_apply.go</code>:114-166).
+            <code>caller</code> refers to the triggering resource. It is a core <code>addrs.SelfType</code> value
+            (<code>internal/addrs/self.go</code>:10-13) and works in any configuration; the lab's offline plan resolved
+            <code>function_name</code> through it. The v1.16 CHANGELOG files it under "stacks:", which is misleading.
+          </p>
+          <p>
+            What happens on failure depends on the event. <code>invokeDestroyActions</code> (first block) knows only continue
+            or error, and forces continue during a full destroy walk; <code>invokeActions</code> (second block) has the three-way
+            switch, at <code>internal/terraform/node_resource_abstract_instance.go</code>:3380-3387 and 3423-3438:
+          </p>
+          <pre><code>		invokeDiags := trigger.Invoke(ctx, n.Addr.Resource, cty.DynamicVal, true)
+
+		// a full destroy walk must never be blocked
+		onFailureContinue := op == walkDestroy || trigger.ActionInvocation.ActionTrigger.OnFailure() == configs.ActionOnFailureContinue
+	…
+		invokeDiags := trigger.Invoke(ctx, n.Addr.Resource, callerVal, false)
+		if invokeDiags.HasErrors() {
+			switch onFailure {
+			case configs.ActionOnFailureHalt:
+				return false, diags.Append(invokeDiags)
+			case configs.ActionOnFailureTaint:
+				// We can only taint a newly created resource, because that's
+				// the only action which can be re-done from scratch. Recording
+				// other action events which need to be reinvoked will require
+				// new data to be saved in the state.
+				return event == configs.AfterCreate, diags.Append(invokeDiags)
+			case configs.ActionOnFailureContinue:
+				// The resource still needs to use the usual failure mechanisms
+				// in the graph walk, so in order to continue all diagnostics
+				// must only be warnings.
+				diags = diags.Append(tfdiags.OverrideAll(invokeDiags, tfdiags.Warning, nil))</code></pre>
+          <p>
+            So <code>taint</code> taints only on <code>after_create</code>, and never for a destroy event. The lab ran one
+            action end to end <span class="recon">measured here</span>. <strong>This run sent real HTTPS requests to AWS
+            Lambda with a fake key, which AWS rejected; §09 lists it.</strong> The configuration was an
+            <code>aws_lambda_invoke</code> action triggered by a <code>terraform_data.release</code> on
+            <code>after_create</code> and <code>after_update</code>, with <code>on_failure = continue</code>:
+          </p>
+          <pre><code>$ terraform plan -out=p.bin                     (10.7 s)
+    # Actions to be invoked after this change in order:
+    # action.aws_lambda_invoke.warm
+Plan: 1 to add, 0 to change, 0 to destroy. Actions: 1 to invoke.
+$ terraform plan -invoke=action.aws_lambda_invoke.warm
+Plan: 0 to add, 0 to change, 0 to destroy. Actions: 1 to invoke.
+$ terraform apply p.bin                         (31.7 s; real HTTPS call with fake key)
+Action started: action.aws_lambda_invoke.warm (triggered by terraform_data.release)
+Action failed: … api error UnrecognizedClientException: The security token included in the request is invalid.
+Warning: Failed to Invoke Lambda Function
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed. Actions: 1 invoked, 1 failed.   (exit=0)
+# change input to "v43", delete on_failure (→ halt), apply -auto-approve:
+Error: Failed to Invoke Lambda Function                                                        (exit=1)
+$ terraform show -json | jq '.values.root_module.resources[0].values.input'  → "v43"</code></pre>
+          <p>
+            Three findings sit in that transcript. With <code>continue</code>, the failure became a warning and the run exited
+            0. With the default <code>halt</code>, the run exited 1, but the triggering change stayed: state held
+            <code>input = "v43"</code> and no taint, and its backup held "v42". <code>halt</code> stops the run; it does not
+            roll anything back. These lines were not re-run by a verifier, under the offline rule; the recorded state file
+            corroborates the halt result. The third finding is the <code>-invoke</code> plan.
+          </p>
+
+          <h3>The <code>-invoke</code> dead end</h3>
+          <p>
+            <code>-invoke=action.X.Y</code> runs one action ad hoc. The CLI accepts one only ("Only one action can be invoked at a
+            time.") and quietly changes the plan mode, at <code>internal/command/arguments/extended.go</code>:232-237:
+          </p>
+          <pre><code>	default:
+		if len(o.ActionTargets) &gt; 0 {
+			o.PlanMode = plans.RefreshOnlyMode
+		} else {
+			o.PlanMode = plans.NormalMode
+		}</code></pre>
+          <p>
+            A normal plan with <code>-invoke</code> becomes refresh-only, which is why the pending <code>terraform_data</code>
+            create vanished from the second plan above: "Plan: 0 to add". Nothing says so. The <code>default:</code> arm is the
+            last in the switch, and the <code>case o.destroyRaw:</code> arm before it sets <code>DestroyMode</code> first
+            (<code>extended.go</code>:221-222), so <code>plan -destroy -invoke=…</code> reaches core unconverted. Core's guard at
+            <code>internal/terraform/context_plan.go</code>:299-309 then fires:
+          </p>
+          <pre><code>	if len(opts.ActionTargets) &gt; 0 {
+		if opts.Mode != plans.RefreshOnlyMode {
+			// The CLI layer (and other similar callers) should prevent this
+			// combination of options.
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Incompatible plan options",
+				"Must be in RefreshOnlyMode when invoking actions. This is a bug in Terraform.",
+			))
+			return nil, nil, diags
+		}</code></pre>
+          <p>
+            A verifier re-ran <code>plan -destroy -invoke=…</code> and got exactly that error, and it is still present on
+            origin/main (behaviour, measured, verified). The comment assumes the CLI prevents the combination; the CLI neither
+            converts nor rejects it. If you want an action and pending changes in one run, trigger it from a lifecycle event;
+            <code>-invoke</code> plans nothing else. One older edge completes the picture: in v1.13 the root schema already
+            accepted <code>action</code> blocks while their decoding was experiment-gated, so a stable 1.13 binary silently
+            dropped them. Figure 20 draws the whole life.
+          </p>
+
+          <figure class="figure wide" id="fig-action-life">
+            <div class="figure-head">
+              <span class="figure-label">Figure 20</span>
+              <p class="figure-title">An action's life from plan to apply, and the two <code>-invoke</code> side paths</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 420" role="img" aria-label="Sequence between Terraform core and the provider. At plan: ValidateActionConfig, then PlanAction, then the invocation is recorded in action_invocations. At apply: the resource change is applied, then InvokeAction streams progress and completed events; on error the on_failure value decides: halt fails the run without rollback, taint only for after_create, continue downgrades to warnings. Destroy events go through invokeDestroyActions with continue or error only. Side paths: -invoke turns a normal plan into refresh-only; -destroy with -invoke reaches core's internal error.">
+                <defs>
+                  <marker id="fig-action-life-black" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-action-life-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="10" y="22" class="svg-lane">CORE</text>
+                <text x="10" y="252" class="svg-lane">PROVIDER</text>
+                <line x1="10" y1="226" x2="1070" y2="226" stroke="#deded9"/>
+                <text x="120" y="22" class="svg-lane">PLAN</text>
+                <text x="520" y="22" class="svg-lane">APPLY</text>
+                <line x1="500" y1="10" x2="500" y2="400" stroke="#b8b8b1" stroke-dasharray="4 4"/>
+
+                <rect x="20" y="40" width="200" height="54" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="30" y="62" class="svg-step">action_trigger fires</text>
+                <text x="30" y="80" class="svg-sub">event and condition matched</text>
+                <rect x="250" y="40" width="230" height="54" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="260" y="62" class="svg-step">action_invocations</text>
+                <text x="260" y="80" class="svg-sub">"Actions: 1 to invoke"</text>
+                <rect x="20" y="262" width="200" height="40" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="30" y="287" class="svg-sub" style="fill:#252525">ValidateActionConfig</text>
+                <rect x="250" y="262" width="230" height="40" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="260" y="287" class="svg-sub" style="fill:#252525">PlanAction</text>
+                <line x1="120" y1="94" x2="120" y2="258" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <line x1="220" y1="282" x2="246" y2="282" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <line x1="365" y1="262" x2="365" y2="98" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-action-life-blue)"/>
+
+                <rect x="520" y="40" width="160" height="54" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="530" y="62" class="svg-step">resource change</text>
+                <text x="530" y="80" class="svg-sub">the triggering CRUD</text>
+                <rect x="520" y="262" width="160" height="58" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="530" y="284" class="svg-sub" style="fill:#252525">InvokeAction</text>
+                <text x="530" y="302" class="svg-sub">streams Progress,</text>
+                <text x="530" y="316" class="svg-sub">Completed</text>
+                <line x1="600" y1="94" x2="600" y2="258" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <rect x="712" y="40" width="170" height="54" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="722" y="62" class="svg-step">invokeActions</text>
+                <text x="722" y="80" class="svg-sub">on error: on_failure</text>
+                <line x1="680" y1="290" x2="700" y2="290" stroke="#3c6f97" stroke-width="1.5"/>
+                <line x1="700" y1="290" x2="700" y2="67" stroke="#3c6f97" stroke-width="1.5"/>
+                <line x1="700" y1="67" x2="708" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-action-life-blue)"/>
+                <rect x="912" y="40" width="158" height="40" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="922" y="58" class="svg-sub" style="fill:#252525">halt (default)</text>
+                <text x="922" y="73" class="svg-sub">exit 1, no rollback</text>
+                <rect x="912" y="88" width="158" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="922" y="106" class="svg-sub" style="fill:#252525">taint</text>
+                <text x="922" y="121" class="svg-sub">after_create only</text>
+                <rect x="912" y="136" width="158" height="40" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="922" y="154" class="svg-sub" style="fill:#252525">continue</text>
+                <text x="922" y="169" class="svg-sub">warnings, exit 0</text>
+                <line x1="882" y1="60" x2="908" y2="60" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <line x1="896" y1="60" x2="896" y2="156" stroke="#252525" stroke-width="2.5"/>
+                <line x1="896" y1="108" x2="908" y2="108" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <line x1="896" y1="156" x2="908" y2="156" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <rect x="712" y="120" width="170" height="70" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="722" y="140" class="svg-step">invokeDestroyActions</text>
+                <text x="722" y="158" class="svg-sub">destroy events</text>
+                <text x="722" y="174" class="svg-sub">continue or error only</text>
+
+                <text x="20" y="352" class="svg-lane">SIDE PATHS, PLAN TIME</text>
+                <rect x="20" y="364" width="300" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="30" y="389" class="svg-sub" style="fill:#252525">plan -invoke → silently refresh-only</text>
+                <rect x="340" y="364" width="400" height="40" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="350" y="389" class="svg-sub" style="fill:#252525">plan -destroy -invoke → "This is a bug in Terraform."</text>
+                <text x="760" y="382" class="svg-note">neither converted nor</text>
+                <text x="760" y="398" class="svg-note">rejected by the CLI</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Thick black arrows are control flow, thin blue arrows carry the provider's answer back to core. The branches are
+              read from <code>node_resource_abstract_instance.go</code> and <code>arguments/extended.go</code> at v1.17.0
+              <span class="src">from the code</span>; the RPC counts, the exit codes and the kept <code>"v43"</code> are
+              <span class="recon">measured here</span> with fake AWS credentials. Why the CLI prints "Action started" before
+              the resource's creation completes for an <code>after_create</code> trigger is an open question.
+            </p>
+          </figure>
+
+          <h2 id="p3-gates"><span class="secnum">08</span>What is still gated</h2>
+          <p class="lede">
+            Three surfaces at the front of the arc are not finished in the open-source CLI. Deferred actions have been in core
+            since v1.8 and still need an experimental build. Stacks is GA, but only as an HCP Terraform product, and the CLI
+            command downloads a plugin to run it. Terraform Policy is GA in the v1.17 CLI, runs as a separate executable, and
+            fails open for <code>plan</code> and <code>apply</code>. The newest surfaces are Terraform-only and partly run
+            outside the <code>terraform</code> process.
+          </p>
+
+          <h3>Deferral: in core, not in the CLI</h3>
+          <p>
+            The <code>deferring</code> package (db07b905e, 26 January 2024, first tagged in v1.8.0) tracks resources whose plan
+            must wait, so that a partial plan can be applied and the rest planned later
+            (<code>internal/plans/deferring/doc.go</code>:4-10). Deferral is transitive: anything that depends on a deferred
+            object is deferred too, and the whole mechanism is a no-op when deferral is not allowed
+            (<code>deferred.go</code>:288-330). With deferral on, unknown <code>count</code> or <code>for_each</code> keys become
+            <code>nodePlannablePartialExpandedResource</code> nodes addressed like <code>module.x[*].res</code>, and a plan file
+            can record five reasons, from <code>INSTANCE_COUNT_UNKNOWN</code> to <code>DEFERRED_PREREQ</code>
+            (<code>internal/plans/planproto/planfile.proto</code>:438-445) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The switch is <code>-allow-deferral</code>, added on 3 April 2024 and first tagged in v1.9.0. Every release binary
+            through v1.17.0 rejects it, as a belated flag-parse error at <code>internal/command/plan.go</code>:195-207: "The
+            -allow-deferral flag is only valid in experimental builds of Terraform." <span class="recon">measured here</span>.
+            Two runtimes turn it on in code: the Stacks runtime always sets <code>DeferralAllowed: true</code>
+            (<code>internal/stacks/stackruntime/internal/stackeval/client_capabilities.go</code>:12), and
+            <code>terraform test</code> passes it through (<code>internal/command/test.go</code>:178). A plain CLI apply sets it
+            only to honour deferrals already recorded. So in the CLI an unknown <code>count</code> still fails "Invalid count
+            argument" (<a href="../engine-and-providers/#p2-expansion">Part 2</a>), and if a provider answers
+            <code>PlanAction</code> with <code>Deferred</code> anyway, core reports <code>UnexpectedProviderDeferralDiagnostic</code>.
+            The v1.17 experiments footer describes the feature as permitting unknown <code>count</code> and
+            <code>for_each</code> in <code>module</code>, <code>resource</code> and <code>data</code> blocks. On origin/main it is
+            still under EXPERIMENTS. In practice, deferral is GA only inside Stacks.
+          </p>
+
+          <h3>Stacks: a product with a CLI shim</h3>
+          <p>
+            HashiCorp announced Stacks GA at HashiConf on 25 September 2025, "for all new HCP Terraform plans based on resources
+            under management (RUM)". It is an HCP product. <code>terraform stacks</code> (v1.13.0, #36931) "delegates all
+            execution to an internal plugin": the CLI discovers the <code>stacksplugin.v1</code> service on
+            <code>app.terraform.io</code>, downloads the plugin and talks to it over go-plugin gRPC with the cookie key
+            <code>TF_STACKS_MAGIC_COOKIE</code> (<code>internal/command/stacks.go</code>:58-77) <span class="src">from the code</span>.
+            The first <code>terraform stacks -help</code>, run under <code>HOME=$PWD</code>, downloaded <code>tfstacks</code>
+            1.4.0, 22,585,528 bytes, into <code>.terraform.d/stacksplugin/</code>; a verifier later deleted it. A tiny stack of
+            one <code>random</code> component passed <code>stacks init</code> and <code>validate</code> locally once a
+            <code>.terraform-version</code> file existed, a rule the plugin enforces and this repository does not
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The language and runtime are not hidden: they live in <code>internal/stacks/*</code>, driven over
+            <code>terraform rpcapi</code>, which v1.13.0 declared GA while saying it is "not intended for public consumption".
+            Core carries a few Stacks-only switches, such as <code>AllowRootEphemeralOutputs</code> (§06) and always-on deferral,
+            and some CHANGELOG lines are Stacks work in core: input-variable validation (#38240) and component no-op reporting
+            (#38049) in v1.15.
+            <a href="../three-clouds/#p4-commercial-edge">Part 4</a> places this in the commercial edge.
+          </p>
+
+          <h3>Terraform Policy: GA, out of process, fail-open</h3>
+          <p>
+            Policy is a second plugin protocol. <code>policy.Connect</code> execs <code>tfpolicy-plugin rpcapi</code>, found on
+            <code>$PATH</code> or through <code>TF_POLICY_PLUGIN</code>, as a go-plugin child with AutoMTLS and magic cookie
+            value <code>6F11ED78A2AB</code> (<code>internal/policy/client.go</code>:31, 116-145; added in #38514, first tagged
+            v1.16.0). The service has <code>Setup</code>, <code>EvaluateResource</code>, <code>EvaluateProvider</code> and
+            <code>EvaluateModule</code>, plus a reverse <code>CallbackService</code> through which the plugin asks core for
+            <code>GetResources</code> and <code>GetDataSource</code>; <code>Setup</code> returns version constraints checked
+            against Terraform (<code>internal/policy/proto/policy.proto</code>:14-29) <span class="src">from the code</span>.
+          </p>
+          <p>
+            It runs at three stages, <code>InitEvaluationStage</code>, <code>PlanEvaluationStage</code> and
+            <code>ApplyEvaluationStage</code> (<code>internal/policy/evaluation_stage.go</code>:10-16). At init, the module and
+            provider installers ask it about each source and version and refuse to download on an error
+            (<code>internal/command/meta_policy.go</code>:83-180). At plan and apply, each instance's attributes and prior
+            attributes go to <code>EvaluateResource</code> from a separate policy subgraph whose nodes run even after their
+            dependencies fail, under a semaphore of <code>TF_POLICY_PARALLELISM</code> or <code>GOMAXPROCS</code>, independent of
+            <code>-parallelism</code> (<code>internal/terraform/policy.go</code>:27-52; <code>graph_policy.go</code>:11-60). The lab's
+            apply trace from §01, with no policy configured, logs "Using GOMAXPROCS=2 for policy evaluation parallelism"
+            <span class="recon">measured here</span>. <a href="../engine-and-providers/#p2-walk">Part 2</a> shows the walker's
+            <code>AlwaysRunVertex</code> that makes those nodes run.
+          </p>
+          <p>
+            Setup is where the asymmetry lives. <code>plan</code> logs a failed setup and carries on, at
+            <code>internal/command/plan.go</code>:106-116:
+          </p>
+          <pre><code>	if len(args.PolicyPaths) &gt; 0 {
+		client, policyDiags, stopClient := c.PolicyClient(c.CommandContext(), args.PolicyPaths, backendPolicyEntitlement(be, policy.PlanEvaluationStage))
+		// if there has been any errors when setting up the policy client, we log them but
+		// we still proceed with the operation, as a failure to set up the policy client
+		// should not prevent the plan operation from running
+		if opReq.View != nil &amp;&amp; policyDiags != nil {
+			opReq.View.PolicyDiagnostics(policyDiags)
+		}
+		opReq.PolicyClient = client
+		defer stopClient()
+	}</code></pre>
+          <p>
+            <code>init</code> stops on the same diagnostics, at <code>internal/command/init_run.go</code>:286-299:
+          </p>
+          <pre><code>	if len(initArgs.PolicyPaths) &gt; 0 {
+		var policyDiags policy.Diagnostics
+		var stopClient func()
+		policyClient, policyDiags, stopClient = c.PolicyClient(ctx, initArgs.PolicyPaths, backendPolicyEntitlement(back, policy.InitEvaluationStage))
+		defer stopClient()
+		// Stream any policy setup diagnostics (e.g. a failure to connect to the
+		// policy engine).
+		view.PolicyDiagnostics(policyDiags)
+		if policyDiags.HasErrors() {
+			diags = diags.Append(earlyConfDiags)
+			diags = diags.Append(backDiags)
+			view.Diagnostics(diags)
+			return 1
+		}</code></pre>
+          <p>
+            With no <code>tfpolicy-plugin</code> on the path, the lab saw both halves <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform plan -policies=policies -out=p.bin       (policies/ is an empty dir; no tfpolicy-plugin on PATH)
+Error: Failed to connect to policy engine
+Failed to connect to policy engine: failed to connect to plugin: exec: "tfpolicy-plugin": executable file not found in $PATH.
+Terraform will perform the following actions: … Plan: 1 to add …                                  plan_rc=0
+$ terraform apply -policies=policies p.bin  → Error: Failed to connect … / Apply complete! Resources: 1 added   apply_rc=0
+$ terraform plan -policies=nope    → Terraform cannot find the policy path at nope. …
+$ terraform query -policies=f.hcl  → … path of a policy set directory, not an individual policy file.</code></pre>
+          <p>
+            An "Error:" was printed, the plan and the apply both went ahead, and both exited 0; <code>init -policies</code> exits 1
+            (behaviour, measured, verified by a re-run of plan and apply). The fail-open is deliberate, as the comment says, and
+            it has a second form. With the real plugin 0.5.0 installed, a local backend sends a nil entitlement, which
+            <code>internal/policy/policy.go</code>:71-74 says means "the plugin skips the check"; the plugin instead rejected it
+            with "entitlement check failed: client did not supply entitlement information.", and the plan again proceeded with
+            exit 0. So a local <code>plan -policies</code> never enforced anything here
+            (<a href="../three-clouds/#p4-tests-policy">Part 4</a> has that run). In CI, do not treat exit 0 from
+            <code>plan -policies</code> as a pass; check that policy results were actually reported.
+          </p>
+
+          <p>
+            Paths are checked before any of this: <code>plan</code>, <code>apply</code> and <code>init</code> accept a policy
+            file or a directory (<code>validatePolicyPaths</code>), while <code>query</code> requires a policy-set directory
+            (#39238) (<code>internal/command/policy.go</code>:13-80). The pieces that arrived in v1.16 faced HCP first: run
+            policy summaries (#38715) and plugin credentials taken from the <code>cloud</code> or <code>remote</code> backend
+            (#38716). The local <code>-policies</code> path stayed experimental until v1.17.
+          </p>
+
+          <h3>Which "GA"</h3>
+          <p>
+            The v1.17.0 CHANGELOG says <code>-policies</code> on plan, apply and query no longer needs an experimental build, and
+            cites #38970. That PR is a replace-action split from 10 August 2026. The gate was removed by c0a2efe291 (#38996,
+            1 September 2026), whose changie entry carries <code>Issue: "38970"</code>, and whose body was rewritten from "plan,
+            apply, and init" to "plan, apply, and query" (CHANGELOG mistake, code, verified). The flag itself appears only in
+            <code>query -help</code>. The entry says nothing about fail-open setup or the local entitlement failure. HCP's policy
+            documentation still says "beta" and "requires v1.16alpha"; the install page says beta and "requires Terraform v1.16 or
+            later"; HCP's public beta started on 16 July 2026. On origin/main, the 1.18.0 Unreleased CHANGELOG still lists
+            <code>terraform query -policies</code> as experimental (CHANGELOG, code, per a verifier). Three surfaces, three
+            maturity labels, for one flag.
+          </p>
+          <p>
+            Policies are <code>*.policy.hcl</code> files of <code>resource_policy "TYPE" "NAME"</code> blocks with
+            <code>enforce { condition, error_message, info_message }</code>, <code>filter</code>, <code>locals</code>,
+            <code>operations</code> and an <code>enforcement_level</code> of advisory, mandatory_overridable or mandatory, the
+            default, according to HashiCorp's reference for v0.5.x. What a running plugin does with a
+            <code>mandatory_overridable</code> failure in the local CLI, which has no override UI, could not be tested without an
+            entitled engine.
+          </p>
+          <p>
+            Taken together, what is still gated at v1.17.0 is machinery rather than language: the <code>cloud</code>,
+            <code>test cleanup</code> and <code>state migrate</code> commands, <code>-allow-deferral</code>, test
+            <code>backend</code> and <code>skip_cleanup</code>, and provider <code>state_store</code> all need an experimental
+            build (<code>commands.go</code>:453-466). The commercial engines, Stacks and Policy, ship as separate executables that
+            the CLI downloads or execs. That is the same seam as the providers of Part 2, used this time for HashiCorp's own
+            products <span class="recon">reconstruction</span>.
+          </p>
+
+          <h2 id="p3-sources"><span class="secnum">09</span>Sources</h2>
+          <ul>
+            <li><a href="https://github.com/hashicorp/terraform/tree/v1.17.0">hashicorp/terraform at <code>v1.17.0</code></a> (<code>018a99c83c5d</code>, 21 October 2026): <code>internal/states</code>, <code>internal/backend</code>, <code>internal/cloud</code>, <code>internal/refactoring</code>, <code>internal/configs</code>, <code>internal/terraform</code>, <code>internal/providers/mock.go</code>, <code>internal/policy</code>, <code>internal/command</code>; CHANGELOGs v1.5.0 to v1.17.0. origin/main <code>a060ad5a1b</code> (23 October 2026) for upstream status only; plugin-framework <code>00badb1b0584</code>.</li>
+            <li>Binaries: <code>terraform</code> v1.17.0 linux_amd64 with providers random 3.9.1 and aws 6.70.0 (google 8.8.0 and azurerm 5.10.0 for schema counts only) from a shared plugin cache; <code>tfstacks</code> 1.4.0; <code>tfpolicy-plugin</code> 0.5.0.</li>
+            <li>HashiCorp documentation and the HashiConf 2025 announcements, fetched 23 October 2026, for HCP-side statements (workspaces, run states, policy maturity, Stacks GA).</li>
+          </ul>
+          <p class="footnote">
+            <strong>Provenance.</strong> Paths, lines and excerpts were re-read from the pinned tree. "Measured here" output came
+            from lab directories on a 2-vCPU box with no cloud credentials, using local state, a toy HTTP state server on
+            127.0.0.1, <code>random</code>, <code>terraform_data</code>, <code>mock_provider</code>, or aws with the fake key
+            <code>AKIAFAKEFAKEFAKEFAKE</code> and the skip switches. Three requests from this part's labs reached real AWS
+            endpoints, and in each case nothing was created and nothing was read: an <code>init</code> with an <code>s3</code>
+            backend sent <code>ListObjectsV2</code> to a real bucket name and got HTTP 301; the action example's
+            <code>Invoke</code> was rejected with UnrecognizedClientException (a 403); and <code>terraform query</code>'s
+            <code>DescribeInstances</code> got 401 AuthFailure. Every fact traces to the research dossier, checked by four
+            verification passes; none was reported upstream. Figure layouts, the "schema, node, RPC" reading and the practical advice
+            are mine. Reproduce with <code>terraform state push</code> of an edited <code>state pull</code>, or a
+            <code>plan</code> beside a running <code>apply</code>. Not verified:
+            why <code>terraform_data.output</code> loses the sensitive path; <code>state_store</code> locking in practice; whether
+            S3-compatible stores honour <code>If-None-Match</code>; HCP run behaviour; why "Action
+            started" precedes creation; local <code>mandatory_overridable</code> handling.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Terraform, taken apart</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../language-and-front-end/">Part 1: The language and the front end</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../engine-and-providers/">Part 2: The engine and the providers</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../three-clouds/">Part 4: Building on three clouds, and the ecosystem</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

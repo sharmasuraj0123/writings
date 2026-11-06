@@ -1,0 +1,355 @@
+          <h2 id="p2-processes"><span class="secnum">{{S}}</span>Providers are processes</h2>
+          <p class="lede">
+            Terraform does not link the AWS provider. It runs it. Every provider is an ordinary executable that core
+            starts as a child process and talks to over gRPC on a Unix socket, with core as the client and the plugin
+            as the server. A trivial plan of one <code>random</code> resource starts that binary three times. The
+            three-cloud plan in Part 4 starts eighteen processes.
+          </p>
+
+          <h3>From the lock file to a factory</h3>
+          <p>
+            <code>Meta.providerFactoriesFromLocks</code> turns each entry in <code>.terraform.lock.hcl</code> into a
+            <code>providers.Factory</code>, but only after the cached package matches one of the lock file's hashes.
+            Otherwise the "factory" just returns the error: "the cached package for … does not match any of the
+            checksums recorded in the dependency lock file" (<code>internal/command/meta_providers.go</code>:408-427)
+            <span class="src">from the code</span>. <a href="../language-and-front-end/#p1-install">Part 1</a>
+            explains where those hashes come from. Three other kinds of factory exist: in-process built-ins such as
+            <code>terraform.io/builtin/terraform</code>, which serves <code>terraform_data</code> with no child process
+            and no gRPC; CLI-config <code>dev_overrides</code>; and providers named in
+            <code>TF_REATTACH_PROVIDERS</code>, which Terraform connects to but never starts or kills.
+          </p>
+          <p>
+            A managed factory call creates one process. The configuration it hands to go-plugin is
+            <code>meta_providers.go</code>:456-479:
+          </p>
+<pre><code>func providerFactory(meta *providercache.CachedProvider) providers.Factory {
+	return func() (providers.Interface, error) {
+		execFile, err := meta.ExecutableFile()
+		if err != nil {
+			return nil, err
+		}
+
+		config := &amp;plugin.ClientConfig{
+			HandshakeConfig:  tfplugin.Handshake,
+			Logger:           logging.NewProviderLogger(""),
+			AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
+			Managed:          true,
+			Cmd:              exec.Command(execFile),
+			AutoMTLS:         enableProviderAutoMTLS,
+			VersionedPlugins: tfplugin.VersionedPlugins,
+			SyncStdout:       logging.PluginOutputMonitor(fmt.Sprintf("%s:stdout", meta.Provider)),
+			SyncStderr:       logging.PluginOutputMonitor(fmt.Sprintf("%s:stderr", meta.Provider)),
+		}
+
+		client := plugin.NewClient(config)
+		rpcClient, err := client.Client()
+		if err != nil {
+			return nil, err
+		}</code></pre>
+          <p>
+            gRPC only, managed (so <code>plugin.CleanupClients()</code>, deferred in <code>main</code>, kills any
+            child left running), mutual TLS on unless <code>TF_DISABLE_PLUGIN_TLS</code> is set, and both protocol
+            majors offered: <code>VersionedPlugins</code> maps 5 to a provider and provisioner set and 6 to a provider
+            set (<code>internal/plugin/plugin.go</code>:14-22). The comment on <code>TF_DISABLE_PLUGIN_TLS</code> says
+            it exists for the SDK test harness's start-up cost and "is not intended to be set by end-users".
+          </p>
+
+          <h3>The handshake</h3>
+          <p>
+            The repository's protocol README admits that "the startup and handshake protocol is not currently
+            documented" (<code>docs/plugin-protocol/README.md</code>:43-44). go-plugin's code is the specification.
+            go-plugin adds four variables to the inherited environment: the magic cookie
+            <code>TF_PLUGIN_MAGIC_COOKIE</code>, <code>PLUGIN_MIN_PORT</code>, <code>PLUGIN_MAX_PORT</code> and
+            <code>PLUGIN_PROTOCOL_VERSIONS</code> (a comma list of majors), plus <code>PLUGIN_CLIENT_CERT</code> under
+            AutoMTLS (<code>go-plugin:client.go</code>:633-692). The cookie value is a 64-hex-digit constant, identical
+            in core and every SDK, under the comment "The magic cookie values should NEVER be changed."
+            (<code>internal/plugin/serve.go</code>:34-36). It is a guard against running a plugin by accident, not a
+            secret.
+          </p>
+          <p>
+            The provider checks the cookie, picks the highest major that both sides list, reserves a temp-file name
+            under <code>/tmp</code>, deletes it and listens on a Unix socket there; only on Windows does it use TCP on
+            127.0.0.1 (<code>go-plugin:server.go</code>:145-222, 528-597). Then it prints one line to stdout,
+            <code>go-plugin:server.go</code>:424-446:
+          </p>
+<pre><code>	if opts.Test == nil {
+		const grpcBrokerMultiplexingSupported = true
+		protocolLine := fmt.Sprintf("%d|%d|%s|%s|%s|%s",
+			CoreProtocolVersion,
+			protoVersion,
+			listener.Addr().Network(),
+			listener.Addr().String(),
+			protoType,
+			serverCert)
+
+		// Old clients will error with new plugins if we blindly append the
+		// seventh segment for gRPC broker multiplexing support, because old
+		// client code uses strings.SplitN(line, "|", 6), which means a seventh
+		// segment will get appended to the sixth segment as "sixthpart|true".
+		//
+		// If the environment variable is set, we assume the client is new enough
+		// to handle a seventh segment, as it should now use
+		// strings.Split(line, "|") and always handle each segment individually.
+		if os.Getenv(envMultiplexGRPC) != "" {
+			protocolLine += fmt.Sprintf("|%v", grpcBrokerMultiplexingSupported)
+		}
+		fmt.Printf("%s\n", protocolLine)
+		_ = os.Stdout.Sync()</code></pre>
+          <p>
+            You can hold the conversation by hand. Run the cached <code>random</code> binary bare, then with the
+            cookie <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ $R
+This binary is a plugin. These are not meant to be executed directly.
+Please execute the program that consumes these plugins, which will
+load any plugins automatically
+$ TF_PLUGIN_MAGIC_COOKIE=d602bf8f470bc67ca7faa0386276bbdd4330efaf76d1a219cb4d6991ca9872b2 \
+  PLUGIN_PROTOCOL_VERSIONS=5,6 timeout 2 $R
+1|5|unix|/tmp/plugin286704651|grpc|                       # stdout: the handshake</code></pre>
+          <p>
+            The bare run exits 1. With the cookie, field 1 is go-plugin's core protocol, always 1. Field 2 is the
+            negotiated Terraform protocol: 5, although 6 was offered, because this binary is a protocol-5 build.
+            Offered only 6, it still answers 5 (<code>1|5|unix|/tmp/plugin3779874446|grpc|</code>), so the mismatch is
+            caught by the client. Fields 3 and 4 are the socket, field 5 the transport, and field 6 the server
+            certificate, empty here because no client certificate was passed. With one, field 6 grew to about 790
+            base64 characters (791 and 795 in two runs). Decoded, it is a self-signed ECDSA P-521 CA certificate for
+            <code>CN=localhost, O=HashiCorp</code>, valid from 30 seconds ago for 262,980 hours, about 30 years.
+          </p>
+          <p>
+            The client is strict about that line. Fewer than four fields is "Unrecognized remote plugin message", a
+            core protocol other than 1 is incompatible, the transport must be <code>grpc</code>, and field 6 counts as
+            a certificate only if it is longer than 50 characters. It waits at most the default
+            <code>StartTimeout</code> of one minute, which Terraform does not change; a provider that dies first gives
+            "plugin exited before we could connect" (<code>go-plugin:client.go</code>:398-400, 823-929). After the
+            handshake, core picks <code>internal/plugin.GRPCProvider</code> for major 5 or
+            <code>internal/plugin6.GRPCProvider</code> for major 6, and keeps the <code>*plugin.Client</code> on it so
+            <code>Close()</code> can kill the child.
+          </p>
+
+          <figure class="figure wide" id="fig-provider-life">
+            <div class="figure-head">
+              <span class="figure-label">Figure 12</span>
+              <p class="figure-title">A provider's life, the handshake line field by field, and how many lives one plan needs</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 600" role="img" aria-label="Top: core execs the provider with the cookie, protocol versions and a client certificate; the provider checks the cookie, opens a Unix socket and prints the handshake line; core dials over mutual TLS, gets the schema or uses the global cache, validates and configures, sends resource RPCs, and finally the close node kills the process with a two second grace period. Middle: the handshake line 1|5|unix|/tmp/plugin286704651|grpc| with each field labelled. Bottom: process lifetimes for one random plan (three processes, one after another), two aws configurations (five processes, at most two alive) and the lab's three-cloud plan (eighteen processes, at most seven alive).">
+                <defs>
+                  <marker id="fig-plife-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-plife-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">ONE PROCESS · meta_providers.go + go-plugin v1.7.0</text>
+                <rect x="30" y="44" width="1060" height="30" fill="#252525"/>
+                <text x="44" y="64" class="svg-step" style="fill: #ffffff">core (terraform)</text>
+                <rect x="30" y="200" width="930" height="30" fill="#367f59"/>
+                <text x="44" y="220" class="svg-step" style="fill: #ffffff">provider process</text>
+                <text x="972" y="220" class="svg-sub">exited</text>
+                <g stroke="#252525" stroke-width="2" fill="none" marker-end="url(#fig-plife-k)">
+                  <line x1="160" y1="74" x2="160" y2="196"/>
+                  <line x1="420" y1="74" x2="420" y2="196"/>
+                  <line x1="540" y1="74" x2="540" y2="196"/>
+                  <line x1="660" y1="74" x2="660" y2="196"/>
+                  <line x1="780" y1="74" x2="780" y2="196"/>
+                  <line x1="900" y1="74" x2="900" y2="196"/>
+                </g>
+                <line x1="300" y1="200" x2="300" y2="78" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-plife-b)"/>
+                <circle cx="160" cy="96" r="9" fill="#ffffff" stroke="#d98226"/><text x="160" y="100" class="svg-num" text-anchor="middle">1</text>
+                <text x="170" y="122" class="svg-sub">exec + env:</text>
+                <text x="170" y="138" class="svg-sub">cookie, 5,6,</text>
+                <text x="170" y="154" class="svg-sub">client cert</text>
+                <circle cx="300" cy="96" r="9" fill="#ffffff" stroke="#d98226"/><text x="300" y="100" class="svg-num" text-anchor="middle">2</text>
+                <text x="310" y="122" class="svg-sub">stdout line:</text>
+                <text x="310" y="138" class="svg-sub">see below</text>
+                <circle cx="420" cy="96" r="9" fill="#ffffff" stroke="#d98226"/><text x="420" y="100" class="svg-num" text-anchor="middle">3</text>
+                <text x="430" y="122" class="svg-sub">mTLS dial</text>
+                <text x="430" y="138" class="svg-sub">Unix socket</text>
+                <circle cx="540" cy="96" r="9" fill="#ffffff" stroke="#d98226"/><text x="540" y="100" class="svg-num" text-anchor="middle">4</text>
+                <text x="550" y="122" class="svg-sub">GetProvider-</text>
+                <text x="550" y="138" class="svg-sub">Schema, or</text>
+                <text x="550" y="154" class="svg-sub">global cache</text>
+                <circle cx="660" cy="96" r="9" fill="#ffffff" stroke="#d98226"/><text x="660" y="100" class="svg-num" text-anchor="middle">5</text>
+                <text x="670" y="122" class="svg-sub">Validate- and</text>
+                <text x="670" y="138" class="svg-sub">Configure-</text>
+                <text x="670" y="154" class="svg-sub">Provider</text>
+                <circle cx="780" cy="96" r="9" fill="#ffffff" stroke="#d98226"/><text x="780" y="100" class="svg-num" text-anchor="middle">6</text>
+                <text x="790" y="122" class="svg-sub">resource</text>
+                <text x="790" y="138" class="svg-sub">RPCs</text>
+                <circle cx="900" cy="96" r="9" fill="#ffffff" stroke="#d98226"/><text x="900" y="100" class="svg-num" text-anchor="middle">7</text>
+                <text x="910" y="122" class="svg-sub">(close) node:</text>
+                <text x="910" y="138" class="svg-sub">Kill, 2 s grace,</text>
+                <text x="910" y="154" class="svg-sub">then force</text>
+                <text x="44" y="252" class="svg-note">Before step 2 the provider checks the cookie (without it: "This binary is a plugin…", exit 1) and picks the highest common major.</text>
+
+                <text x="30" y="290" class="svg-lane">THE HANDSHAKE LINE · measured, random 3.9.1, no client cert</text>
+                <g style="font: 600 15px var(--mono); fill: #252525">
+                  <text x="60" y="324">1</text>
+                  <text x="84" y="324" style="fill: #b8b8b1">|</text>
+                  <text x="108" y="324">5</text>
+                  <text x="132" y="324" style="fill: #b8b8b1">|</text>
+                  <text x="156" y="324">unix</text>
+                  <text x="208" y="324" style="fill: #b8b8b1">|</text>
+                  <text x="232" y="324">/tmp/plugin286704651</text>
+                  <text x="428" y="324" style="fill: #b8b8b1">|</text>
+                  <text x="452" y="324">grpc</text>
+                  <text x="504" y="324" style="fill: #b8b8b1">|</text>
+                  <text x="528" y="324" style="fill: #3c6f97">(empty)</text>
+                </g>
+                <g stroke="#d98226" stroke-width="1.2">
+                  <line x1="56" y1="334" x2="74" y2="334"/>
+                  <line x1="104" y1="334" x2="122" y2="334"/>
+                  <line x1="152" y1="334" x2="198" y2="334"/>
+                  <line x1="228" y1="334" x2="418" y2="334"/>
+                  <line x1="448" y1="334" x2="494" y2="334"/>
+                  <line x1="524" y1="334" x2="592" y2="334"/>
+                </g>
+                <text x="40" y="354" class="svg-sub">core=1</text>
+                <text x="152" y="354" class="svg-sub">network</text>
+                <text x="448" y="354" class="svg-sub">transport</text>
+                <text x="88" y="372" class="svg-sub">Terraform major, negotiated</text>
+                <text x="290" y="372" class="svg-sub">socket path</text>
+                <text x="524" y="354" class="svg-sub">server cert: ≈790 base64</text>
+                <text x="524" y="372" class="svg-sub">chars with a client cert</text>
+                <text x="700" y="324" class="svg-note">P-521, CN=localhost, O=HashiCorp,</text>
+                <text x="700" y="342" class="svg-note">valid 262,980 h; a 7th "|true" field only</text>
+                <text x="700" y="360" class="svg-note">if the client asks for gRPC multiplexing.</text>
+
+                <text x="30" y="410" class="svg-lane">PROVIDER PROCESSES PER PLAN · measured here</text>
+                <text x="30" y="440" class="svg-sub">one random config: 3</text>
+                <rect x="290" y="428" width="52" height="16" fill="#dfede5" stroke="#367f59"/>
+                <rect x="360" y="428" width="100" height="16" fill="#dfede5" stroke="#367f59"/>
+                <rect x="469" y="428" width="120" height="16" fill="#dfede5" stroke="#367f59"/>
+                <text x="296" y="460" class="svg-sub">schema</text>
+                <text x="366" y="460" class="svg-sub">validate</text>
+                <text x="475" y="460" class="svg-sub">plan</text>
+                <text x="604" y="440" class="svg-note">one trace: 79, 151, 182 ms alive, one after another</text>
+
+                <text x="30" y="490" class="svg-sub">two aws configs: 5, ≤ 2 alive</text>
+                <rect x="290" y="478" width="110" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="412" y="472" width="90" height="12" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="412" y="487" width="90" height="12" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="514" y="472" width="140" height="12" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="514" y="487" width="140" height="12" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="296" y="515" class="svg-sub">schema</text>
+                <text x="418" y="515" class="svg-sub">validate ×2</text>
+                <text x="520" y="515" class="svg-sub">plan ×2</text>
+                <text x="670" y="490" class="svg-note">aws, west · 832,532,642-byte binary</text>
+
+                <text x="30" y="548" class="svg-sub">lab three-cloud plan: 18</text>
+                <rect x="290" y="536" width="40" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="334" y="536" width="40" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="378" y="536" width="40" height="14" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="422" y="536" width="20" height="14" fill="#dfede5" stroke="#367f59"/>
+                <g fill="#f7e3c8" stroke="#d98226">
+                  <rect x="460" y="528" width="150" height="6"/>
+                  <rect x="460" y="535" width="150" height="6"/>
+                  <rect x="460" y="542" width="150" height="6"/>
+                  <rect x="460" y="549" width="150" height="6"/>
+                  <rect x="460" y="556" width="150" height="6"/>
+                  <rect x="460" y="563" width="150" height="6"/>
+                  <rect x="460" y="570" width="150" height="6"/>
+                </g>
+                <text x="290" y="572" class="svg-sub">4 schema runs,</text>
+                <text x="290" y="588" class="svg-sub">one at a time</text>
+                <text x="626" y="548" class="svg-note">14 more across validate and plan; peak 7 alive,</text>
+                <text x="626" y="566" class="svg-note">≈ 1.38 GB combined RSS (aws 5, google 5, azurerm 5, random 3)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              A provider is a process per configuration per walk. The sequence and the line are from
+              <code>go-plugin:server.go</code>:424-446 and <code>client.go</code>:633-929 <span class="src">from the code</span>;
+              the line itself and all three process counts are <span class="recon">measured here</span>. Only the
+              random row is drawn to scale, from one trace; the aws and lab rows show counts and concurrency, with
+              schematic durations.
+            </p>
+          </figure>
+
+          <h3>Schemas, once per process unless the provider says otherwise</h3>
+          <p>
+            Before any graph is built, <code>LoadSchemas</code> fetches every provider's schema in a plain sequential
+            loop (<code>internal/schemarepo/loadschemas/load.go</code>:36-80). For each provider it checks a
+            process-global <code>providers.SchemaCache</code>; on a miss it starts a throwaway instance just to read the
+            schema and closes it. A later process may skip the RPC only if the provider advertised
+            <code>get_provider_schema_optional</code>, <code>internal/plugin6/grpc_provider.go</code>:96-113:
+          </p>
+<pre><code>func (p *GRPCProvider) GetProviderSchema() providers.GetProviderSchemaResponse {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// check the global cache if we can
+	if !p.Addr.IsZero() {
+		if resp, ok := providers.SchemaCache.Get(p.Addr); ok &amp;&amp; resp.ServerCapabilities.GetProviderSchemaOptional {
+			logger.Trace("GRPCProvider.v6: returning cached schema", p.Addr.String())
+			return resp
+		}
+	}
+	logger.Trace("GRPCProvider.v6: GetProviderSchema")
+
+	// If the local cache is non-zero, we know this instance has called
+	// GetProviderSchema at least once and we can return early.
+	if p.schema.Provider.Body != nil {
+		return p.schema
+	}</code></pre>
+          <p>
+            The framework always advertises the capability, and so does the aws provider; in its trace every process
+            after the first served the schema from core's cache <span class="recon">measured here</span>. That
+            matters because schemas are large. The aws schema is 19,743,820 bytes of JSON with 1,742 resource types;
+            the four cached providers' <code>providers schema -json</code> output is 32,820,418 bytes. Core asks gRPC
+            for up to 64 MiB on this one response, through an option grpc-go marks experimental, where the default
+            would be 4 MB (<code>grpc_provider.go</code>:52-55, 124-133). Serving the aws schema took 9–23 s depending
+            on page cache.
+          </p>
+
+          <h3>A process per configuration, per walk</h3>
+          <p>
+            During a walk, provider instances are cached by provider <em>configuration</em> address
+            (<code>eval_context_builtin.go</code>:166-214). <code>aws</code> and <code>aws.west</code> are two entries,
+            so two processes. The <code>provider[…]</code> node starts its process and validates the configuration (in
+            the validate walk) or validates and configures it (in plan and apply). The process dies when the
+            provider's <code>(close)</code> node runs, after every consumer: <code>Close()</code> calls go-plugin's
+            <code>Kill()</code>, which closes the connection, waits up to two seconds for a clean exit, then forces it
+            (<code>grpc_provider.go</code>:1885-1904). Provider functions get a separate, <em>unconfigured</em>
+            instance per provider type, closed at the end of the walk (<code>eval_context_builtin.go</code>:585-603).
+            That is why <code>provider::aws::arn_parse</code> works with no <code>provider "aws"</code> block and no
+            credentials, and why it costs an extra process.
+          </p>
+          <p>
+            The counts follow directly. A <code>TF_LOG=trace</code> plan of one <code>random</code> configuration
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>… LoadSchemas … Initializing provider "registry.terraform.io/hashicorp/random" to read its schema
+… plugin started … pid=1693389
+… GRPCProvider: Close / plugin exited
+… Starting graph walk: walkValidate
+… plugin started … pid=1693397
+… GRPCProvider: ValidateResourceConfig   (×2)
+… GRPCProvider: Close / plugin exited
+… Starting graph walk: walkPlan
+… plugin started … pid=1693414
+… GRPCProvider: ValidateProviderConfig / ConfigureProvider / ValidateResourceConfig / PlanResourceChange (×2)
+… GRPCProvider: Close / plugin exited</code></pre>
+          <p>
+            Three processes, one after another: schema, validate walk, plan walk. Two aws configurations started five
+            aws processes (one schema, two per walk), at most two alive at once, with total wall time between 11 and
+            48 s depending on page cache. One aws configuration plus one <code>arn_parse</code> call also started five,
+            with a peak of about 765–779 MB combined resident memory. The lab's three-cloud plan in
+            <a href="../three-clouds/#p4-project">Part 4</a> started 18: aws, google and azurerm five each, random
+            three, at most seven alive, about 1.38 GB combined. A <code>terraform_data</code>-only configuration starts
+            none.
+          </p>
+          <p>
+            Start-up and shutdown are cheap for small binaries and not for large ones. The random handshake took about
+            40–70 ms before the first RPC and exited 3–8 ms after <code>Close</code>; the 832 MB aws binary took
+            0.5–3.6 s to hand-shake and 80–260 ms to exit, both depending on page cache and load. A whole one-resource
+            <code>random</code> plan ran in 0.75–0.9 s. If your plans are slow and small, count the provider
+            configurations, aliases and function calls before you look anywhere else: each one is another launch of the
+            binary in every walk.
+          </p>
+          <p>
+            Mocks do not avoid this. <code>terraform test</code> with <code>mock_provider</code> still starts the real
+            binary once for its schema and still sends <code>ValidateResourceConfig</code>; only configure, plan and
+            apply are faked, and <code>CallFunction</code> is forwarded to the real provider
+            (<code>internal/providers/mock.go</code>:191-197, 410-412). <a href="../three-clouds/#p4-tests-policy">Part
+            4</a> shows what that means for a <code>list</code> block in a test. When a provider crashes, core rebuilds
+            the panic from the child's stderr, capturing lines from the first <code>panic: </code> or
+            <code>fatal error: </code> even with logging off, and prints "The … plugin crashed!"
+            (<code>internal/logging/panic.go</code>:92-217).
+          </p>

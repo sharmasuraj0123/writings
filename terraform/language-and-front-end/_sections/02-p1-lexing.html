@@ -1,0 +1,225 @@
+          <h2 id="p1-lexing"><span class="secnum">{{S}}</span>Bytes to tokens</h2>
+          <p>
+            HCL's specification describes three sub-languages that share one file. The structural language is bodies,
+            blocks and attributes. The expression language is values, operators and calls. The template language is
+            what lives between quotes and inside heredocs (<code>hcl/hclsyntax/spec.md</code>:10-21)
+            <span class="src">from the code</span>. The structural grammar is five productions, and it is short enough
+            to quote whole (<code>hcl/hclsyntax/spec.md</code>:160-164):
+          </p>
+<pre><code>ConfigFile   = Body;
+Body         = (Attribute | Block | OneLineBlock)*;
+Attribute    = Identifier "=" Expression Newline;
+Block        = Identifier (StringLit|Identifier)* "{" Newline Body "}" Newline;
+OneLineBlock = Identifier (StringLit|Identifier)* "{" (Identifier "=" Expression)? "}" Newline;</code></pre>
+          <p>
+            Two details in it matter later. An attribute ends with a <code>Newline</code>, so line breaks are part of
+            the grammar and the parser has to know when to ignore them (§03). And nothing in it names a block type: there
+            is no <code>resource</code> or <code>variable</code> keyword. Identifiers are Unicode UAX #31,
+            <code>ID_Start (ID_Continue | '-')*</code>, and HCL has no globally reserved words, only words that mean
+            something in a given position (<code>spec.md</code>:98, 115-116) <span class="src">from the code</span>.
+            Every word Terraform cares about is given meaning later, by a schema.
+          </p>
+
+          <h3>Five machines in one generated file</h3>
+          <p>
+            <code>hclsyntax.ParseConfig</code> calls <code>LexConfig</code>, which runs <code>scanTokens</code> in
+            <code>scanNormal</code> mode. The scanner is written in Ragel, a state-machine compiler, in
+            <code>scan_tokens.rl</code>. It is compiled into <code>scan_tokens.go</code>, which is 5,273 lines at HCL
+            v2.24.0, the version Terraform v1.17.0 ships, and 6,042 on HCL main after a Unicode 17 regeneration
+            <span class="recon">measured here</span>. The <code>.rl</code> file defines five machines:
+            <code>main</code> for structure and expressions, <code>stringTemplate</code> for quoted strings,
+            <code>heredocTemplate</code>, <code>bareTemplate</code> for standalone templates and JSON strings, and
+            <code>identOnly</code> (<code>scan_tokens.rl</code>:255-315). The scan mode picks the entry machine:
+            <code>scanNormal</code> starts in <code>main</code>, <code>scanTemplate</code> in <code>bareTemplate</code>,
+            <code>scanIdentOnly</code> in <code>identOnly</code> (<code>scan_tokens.rl</code>:330-339)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Before any machine runs, <code>scanTokens</code> calls <code>stripUTF8BOM</code> on the input and shifts the
+            start position by however many bytes it removed (<code>scan_tokens.rl</code>:20-23). Hold that thought; the
+            spec says something different.
+          </p>
+
+          <h3>Templates inside expressions inside templates</h3>
+          <p>
+            The scanner's hard job is nesting. A template can contain an interpolation, the interpolation is an
+            expression, the expression can contain an object constructor with braces, and the object can contain
+            another string with a <code>}</code> in it. A regular language cannot count, so the scanner uses two Ragel
+            features and a little Go state. <code>fcall</code> pushes the current machine on a stack and jumps to
+            another; <code>fret</code> pops back. A counter, <code>braces</code>, tracks brace depth, and a slice,
+            <code>retBraces</code>, remembers the depth at which each interpolation began.
+            <code>hcl/hclsyntax/scan_tokens.rl</code>:171-179 and 196-206 <span class="src">from the code</span>:
+          </p>
+<pre><code>        action beginTemplateInterp {
+            token(TokenTemplateInterp);
+            braces++;
+            retBraces = append(retBraces, braces);
+            if len(heredocs) &gt; 0 {
+                heredocs[len(heredocs)-1].StartOfLine = false;
+            }
+            fcall main;
+        }
+        …
+        action closeBrace {
+            if len(retBraces) &gt; 0 &amp;&amp; retBraces[len(retBraces)-1] == braces {
+                token(TokenTemplateSeqEnd);
+                braces--;
+                retBraces = retBraces[0:len(retBraces)-1]
+                fret;
+            } else {
+                token(TokenCBrace);
+                braces--;
+            }
+        }</code></pre>
+          <p>
+            A <code>"</code> in <code>main</code> emits <code>TokenOQuote</code> and <code>fcall</code>s into
+            <code>stringTemplate</code>. Inside the string, <code>${</code> or <code>%{</code> emits an interpolation
+            or control token, increments <code>braces</code>, pushes it, and <code>fcall</code>s back into
+            <code>main</code>. From then on every <code>}</code> asks one question: is the brace depth exactly the depth
+            this interpolation opened at? If so, the <code>}</code> closes the interpolation, emits
+            <code>TokenTemplateSeqEnd</code> and returns to the string. If not, it is an ordinary
+            <code>TokenCBrace</code>. A <code>}</code> inside a nested string never reaches <code>closeBrace</code> at
+            all, because <code>stringTemplate</code> treats it as literal text. Figure {{fig-scanner}} runs one line
+            through these rules by hand.
+          </p>
+
+          <figure class="figure wide" id="fig-scanner">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The scanner's nesting: which machine is running, and what each <code>}</code> becomes</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 540" role="img" aria-label="Left: nested boxes for the structural language in machine main, an expression, a string template in machine stringTemplate, an expression again in main entered with fcall, and a nested string. Right: a token-by-token trace of a = &quot;x${ {k=&quot;}&quot;}.k }y&quot; listing the running machine, the token emitted, the brace counter and the retBraces stack after each token.">
+                <text x="10" y="24" class="svg-lane">NESTING, OUTSIDE IN</text>
+                <rect x="10" y="36" width="370" height="420" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="22" y="56" class="svg-step">Structural language</text>
+                <text x="22" y="73" class="svg-sub">machine main · a = …</text>
+                <rect x="30" y="86" width="330" height="356" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="42" y="106" class="svg-step">Expression</text>
+                <text x="42" y="123" class="svg-sub">machine main · "x${…}y"</text>
+                <rect x="50" y="136" width="290" height="292" rx="5" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="62" y="156" class="svg-step">Template</text>
+                <text x="62" y="173" class="svg-sub">stringTemplate · x, then y</text>
+                <text x="62" y="190" class="svg-sub">entered on " by fcall</text>
+                <rect x="70" y="204" width="250" height="210" rx="5" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="82" y="224" class="svg-step">Expression again</text>
+                <text x="82" y="241" class="svg-sub">main · { k = "}" }.k</text>
+                <text x="82" y="258" class="svg-sub">entered on ${: push depth</text>
+                <text x="82" y="275" class="svg-sub">left on } at that depth</text>
+                <rect x="90" y="290" width="210" height="110" rx="5" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="102" y="310" class="svg-step">Template again</text>
+                <text x="102" y="327" class="svg-sub">stringTemplate · "}"</text>
+                <text x="102" y="344" class="svg-sub">a } here is literal</text>
+                <text x="102" y="361" class="svg-sub">text: TokenQuotedLit</text>
+                <text x="102" y="385" class="svg-note">…and so on, as deep as needed</text>
+                <text x="10" y="480" class="svg-sub" style="fill:#252525">Heredocs nest the same way via heredocTemplate.</text>
+                <text x="10" y="498" class="svg-sub">Two more machines: bareTemplate (standalone</text>
+                <text x="10" y="515" class="svg-sub">templates, JSON strings) and identOnly.</text>
+
+                <text x="410" y="24" class="svg-lane">a = "x${ {k="}"}.k }y", ONE TOKEN PER ROW</text>
+                <text x="410" y="50" class="svg-lane">INPUT</text>
+                <text x="470" y="50" class="svg-lane">MACHINE</text>
+                <text x="580" y="50" class="svg-lane">TOKEN EMITTED</text>
+                <text x="900" y="50" class="svg-lane">BRACES</text>
+                <text x="975" y="50" class="svg-lane">RETBRACES</text>
+                <line x1="404" y1="58" x2="1070" y2="58" stroke="#deded9"/>
+                <rect x="404" y="303" width="666" height="21" fill="#f7e3c8"/>
+                <rect x="404" y="369" width="666" height="21" fill="#f7e3c8"/>
+                <text x="410" y="76" class="svg-sub" style="fill:#252525">a</text><text x="470" y="76" class="svg-sub">main</text><text x="580" y="76" class="svg-sub" style="fill:#252525">TokenIdent</text><text x="900" y="76" class="svg-sub">0</text><text x="975" y="76" class="svg-sub">[]</text>
+                <text x="410" y="98" class="svg-sub" style="fill:#252525">=</text><text x="470" y="98" class="svg-sub">main</text><text x="580" y="98" class="svg-sub" style="fill:#252525">TokenEqual</text><text x="900" y="98" class="svg-sub">0</text><text x="975" y="98" class="svg-sub">[]</text>
+                <text x="410" y="120" class="svg-sub" style="fill:#252525">"</text><text x="470" y="120" class="svg-sub">main</text><text x="580" y="120" class="svg-sub" style="fill:#252525">TokenOQuote, fcall stringTemplate</text><text x="900" y="120" class="svg-sub">0</text><text x="975" y="120" class="svg-sub">[]</text>
+                <text x="410" y="142" class="svg-sub" style="fill:#252525">x</text><text x="470" y="142" class="svg-sub">stringTemplate</text><text x="580" y="142" class="svg-sub" style="fill:#252525">TokenQuotedLit</text><text x="900" y="142" class="svg-sub">0</text><text x="975" y="142" class="svg-sub">[]</text>
+                <text x="410" y="164" class="svg-sub" style="fill:#252525">${</text><text x="470" y="164" class="svg-sub">stringTemplate</text><text x="580" y="164" class="svg-sub" style="fill:#252525">TokenTemplateInterp, push, fcall main</text><text x="900" y="164" class="svg-sub">1</text><text x="975" y="164" class="svg-sub">[1]</text>
+                <text x="410" y="186" class="svg-sub" style="fill:#252525">{</text><text x="470" y="186" class="svg-sub">main</text><text x="580" y="186" class="svg-sub" style="fill:#252525">TokenOBrace</text><text x="900" y="186" class="svg-sub">2</text><text x="975" y="186" class="svg-sub">[1]</text>
+                <text x="410" y="208" class="svg-sub" style="fill:#252525">k</text><text x="470" y="208" class="svg-sub">main</text><text x="580" y="208" class="svg-sub" style="fill:#252525">TokenIdent</text><text x="900" y="208" class="svg-sub">2</text><text x="975" y="208" class="svg-sub">[1]</text>
+                <text x="410" y="230" class="svg-sub" style="fill:#252525">=</text><text x="470" y="230" class="svg-sub">main</text><text x="580" y="230" class="svg-sub" style="fill:#252525">TokenEqual</text><text x="900" y="230" class="svg-sub">2</text><text x="975" y="230" class="svg-sub">[1]</text>
+                <text x="410" y="252" class="svg-sub" style="fill:#252525">"</text><text x="470" y="252" class="svg-sub">main</text><text x="580" y="252" class="svg-sub" style="fill:#252525">TokenOQuote, fcall stringTemplate</text><text x="900" y="252" class="svg-sub">2</text><text x="975" y="252" class="svg-sub">[1]</text>
+                <text x="410" y="274" class="svg-sub" style="fill:#252525">}</text><text x="470" y="274" class="svg-sub">stringTemplate</text><text x="580" y="274" class="svg-sub" style="fill:#252525">TokenQuotedLit (literal text)</text><text x="900" y="274" class="svg-sub">2</text><text x="975" y="274" class="svg-sub">[1]</text>
+                <text x="410" y="296" class="svg-sub" style="fill:#252525">"</text><text x="470" y="296" class="svg-sub">stringTemplate</text><text x="580" y="296" class="svg-sub" style="fill:#252525">TokenCQuote, fret</text><text x="900" y="296" class="svg-sub">2</text><text x="975" y="296" class="svg-sub">[1]</text>
+                <text x="410" y="318" class="svg-sub" style="fill:#252525">}</text><text x="470" y="318" class="svg-sub">main</text><text x="580" y="318" class="svg-sub" style="fill:#252525">TokenCBrace: depth 2 ≠ 1</text><text x="900" y="318" class="svg-sub">1</text><text x="975" y="318" class="svg-sub">[1]</text>
+                <text x="410" y="340" class="svg-sub" style="fill:#252525">.</text><text x="470" y="340" class="svg-sub">main</text><text x="580" y="340" class="svg-sub" style="fill:#252525">TokenDot</text><text x="900" y="340" class="svg-sub">1</text><text x="975" y="340" class="svg-sub">[1]</text>
+                <text x="410" y="362" class="svg-sub" style="fill:#252525">k</text><text x="470" y="362" class="svg-sub">main</text><text x="580" y="362" class="svg-sub" style="fill:#252525">TokenIdent</text><text x="900" y="362" class="svg-sub">1</text><text x="975" y="362" class="svg-sub">[1]</text>
+                <text x="410" y="384" class="svg-sub" style="fill:#252525">}</text><text x="470" y="384" class="svg-sub">main</text><text x="580" y="384" class="svg-sub" style="fill:#252525">TokenTemplateSeqEnd: 1 = 1, pop, fret</text><text x="900" y="384" class="svg-sub">0</text><text x="975" y="384" class="svg-sub">[]</text>
+                <text x="410" y="406" class="svg-sub" style="fill:#252525">y</text><text x="470" y="406" class="svg-sub">stringTemplate</text><text x="580" y="406" class="svg-sub" style="fill:#252525">TokenQuotedLit</text><text x="900" y="406" class="svg-sub">0</text><text x="975" y="406" class="svg-sub">[]</text>
+                <text x="410" y="428" class="svg-sub" style="fill:#252525">"</text><text x="470" y="428" class="svg-sub">stringTemplate</text><text x="580" y="428" class="svg-sub" style="fill:#252525">TokenCQuote, fret</text><text x="900" y="428" class="svg-sub">0</text><text x="975" y="428" class="svg-sub">[]</text>
+                <text x="410" y="450" class="svg-sub" style="fill:#252525">end</text><text x="470" y="450" class="svg-sub">main</text><text x="580" y="450" class="svg-sub" style="fill:#252525">TokenEOF</text><text x="900" y="450" class="svg-sub">0</text><text x="975" y="450" class="svg-sub">[]</text>
+                <line x1="404" y1="462" x2="1070" y2="462" stroke="#deded9"/>
+                <text x="410" y="484" class="svg-note">Spaces in main produce no token. The two shaded rows are the only place the counter decides anything:</text>
+                <text x="410" y="502" class="svg-note">the same character, }, becomes an object's closing brace in one and the end of the interpolation in the other.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Hand trace of the rules in <code>scan_tokens.rl</code>:171-206 and the machine definitions at 255-315
+              <span class="recon">reconstruction</span>: no Go toolchain was on the machine to dump tokens, so the trace
+              was not run. The point it makes is in the code: the scanner needs a stack of machines and a stack of
+              depths, and HCL's "three languages" are really two machines calling each other.
+            </p>
+          </figure>
+
+          <h3>Heredocs, escapes and the token alphabet</h3>
+          <p>
+            Heredocs need their own state because the closing marker is a whole line. <code>beginHeredocTemplate</code>
+            slices the marker out of <code>&lt;&lt;EOT</code> or <code>&lt;&lt;-EOT</code> and pushes it on a
+            <code>heredocs</code> stack. A line ending in a newline is the closer only if its
+            <code>bytes.TrimSpace</code>d text equals the marker. When it is, the scanner emits
+            <code>TokenCHeredoc</code> and then, separately, a <code>TokenNewline</code> for the newline after it. The
+            comment says why: otherwise the closing marker would swallow "a newline that would normally be used to mark
+            the end of an attribute definition" (<code>scan_tokens.rl</code>:100-157) <span class="src">from the code</span>.
+            That is the grammar's <code>Newline</code> rule leaking into the lexer. Escapes are similar small rules:
+            <code>$${</code> and <code>%%{</code> produce a literal <code>${</code> and <code>%{</code>, and a
+            <code>$</code> not followed by <code>{</code> is held back and stays text (<code>scan_tokens.rl</code>:235-237).
+          </p>
+          <p>
+            Token types are Go runes chosen to be readable in a debugger: <code>TokenOQuote = '«'</code>,
+            <code>TokenCQuote = '»'</code>, <code>TokenTemplateInterp = '∫'</code>, <code>TokenTemplateControl = 'λ'</code>,
+            <code>TokenTemplateSeqEnd = '∎'</code>, <code>TokenEOF = '␄'</code> and, for invalid UTF-8,
+            <code>TokenBadUTF8 = '💩'</code> (<code>hclsyntax/token.go</code>:28-109) <span class="src">from the code</span>.
+            Single-line comments absorb their newline, so when the peeker filters comments out it puts a
+            <code>TokenNewline</code> back, and <code>x = 1 # note</code> still ends its attribute
+            (<code>peeker.go</code>:73-104).
+          </p>
+
+          <h3>Tokens for characters HCL does not use</h3>
+          <p>
+            The scanner also recognises characters the language never uses: <code>&amp;</code>, <code>|</code>,
+            <code>^</code>, <code>~</code>, <code>;</code>, the backtick and the apostrophe. It emits tokens for them so
+            that <code>checkInvalidTokens</code> can say something useful, such as "Single quotes are not valid", instead
+            of a bare parse error (<code>token.go</code>:87-103, 186-323) <span class="src">from the code</span>. Two of
+            those friendly messages can never fire. <code>checkInvalidTokens</code> has cases for
+            <code>TokenStarStar</code> (<code>"**" is not a supported operator</code>) and <code>TokenTabs</code> ("Tab characters
+            may not be used"), but nothing in the scanner emits either token: they appear only at <code>token.go</code>:96,
+            100, 224 and 273, and <code>main</code>'s whitespace rule is <code>Spaces = (' ' | 0x09)+</code>, tab included
+            (<code>scan_tokens.rl</code>:88). The result, from <code>terraform validate</code>
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>x = 2 ** 3          → Error: Invalid expression (Expected the start of an expression, but found an invalid expression token.)
+x = 'a'             → Error: Invalid character (Single quotes are not valid...)
+&lt;TAB&gt;x = 1          → Success!   (despite the "Tab characters may not be used" diagnostic existing)
+&lt;BOM&gt;locals {...}   → Success!</code></pre>
+
+          <p>
+            Line breaks inside quotes get a token of their own too. In <code>stringTemplate</code> a newline emits
+            <code>TokenQuotedNewline</code>, so a quoted string that runs onto a second line produces "Invalid
+            multi-line string" and "Unterminated template string" rather than silently joining the lines
+            (<code>scan_tokens.rl</code>:260; <code>token.go</code>:295-301) <span class="src">from the code</span>.
+            Multi-line text belongs in a heredoc. Once the parser has reported one syntax error it sets a
+            <code>recovery</code> flag that suppresses the follow-on "bad token" errors, so a file with two mistakes
+            reported only the first <span class="recon">measured here</span>. Fix, re-run, repeat.
+          </p>
+
+          <h3>The spec and the scanner disagree; the code wins</h3>
+          <p>
+            Three statements in <code>spec.md</code> are not what the scanner does. The spec says "UTF-8 encoded Unicode
+            byte order marks are not permitted" (<code>spec.md</code>:61-62); the scanner has stripped a leading BOM since
+            HCL commit <code>291f7fb</code>, "Accept and ignore UTF-8 byte order marks", on 19 December 2018, and the
+            spec text was never updated. The tab diagnostic implies tabs are rejected; they are whitespace. And the
+            spec's <code>Identifier</code> starts with <code>ID_Start</code>, while the scanner's rule is
+            <code>Ident = (ID_Start | '_') (ID_Continue | '-')*</code>, so a leading underscore is accepted
+            (<code>scan_tokens.rl</code>:46 against <code>spec.md</code>:98) <span class="src">from the code</span>.
+          </p>
+          <p>
+            For a practitioner the rule is simple: when the HCL spec and <code>terraform validate</code> disagree,
+            <code>validate</code> is the language. A file indented with tabs, or saved by an editor that writes a BOM, is
+            valid Terraform; <code>terraform fmt</code> will turn the tabs into two spaces. The scanner is wider than the
+            spec, never narrower: every gap found accepts more input, not less <span class="recon">reconstruction</span>.
+          </p>

@@ -1,0 +1,370 @@
+          <h2 id="p2-wire"><span class="secnum">{{S}}</span>The wire contract</h2>
+          <p class="lede">
+            Between core and a provider there is one file: <code>docs/plugin-protocol/tfplugin6.proto</code>. It is
+            MPL-licensed while core is BUSL, it is what OpenTofu, the plugin framework and every provider build
+            against, and it has grown from 12 RPCs to 36. Its values cross as schema-typed msgpack that can say "unknown,
+            but not null, and starting with <code>a-</code>". Its version label stopped tracking its contents three
+            releases ago.
+          </p>
+
+          <h3>36 RPCs, 35 methods</h3>
+          <p>
+            At v1.17.0 the <code>Provider</code> service declares 36 RPCs, in comment-delimited groups: information
+            and validation, one-time configuration, the managed-resource lifecycle, ephemeral resources, list
+            resources, functions, state stores, actions and shutdown (<code>tfplugin6.proto</code>:350-430). Four of
+            them stream: <code>ListResource</code>, <code>InvokeAction</code> and <code>ReadStateBytes</code> stream
+            responses, and <code>WriteStateBytes</code> streams requests. The header says "protocol version 6.11".
+            The copy under <code>internal/tfplugin6/</code> that the Go stubs are generated from is a git symlink to
+            the docs file, not a duplicate <span class="src">from the code</span>.
+          </p>
+          <p>
+            Core's side is <code>providers.Interface</code>, with 35 methods: the 36 RPCs minus two, plus
+            <code>Close</code> (<code>internal/providers/provider.go</code>:17-152). The two it never calls are
+            <code>GetFunctions</code>, because function signatures already arrive inside
+            <code>GetProviderSchema</code>, and <code>GetMetadata</code>, which the proto file itself calls "CURRENTLY
+            UNUSED", existing "mostly for convenience of code generation inside of terraform-plugin-mux"
+            (<code>tfplugin6.proto</code>:353-358). <code>plugin6.GRPCProvider</code> is "mostly a translation layer"
+            between those cty-typed methods and the proto types. Errors travel as diagnostics in the response, not as
+            gRPC status codes; when a status does arrive, core maps it to one of four messages, such as "Plugin did not
+            respond" for <code>Unavailable</code> (<code>internal/plugin6/grpc_error.go</code>:16-77). The
+            <code>ApplyResourceChange</code> request has no create, update or delete flag. The provider infers which
+            from whether the prior or planned state is null.
+          </p>
+
+          <h3>Protocol 5 is what the big providers speak</h3>
+          <p>
+            Protocol 6 first shipped in v0.15.0, although HashiCorp's protocol page describes it as "compatible with
+            Terraform CLI version 1.0 and later". Protocol 5, labelled 5.10
+            in Terraform's tree, is still served by every provider in this machine's cache: aws 6.70.0, google 8.8.0,
+            azurerm 5.10.0 and random 3.9.1 are all <code>_x5</code> builds, and each negotiated version 5 with
+            v1.17.0 <span class="recon">measured here</span>. Version 5 names the same operations differently
+            (<code>GetSchema</code>, <code>PrepareProviderConfig</code>, <code>Configure</code>, <code>Stop</code>),
+            keeps the provisioner service, which exists only in protocol 5, and lacks three things of 6: nested
+            attributes (<code>nested_type</code>), the v1.16 computed blocks, and state stores. So none of the 4,229
+            resource schemas served by aws, google and azurerm contains a single nested attribute; they nest with
+            blocks only. HashiCorp's own docs list terraform-plugin-sdk/v2 under protocol 5 only. The framework serves
+            protocol 6 by default, which is why random, a framework provider, sets <code>ProtocolVersion: 5</code>
+            explicitly to stay on 5.
+          </p>
+          <p>
+            Inside a major version, negotiation is two bags of booleans (<code>tfplugin6.proto</code>:280-328).
+            <code>ServerCapabilities</code> has <code>plan_destroy</code>, <code>get_provider_schema_optional</code>,
+            <code>move_resource_state</code> and <code>generate_resource_config</code>.
+            <code>ClientCapabilities</code> has <code>deferral_allowed</code>, <code>write_only_attributes_allowed</code>,
+            <code>store_planned_private</code> and <code>computed_blocks_allowed</code>. CLI walks always send the last
+            three as true, and <code>deferral_allowed</code> follows the walk. Protocol 5's client bag stops after the
+            first two, and a provider's own logs show exactly those: <code>deferral_allowed=false</code>,
+            <code>write_only_attributes_allowed=true</code> <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Values: schema-typed msgpack</h3>
+          <p>
+            Every structured value crosses as a <code>DynamicValue</code> with two byte fields,
+            <code>msgpack = 1</code> and <code>json = 2</code>. Core always sends msgpack and reads msgpack when
+            present. The wire-format document tells servers to answer in msgpack too, "because Terraform does not
+            consistently support JSON responses across all request types and all Terraform versions"; JSON survives
+            mainly for raw state in <code>UpgradeResourceState</code>. The encoding is driven by the schema: msgpack
+            carries no type information, so both sides must agree on the schema's implied type. Strings are strings,
+            numbers are integers, floats or decimal strings, lists, sets and tuples are arrays, maps and objects are
+            string-keyed maps, null is <code>c0</code>, and only an attribute of type <code>dynamic</code> carries its
+            type, as a two-element array of JSON type bytes and value. <code>PlanResourceChange</code> shows the
+            pattern, <code>internal/plugin6/grpc_provider.go</code>:662-682:
+          </p>
+<pre><code>	configMP, err := msgpack.Marshal(r.Config, resSchema.Body.ImpliedType())
+	if err != nil {
+		resp.Diagnostics = resp.Diagnostics.Append(err)
+		return resp
+	}
+
+	propMP, err := msgpack.Marshal(r.ProposedNewState, resSchema.Body.ImpliedType())
+	if err != nil {
+		resp.Diagnostics = resp.Diagnostics.Append(err)
+		return resp
+	}
+
+	protoReq := &amp;proto6.PlanResourceChange_Request{
+		TypeName:           r.TypeName,
+		PriorState:         &amp;proto6.DynamicValue{Msgpack: priorMP},
+		Config:             &amp;proto6.DynamicValue{Msgpack: configMP},
+		ProposedNewState:   &amp;proto6.DynamicValue{Msgpack: propMP},
+		PriorPrivate:       r.PriorPrivate,
+		ClientCapabilities: clientCapabilitiesToProto(r.ClientCapabilities),
+		PlannedPrivate:     r.PlannedPrivate,
+	}</code></pre>
+          <p>
+            Unknown values need an encoding of their own, and msgpack's extension types provide it. go-cty's encoder,
+            <code>go-cty:cty/msgpack/unknown.go</code>:18-41 (Terraform pins go-cty v1.18.1; this clone is a later,
+            untagged commit):
+          </p>
+<pre><code>// unknownValBytes is the raw bytes of the msgpack fixext1 value we
+// write to represent a totally unknown value. It's an extension value of
+// type zero whose value is irrelevant. Since it's irrelevant, we
+// set it to a single byte whose value is also zero, since that's
+// the most compact possible representation.
+//
+// The representation of a refined unknown value is different. See
+// marshalUnknownValue for more details.
+var unknownValBytes = []byte{0xd4, 0, 0}
+
+func (uv unknownType) MarshalMsgpack() ([]byte, error) {
+	return unknownValBytes, nil
+}
+
+const unknownWithRefinementsExt = 0x0c
+
+type unknownValRefinementKey int64
+
+const unknownValNullness unknownValRefinementKey = 1
+const unknownValStringPrefix unknownValRefinementKey = 2
+const unknownValNumberMin unknownValRefinementKey = 3
+const unknownValNumberMax unknownValRefinementKey = 4
+const unknownValLengthMin unknownValRefinementKey = 5
+const unknownValLengthMax unknownValRefinementKey = 6</code></pre>
+          <p>
+            A plain unknown is three bytes, <code>d4 00 00</code>. A refined one (the refinements are the not-null,
+            prefix and bounds facts described in <a href="../language-and-front-end/#p1-values">Part 1</a>) is
+            extension 12 wrapping an integer-keyed map. String prefixes are truncated below 256 bytes, and go-cty's
+            decoder rejects a refinement payload over 1 KiB as oversize. Core's decoder is stricter than the
+            specification: the wire-format document says a server "should treat _any_ MessagePack extension code as
+            representing an unknown value", but core errors on any extension longer than one byte whose type is not 12.
+            A saved plan holds the same encoder's output, so a plan file shows the bytes. Two outputs added to the
+            <code>random</code> configuration, <code>"pfx-${random_pet.p.id}"</code> and
+            <code>length(random_pet.p.id)</code>, decode as <span class="recon">measured here</span>:
+          </p>
+<pre><code>output refined_prefix (23 bytes): 92 c4 08 22 73 74 72 69 6e 67 22 c7 09 0c 82 01 c2 02 a4 70 66 78 2d
+  decoded: [b'"string"', &lt;unknown refined {1: False, 2: 'pfx-'}&gt;]
+output refined_len (21 bytes): 92 c4 08 22 6e 75 6d 62 65 72 22 c7 07 0c 82 01 c2 03 92 00 c3
+  decoded: [b'"number"', &lt;unknown refined {1: False, 3: [0, True]}&gt;]</code></pre>
+          <p>
+            Read the first: <code>92</code> is the two-element <code>dynamic</code> wrapper, <code>c4 08</code> and
+            <code>"string"</code> are the type, <code>c7 09 0c</code> is an extension of nine bytes and type 12,
+            <code>82</code> a two-entry map, <code>01 c2</code> "nullness: false", and <code>02 a4 70 66 78 2d</code>
+            "prefix: <code>pfx-</code>". The second says "a number, not null, at least 0, inclusive". Figure 13 lays out
+            the rest of the file.
+          </p>
+
+          <figure class="figure wide" id="fig-plan-bytes">
+            <div class="figure-head">
+              <span class="figure-label">Figure 13</span>
+              <p class="figure-title">Inside a saved plan: ZIP members, the tfplan protobuf, and msgpack values byte by byte</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 470" role="img" aria-label="Left: the members of a 3,017-byte plan ZIP with their sizes. Middle: the tfplan protobuf's field numbers, from version 3 through resource changes, outputs, backend, Terraform version, timestamp, applyable and complete. Right: the 44-byte msgpack planned state of random_pet.p with keys, a plain unknown, a null and a small integer coloured, then the refined unknown c7 07 0c 82 01 c2 02 a2 61 2d meaning not null with prefix a-, then the plain unknown d4 00 00.">
+                <text x="30" y="26" class="svg-lane">p.tfplan · ZIP, Deflate · 3,017 B</text>
+                <g class="svg-sub">
+                  <text x="30" y="56" class="svg-sub">tfplan</text>
+                  <text x="30" y="82" class="svg-sub">.terraform.lock.hcl</text>
+                  <text x="30" y="108" class="svg-sub">tfconfig/m-/main.tf</text>
+                  <text x="30" y="134" class="svg-sub">tfconfig/m-child/…</text>
+                  <text x="30" y="160" class="svg-sub">tfstate</text>
+                  <text x="30" y="186" class="svg-sub">tfstate-prev</text>
+                  <text x="30" y="212" class="svg-sub">tfconfig/modules.json</text>
+                </g>
+                <rect x="180" y="44" width="120" height="16" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="180" y="70" width="116" height="16" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="180" y="96" width="55" height="16" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="180" y="122" width="15" height="16" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="180" y="148" width="14" height="16" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="180" y="174" width="14" height="16" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="180" y="200" width="12" height="16" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="306" y="56" class="svg-sub">1276</text>
+                <text x="302" y="82" class="svg-sub">1229</text>
+                <text x="241" y="108" class="svg-sub">589</text>
+                <text x="201" y="134" class="svg-sub">157</text>
+                <text x="200" y="160" class="svg-sub">145</text>
+                <text x="200" y="186" class="svg-sub">145</text>
+                <text x="198" y="212" class="svg-sub">130</text>
+                <text x="30" y="244" class="svg-note">Uncompressed bytes. The two</text>
+                <text x="30" y="262" class="svg-note">state snapshots are serial 0 with</text>
+                <text x="30" y="280" class="svg-note">an empty lineage: a first plan.</text>
+
+                <line x1="352" y1="20" x2="352" y2="300" stroke="#deded9"/>
+                <text x="372" y="26" class="svg-lane">tfplan · protobuf fields</text>
+                <g>
+                  <text x="372" y="56" class="svg-sub">#1  version = 3</text>
+                  <text x="372" y="78" class="svg-sub">#3  resource_changes[]</text>
+                  <text x="396" y="98" class="svg-sub">#13 addr  terraform_data.d["a"]</text>
+                  <text x="396" y="118" class="svg-sub">#8  provider</text>
+                  <text x="396" y="138" class="svg-sub">#9  change</text>
+                  <text x="420" y="158" class="svg-sub">#2 values → DynamicValue</text>
+                  <text x="444" y="178" class="svg-sub" style="fill: #d98226">#1 msgpack →</text>
+                  <text x="372" y="202" class="svg-sub">#4  output_changes</text>
+                  <text x="372" y="222" class="svg-sub">#13 backend  "local" … "default"</text>
+                  <text x="372" y="242" class="svg-sub">#14 terraform_version "1.17.0"</text>
+                  <text x="372" y="262" class="svg-sub">#21 timestamp</text>
+                  <text x="372" y="282" class="svg-sub">#25 applyable 1 · #26 complete 1</text>
+                </g>
+                <line x1="384" y1="82" x2="384" y2="138" stroke="#b8b8b1"/>
+                <line x1="408" y1="142" x2="408" y2="158" stroke="#b8b8b1"/>
+
+                <line x1="660" y1="20" x2="660" y2="300" stroke="#deded9"/>
+                <text x="680" y="26" class="svg-lane">random_pet.p planned state · 44 B</text>
+                <g stroke="#ffffff" stroke-width="1">
+                  <rect x="680" y="42" width="17" height="20" fill="#deded9"/>
+                  <rect x="697" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="714" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="731" y="42" width="17" height="20" fill="#e0ebf2"/>
+                  <rect x="748" y="42" width="17" height="20" fill="#f7e3c8"/><rect x="765" y="42" width="17" height="20" fill="#f7e3c8"/><rect x="782" y="42" width="17" height="20" fill="#f7e3c8"/>
+                  <rect x="799" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="816" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="833" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="850" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="867" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="884" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="901" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="918" y="42" width="17" height="20" fill="#e0ebf2"/>
+                  <rect x="935" y="42" width="17" height="20" fill="#ece6f3"/>
+                  <rect x="952" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="969" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="986" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="1003" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="1020" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="1037" y="42" width="17" height="20" fill="#e0ebf2"/><rect x="1054" y="42" width="17" height="20" fill="#e0ebf2"/>
+                  <rect x="1071" y="42" width="17" height="20" fill="#dfede5"/>
+                </g>
+                <g class="svg-sub" text-anchor="middle">
+                  <text x="688" y="56" class="svg-sub" text-anchor="middle">85</text>
+                  <text x="705" y="56" class="svg-sub" text-anchor="middle">a2</text><text x="722" y="56" class="svg-sub" text-anchor="middle">69</text><text x="739" y="56" class="svg-sub" text-anchor="middle">64</text>
+                  <text x="756" y="56" class="svg-sub" text-anchor="middle">d4</text><text x="773" y="56" class="svg-sub" text-anchor="middle">00</text><text x="790" y="56" class="svg-sub" text-anchor="middle">00</text>
+                  <text x="807" y="56" class="svg-sub" text-anchor="middle">a7</text><text x="824" y="56" class="svg-sub" text-anchor="middle">6b</text><text x="841" y="56" class="svg-sub" text-anchor="middle">65</text><text x="858" y="56" class="svg-sub" text-anchor="middle">65</text><text x="875" y="56" class="svg-sub" text-anchor="middle">70</text><text x="892" y="56" class="svg-sub" text-anchor="middle">65</text><text x="909" y="56" class="svg-sub" text-anchor="middle">72</text><text x="926" y="56" class="svg-sub" text-anchor="middle">73</text>
+                  <text x="943" y="56" class="svg-sub" text-anchor="middle">c0</text>
+                  <text x="960" y="56" class="svg-sub" text-anchor="middle">a6</text><text x="977" y="56" class="svg-sub" text-anchor="middle">6c</text><text x="994" y="56" class="svg-sub" text-anchor="middle">65</text><text x="1011" y="56" class="svg-sub" text-anchor="middle">6e</text><text x="1028" y="56" class="svg-sub" text-anchor="middle">67</text><text x="1045" y="56" class="svg-sub" text-anchor="middle">74</text><text x="1062" y="56" class="svg-sub" text-anchor="middle">68</text>
+                  <text x="1079" y="56" class="svg-sub" text-anchor="middle">02</text>
+                </g>
+                <text x="680" y="80" class="svg-sub">map(5)  "id"  unknown  "keepers"  null</text>
+                <text x="680" y="96" class="svg-sub">"length"  2  … then "prefix", "separator"</text>
+
+                <text x="680" y="132" class="svg-lane">terraform_data.d["a"].input · refined</text>
+                <g stroke="#ffffff" stroke-width="1">
+                  <rect x="680" y="146" width="24" height="22" fill="#f7e3c8"/><rect x="704" y="146" width="24" height="22" fill="#f7e3c8"/><rect x="728" y="146" width="24" height="22" fill="#f7e3c8"/>
+                  <rect x="752" y="146" width="24" height="22" fill="#deded9"/>
+                  <rect x="776" y="146" width="24" height="22" fill="#ece6f3"/><rect x="800" y="146" width="24" height="22" fill="#ece6f3"/>
+                  <rect x="824" y="146" width="24" height="22" fill="#dfede5"/><rect x="848" y="146" width="24" height="22" fill="#dfede5"/><rect x="872" y="146" width="24" height="22" fill="#dfede5"/><rect x="896" y="146" width="24" height="22" fill="#dfede5"/>
+                </g>
+                <text x="692" y="161" class="svg-sub" text-anchor="middle">c7</text><text x="716" y="161" class="svg-sub" text-anchor="middle">07</text><text x="740" y="161" class="svg-sub" text-anchor="middle">0c</text><text x="764" y="161" class="svg-sub" text-anchor="middle">82</text><text x="788" y="161" class="svg-sub" text-anchor="middle">01</text><text x="812" y="161" class="svg-sub" text-anchor="middle">c2</text><text x="836" y="161" class="svg-sub" text-anchor="middle">02</text><text x="860" y="161" class="svg-sub" text-anchor="middle">a2</text><text x="884" y="161" class="svg-sub" text-anchor="middle">61</text><text x="908" y="161" class="svg-sub" text-anchor="middle">2d</text>
+                <text x="680" y="188" class="svg-sub">ext8 len 7 type 12</text>
+                <text x="776" y="206" class="svg-sub">1: not null</text>
+                <text x="848" y="188" class="svg-sub">2: prefix "a-"</text>
+                <text x="934" y="161" class="svg-note">show -json: "input": true</text>
+
+                <text x="680" y="240" class="svg-lane">a plain unknown</text>
+                <g stroke="#ffffff" stroke-width="1">
+                  <rect x="680" y="252" width="24" height="22" fill="#f7e3c8"/><rect x="704" y="252" width="24" height="22" fill="#f7e3c8"/><rect x="728" y="252" width="24" height="22" fill="#f7e3c8"/>
+                </g>
+                <text x="692" y="267" class="svg-sub" text-anchor="middle">d4</text><text x="716" y="267" class="svg-sub" text-anchor="middle">00</text><text x="740" y="267" class="svg-sub" text-anchor="middle">00</text>
+                <text x="764" y="267" class="svg-sub">fixext1, type 0, one zero byte</text>
+                <text x="680" y="294" class="svg-note">terraform-plugin-go turns any extension into this.</text>
+
+                <line x1="30" y1="320" x2="1090" y2="320" stroke="#deded9"/>
+                <text x="30" y="346" class="svg-lane">KEY</text>
+                <rect x="30" y="358" width="14" height="14" fill="#deded9"/><text x="52" y="370" class="svg-sub">container header (map, ext map)</text>
+                <rect x="290" y="358" width="14" height="14" fill="#e0ebf2"/><text x="312" y="370" class="svg-sub">key string</text>
+                <rect x="420" y="358" width="14" height="14" fill="#f7e3c8"/><text x="442" y="370" class="svg-sub">unknown marker / extension header</text>
+                <rect x="700" y="358" width="14" height="14" fill="#ece6f3"/><text x="722" y="370" class="svg-sub">null, or nullness refinement</text>
+                <rect x="30" y="384" width="14" height="14" fill="#dfede5"/><text x="52" y="396" class="svg-sub">known value, or prefix refinement</text>
+                <text x="30" y="430" class="svg-note">The tfplan field numbers are from planfile.proto and a schema-less dump of the member; values inside #1 msgpack</text>
+                <text x="30" y="448" class="svg-note">are cty msgpack, the same encoding that crosses the wire in PlanResourceChange.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The plan file keeps what the JSON view throws away: core already knows <code>input</code> will start with
+              <code>a-</code>. Member sizes, field numbers and bytes are from the engine lab's <code>p.tfplan</code> and
+              the protocol lab's <code>random_pet.p</code> plan, decoded with stdlib-only scripts
+              <span class="recon">measured here</span>. The 44-byte <code>random_pet.p</code> value was not re-run by the
+              verifier; the refined bytes were.
+            </p>
+          </figure>
+
+          <h3>Where refinements die</h3>
+          <p>
+            Core produces refined unknowns, and providers built on terraform-plugin-go never see them.
+            <code>terraform-plugin-go:tftypes/value_msgpack.go</code>:39-51, at v0.31.0, the version the framework and
+            the aws, google and random providers use:
+          </p>
+<pre><code>func msgpackUnmarshal(dec *msgpack.Decoder, typ Type, path *AttributePath) (Value, error) {
+	peek, err := dec.PeekCode()
+	if err != nil {
+		return Value{}, path.NewErrorf("error peeking next byte: %w", err)
+	}
+	if msgpackCodes.IsExt(peek) {
+		// as with go-cty, assume all extensions are unknown values
+		err := dec.Skip()
+		if err != nil {
+			return Value{}, path.NewErrorf("error skipping extension byte: %w", err)
+		}
+		return NewValue(typ, UnknownValue), nil
+	}</code></pre>
+          <p>
+            Every extension becomes a plain unknown, and the provider re-encodes it as <code>d4 00 00</code>; the
+            string "refine" does not appear in plugin-go's Go files. A framework provider therefore cannot use a known prefix or a known
+            length bound to plan more precisely, even when core knows one. The refinement
+            does survive on core's side, in the plan file, and <code>terraform show -json</code> drops it again,
+            printing <code>"input": true</code>.
+          </p>
+
+          <h3>A label is not a version</h3>
+          <p>
+            The protocol README describes a rule: "A new minor release of Terraform should only introduce one new
+            minor release of the plugin-protocol" (<code>docs/plugin-protocol/README.md</code>:218-220). Figure 14
+            reads the header and counts the RPCs at every minor tag.
+          </p>
+
+          <figure class="figure wide" id="fig-protocol-growth">
+            <div class="figure-head">
+              <span class="figure-label">Figure 14</span>
+              <p class="figure-title">tfplugin6 by Terraform release: the label, the RPC count, and who calls what</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Terraform</th><th>header</th><th>RPCs</th><th>added</th></tr></thead>
+                <tbody>
+                  <tr><td>v0.15.0 – v1.0</td><td>6.0</td><td>12</td><td>protocol 6 first ships</td></tr>
+                  <tr><td>v1.1 · v1.2</td><td>6.1 · 6.2</td><td>12</td><td>no new RPC</td></tr>
+                  <tr><td>v1.3 – v1.5</td><td>6.3</td><td>12</td><td><code>plan_destroy</code> capability (v1.3)</td></tr>
+                  <tr><td>v1.6 – v1.7</td><td>6.4</td><td>13</td><td><code>GetMetadata</code>; schema-optional capability</td></tr>
+                  <tr><td>v1.8</td><td>6.5</td><td>16</td><td><code>GetFunctions</code>, <code>CallFunction</code>, <code>MoveResourceState</code></td></tr>
+                  <tr><td>v1.9</td><td>6.6</td><td>16</td><td>deferral fields</td></tr>
+                  <tr><td>v1.10</td><td>6.7</td><td>20</td><td>four ephemeral-resource RPCs</td></tr>
+                  <tr><td>v1.11</td><td>6.8</td><td>20</td><td>write-only attributes</td></tr>
+                  <tr><td>v1.12</td><td>6.9</td><td>22</td><td>identity schemas and upgrade</td></tr>
+                  <tr><td>v1.13</td><td>6.10</td><td>28</td><td>list resources (2); first four state-store RPCs</td></tr>
+                  <tr><td>v1.14</td><td style="background: var(--red-soft)">6.10</td><td>32</td><td>actions (3), <code>GenerateResourceConfig</code></td></tr>
+                  <tr><td>v1.15</td><td style="background: var(--red-soft)">6.10</td><td>36</td><td>state bytes (2, streaming) and locks (2)</td></tr>
+                  <tr><td>v1.16</td><td>6.11</td><td>36</td><td>computed blocks, planned private</td></tr>
+                  <tr><td>v1.17</td><td>6.11</td><td>36</td><td>nothing</td></tr>
+                </tbody>
+              </table>
+              <table style="font-size: 13px; margin-top: 18px">
+                <thead><tr><th>group (v1.17.0)</th><th>RPCs</th><th>streaming</th><th>Terraform core calls</th><th>OpenTofu v1.13.2 calls</th></tr></thead>
+                <tbody>
+                  <tr><td>information and validation</td><td>8</td><td>–</td><td>7 (not <code>GetMetadata</code>)</td><td>7</td></tr>
+                  <tr><td>configure</td><td>1</td><td>–</td><td>1</td><td>1</td></tr>
+                  <tr><td>managed resources</td><td>7</td><td>–</td><td>7</td><td style="background: var(--red-soft)">6 (not <code>GenerateResourceConfig</code>)</td></tr>
+                  <tr><td>ephemeral resources</td><td>4</td><td>–</td><td>4</td><td>4</td></tr>
+                  <tr><td>list resources</td><td>2</td><td>1</td><td>2</td><td style="background: var(--red-soft)">0</td></tr>
+                  <tr><td>functions</td><td>2</td><td>–</td><td>1 (<code>CallFunction</code>)</td><td>2</td></tr>
+                  <tr><td>state stores</td><td>8</td><td>2</td><td style="background: var(--orange-soft)">8, experiments only</td><td style="background: var(--red-soft)">0</td></tr>
+                  <tr><td>actions</td><td>3</td><td>1</td><td>3</td><td style="background: var(--red-soft)">0</td></tr>
+                  <tr><td>shutdown</td><td>1</td><td>–</td><td>1</td><td>1</td></tr>
+                  <tr><td><strong>total</strong></td><td><strong>36</strong></td><td><strong>4</strong></td><td><strong>34</strong> (+ <code>Close</code> = 35 methods)</td><td><strong>21</strong></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              The RPC count grew in nearly every minor release since v1.6, and the header label missed two of the
+              biggest steps: 6.10 covers 28, 32 and 36 RPCs (red). Header and count per tag come from
+              <code>git show &lt;tag&gt;:docs/plugin-protocol/…</code> <span class="recon">measured here</span>; the
+              lower table follows the proto file's groups, <code>providers.Interface</code> and a grep of OpenTofu's
+              <code>internal/plugin6/grpc_provider.go</code> <span class="src">from the code</span>.
+            </p>
+          </figure>
+
+          <p>
+            The rule was followed until it was not. v1.0, v1.4, v1.5 and v1.7 kept the previous label without adding an
+            RPC, which is harmless. Then PR #37005, first in v1.13.0, collapsed the per-minor files into one
+            <code>tfplugin6.proto</code>, and v1.14 and v1.15 added eight RPCs under the same 6.10 header. The README
+            still describes the abandoned "new file … for each new minor version" process a few lines above an "Edit
+            the <code>.proto</code> files" section that contradicts it. Labels do not identify contents across
+            repositories either. Terraform's files say 5.10 and 6.11; terraform-plugin-go v0.31.0's say 5.11 and 6.11,
+            with the same RPC list but different messages: plugin-go's "6.11" lacks the v1.16 computed-block and
+            planned-private fields. So framework providers on v0.31.0, which includes aws, google and random, cannot use
+            those v1.16 features yet. OpenTofu's <code>tfplugin6.10.proto</code> defines all 36 RPCs, and its client
+            calls 21 of them. <a href="../three-clouds/#p4-opentofu">Part 4</a> follows that divergence. If you need to
+            know what a provider or a client supports, read its capabilities and its RPC list, not the number in the
+            header.
+          </p>
+          <p>
+            On the provider side, the framework is four layers: plugin-go's <code>tf6server</code> speaks gRPC, the
+            framework's <code>proto6server</code> converts proto to framework types, <code>fwserver</code> runs the
+            logic, and the author's <code>resource.Resource</code> implements six required methods (Metadata, Schema,
+            Create, Read, Update, Delete), with everything else optional. The framework always advertises four
+            server capabilities, including <code>get_provider_schema_optional</code>, and it nulls write-only
+            attributes in its own planned state before core checks that they are null. Both sides enforce the
+            contract.
+          </p>

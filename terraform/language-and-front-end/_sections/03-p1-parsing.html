@@ -1,0 +1,294 @@
+          <h2 id="p1-parsing"><span class="secnum">{{S}}</span>Recursive descent, and why parser shape is graph shape</h2>
+          <p>
+            HCL's parser is hand-written recursive descent: one Go function per grammar rule, each calling the next.
+            It reads tokens through a <code>peeker</code>, and the interesting state in the peeker is a single slice of
+            booleans. Line numbers below are from HCL main; at v2.24.0, the version Terraform v1.17.0 ships,
+            <code>parser.go</code> lines above about 370 sit 9 or 10 lower, with identical code.
+          </p>
+
+          <h3>Newlines are a stack</h3>
+          <p>
+            The grammar says an attribute ends with a newline, but nobody wants a newline inside a function call's
+            argument list to end anything. The peeker solves this with <code>IncludeNewlinesStack</code>, initialised
+            to <code>[]bool{true}</code> (<code>hclsyntax/peeker.go</code>:41-48). Opening a parenthesis, a bracket, a
+            call or a <code>for</code> expression pushes <code>false</code>; an object constructor pushes
+            <code>true</code>; each closer pops. While the top is <code>false</code>, <code>Peek</code> skips
+            <code>TokenNewline</code>. <code>ParseConfig</code> checks that the stack is back to its one entry at the
+            end (<code>peeker.go</code>:106-123; <code>parser.go</code>:882, 968, 1239, 1426-1434, 1590)
+            <span class="src">from the code</span>. The consequences are easy to reproduce with
+            <code>terraform validate</code> <span class="recon">measured here</span>:
+          </p>
+<pre><code>x = 1 +⏎ 2          → Error: Invalid expression
+x = (1 +⏎ 2)        → Success!
+x = true⏎ ? 1⏎ : 2  → Error: Argument or block definition required
+locals { x = 1, y = 2 } → Error: Invalid single-argument block definition
+x = foo.0.0         → Error: Invalid legacy index syntax</code></pre>
+          <p>
+            At body level the newline after <code>+</code> ends the attribute, so the expression is incomplete. Inside
+            parentheses the same newline is invisible. A ternary cannot start a continuation line with <code>?</code>,
+            because by then the attribute has ended and the parser expects a new attribute or block. The practical rule:
+            to break a long expression across lines, wrap it in parentheses. The last line is a lexer effect, not a
+            parser one: <code>0.0</code> scans as one number, so the legacy <code>foo.0</code> index syntax still works
+            once but not twice (<code>parser.go</code>:660-705) <span class="src">from the code</span>.
+          </p>
+
+          <h3>A body is a map and a slice, with no schema</h3>
+          <p>
+            <code>ParseBody</code> loops until its end token. It skips newlines, and for each identifier calls
+            <code>ParseBodyItem</code>, which decides between attribute and block by looking one token ahead.
+            <code>hcl/hclsyntax/parser.go</code>:157-161 <span class="src">from the code</span>:
+          </p>
+<pre><code>	switch next.Type {
+	case TokenEqual:
+		return p.finishParsingBodyAttribute(ident, false)
+	case TokenOQuote, TokenOBrace, TokenIdent:
+		return p.finishParsingBodyBlock(ident)</code></pre>
+          <p>
+            Attributes go into a map keyed by name, where a duplicate is the only structural error ("Attribute
+            redefined"). Blocks go into a slice in source order (<code>parser.go</code>:27-139). Nothing here knows that
+            <code>resource</code> takes two labels or that <code>count</code> is special. A misspelled block type parses
+            perfectly; it fails later, when a schema is applied (§04). The parser does have opinions about block
+            <em>shape</em>, and they show as specific messages: <code>locals = {}</code> is "Unsupported argument",
+            <code>locals</code> followed by <code>{</code> on the next line is "Argument or block definition required",
+            and commas between arguments are "Unexpected comma after argument" <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Precedence is the order of a slice</h3>
+          <p>
+            Expressions descend through four functions. <code>parseTernaryConditional</code> parses a condition with
+            <code>parseBinaryOps(binaryOps)</code>, and if a <code>?</code> follows, parses both arms with the full
+            <code>ParseExpression</code>, which makes <code>?:</code> right-associative and looser than
+            <code>||</code> (<code>parser.go</code>:491-550). <code>parseBinaryOps</code> handles the operators.
+            <code>parseExpressionWithTraversals</code> handles <code>.attr</code>, <code>[index]</code> and splats after
+            a term. <code>parseExpressionTerm</code> handles literals, names, calls, parentheses and the unary
+            <code>-</code> and <code>!</code>, whose operand is a term with traversals, so <code>-46+5</code> is
+            <code>(-46)+5</code> and a negative number is a <code>UnaryOpExpr</code>, not a literal
+            (<code>parser.go</code>:1074-1103) <span class="src">from the code</span>.
+          </p>
+          <p>
+            There is no precedence table in the usual sense, and no <code>operation.go</code>. The levels are the order
+            of a Go slice of maps, lowest first. <code>hcl/hclsyntax/expression_ops.go</code>:167-193
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	binaryOps = []map[TokenType]*Operation{
+		{
+			TokenOr: OpLogicalOr,
+		},
+		{
+			TokenAnd: OpLogicalAnd,
+		},
+		{
+			TokenEqualOp:  OpEqual,
+			TokenNotEqual: OpNotEqual,
+		},
+		{
+			TokenGreaterThan:   OpGreaterThan,
+			TokenGreaterThanEq: OpGreaterThanOrEqual,
+			TokenLessThan:      OpLessThan,
+			TokenLessThanEq:    OpLessThanOrEqual,
+		},
+		{
+			TokenPlus:  OpAdd,
+			TokenMinus: OpSubtract,
+		},
+		{
+			TokenStar:    OpMultiply,
+			TokenSlash:   OpDivide,
+			TokenPercent: OpModulo,
+		},
+	}</code></pre>
+          <p>
+            <code>parseBinaryOps(ops)</code> takes <code>ops[0]</code> as "this level" and <code>ops[1:]</code> as
+            everything tighter. It parses a left operand by recursing on the tighter levels, then loops while the next
+            token is one of this level's operators, folding left. <code>hcl/hclsyntax/parser.go</code>:585-607 (576-598 at
+            v2.24.0) <span class="src">from the code</span>:
+          </p>
+<pre><code>	for {
+		next := p.Peek()
+		var newOp *Operation
+		var ok bool
+		if newOp, ok = thisLevel[next.Type]; !ok {
+			break
+		}
+
+		// Are we extending an expression started on the previous iteration?
+		if operation != nil {
+			lhs = &amp;BinaryOpExpr{
+				LHS: lhs,
+				Op:  operation,
+				RHS: rhs,
+
+				SrcRange: hcl.RangeBetween(lhs.Range(), rhs.Range()),
+			}
+		}
+
+		operation = newOp
+		p.Read() // eat operator token
+		var rhsDiags hcl.Diagnostics
+		rhs, rhsDiags = p.parseBinaryOps(remaining)</code></pre>
+          <p>
+            This is precedence climbing with the table as data. When the slice runs out, the recursion bottoms out in
+            <code>parseExpressionWithTraversals</code>. Adding an operator level would be one more map in the slice. The
+            measured results match the table: <code>1 + 2 * 3 - 4 / 2</code> is <code>5</code>,
+            <code>true || false &amp;&amp; false</code> is <code>true</code>, <code>-2 * -3</code> is <code>6</code>, and
+            <code>false ? 1 : true ? 2 : 3</code> is <code>2</code> <span class="recon">measured here</span>.
+            <code>true</code>, <code>false</code> and <code>null</code> are keywords only in term position and only when
+            not followed by <code>(</code> or <code>::</code>; every other leading identifier becomes a
+            <code>ScopeTraversalExpr</code> (<code>parser.go</code>:1016-1050).
+          </p>
+
+          <figure class="figure wide" id="fig-precedence">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The six-row slice, the tree it produces, and two traversals that look alike</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 668" role="img" aria-label="Left: the parse ladder from the ternary at the top through six binary operator levels, lowest first, down to unary operators and terms. Right: the syntax tree of !a || b &amp;&amp; c == d + e * f ? x : y. Bottom: aws_instance.web[0].id parses as one ScopeTraversalExpr, while aws_instance.web[var.i].id parses as a RelativeTraversalExpr around an IndexExpr around a ScopeTraversalExpr.">
+                <text x="10" y="24" class="svg-lane">PARSE LADDER, LOOSEST FIRST</text>
+                <rect x="10" y="36" width="310" height="36" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="20" y="59" class="svg-step">? :</text><text x="90" y="59" class="svg-sub">parseTernaryConditional</text>
+                <rect x="10" y="80" width="310" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="103" class="svg-num">[0]</text><text x="50" y="103" class="svg-step">||</text><text x="140" y="103" class="svg-sub">OpLogicalOr</text>
+                <rect x="10" y="124" width="310" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="147" class="svg-num">[1]</text><text x="50" y="147" class="svg-step">&amp;&amp;</text><text x="140" y="147" class="svg-sub">OpLogicalAnd</text>
+                <rect x="10" y="168" width="310" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="191" class="svg-num">[2]</text><text x="50" y="191" class="svg-step">==  !=</text><text x="140" y="191" class="svg-sub">OpEqual, OpNotEqual</text>
+                <rect x="10" y="212" width="310" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="235" class="svg-num">[3]</text><text x="50" y="235" class="svg-step">&lt; &lt;= &gt; &gt;=</text><text x="140" y="235" class="svg-sub">comparisons</text>
+                <rect x="10" y="256" width="310" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="279" class="svg-num">[4]</text><text x="50" y="279" class="svg-step">+  -</text><text x="140" y="279" class="svg-sub">OpAdd, OpSubtract</text>
+                <rect x="10" y="300" width="310" height="36" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="323" class="svg-num">[5]</text><text x="50" y="323" class="svg-step">*  /  %</text><text x="140" y="323" class="svg-sub">multiply, divide, modulo</text>
+                <rect x="10" y="344" width="310" height="36" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="20" y="367" class="svg-step">!  -</text><text x="90" y="367" class="svg-sub">unary, in parseExpressionTerm</text>
+                <rect x="10" y="388" width="310" height="36" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="20" y="411" class="svg-step">a.b[0]</text><text x="90" y="411" class="svg-sub">parseExpressionWithTraversals</text>
+                <text x="10" y="448" class="svg-note">Rows [0] to [5] are binaryOps; each operand of</text>
+                <text x="10" y="464" class="svg-note">row n is parsed with rows n+1 onwards.</text>
+
+                <text x="380" y="24" class="svg-lane">!a || b &amp;&amp; c == d + e * f ? x : y</text>
+                <g stroke="#b8b8b1" stroke-width="1.2">
+                  <line x1="720" y1="68" x2="580" y2="110"/><line x1="720" y1="68" x2="860" y2="110"/><line x1="720" y1="68" x2="960" y2="110"/>
+                  <line x1="580" y1="138" x2="450" y2="180"/><line x1="580" y1="138" x2="680" y2="180"/>
+                  <line x1="450" y1="208" x2="450" y2="250"/>
+                  <line x1="680" y1="208" x2="600" y2="250"/><line x1="680" y1="208" x2="760" y2="250"/>
+                  <line x1="760" y1="278" x2="680" y2="320"/><line x1="760" y1="278" x2="840" y2="320"/>
+                  <line x1="840" y1="348" x2="760" y2="390"/><line x1="840" y1="348" x2="920" y2="390"/>
+                  <line x1="920" y1="418" x2="860" y2="460"/><line x1="920" y1="418" x2="980" y2="460"/>
+                </g>
+                <rect x="650" y="40" width="140" height="28" rx="4" fill="#f7f7f5" stroke="#252525"/>
+                <text x="720" y="58" class="svg-sub" text-anchor="middle" style="fill:#252525">ConditionalExpr</text>
+                <text x="616" y="92" class="svg-sub">cond</text><text x="772" y="100" class="svg-sub">true</text><text x="858" y="80" class="svg-sub">false</text>
+                <rect x="520" y="110" width="120" height="28" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="580" y="128" class="svg-sub" text-anchor="middle" style="fill:#252525">BinaryOp ||</text>
+                <rect x="838" y="110" width="44" height="28" rx="4" fill="#fff" stroke="#b8b8b1"/>
+                <text x="860" y="128" class="svg-sub" text-anchor="middle" style="fill:#252525">x</text>
+                <rect x="938" y="110" width="44" height="28" rx="4" fill="#fff" stroke="#b8b8b1"/>
+                <text x="960" y="128" class="svg-sub" text-anchor="middle" style="fill:#252525">y</text>
+                <rect x="390" y="180" width="120" height="28" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="450" y="198" class="svg-sub" text-anchor="middle" style="fill:#252525">UnaryOp !</text>
+                <rect x="620" y="180" width="120" height="28" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="680" y="198" class="svg-sub" text-anchor="middle" style="fill:#252525">BinaryOp &amp;&amp;</text>
+                <rect x="428" y="250" width="44" height="28" rx="4" fill="#fff" stroke="#b8b8b1"/>
+                <text x="450" y="268" class="svg-sub" text-anchor="middle" style="fill:#252525">a</text>
+                <rect x="578" y="250" width="44" height="28" rx="4" fill="#fff" stroke="#b8b8b1"/>
+                <text x="600" y="268" class="svg-sub" text-anchor="middle" style="fill:#252525">b</text>
+                <rect x="700" y="250" width="120" height="28" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="760" y="268" class="svg-sub" text-anchor="middle" style="fill:#252525">BinaryOp ==</text>
+                <rect x="658" y="320" width="44" height="28" rx="4" fill="#fff" stroke="#b8b8b1"/>
+                <text x="680" y="338" class="svg-sub" text-anchor="middle" style="fill:#252525">c</text>
+                <rect x="780" y="320" width="120" height="28" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="840" y="338" class="svg-sub" text-anchor="middle" style="fill:#252525">BinaryOp +</text>
+                <rect x="738" y="390" width="44" height="28" rx="4" fill="#fff" stroke="#b8b8b1"/>
+                <text x="760" y="408" class="svg-sub" text-anchor="middle" style="fill:#252525">d</text>
+                <rect x="860" y="390" width="120" height="28" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="920" y="408" class="svg-sub" text-anchor="middle" style="fill:#252525">BinaryOp *</text>
+                <rect x="838" y="460" width="44" height="28" rx="4" fill="#fff" stroke="#b8b8b1"/>
+                <text x="860" y="478" class="svg-sub" text-anchor="middle" style="fill:#252525">e</text>
+                <rect x="958" y="460" width="44" height="28" rx="4" fill="#fff" stroke="#b8b8b1"/>
+                <text x="980" y="478" class="svg-sub" text-anchor="middle" style="fill:#252525">f</text>
+                <text x="390" y="470" class="svg-note">Every leaf is a ScopeTraversalExpr with</text>
+                <text x="390" y="486" class="svg-note">a one-step traversal.</text>
+
+                <line x1="10" y1="512" x2="1070" y2="512" stroke="#deded9"/>
+                <text x="10" y="536" class="svg-lane">TWO REFERENCES THAT LOOK ALIKE</text>
+                <text x="10" y="566" class="svg-sub" style="fill:#252525">aws_instance.web[0].id</text>
+                <rect x="250" y="548" width="500" height="28" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="262" y="566" class="svg-sub" style="fill:#252525">ScopeTraversalExpr: aws_instance · .web · [0] · .id</text>
+                <text x="770" y="566" class="svg-sub">Variables(): one traversal, 4 steps</text>
+                <text x="10" y="618" class="svg-sub" style="fill:#252525">aws_instance.web[var.i].id</text>
+                <rect x="250" y="592" width="500" height="62" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="262" y="610" class="svg-sub" style="fill:#252525">RelativeTraversalExpr ( .id ) over</text>
+                <text xml:space="preserve" x="262" y="628" class="svg-sub" style="fill:#252525">  IndexExpr ( key: var.i ) over</text>
+                <text xml:space="preserve" x="262" y="644" class="svg-sub" style="fill:#252525">    ScopeTraversalExpr: aws_instance · .web</text>
+                <text x="770" y="611" class="svg-sub">Variables(): two traversals,</text>
+                <text x="770" y="628" class="svg-sub">aws_instance.web and var.i</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The tree follows from <code>parseBinaryOps</code> over <code>binaryOps</code> and
+              <code>parseTernaryConditional</code> (<code>parser.go</code>:491-625) <span class="recon">reconstruction</span>;
+              the traversal shapes follow from <code>makeRelativeTraversal</code> (<code>parser.go</code>:901-959)
+              <span class="src">from the code</span>. A constant index extends the traversal in place; a computed one breaks
+              it, and the references Terraform sees change with it.
+            </p>
+          </figure>
+
+          <h3>Traversals: extended in place, or broken out</h3>
+          <p>
+            After a term, <code>parseExpressionWithTraversals</code> loops over <code>.name</code>, <code>[key]</code>,
+            <code>.*</code> and <code>[*]</code>. For an attribute step, or an index whose key is a literal or a
+            literal-only string template, it calls <code>makeRelativeTraversal</code>, which appends the step to an
+            existing <code>ScopeTraversalExpr</code> "in place (mutating it)". For any other key, such as
+            <code>var.i</code>, it wraps what it has so far in an <code>IndexExpr</code>, and later steps become a
+            <code>RelativeTraversalExpr</code> around that (<code>parser.go</code>:901-927, 938-959)
+            <span class="src">from the code</span>. Splats compile to <code>SplatExpr{Source, Each, Item}</code>, where
+            <code>Item</code> is an <code>AnonSymbolExpr</code> placeholder that <code>Each</code> is evaluated against
+            once per element (<code>parser.go</code>:859-877).
+          </p>
+          <p>
+            The two splat spellings are not synonyms. The full splat <code>[*]</code> applies every following step to
+            each element, so <code>x[*].a[0]</code> takes element 0 of each <code>a</code>. The attribute-only splat
+            <code>.*</code>, kept from Terraform 0.11's HIL, stops absorbing steps at the first index, so
+            <code>x.*.a[0]</code> indexes the resulting list and returns the first element's <code>a</code>
+            (<code>spec.md</code>:594-610; <code>parser.go</code>:707-811) <span class="src">from the code</span>. A splat
+            on a single non-list value wraps it in a one-element tuple, and on a null non-list value gives
+            <code>[]</code>, while a splat of a null list is the error "Splat of null value"
+            (<code>expression.go</code>:1807-1823, 1800-1816 at v2.24.0) <span class="recon">measured here</span>. A
+            splat is a cheap way to turn "maybe one object" into "a list of zero or one".
+          </p>
+          <p>
+            The reason this is more than tidiness: Terraform builds its dependency graph from references, and it finds
+            references by calling <code>Expression.Variables()</code>, which returns the expression's root traversals,
+            then parsing each with <code>addrs.parseRef</code>. The roots it understands are <code>count</code>,
+            <code>each</code>, <code>data</code>, <code>resource</code>, <code>ephemeral</code>, <code>list</code>,
+            <code>local</code>, <code>module</code>, <code>path</code>, <code>self</code>, <code>caller</code>,
+            <code>terraform</code>, <code>var</code> and <code>action</code>; <code>template</code>, <code>lazy</code> and
+            <code>arg</code> are reserved; any other root is a managed resource type
+            (<code>internal/addrs/parse_ref.go</code>:199-437) <span class="src">from the code</span>. So
+            <code>aws_instance.web[0].id</code> arrives as one traversal that names an instance, and
+            <code>aws_instance.web[var.i].id</code> arrives as two: the resource as a whole, and <code>var.i</code>. The
+            parser decides which references exist, and the graph in
+            <a href="../engine-and-providers/#p2-plan-graph">Part 2</a> is built from exactly those
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>Templates that unwrap, and the newest token</h3>
+          <p>
+            Two more parser rules surprise people. A template that is exactly one interpolation is a passthrough: when
+            the parts are one interpolation plus the synthetic end token, <code>parseTemplateInner</code> sets
+            <code>passthru</code>, and the result is a <code>TemplateWrapExpr</code> that keeps the inner value's type
+            (<code>parser_template.go</code>:39-60). So <code>type("${true}")</code> is <code>bool</code>, while
+            <code>type("x${true}")</code> is <code>string</code> <span class="recon">measured here</span>. That is why
+            <code>terraform fmt</code> can rewrite a lone <code>"${var.x}"</code> to <code>var.x</code> without changing
+            meaning.
+          </p>
+          <p>
+            And <code>::</code> is the newest token. Namespaced function calls such as
+            <code>provider::aws::arn_parse(…)</code> arrived in HCL v2.20.0 for Terraform 1.8. The scanner emits
+            <code>TokenDoubleColon</code>, and the parser glues the segments into one name string,
+            <code>nameStr + "::" + …</code>, with a comment explaining that this keeps the API unchanged for code
+            written before namespaces existed (<code>parser.go</code>:1178-1208) <span class="src">from the code</span>.
+            The grammar in <code>spec.md</code> still has no <code>::</code> in its <code>FunctionCall</code> rule; it is
+            one more place where the code is the specification.
+          </p>

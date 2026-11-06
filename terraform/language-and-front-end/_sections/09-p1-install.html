@@ -1,0 +1,222 @@
+          <h2 id="p1-install"><span class="secnum">{{S}}</span>Installing modules and providers</h2>
+          <p>
+            <code>InitCommand.run</code> fixes the order of everything <code>terraform init</code> does
+            (<code>internal/command/init_run.go</code>:28-467) <span class="src">from the code</span>. It loads the root
+            module early, reads the lock file, installs the provider for an experimental <code>state_store</code> if there
+            is one, initialises the backend, reads the state (so providers of resources that exist only in state are
+            installed too, and can destroy them), installs modules, loads the full tree, checks
+            <code>required_version</code>, installs providers, and saves the lock file. §07 and §08 covered loading;
+            backends are <a href="../state-and-features/#p3-locks">Part 3</a>. This section is the two installers.
+          </p>
+
+          <h3>Modules: three kinds of address, no lock</h3>
+          <p>
+            <code>initwd.ModuleInstaller</code> dispatches on the evaluated source address
+            (<code>internal/initwd/module_install.go</code>:295-320). A source starting <code>./</code> or
+            <code>../</code> is local: it is joined to the parent's recorded directory, nothing is downloaded, and a
+            <code>version</code> on it is an error. Anything that parses as a registry address goes to the registry.
+            Everything else goes to go-getter, which means a malformed registry address is silently treated as a remote
+            URL (<code>moduleaddrs/source_parsing.go</code>:29-97) <span class="src">from the code</span>. When a
+            <code>version</code> is present the source is parsed strictly as a registry address, so that mistake gets a
+            better error. Shorthand detection is frozen at six legacy detectors (GitHub, Git over SSH, Bitbucket, GCS, S3
+            and absolute paths), and Terraform pins its own go-getter getters and disables go-getter's detectors; new
+            schemes must use <code>type::url</code>.
+          </p>
+          <p>
+            A registry module install is four requests: <code>modules.v1</code> service discovery, <code>GET …/versions</code>
+            (cached per run), selection of the newest matching version, and <code>GET …/&lt;version&gt;/download</code>,
+            whose answer is only a header. The real location comes from <code>X-Terraform-Get</code>, on a 200 or 204;
+            local paths and registry addresses are refused there, and the HTTP getter follows at most ten
+            <code>X-Terraform-Get</code> redirections (<code>internal/registry/client.go</code>:236-272;
+            <code>getmodules/getter.go</code>:83-87). Results are recorded in <code>.terraform/modules/modules.json</code>,
+            keyed by module call path. Module versions are never locked: <code>.terraform.lock.hcl</code> holds providers
+            only, and a <code>module</code> block in it merely warns "Dependency locks for modules are not yet supported"
+            (<code>internal/depsfile/locks_file.go</code>:166-234). Pin modules with an exact <code>version</code> if you
+            need reproducibility.
+          </p>
+
+          <h3>Providers: select, query, link or download</h3>
+          <p>
+            The provider set is the union of <code>required_providers</code>, implicit dependencies of every resource
+            whose provider is not listed, <code>provider</code> blocks, test files and the state. An unqualified name
+            means <code>registry.terraform.io/hashicorp/&lt;name&gt;</code>, except <code>terraform</code>, which is the
+            built-in provider (<code>internal/addrs/provider.go</code>:66-93). A third-party resource with no
+            <code>required_providers</code> entry therefore fails as <code>hashicorp/mongodbatlas</code>, and the error
+            suggests <code>mongodb/mongodbatlas</code>.
+          </p>
+          <p>
+            <code>providercache.Installer.EnsureProviderVersions</code> then runs in steps (Figure {{fig-install}}). Step 1
+            narrows each provider with a satisfying lock entry to exactly its locked version, unless <code>-upgrade</code>;
+            a lock that conflicts with the current constraints fails here, before any network call. Step 2 queries the
+            source's <code>AvailableVersions</code> for every provider, locked or not, and walks backwards to the newest
+            acceptable one (<code>installer.go</code>:293-352) <span class="src">from the code</span>. A trace showed the
+            <code>GET …/hashicorp/random/versions</code> with a lock file present <span class="recon">measured here</span>.
+            Step 3a links from the global plugin cache only if a lock entry exists and the cached package matches one of
+            its hashes; the comment says why: "If there was no lock file entry at all then we need to install the package
+            for real so that we can lock as complete as possible a set of checksums" (<code>installer.go</code>:402-433).
+          </p>
+          <p>
+            That has a cost on a shared machine. With <code>TF_PLUGIN_CACHE_DIR</code> set and no lock file,
+            <code>init</code> printed "Installed hashicorp/random v3.9.1 (signed by HashiCorp)": it downloaded into the
+            shared cache and rewrote the entry. With a lock, it printed "Using … from the shared cache directory"
+            <span class="recon">measured here</span>. On this box a no-lock <code>init</code> failed with "text file busy"
+            because another process was running that provider binary, and concurrent <code>init</code>s rewrote the cache
+            mid-run and broke a plan's lock check. Commit the lock file, and let one process populate a shared cache.
+          </p>
+
+          <figure class="figure wide" id="fig-install">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Installing one provider, and what the lock file records</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 560" role="img" aria-label="Left: the provider install flow: select a version, query available versions even with a lock, link from the cache only if the lock matches, otherwise fetch package metadata, download, check the SHA256SUMS listing, the archive checksum and the GPG signature, unzip and link, then record a local h1 hash and the signed zh hashes. Right: an annotated .terraform.lock.hcl for random 3.9.1 and the five trust tiers init prints.">
+                <defs>
+                  <marker id="fig-install-black" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="10" y="24" class="svg-lane">EnsureProviderVersions, ONE PROVIDER</text>
+                <rect x="10" y="38" width="300" height="34" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="20" y="60" class="svg-sub" style="fill:#252525">1  lock narrows, else constraints</text>
+                <rect x="10" y="88" width="300" height="34" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="20" y="110" class="svg-sub" style="fill:#252525">2  AvailableVersions: GET …/versions</text>
+                <text x="330" y="102" class="svg-sub" style="fill:#ad4b43">asked even with a lock:</text>
+                <text x="330" y="118" class="svg-sub" style="fill:#ad4b43">init is not offline</text>
+                <rect x="10" y="138" width="300" height="34" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="20" y="160" class="svg-sub" style="fill:#252525">3a cached, and matches the lock?</text>
+                <rect x="340" y="138" width="180" height="34" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="350" y="160" class="svg-sub" style="fill:#252525">yes: symlink from cache</text>
+                <rect x="10" y="188" width="300" height="34" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="20" y="210" class="svg-sub" style="fill:#252525">3b PackageMeta for linux_amd64</text>
+                <rect x="10" y="238" width="300" height="34" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text xml:space="preserve" x="20" y="260" class="svg-sub" style="fill:#252525">   download zip to temp</text>
+                <text x="330" y="252" class="svg-sub" style="fill:#d98226">no lock: lands in the</text>
+                <text x="330" y="268" class="svg-sub" style="fill:#d98226">shared cache if set</text>
+                <rect x="10" y="288" width="300" height="34" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text xml:space="preserve" x="20" y="310" class="svg-sub" style="fill:#252525">   SHA256SUMS lists the file</text>
+                <rect x="10" y="338" width="300" height="34" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text xml:space="preserve" x="20" y="360" class="svg-sub" style="fill:#252525">   archive SHA-256 = shasum</text>
+                <rect x="10" y="388" width="300" height="34" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text xml:space="preserve" x="20" y="410" class="svg-sub" style="fill:#252525">   GPG signature on SHA256SUMS</text>
+                <text x="330" y="402" class="svg-sub">sets the trust tier;</text>
+                <text x="330" y="418" class="svg-sub">expired key: only a WARN</text>
+                <rect x="10" y="438" width="300" height="34" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="20" y="460" class="svg-sub" style="fill:#252525">3c unzip, link into .terraform/</text>
+                <rect x="10" y="488" width="300" height="34" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="20" y="510" class="svg-sub" style="fill:#252525">record local h1: + signed zh:</text>
+                <g stroke="#252525" stroke-width="2.5" fill="none">
+                  <line x1="160" y1="72" x2="160" y2="85" marker-end="url(#fig-install-black)"/>
+                  <line x1="160" y1="122" x2="160" y2="135" marker-end="url(#fig-install-black)"/>
+                  <line x1="310" y1="155" x2="337" y2="155" marker-end="url(#fig-install-black)"/>
+                  <line x1="160" y1="172" x2="160" y2="185" marker-end="url(#fig-install-black)"/>
+                  <line x1="160" y1="222" x2="160" y2="235" marker-end="url(#fig-install-black)"/>
+                  <line x1="160" y1="272" x2="160" y2="285" marker-end="url(#fig-install-black)"/>
+                  <line x1="160" y1="322" x2="160" y2="335" marker-end="url(#fig-install-black)"/>
+                  <line x1="160" y1="372" x2="160" y2="385" marker-end="url(#fig-install-black)"/>
+                  <line x1="160" y1="422" x2="160" y2="435" marker-end="url(#fig-install-black)"/>
+                  <line x1="160" y1="472" x2="160" y2="485" marker-end="url(#fig-install-black)"/>
+                  <path d="M520,155 L538,155 L538,505 L313,505" marker-end="url(#fig-install-black)"/>
+                </g>
+                <text x="170" y="182" class="svg-sub">no</text>
+
+                <text x="570" y="24" class="svg-lane">.terraform.lock.hcl (MEASURED, TRIMMED)</text>
+                <rect x="566" y="36" width="504" height="186" rx="4" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="578" y="58" class="svg-sub" style="fill:#252525">provider "registry.terraform.io/</text>
+                <text xml:space="preserve" x="578" y="74" class="svg-sub" style="fill:#252525">          hashicorp/random" {</text>
+                <text xml:space="preserve" x="578" y="94" class="svg-sub" style="fill:#252525">  version     = "3.9.1"</text>
+                <text xml:space="preserve" x="578" y="112" class="svg-sub" style="fill:#252525">  constraints = "~&gt; 3.9.1"</text>
+                <text xml:space="preserve" x="578" y="130" class="svg-sub" style="fill:#252525">  hashes = [</text>
+                <text xml:space="preserve" x="578" y="148" class="svg-sub" style="fill:#765b98">    "h1:g40qr7yD…EJ+0=",</text>
+                <text xml:space="preserve" x="578" y="166" class="svg-sub" style="fill:#3c6f97">    "zh:05f4734c…48d7",</text>
+                <text xml:space="preserve" x="578" y="184" class="svg-sub" style="fill:#3c6f97">    … 13 zh: lines …</text>
+                <text xml:space="preserve" x="578" y="200" class="svg-sub" style="fill:#252525">  ]</text>
+                <text x="578" y="216" class="svg-sub" style="fill:#252525">}</text>
+                <text x="830" y="112" class="svg-sub">← evaluated from the</text>
+                <text xml:space="preserve" x="830" y="126" class="svg-sub">  1.17 expression</text>
+                <text x="830" y="148" class="svg-sub" style="fill:#765b98">← dirhash.Hash1, local,</text>
+                <text xml:space="preserve" x="830" y="162" class="svg-sub" style="fill:#765b98">  this platform only</text>
+                <text x="830" y="180" class="svg-sub" style="fill:#3c6f97">← SHA256SUMS lines: 12 zips</text>
+                <text xml:space="preserve" x="830" y="194" class="svg-sub" style="fill:#3c6f97">  + the manifest JSON</text>
+
+                <text x="570" y="262" class="svg-lane">TRUST TIERS init PRINTS</text>
+                <line x1="566" y1="272" x2="1070" y2="272" stroke="#deded9"/>
+                <text x="570" y="292" class="svg-lane">PACKAGE CAME WITH</text><text x="820" y="292" class="svg-lane">MESSAGE</text>
+                <line x1="566" y1="300" x2="1070" y2="300" stroke="#deded9"/>
+                <text x="570" y="322" class="svg-sub" style="fill:#252525">HashiCorp's signing key</text><text x="820" y="322" class="svg-sub" style="fill:#367f59">signed by HashiCorp</text>
+                <text x="570" y="346" class="svg-sub" style="fill:#252525">partner trust signature</text><text x="820" y="346" class="svg-sub" style="fill:#367f59">signed by a HashiCorp partner</text>
+                <text x="570" y="370" class="svg-sub" style="fill:#252525">any other registry key</text><text x="820" y="370" class="svg-sub" style="fill:#d98226">self-signed</text>
+                <text x="570" y="394" class="svg-sub" style="fill:#252525">network mirror checksum</text><text x="820" y="394" class="svg-sub" style="fill:#d98226">verified checksum</text>
+                <text x="570" y="418" class="svg-sub" style="fill:#252525">filesystem mirror</text><text x="820" y="418" class="svg-sub" style="fill:#ad4b43">unauthenticated</text>
+                <text x="570" y="442" class="svg-sub" style="fill:#252525">unknown signature issuer</text><text x="820" y="442" class="svg-sub" style="fill:#ad4b43">hard error</text>
+                <line x1="566" y1="454" x2="1070" y2="454" stroke="#deded9"/>
+                <text x="570" y="480" class="svg-note">The lock records signed zh: hashes only when the signature verified;</text>
+                <text x="570" y="498" class="svg-note">otherwise only the h1: just computed, which covers one platform.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Flow from <code>internal/providercache/installer.go</code>:212-734 and <code>package_install.go</code>:27-142;
+              tiers from <code>getproviders/package_authentication.go</code>:22-59, 410-564 <span class="src">from the code</span>.
+              The lock file and the "Installed" and "Using" messages are from a v1.17.0 <code>init</code> of random 3.9.1
+              <span class="recon">measured here</span>. Red marks the step that needs the network every time.
+            </p>
+          </figure>
+
+          <h3>Three checks, and two hashes</h3>
+          <p>
+            A downloaded zip goes to a temp file, then through source authentication, then the lock-file hashes, and only
+            then is unzipped; installing into a symlinked target is refused (<code>package_install.go</code>:27-142). For a
+            registry package, authentication is three checks in order: the SHA256SUMS document lists the file with its
+            sum, the archive's SHA-256 equals the registry's <code>shasum</code>, and the GPG signature on SHA256SUMS
+            verifies against a key the registry returned (key <code>34365D9472D7468F</code> for HashiCorp). An expired
+            signing key is tolerated: <code>ErrKeyExpired</code> is downgraded to "[WARN] expired openpgp key from
+            HashiCorp Security", which appeared in a live trace <span class="recon">measured here</span>. v1.17 accepts
+            plugin protocol 5 or 6 only.
+          </p>
+          <p>
+            The lock file, <code>.terraform.lock.hcl</code>, is regenerated from scratch with <code>hclwrite</code> each
+            time, providers sorted, never edited in place. Each entry has <code>version</code>, <code>constraints</code>
+            and a sorted set of hashes, so <code>h1:</code> lines always precede <code>zh:</code>
+            (<code>depsfile/locks_file.go</code>:114-164; <code>locks.go</code>:177-212). <code>zh:</code> is the hex
+            SHA-256 of a release zip, taken from SHA256SUMS. <code>h1:</code> is Go's <code>dirhash.Hash1</code> over the
+            unpacked files, and it can be recomputed by hand: SHA-256 each file, sort the
+            <code>"&lt;hex&gt;  &lt;path&gt;"</code> lines, SHA-256 the list, base64 the result. For random 3.9.1 on
+            linux_amd64 that gives <code>h1:g40qr7yDmIpaur4SsK5BcOda3HSo1RJ6zHVMqN4EJ+0=</code>, the same value as the lock
+            file <span class="recon">measured here</span>. Which hashes are recorded is decided here.
+            <code>internal/providercache/installer.go</code>:710-724 <span class="src">from the code</span>:
+          </p>
+<pre><code>		var signedHashes []getproviders.Hash
+		if authResult.SignedByAnyParty() {
+			// We'll trust new hashes from upstream only if they were verified
+			// as signed by a suitable key. Otherwise, we'd record only
+			// a new hash we just calculated ourselves from the bytes on disk,
+			// and so the hashes would cover only the current platform.
+			signedHashes = append(signedHashes, meta.AcceptableHashes()...)
+		}
+
+		var newHashes []getproviders.Hash
+		newHashes = append(newHashes, newHash)
+		newHashes = append(newHashes, priorHashes...)
+		newHashes = append(newHashes, signedHashes...)
+
+		locks.SetProvider(provider, version, reqs[provider], newHashes)</code></pre>
+          <p>
+            <code>AcceptableHashes</code> takes every line of SHA256SUMS, so the lock for random 3.9.1 has one
+            <code>h1:</code> and 13 <code>zh:</code>: twelve zips and one for <code>terraform-provider-random_3.9.1_manifest.json</code>,
+            which is not a package <span class="recon">measured here</span>. A corrupted hash makes every later
+            command stop: <code>plan</code> failed with "Required plugins are not installed … does not match any of the
+            checksums". <code>-lockfile=readonly</code> errors if the provider set changed and otherwise only warns.
+          </p>
+
+          <h3>Offline means a mirror</h3>
+          <p>
+            Because step 2 always asks the source, <code>terraform init</code> under the default installation method is not
+            offline, even with a lock file and a warm cache. In a namespace with no network it failed with "could not
+            connect to registry.terraform.io" <span class="recon">measured here</span>; the lab's own README had claimed
+            otherwise and was corrected. The offline route is a <code>provider_installation</code> block in the CLI
+            configuration with a <code>filesystem_mirror</code>, which accepts packed or unpacked layouts and performs no
+            authentication: <code>init</code> printed "Installed … (unauthenticated)". Mirror installs lock only the local
+            <code>h1:</code> and warn "Incomplete lock file information for providers"; <code>terraform providers lock
+            -platform=…</code> fills in the rest, and two platforms gave 2 <code>h1:</code> plus 13 <code>zh:</code>
+            <span class="recon">measured here</span>. A no-lock <code>init</code> with the requirement written as an
+            expression took 1.0 s, one cold-ish run on a 2-vCPU box. The configuration was now loaded, the tree built,
+            and every provider on disk; <a href="../engine-and-providers/#p2-plan-graph">Part 2</a> builds the graph.
+          </p>

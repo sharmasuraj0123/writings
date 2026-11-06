@@ -1,0 +1,231 @@
+          <h2 id="p3-locks"><span class="secnum">{{S}}</span>Locks, per backend</h2>
+          <p class="lede">
+            A state lock is whatever atomic primitive the backend's storage happens to offer: a POSIX record lock, a
+            conditional object write, a blob lease, a database advisory lock. Core sees only a <code>Lock</code> method that
+            returns an ID or an error. Two defaults decide how that works in practice. <code>-lock-timeout</code> is zero, so
+            a held lock fails your command at once. And the S3 backend, configured with neither of its two lock options,
+            takes no lock at all and says nothing about it.
+          </p>
+
+          <h3>One attempt by default</h3>
+          <p>
+            A lock request carries a <code>LockInfo</code> with seven fields, <code>ID</code>, <code>Operation</code>,
+            <code>Info</code>, <code>Who</code>, <code>Version</code>, <code>Created</code> and <code>Path</code>; its ID comes
+            from <code>math/rand</code> in UUID shape, with a comment that it "doesn't need to be cryptographically secure"
+            (<code>internal/states/statemgr/locker.go</code>:118-172) <span class="src">from the code</span>. The retry loop is
+            <code>LockWithContext</code>, at <code>locker.go</code>:75-88 and 101-111 (the guard for an incomplete
+            <code>LockError</code> in between is left out):
+          </p>
+          <pre><code>func LockWithContext(ctx context.Context, s Locker, info *LockInfo) (string, error) {
+	delay := time.Second
+	maxDelay := 16 * time.Second
+	for {
+		id, err := s.Lock(info)
+		if err == nil {
+			return id, nil
+		}
+
+		le, ok := err.(*LockError)
+		if !ok {
+			// not a lock error, so we can't retry
+			return "", err
+		}
+	…
+		select {
+		case &lt;-ctx.Done():
+			// return the last lock error with the info
+			return "", err
+		case &lt;-time.After(delay):
+			if delay &lt; maxDelay {
+				delay *= 2
+			}
+		}
+	}
+}</code></pre>
+          <p>
+            Only a <code>*LockError</code> whose <code>Info</code> has an ID is retried; anything else fails immediately. The
+            wait starts at one second and doubles to a 16-second cap. Every state-touching command defaults
+            <code>-lock-timeout</code> to <code>0s</code>: plan, apply, refresh, init, <code>state mv</code>, <code>rm</code>,
+            <code>push</code> and <code>replace-provider</code> (<code>internal/command/arguments/extended.go</code>:270-271,
+            <code>init.go</code>:110-111 and the state command parsers) <span class="src">from the code</span>. With a zero
+            timeout the context is already done when the first <code>LockError</code> comes back, so there is exactly one
+            attempt (<code>internal/command/clistate/state.go</code>:109-138). The CLI prints "Acquiring state lock…" only if
+            the lock takes longer than its 400 ms <code>LockThreshold</code> (<code>clistate/state.go</code>:23).
+          </p>
+          <p>
+            Two processes against one local state show all of it. The lab ran a nine-second apply in the background, then
+            tried everything else against the held lock <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform apply -auto-approve &amp;        # holds the lock ~9 s
+$ cat .terraform.tfstate.lock.info
+{"ID":"b6aa29e9-…","Operation":"OperationTypeApply","Info":"","Who":"coder@…","Version":"1.17.0","Created":"2026-10-23T15:23:05.72…Z","Path":"terraform.tfstate"}
+$ time terraform plan          → Error acquiring the state lock / Error message: resource temporarily unavailable   (real 0.350s)
+$ terraform plan -lock=false   → Plan: 0 to add, 1 to change, 0 to destroy.
+$ terraform force-unlock -force &lt;ID&gt;  → Failed to unlock state: LocalState not locked
+$ terraform force-unlock &lt;ID&gt;         → Local state cannot be unlocked by another process
+$ TF_LOG=trace terraform plan -lock-timeout=20s → attempts at 43.224, 44.225, 46.226, 50.229
+                                                 → Plan: 1 to add, 0 to change, 1 to destroy.  (real 7.501s)</code></pre>
+          <p>
+            The immediate failure took 0.35 s here and 0.14 s on a verifier's re-run; that number moves with the box. The four
+            attempts with a 20-second timeout sit at +0, +1, +3 and +7 s, which is waits of 1, 2 and 4 s, and the plan got the
+            lock when the apply finished; a re-run saw the same shape. <code>-lock=false</code> really does bypass the lock:
+            <code>statemgr.LockDisabled</code> turns <code>Lock</code> and <code>Unlock</code> into no-ops and passes reads and
+            writes through (<code>internal/states/statemgr/lock.go</code>:13-48), and the bypassing plan completed while the
+            other process held the apply lock.
+          </p>
+          <p>
+            <code>plan</code> takes the lock too, with operation <code>OperationTypePlan</code>, so a teammate's long plan blocks
+            your apply, and with the default timeout your apply fails at once rather than waiting
+            <span class="recon">measured here</span> (the plan-locking run, against the toy HTTP backend, was not re-run by a
+            verifier). The practical setting is a non-zero <code>-lock-timeout</code> in CI, sized to your longest plan.
+          </p>
+
+          <h3>What each backend builds</h3>
+          <p>
+            <strong>local.</strong> A non-blocking POSIX <code>fcntl F_SETLK</code> on <code>terraform.tfstate</code> itself
+            (<code>LockFileEx</code> on Windows), plus a 0600 sidecar <code>.terraform.tfstate.lock.info</code> holding the
+            <code>LockInfo</code> (<code>internal/states/statemgr/filesystem_lock_unix.go</code>:15-41;
+            <code>filesystem.go</code>:487-529). The kernel lock dies with the process that holds it, and
+            <code>force-unlock</code> refuses local state either way: without <code>-force</code> it says the state "cannot be
+            unlocked by another process", and with it the new process finds it holds nothing, "LocalState not locked"
+            (<code>internal/command/unlock.go</code>:78-110; <code>filesystem.go</code>:345-351) <span class="src">from the code</span>.
+          </p>
+          <p>
+            <strong>s3.</strong> Two mechanisms, both opt-in. <code>use_lockfile</code> writes the <code>LockInfo</code> JSON to
+            <code>&lt;key&gt;.tflock</code> with a conditional <code>PutObject</code> carrying <code>If-None-Match: *</code>; on
+            a 412 Terraform reads the existing <code>.tflock</code> to name the holder (<code>s3/client.go</code>:346-404).
+            <code>dynamodb_table</code> does a <code>PutItem</code> with <code>attribute_not_exists(LockID)</code>, where
+            <code>LockID</code> is <code>&lt;bucket&gt;/&lt;key&gt;</code>, and keeps a <code>-md5</code> digest item that
+            drives a consistency loop retrying a mismatched <code>Get</code> every 2 s for up to 10 s
+            (<code>s3/client.go</code>:39, 57-125, 406-436). The matrix is at
+            <code>internal/backend/remote-state/s3/client.go</code>:285-288 and 327-340:
+          </p>
+          <pre><code>	// no file, no dynamodb
+	if !c.useLockFile &amp;&amp; c.ddbTable == "" {
+		return "", nil
+	}
+	…
+	// double locking: dynamodb + file (design decision: both must succeed)
+	log.Info("Attempting to lock remote state (S3 Native and DynamoDB)...")
+	if err := c.lockWithFile(ctx, info, log); err != nil {
+		return "", err
+	}
+
+	if err := c.lockWithDynamoDB(ctx, info); err != nil {
+		// Release the file lock if attempting to acquire the DynamoDB lock fails.
+		if unlockErr := c.unlockWithFile(ctx, info.ID, &amp;statemgr.LockError{}, log); unlockErr != nil {
+			return "", fmt.Errorf("failed to clean up file lock after DynamoDB lock error: %v; original error: %w", unlockErr, err)
+		}
+
+		return "", err
+	}</code></pre>
+          <p>
+            The first three lines are the finding: with neither option set, <code>Lock</code> returns an empty ID and no
+            error, so every command proceeds as if it held the lock <span class="src">from the code</span>. Nothing warns.
+            Native locking arrived in v1.10.0 alongside DynamoDB (code first committed on 1 September 2024, 8be88f76e) and was
+            declared GA in v1.11.0 (#36338), which deprecated the DynamoDB arguments. The deprecation warning comes from
+            <code>PrepareConfig</code>, so it appears at <code>init</code> and not at <code>validate</code>, which printed
+            "Success!" for a <code>dynamodb_table</code> backend <span class="recon">measured here</span> (not re-run by a
+            verifier). If you run S3 state, set <code>use_lockfile = true</code>. One open question sits under that advice:
+            whether S3-compatible stores such as MinIO, R2 or Ceph honour <code>If-None-Match</code>; if one does not,
+            <code>use_lockfile</code> may silently not lock there. Unlock in both modes reads the lock, compares the ID, then
+            deletes, and a TODO notes that the DynamoDB comparison is not atomic (<code>s3/client.go</code>:508-589).
+          </p>
+          <p>
+            <strong>gcs and azurerm.</strong> GCS creates <code>&lt;prefix&gt;/&lt;workspace&gt;.tflock</code> with a
+            <code>DoesNotExist</code> condition and uses the object's generation number as the lock ID; unlock is a delete
+            with <code>GenerationMatch</code> (<code>gcs/client.go</code>:96-139). azurerm takes an infinite blob lease
+            (<code>LeaseDuration: -1</code>) on the state blob itself, proposing the <code>LockInfo</code> ID as the lease ID,
+            and stores the info base64-encoded in blob metadata <code>terraformlockid</code>
+            (<code>azure/client.go</code>:25-27, 143-270) <span class="src">from the code</span>.
+          </p>
+          <p>
+            <strong>http.</strong> Locking happens only if <code>lock_address</code> is set, using configurable
+            <code>LOCK</code>/<code>UNLOCK</code> methods where 409 or 423 means "locked", and state writes carry the lock ID as
+            <code>?ID=…</code> (<code>http/client.go</code>:93-123, 205-243). <code>Unlock(id)</code> never sends
+            <code>id</code>: it replays this process's own lock JSON (<code>http/client.go</code>:126-143). A fresh
+            <code>force-unlock</code> process has no lock JSON, so the lab server received <code>UNLOCK body=b''</code>; a
+            bogus ID "succeeded"; and a force-unlock during a live apply let a second <code>plan</code> lock and unlock
+            while the apply was still running, after which the apply posted with its stale ID
+            <span class="recon">measured here</span>. Those runs were not re-run by a verifier; the code half is confirmed.
+            HashiCorp's locking page calls the lock ID "a nonce" that makes unlocks target the right lock; for HTTP the client
+            does not enforce that, and the server must.
+          </p>
+          <p>
+            <strong>The rest.</strong> <code>pg</code> uses <code>pg_try_advisory_lock</code>; <code>kubernetes</code> a
+            <code>coordination.k8s.io/v1</code> Lease whose holder identity is the lock ID; <code>oci</code> a conditional
+            <code>PutObject</code> with <code>IfNoneMatch: "*"</code>; <code>oss</code> a TableStore row
+            (<code>internal/backend/remote-state/{pg,kubernetes,oci,oss}</code>). Backends are compiled in, not plugins:
+            v1.17 ships 13 names plus the internal <code>cloud</code> (<code>internal/backend/init/init.go</code>:33-86).
+            <code>oci</code> is the newest. Its CHANGELOG line in v1.12.0 cites #34465, while the commit that added it is
+            #36872 (804e97021), and <code>git tag --contains</code> first lists v1.13.0 (CHANGELOG mistake, code, verified). A
+            generic <code>remote.State</code> whose client has no <code>Lock</code> at all also "succeeds" silently
+            (<code>internal/states/remote/state.go</code>:238-250).
+          </p>
+          <p>
+            <strong>HCP Terraform and <code>state_store</code>.</strong> The <code>cloud</code> backend's lock is a workspace
+            lock ("Locked by Terraform"), and its force-unlock ID is literally <code>&lt;org&gt;/&lt;workspace&gt;</code>
+            (<code>internal/cloud/state.go</code>:334-361, 452-520). Experimental pluggable state storage hands state to a
+            provider through eight tfplugin6 RPCs, including <code>LockState</code> and <code>UnlockState</code>, with chunks
+            negotiated at 8 MiB and capped at 128 MiB (<code>docs/plugin-protocol/tfplugin6.proto</code>:403-421;
+            <code>internal/backend/pluggable/chunks/chunks.go</code>:6-18). <code>LockState</code> carries only type, state ID
+            and operation, and the gRPC client returns a plain error, so <code>-lock-timeout</code> would never retry it
+            (<code>internal/states/remote/remote_grpc.go</code>:118-130). That consequence is inferred from code; testing it
+            needs an experimental build. The release binary rejects the block outright: "Blocks of type "state_store" are not
+            expected here." <span class="recon">measured here</span>
+          </p>
+
+          <figure class="figure wide" id="fig-locks">
+            <div class="figure-head">
+              <span class="figure-label">Figure 16</span>
+              <p class="figure-title">What a lock is, per backend, and how long a waiting command tries</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>backend</th><th>primitive</th><th>default</th><th>lock ID, force-unlock</th><th>workspace layout</th></tr></thead>
+                <tbody>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">local</td><td>non-blocking <code>fcntl F_SETLK</code> on the state file + 0600 <code>.lock.info</code> sidecar</td><td style="background: var(--green-soft)">on</td><td>refused: "Local state cannot be unlocked by another process"</td><td><code>terraform.tfstate.d/&lt;name&gt;/</code></td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">s3 + use_lockfile</td><td>conditional <code>PutObject</code> of <code>&lt;key&gt;.tflock</code>, <code>If-None-Match: *</code></td><td style="background: var(--orange-soft)">opt-in</td><td>ID read and compared, then deleted</td><td rowspan="3"><code>env:/&lt;name&gt;/&lt;key&gt;</code> (prefix configurable)</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">s3 + dynamodb_table</td><td><code>PutItem</code>, <code>attribute_not_exists(LockID)</code>; deprecated in v1.11</td><td style="background: var(--orange-soft)">opt-in</td><td>ID compared non-atomically (TODO)</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">s3, neither</td><td><strong>none</strong>: <code>Lock</code> returns <code>"", nil</code></td><td style="background: var(--red-soft)">no lock</td><td>nothing to unlock</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">gcs</td><td><code>.tflock</code> object created with <code>DoesNotExist</code></td><td style="background: var(--green-soft)">on</td><td>ID = object generation; <code>GenerationMatch</code> delete</td><td><code>&lt;prefix&gt;/&lt;name&gt;.tfstate</code></td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">azurerm</td><td>infinite blob lease on the state blob; info in metadata</td><td style="background: var(--green-soft)">on</td><td>lease ID = LockInfo ID; verified</td><td><code>&lt;key&gt;env:&lt;name&gt;</code></td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">http</td><td>configurable <code>LOCK</code> / <code>UNLOCK</code>; 409 or 423 = locked</td><td style="background: var(--orange-soft)">if <code>lock_address</code></td><td>unlock sends no ID; a bogus ID "succeeded"</td><td>no workspaces</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">pg, kubernetes, oci, oss</td><td>advisory lock; Lease; conditional <code>PutObject</code>; TableStore row</td><td>not stated</td><td>not described</td><td>not described</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">cloud (HCP)</td><td>workspace lock</td><td style="background: var(--green-soft)">on</td><td>ID is <code>&lt;org&gt;/&lt;workspace&gt;</code>; stays locked after a failed upload</td><td>HCP workspaces</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px">state_store</td><td><code>LockState</code> / <code>UnlockState</code> RPCs to a provider</td><td style="background: var(--red-soft)">experimental build</td><td>provider-defined; plain errors, never retried</td><td>provider's <code>GetStates</code></td></tr>
+                </tbody>
+              </table>
+              <svg viewBox="0 0 1000 150" role="img" aria-label="Timeline of lock attempts. With the default lock timeout of zero there is a single attempt at time zero. With a timeout, attempts happen at 0, 1, 3 and 7 seconds as measured, then 15, 31 and 47 seconds as the delay reaches its 16 second cap." style="margin-top: 18px">
+                <text x="10" y="20" class="svg-lane">ATTEMPTS BY LOCKWITHCONTEXT, SECONDS AFTER THE FIRST</text>
+                <line x1="150" y1="58" x2="980" y2="58" stroke="#b8b8b1"/>
+                <line x1="150" y1="112" x2="980" y2="112" stroke="#b8b8b1"/>
+                <text x="10" y="62" class="svg-sub" style="fill:#252525">-lock-timeout=0</text>
+                <text x="10" y="116" class="svg-sub" style="fill:#252525">-lock-timeout=60s</text>
+                <circle cx="160" cy="58" r="7" fill="#ad4b43"/>
+                <text x="176" y="62" class="svg-sub">one attempt, then "Error acquiring the state lock"</text>
+                <circle cx="160" cy="112" r="7" fill="#3c6f97"/>
+                <circle cx="176" cy="112" r="7" fill="#3c6f97"/>
+                <circle cx="208" cy="112" r="7" fill="#3c6f97"/>
+                <circle cx="272" cy="112" r="7" fill="#3c6f97"/>
+                <circle cx="400" cy="112" r="7" fill="#f7f7f5" stroke="#3c6f97" stroke-width="1.5"/>
+                <circle cx="656" cy="112" r="7" fill="#f7f7f5" stroke="#3c6f97" stroke-width="1.5"/>
+                <circle cx="912" cy="112" r="7" fill="#f7f7f5" stroke="#3c6f97" stroke-width="1.5"/>
+                <text x="154" y="138" class="svg-sub">0</text>
+                <text x="202" y="138" class="svg-sub">3</text>
+                <text x="268" y="138" class="svg-sub">7</text>
+                <text x="392" y="138" class="svg-sub">15</text>
+                <text x="648" y="138" class="svg-sub">31</text>
+                <text x="904" y="138" class="svg-sub">47</text>
+                <text x="168" y="96" class="svg-note">measured: +0, +1, +3, +7</text>
+                <text x="420" y="96" class="svg-note">from the code: delay doubles to a 16 s cap, then stays</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Rows are read from <code>internal/backend/remote-state</code> and <code>internal/cloud</code> at v1.17.0
+              <span class="src">from the code</span>; the local and HTTP behaviour and the four filled attempts are
+              <span class="recon">measured here</span>, and the hollow attempts are computed from <code>locker.go</code>. Only
+              a <code>*LockError</code> that names a holder is retried, whatever the timeout. The red cells are the two ways
+              to have no working wait: an S3 backend with no lock option, and a provider store whose errors are not lock errors.
+            </p>
+          </figure>

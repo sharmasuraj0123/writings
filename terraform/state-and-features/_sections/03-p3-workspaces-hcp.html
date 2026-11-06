@@ -1,0 +1,128 @@
+          <h2 id="p3-workspaces-hcp"><span class="secnum">{{S}}</span>Workspaces, remote state and HCP Terraform</h2>
+          <p class="lede">
+            Three features look like boundaries and are not. A CLI workspace is a second key in the same backend, reached with
+            the same credentials. <code>terraform_remote_state</code> reads another configuration's whole state and hands its
+            outputs over with the <code>sensitive</code> flag removed. And HCP Terraform, the one place that does isolate
+            workspaces, does it by turning the CLI into a client of a run service.
+          </p>
+
+          <h3>Workspaces are key mappings</h3>
+          <p>
+            The selected workspace comes from <code>TF_WORKSPACE</code> if set, else from <code>.terraform/environment</code>,
+            else <code>default</code>; a name must be non-empty and equal its own <code>url.PathEscape</code>
+            (<code>internal/command/meta.go</code>:765-835) <span class="src">from the code</span>. What a name maps to is up to
+            the backend. The local backend keeps <code>default</code> at <code>terraform.tfstate</code> and every other workspace
+            in <code>terraform.tfstate.d/&lt;name&gt;/terraform.tfstate</code>; its <code>Workspaces()</code> is
+            <code>default</code> plus the sorted subdirectories, and <code>DeleteWorkspace</code> is an
+            <code>os.RemoveAll</code> that refuses only <code>default</code> (<code>internal/backend/local/backend.go</code>:29-32,
+            199-258). S3 puts other workspaces at <code>&lt;workspace_key_prefix&gt;/&lt;name&gt;/&lt;key&gt;</code> with prefix
+            <code>env:</code>; GCS uses a flat <code>&lt;prefix&gt;/&lt;name&gt;.tfstate</code>; azurerm appends
+            <code>env:&lt;name&gt;</code> to the key; HTTP has no workspaces at all and answers <code>workspace new dev</code>
+            with "workspaces not supported". Creating an S3 workspace takes a lock, re-reads to avoid a race and writes an
+            empty state so the new name is listable (<code>s3/backend_state.go</code>:210-253).
+          </p>
+          <p>
+            The local backend's walk-through in the lab shows the shape <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform apply                    → ws = "ws=default"
+$ terraform workspace new staging    → Created and switched to workspace "staging"!
+$ terraform apply                    → ws = "ws=staging"
+$ terraform workspace new "bad/name" → The workspace name "bad/name" is not allowed. The name must contain only URL safe …
+$ TF_WORKSPACE=nope terraform output → Warning: No outputs found      (and terraform.tfstate.d/nope/ now exists)
+$ terraform workspace select default; terraform workspace delete staging → Error: Workspace is not empty … - terraform_data.env
+$ terraform workspace delete -force staging → Deleted workspace "staging"! WARNING: "staging" was non-empty.</code></pre>
+          <p>
+            Two lines bite. Asking for a workspace's state manager creates its directory, so a mistyped
+            <code>TF_WORKSPACE</code> in a pipeline does not fail; it reads an empty state and leaves a new workspace behind
+            that <code>workspace list</code> then shows (<code>local/backend.go</code>:260-289, 489-509). A
+            <code>plan</code> in that workspace would propose creating everything <span class="recon">reconstruction</span>. And <code>delete -force</code> deletes the
+            state of a non-empty workspace, so the real objects keep running with no record; it also releases the lock before
+            deleting, because some backends cannot delete a locked object, and a TODO notes the gap
+            (<code>internal/command/workspace_delete.go</code>:110-175). On origin/main the closing WARNING becomes a
+            diagnostic, "Workspace %q was non-empty". HashiCorp's CLI documentation says the same thing in its own words:
+            CLI workspaces are not an isolation mechanism, because they share one backend and one set of credentials, while
+            HCP workspaces behave like separate working directories. If two environments need different access, give them
+            different backends or different HCP workspaces.
+          </p>
+
+          <p>
+            The name rules have tightened release by release. v1.13 rejected an empty name in <code>workspace new</code> and
+            <code>delete</code> (#37267, #37275); since v1.16 an invalid name in <code>.terraform/environment</code> is an error
+            for every backend command (#38594), and <code>workspace list -json</code> (#38397) marks the current one
+            (<code>meta.go</code>:808-813; v1.16.0 CHANGELOG) <span class="src">from the code</span>. Inside configuration the
+            name is <code>terraform.workspace</code>, which is how the lab's <code>input = "ws=${terraform.workspace}"</code>
+            printed a different value per workspace. That interpolation is the usual way one configuration serves several
+            environments, and it is also the reason a typo in the name silently changes what the configuration means.
+          </p>
+
+          <h3>Remote state drops <code>sensitive</code></h3>
+          <p>
+            <code>data "terraform_remote_state"</code> lives in the built-in <code>terraform</code> provider. It instantiates a
+            full backend inside the consumer's process, refreshes the producer's entire snapshot and then exposes only the
+            root outputs (<code>internal/builtin/providers/terraform/data_source_state.go</code>:103-179). Two consequences
+            follow. The consumer needs read access to the whole producer state, which (§01) holds every secret in cleartext.
+            And the copy loses its marks, at <code>data_source_state.go</code>:143-146 and 172-176:
+          </p>
+          <pre><code>	if err := state.RefreshState(); err != nil {
+		diags = diags.Append(err)
+		return cty.NilVal, diags
+	}
+	…
+	for k, os := range remoteState.RootOutputValues {
+		outputs[k] = os.Value
+	}
+
+	newState["outputs"] = cty.ObjectVal(outputs)</code></pre>
+          <p>
+            The loop copies <code>os.Value</code> and never reads <code>os.Sensitive</code> <span class="src">from the code</span>.
+            In the lab, a producer with <code>output "token" { value = "s3cr3t"  sensitive = true }</code> printed
+            <code>token = &lt;sensitive&gt;</code> on apply. A consumer that read it through a local
+            <code>terraform_remote_state</code> and re-exported it as <code>output "token_is"</code> printed
+            <code>token_is = "s3cr3t"</code>, with no error about a sensitive value reaching a non-sensitive output
+            <span class="recon">measured here</span>. So a downstream configuration has to mark such outputs
+            <code>sensitive</code> again itself. <code>GetRootOutputValues</code> sits on the <code>Persistent</code> interface
+            so that an operations backend can grant output-only reads (<code>internal/states/statemgr/persistent.go</code>:31-38);
+            HCP's documentation describes the <code>tfe_outputs</code> data source, which needs only output-read permission.
+          </p>
+
+          <h3>HCP Terraform turns the CLI into a client</h3>
+          <p>
+            The <code>cloud</code> block takes <code>hostname</code> (default <code>app.terraform.io</code>),
+            <code>organization</code>, <code>token</code> and <code>workspaces { name | tags | project }</code>, with
+            environment fallbacks such as <code>TF_CLOUD_ORGANIZATION</code> and <code>TF_WORKSPACE</code>
+            (<code>internal/cloud/backend.go</code>:43, 145-180, 496-600). The package arrived in v1.1.0 as the successor to the
+            <code>remote</code> backend, which is still registered in v1.17 <span class="src">from the code</span>. With no
+            token, <code>init</code> stops at "Initializing HCP Terraform..." with "Error: Required token could not be found"
+            <span class="recon">measured here</span>; that is as far as this machine could go.
+          </p>
+          <p>
+            Unless the workspace uses local execution, <code>plan</code> and <code>apply</code> no longer run on your machine.
+            The CLI creates a configuration version, uploads the directory (honouring <code>.terraformignore</code>), creates a
+            run and streams its logs (<code>internal/cloud/backend.go</code>:918-935; <code>backend_common.go</code>:556-618).
+            A <code>plan</code> without <code>-out</code> is a speculative run; <code>plan -out</code> makes a saved-plan run;
+            <code>-refresh-only</code>, <code>-destroy</code> and <code>-minimal-refresh</code> map to run options
+            (<code>backend_plan.go</code>:126-175). The CLI renders a run in a fixed order: pre-plan tasks, plan, post-plan
+            tasks, cost estimate, Sentinel, then Terraform Policy evaluations (<code>backend_plan.go</code>:280-345).
+            HCP's run-states page puts the OPA check before cost estimation and Sentinel after it, so the docs and the CLI's
+            rendering disagree. The code half is verified; the web half was not re-checked.
+          </p>
+          <p>
+            The selector has two modes. With <code>workspaces { name = … }</code>, <code>TF_WORKSPACE</code> may only repeat
+            that name; with <code>tags</code>, which takes a string list or, preferred since v1.10 (#35937), a key-value map,
+            <code>TF_WORKSPACE</code> picks among the matching workspaces (<code>internal/cloud/backend.go</code>:538-600).
+            Around the run, HCP adds things the CLI cannot see or test: run tasks at four stages with advisory or mandatory
+            enforcement, a stored state version per run with rollback from the UI, and health assessments for drift on paid
+            tiers. Those come from HashiCorp's documentation, fetched on 23 October 2026, and were not exercised here.
+          </p>
+          <p>
+            Persisting to HCP uploads three things: the raw state, a schema-aware JSON rendering when schemas are available,
+            and the JSON outputs, with lineage, serial, an MD5 and the run ID (<code>internal/cloud/state.go</code>:164-331).
+            That is why <code>PersistState</code> takes schemas (§01), and why <code>state push</code> and
+            <code>state mv</code> load provider schemas first in cloud mode. Intermediate snapshots are off unless the API
+            returns an <code>X-Terraform-Snapshot-Interval</code> header; final snapshots always upload. One more choice is
+            deliberate. When the last state upload failed, the cloud manager does not unlock, at
+            <code>internal/cloud/state.go</code>:462-466: "If so, we will not unlock the workspace to prevent any changes from
+            being applied until the correct state is uploaded." A workspace stuck in "Locked by Terraform" after a network
+            failure may be guarding a state that never arrived, and force-unlocking it with <code>&lt;org&gt;/&lt;workspace&gt;</code>
+            should come after uploading the right state <span class="recon">reconstruction</span>.
+          </p>

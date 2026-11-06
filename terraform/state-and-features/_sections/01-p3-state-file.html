@@ -1,0 +1,281 @@
+          <h2 id="p3-state-file"><span class="secnum">{{S}}</span>One document per workspace</h2>
+          <p class="lede">
+            Terraform is a compiler whose intermediate representation is a dependency graph and whose back end is somebody
+            else's process. Parts 1 and 2 followed one plan from bytes to provider calls. This part covers what lasts after
+            the run. Terraform's record of what exists is one JSON document per workspace. It is rewritten whole, it stores
+            secrets in plaintext, and two writers are kept apart only by an advisory lock that each backend builds from its
+            own storage. No write does a compare-and-swap. The second half of this part follows the features added from
+            v1.5 to v1.17. Almost every one is a small schema, a graph node and usually one new RPC, and the newest ones are
+            the least finished: gated behind experiments, sold through HCP, or run in a separate process.
+          </p>
+
+          <h3>The manager contract</h3>
+          <p>
+            Every place Terraform keeps state is reached through a <code>statemgr.Full</code>. That is three interfaces in
+            one: <code>Transient</code> (an in-memory snapshot, <code>State</code> and <code>WriteState</code>),
+            <code>Persistent</code> (<code>RefreshState</code>, <code>PersistState</code>, <code>GetRootOutputValues</code>)
+            and <code>Locker</code> (<code>Lock</code>, <code>Unlock</code>)
+            (<code>internal/states/statemgr/statemgr.go</code>:12-29; <code>persistent.go</code>:25-29)
+            <span class="src">from the code</span>. A transient snapshot lives only inside the process; a persistent one is
+            shared with other Terraform processes. The split lets a backend take a write after every resource but upload
+            less often (<code>transient.go</code>:11-14; <code>persistent.go</code>:19-21). <code>PersistState</code> even
+            takes the provider schemas as an argument, because HCP Terraform uploads a schema-aware JSON rendering beside
+            the raw snapshot (<code>persistent.go</code>:83-88).
+          </p>
+          <p>
+            The contract says what a persister owes other processes. <code>persistent.go</code>:77-81 states that a
+            Persister "must detect updates made by other processes that may be running concurrently and avoid destroying
+            those changes". The next interface relaxes it at once: a manager that also implements <code>Locker</code> need
+            only be concurrency-safe "within a single Terraform process", "under the assumption that the locking mechanism
+            effectively prevents multiple Terraform processes from reading and writing state concurrently"
+            (<code>locker.go</code>:28-34). The lock is also advisory by contract: "A Locker is not required to prevent
+            non-cooperating processes from concurrently modifying the state" (<code>locker.go</code>:41-47)
+            <span class="src">from the code</span>. So the guarantee is a lock that cooperating Terraform processes respect.
+            §02 shows what that lock is on each backend.
+          </p>
+
+          <h3>The v4 file</h3>
+          <p>
+            The document itself is version 4 JSON with seven top-level keys: <code>version</code> (hard-coded 4),
+            <code>terraform_version</code>, <code>serial</code>, <code>lineage</code>, <code>outputs</code>,
+            <code>resources</code> and <code>check_results</code> (<code>internal/states/statefile/version4.go</code>:668-675).
+            Resources and their instances are sorted with <code>sort.Stable</code> by module, mode, type and name, so two
+            equivalent states serialize identically and diffs stay small (<code>version4.go</code>:682-684). Each instance
+            records its <code>schema_version</code>, <code>attributes</code>, <code>sensitive_attributes</code>, identity
+            fields, <code>private</code> and <code>dependencies</code>; the struct also declares an <code>each</code> field
+            that the v4 writer never sets, and measured states have none (<code>version4.go</code>:694-722)
+            <span class="src">from the code</span>. The <code>dependencies</code> list matters later: destroy order is
+            computed from it, not from the current configuration (<a href="../engine-and-providers/#p2-plan-apply">Part 2</a>).
+          </p>
+          <p>
+            Sensitivity is metadata, not encryption. A lab apply with a sensitive variable, a
+            <code>random_password</code> and a sensitive output left all three in cleartext. The output <code>pw</code> sits
+            in the file as <code>"value": "xdcJMevxyoflqcL6"</code> next to <code>"sensitive": true</code>, and the variable's
+            value sits inside <code>terraform_data.app</code>'s <code>input</code>. <code>sensitive_attributes</code> is only a
+            list of paths, here <code>[input, secret]</code>. The provider-computed copy of the same value in
+            <code>output.secret</code> carries no path at all <span class="recon">measured here</span>. Why the mark does not
+            follow that copy is an open question. The practical rule: anyone who can read the state blob can read every
+            secret in it, so restrict reads of the state storage itself. HashiCorp's documentation
+            says to keep secrets out of state with ephemeral values and write-only arguments (§06).
+          </p>
+
+          <figure class="figure wide" id="fig-state-file">
+            <div class="figure-head">
+              <span class="figure-label">Figure 15</span>
+              <p class="figure-title">The state file, its two counters, and the only gate that checks them</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 470" role="img" aria-label="Left: an annotated v4 state file from a lab apply with lineage, serial 6, a sensitive output in cleartext, a terraform_data instance whose secret appears in cleartext in input and output with only the input path flagged, and its dependencies. Middle: serial counters; the local filesystem manager bumps serial on every differing write, reaching 4 after a fresh three-resource apply and 6 after the next apply, while a remote state uploaded once and reached serial 1. Right: the outcomes of CheckValidImport, used only by a non-forced state push, with the three measured error messages.">
+                <defs>
+                  <marker id="fig-state-file-black" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-state-file-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="10" y="22" class="svg-lane">TERRAFORM.TFSTATE (LAB E1, AFTER TWO APPLIES)</text>
+                <rect x="10" y="32" width="520" height="400" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="22" y="54" class="svg-sub" style="fill:#252525" xml:space="preserve">{</text>
+                <text x="22" y="74" class="svg-sub" style="fill:#252525" xml:space="preserve">  "version": 4,</text>
+                <text x="22" y="94" class="svg-sub" style="fill:#252525" xml:space="preserve">  "terraform_version": "1.17.0",</text>
+                <rect x="30" y="102" width="102" height="18" rx="3" fill="#ece6f3"/>
+                <text x="22" y="115" class="svg-sub" style="fill:#252525" xml:space="preserve">  "serial": 6,</text>
+                <rect x="30" y="123" width="276" height="18" rx="3" fill="#ece6f3"/>
+                <text x="22" y="136" class="svg-sub" style="fill:#252525" xml:space="preserve">  "lineage": "83ff9767-…-e40f5f293ebb",</text>
+                <text x="22" y="157" class="svg-sub" style="fill:#252525" xml:space="preserve">  "outputs": { "pw": {</text>
+                <rect x="42" y="165" width="208" height="18" rx="3" fill="#f3dfdc"/>
+                <text x="22" y="178" class="svg-sub" style="fill:#252525" xml:space="preserve">    "value": "xdcJMevxyoflqcL6",</text>
+                <text x="22" y="199" class="svg-sub" style="fill:#252525" xml:space="preserve">    "sensitive": true } },</text>
+                <text x="22" y="220" class="svg-sub" style="fill:#252525" xml:space="preserve">  "resources": [ …,</text>
+                <text x="22" y="241" class="svg-sub" style="fill:#252525" xml:space="preserve">    { "type": "terraform_data", "name": "app",</text>
+                <text x="22" y="262" class="svg-sub" style="fill:#252525" xml:space="preserve">      "instances": [{ "attributes": {</text>
+                <rect x="66" y="270" width="220" height="18" rx="3" fill="#f3dfdc"/>
+                <text x="22" y="283" class="svg-sub" style="fill:#252525" xml:space="preserve">        "input":  {"secret": "s3cret"},</text>
+                <rect x="66" y="291" width="220" height="18" rx="3" fill="#f3dfdc"/>
+                <text x="22" y="304" class="svg-sub" style="fill:#252525" xml:space="preserve">        "output": {"secret": "s3cret"} },</text>
+                <text x="22" y="325" class="svg-sub" style="fill:#252525" xml:space="preserve">        "sensitive_attributes":</text>
+                <text x="22" y="346" class="svg-sub" style="fill:#252525" xml:space="preserve">          [[input, secret]],</text>
+                <text x="22" y="367" class="svg-sub" style="fill:#252525" xml:space="preserve">        "dependencies": ["random_pet.name"]</text>
+                <text x="22" y="388" class="svg-sub" style="fill:#252525" xml:space="preserve">      }] } ],</text>
+                <text x="22" y="409" class="svg-sub" style="fill:#252525" xml:space="preserve">  "check_results": null }</text>
+                <text x="332" y="115" class="svg-note">bumped per write (local)</text>
+                <text x="332" y="136" class="svg-note">minted once, kept forever</text>
+                <text x="332" y="199" class="svg-note">cleartext; "sensitive" is a flag</text>
+                <text x="332" y="241" class="svg-note">sorted by module, mode, type, name</text>
+                <text x="332" y="304" class="svg-note">provider's copy: not flagged</text>
+                <text x="332" y="346" class="svg-note">a path list, not encryption</text>
+                <text x="332" y="388" class="svg-note">destroy order comes from here</text>
+                <text x="332" y="409" class="svg-note">"each": declared, never written</text>
+
+                <text x="552" y="22" class="svg-lane">WHAT SERIAL COUNTS</text>
+                <text x="552" y="48" class="svg-step">statemgr.Filesystem (local)</text>
+                <text x="552" y="66" class="svg-sub">one bump per differing WriteState</text>
+                <rect x="552" y="78" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="567" y="97" class="svg-sub" style="fill:#252525">1</text>
+                <rect x="600" y="78" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="615" y="97" class="svg-sub" style="fill:#252525">2</text>
+                <rect x="648" y="78" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="663" y="97" class="svg-sub" style="fill:#252525">3</text>
+                <rect x="696" y="78" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="711" y="97" class="svg-sub" style="fill:#252525">4</text>
+                <text x="552" y="124" class="svg-sub">fresh apply, 3 resources: serial 4</text>
+                <rect x="552" y="136" width="40" height="28" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="567" y="155" class="svg-sub" style="fill:#252525">4</text>
+                <rect x="600" y="136" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="615" y="155" class="svg-sub" style="fill:#252525">5</text>
+                <rect x="648" y="136" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="663" y="155" class="svg-sub" style="fill:#252525">6</text>
+                <text x="552" y="182" class="svg-sub">one changed input: 4 → 6; .backup = 4</text>
+
+                <text x="552" y="222" class="svg-step">remote.State (toy HTTP server)</text>
+                <text x="552" y="240" class="svg-sub">one bump per persist that differs</text>
+                <rect x="552" y="252" width="40" height="28" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="567" y="271" class="svg-sub" style="fill:#252525">1</text>
+                <text x="604" y="271" class="svg-sub">GET LOCK GET GET POST UNLOCK</text>
+                <text x="552" y="298" class="svg-sub">1-resource apply: one upload, serial 1</text>
+                <text x="552" y="330" class="svg-sub">persists: every 20 s, plus a final one</text>
+                <text x="552" y="348" class="svg-sub">no compare-and-swap on the remote serial</text>
+                <text x="552" y="392" class="svg-note">Neither counter is checked on an ordinary</text>
+                <text x="552" y="408" class="svg-note">write: the lock is the only exclusion.</text>
+
+                <text x="812" y="22" class="svg-lane">CHECKVALIDIMPORT</text>
+                <text x="812" y="40" class="svg-sub">new snapshot vs stored</text>
+                <rect x="812" y="52" width="258" height="26" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="822" y="69" class="svg-sub" style="fill:#252525">newer serial, same lineage: ok</text>
+                <rect x="812" y="84" width="258" height="26" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="822" y="101" class="svg-sub" style="fill:#252525">empty lineage (legacy): ok</text>
+                <rect x="812" y="116" width="258" height="26" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="822" y="133" class="svg-sub" style="fill:#252525">same serial, same content: ok</text>
+                <rect x="812" y="148" width="258" height="58" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="822" y="165" class="svg-sub" style="fill:#252525">older serial:</text>
+                <text x="822" y="182" class="svg-sub">cannot import state with serial 2</text>
+                <text x="822" y="198" class="svg-sub">over newer state with serial 6</text>
+                <rect x="812" y="212" width="258" height="58" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="822" y="229" class="svg-sub" style="fill:#252525">other lineage:</text>
+                <text x="822" y="246" class="svg-sub">cannot import state with lineage</text>
+                <text x="822" y="262" class="svg-sub">"00000000-…" over unrelated state</text>
+                <rect x="812" y="276" width="258" height="58" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="822" y="293" class="svg-sub" style="fill:#252525">same serial, other content:</text>
+                <text x="822" y="310" class="svg-sub">cannot overwrite existing state</text>
+                <text x="822" y="326" class="svg-sub">with serial 6 with a different state</text>
+                <rect x="812" y="346" width="258" height="64" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+                <text x="822" y="364" class="svg-sub" style="fill:#252525">used by: state push (no -force)</text>
+                <text x="822" y="381" class="svg-sub">skipped: state push -force,</text>
+                <text x="822" y="398" class="svg-sub">-migrate-state (always forced)</text>
+                <line x1="738" y1="92" x2="806" y2="92" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-state-file-purple)"/>
+                <text x="10" y="458" class="svg-note">Highlighted lines: purple are the two counters; red are values that were secret in configuration and are cleartext in the file.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The file is lab <code>e1</code>'s state after a fresh apply and a second apply with
+              <code>-var secret=s3cret</code>, trimmed; the serial runs and the three error strings are from the lab's applies
+              and <code>state push</code> attempts <span class="recon">measured here</span>. The remote run is one
+              resource against a 30-line HTTP server, so it is not the same apply as the local runs. Lineage and serial are
+              compared in only two places, a non-forced <code>state push</code> and the saved-plan check; everywhere else
+              the backend's lock does the work.
+            </p>
+          </figure>
+
+          <h3>Lineage, serial, and where they are checked</h3>
+          <p>
+            Two fields identify a snapshot. <code>lineage</code> is a random UUID minted once, when state is first recorded
+            at a location, and kept forever; <code>serial</code> counts snapshots within that lineage, and
+            <code>NewStateFile</code> starts at serial 0 (<code>statemgr/lineage.go</code>:12-23; <code>helper.go</code>:16-24).
+            <code>SnapshotMeta.Compare</code> sorts a pair into five relations: older, newer, equal, unrelated (different
+            lineage) and legacy (empty lineage) (<code>migrate.go</code>:137-175) <span class="src">from the code</span>. The
+            gate that uses them is <code>CheckValidImport</code>, at <code>internal/states/statemgr/migrate.go</code>:195-210:
+          </p>
+          <pre><code>	rel := new.Compare(existing)
+	switch rel {
+	case SnapshotNewer:
+		return nil // a newer snapshot is fine
+	case SnapshotLegacy:
+		return nil // anything goes for a legacy state
+	case SnapshotUnrelated:
+		return fmt.Errorf("cannot import state with lineage %q over unrelated state with lineage %q", new.Lineage, existing.Lineage)
+	case SnapshotEqual:
+		if statefile.StatesMarshalEqual(newFile.State, existingFile.State) {
+			// If lineage, serial, and state all match then this is fine.
+			return nil
+		}
+		return fmt.Errorf("cannot overwrite existing state with serial %d with a different state that has the same serial", new.Serial)
+	case SnapshotOlder:
+		return fmt.Errorf("cannot import state with serial %d over newer state with serial %d", new.Serial, existing.Serial)</code></pre>
+          <p>
+            This gate guards one door: a non-forced <code>terraform state push</code>. Both the filesystem manager and
+            <code>remote.State</code> run it only inside <code>WriteStateForMigration</code> when <code>force</code> is false
+            (<code>filesystem.go</code>:420; <code>internal/states/remote/state.go</code>:102). Backend migration always passes
+            true: <code>statemgr.Migrate</code> calls <code>WriteStateForMigration(s, true)</code> when both sides support
+            it, and otherwise a plain <code>WriteState</code> that loses lineage and serial altogether
+            (<code>migrate.go</code>:58-71). During <code>init -migrate-state</code> lineage is used only to skip copying a
+            state that is already identical (<code>internal/command/meta_backend_migrate.go</code>:352-361); the overwrite is
+            gated by a confirmation prompt, and <code>-force-copy</code> skips the prompt <span class="src">from the code</span>.
+            The other door is the saved plan: apply refuses "Saved plan is stale" when a new snapshot was persisted after the
+            plan was written (<a href="../engine-and-providers/#p2-plan-apply">Part 2</a>). Everything else, including every
+            write during an ordinary apply, goes through without a comparison.
+          </p>
+          <p>
+            The lab's <code>state push</code> run shows the gate at work on a local state at serial 6 with lineage
+            <code>211cc19e-…</code> <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform state push older.json        # serial set to 2
+Failed to write state: cannot import state with serial 2 over newer state with serial 6
+$ (lineage 0000…, serial 99) → cannot import state with lineage "00000000-…" over unrelated state with lineage "211cc19e-…"
+$ (serial 6, one instance dropped) → cannot overwrite existing state with serial 6 with a different state that has the same serial
+$ (serial 20, one instance dropped) → ok; stored serial 21
+$ terraform state push -force other.json  → stored lineage 00000000-…, serial 99</code></pre>
+          <p>
+            The pushed serial 20 landed as 21 because <code>state push</code> writes and persists again after the import,
+            and a changed write bumps the counter (<code>internal/command/state_push.go</code>:139-158). The forced push
+            stored serial 99 only because its content matched the current state; a verifier's re-run with different content
+            got 100. A forced push replaced the lineage outright. The practical consequence is short: <code>-force</code>
+            and <code>-migrate-state</code> are the two commands that can overwrite a teammate's newer state, and nothing
+            but a prompt (or nothing, with <code>-force-copy</code>) stands in the way.
+          </p>
+
+          <h3>Two write paths</h3>
+          <p>
+            The local manager and the remote one count differently. <code>Filesystem.WriteState</code> calls itself "an
+            incorrect implementation of Writer that actually also persists": every write seeks to 0, truncates and writes the
+            file in place, with a TODO to write a temporary file and rename it instead (<code>filesystem.go</code>:124-141,
+            191-196). Its <code>PersistState</code> is a no-op (<code>filesystem.go</code>:228-232). Serial goes up on every
+            write that differs from the snapshot first read (<code>filesystem.go</code>:204-210), so a fresh three-resource
+            apply ended at serial 4 and a later apply that changed one input went from 4 to 6. The <code>.backup</code> file is
+            written once, before the first changing write, and holds the snapshot the manager opened; a first-ever apply leaves
+            none <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <code>remote.State</code> keeps writes in memory and uploads in <code>PersistState</code>, at
+            <code>internal/states/remote/state.go</code>:176-185 and 205-213:
+          </p>
+          <pre><code>	if s.readState != nil {
+		lineageUnchanged := s.readLineage != "" &amp;&amp; s.lineage == s.readLineage
+		serialUnchanged := s.readSerial != 0 &amp;&amp; s.serial == s.readSerial
+		stateUnchanged := statefile.StatesMarshalEqual(s.state, s.readState)
+		if stateUnchanged &amp;&amp; lineageUnchanged &amp;&amp; serialUnchanged {
+			// If the state, lineage or serial haven't changed at all then we have nothing to do.
+			return nil
+		}
+		s.serial++
+	} else {
+	…
+	f := statefile.New(s.state, s.lineage, s.serial)
+
+	var buf bytes.Buffer
+	err := statefile.Write(f, &amp;buf)
+	if err != nil {
+		return err
+	}
+
+	diags := s.Client.Put(buf.Bytes())</code></pre>
+          <p>
+            There is no read of the remote's current serial before the <code>Put</code> <span class="src">from the code</span>.
+            The local backend's <code>StateHook</code> calls <code>WriteState</code> after every resource and
+            <code>PersistState</code> only when forced (on interrupt) or when at least 20 seconds have passed since the last
+            persist; <code>TF_STATE_PERSIST_INTERVAL</code> can raise that interval but not lower it
+            (<code>internal/backend/local/hook_state.go</code>:42-113; <code>persistent.go</code>:190-192). A one-resource
+            apply against a toy HTTP backend produced exactly one upload and serial 1
+            <span class="recon">measured here</span>. So a local serial counts writes and a remote serial counts persists;
+            comparing them across backends means nothing. <code>terraform state mv</code> and <code>rm</code> are one lock,
+            one write and one persist each, bumping serial by one; a cross-state <code>mv -state-out</code> is two
+            independent persists, so a failure between them leaves the object in both files
+            (<code>internal/command/state_mv.go</code>:100-162). Their timestamped backups have one-second resolution, and two
+            mutations in the same second share one file <span class="recon">measured here</span>.
+          </p>

@@ -1,0 +1,308 @@
+          <h2 id="p2-instance"><span class="secnum">{{S}}</span>One instance's plan</h2>
+          <p class="lede">
+            Inside the instance subgraph, each <code>random_pet.p[0]</code> runs the same sequence. Core upgrades and
+            refreshes the stored object, computes what the new object should look like, asks the provider for a plan,
+            checks the answer, and only then decides the action, from values alone. The provider proposes; core
+            decides. One v1.17 option, <code>-minimal-refresh</code>, changes the sequence, and it costs more RPCs, not
+            fewer, as soon as anything changes.
+          </p>
+
+          <h3>Read, upgrade, refresh</h3>
+          <p>
+            The managed-resource path is <code>NodePlannableResourceInstance.managedResourceExecute</code>
+            (<code>internal/terraform/node_resource_plan_instance.go</code>:191-520). It reads the instance from state
+            and upgrades it with <code>UpgradeResourceState</code>, which deliberately receives no configuration:
+            only the type, the stored schema version and the raw JSON or flatmap state, and it must return state valid
+            under the current schema (<code>tfplugin6.proto</code>:506-540). The upgraded object is written into both
+            <code>prevRunState</code> and <code>refreshState</code>. Then, unless refresh is skipped, core sends
+            <code>ReadResource</code>, which also carries no configuration (current state, private bytes,
+            <code>provider_meta</code>, capabilities and identity in; new state, private, deferral and identity out),
+            and stores the result in <code>refreshState</code>. In refresh-only mode the work ends there
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Keeping <code>prevRunState</code> and <code>refreshState</code> apart is what lets <code>planWalk</code>
+            compute drift separately from proposed changes: the first is what the last apply left, the second is what
+            the provider says exists now <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>The proposal core makes before the provider does</h3>
+          <p>
+            Before any RPC about the future, core computes a proposed new object itself with
+            <code>objchange.ProposedNew</code>, after stripping marks from the config and prior values. The rule for
+            each attribute is <code>internal/plans/objchange/objchange.go</code>:349-372:
+          </p>
+<pre><code>		case attr.Computed &amp;&amp; configV.IsNull():
+			// configV will always be null in this case, by definition.
+			// priorV may also be null, but that's okay.
+			newV = priorV
+
+			// the exception to the above is that if the config is optional and
+			// the _prior_ value contains non-computed values, we can infer
+			// that the config must have been non-null previously.
+			if optionalValueNotComputable(attr, priorV) {
+				newV = configV
+			}
+
+		case attr.NestedType != nil:
+			// For non-computed NestedType attributes, we need to descend
+			// into the individual nested attributes to build the final
+			// value, unless the entire nested attribute is unknown.
+			newV = proposedNewNestedType(attr.NestedType, priorV, configV)
+		default:
+			// For non-computed attributes, we always take the config value,
+			// even if it is null. If it's _required_ then null values
+			// should've been caught during an earlier validation step, and
+			// so we don't really care about that here.
+			newV = configV
+		}</code></pre>
+          <p>
+            Read it as a user. If an attribute is optional and computed and you delete it from your configuration,
+            the proposal keeps the old value; the provider decides whether that means "leave it" or "reset it". If
+            an attribute is not computed, deleting it from configuration proposes null, and the plan will show the
+            removal.
+          </p>
+
+          <h3>The request, and the answer core distrusts</h3>
+          <p>
+            <code>PlanResourceChange</code> then carries the config, the prior state, the proposed new state, the prior
+            private bytes, <code>provider_meta</code>, the client capabilities, the prior identity and, since v1.16,
+            planned private bytes (<code>node_resource_abstract_instance.go</code>:998-1051). Every value crosses
+            unmarked. Core keeps the mark paths and re-applies them afterwards, along with any paths the provider's
+            schema calls sensitive (lines 990-993, 1180-1182). It has no choice: go-cty's msgpack encoder refuses a
+            marked value with "value has marks, so it cannot be serialized". The consequence is that a provider never
+            learns that you marked a value <code>sensitive</code>; it sees only its own schema's flags
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            When the answer comes back, core checks it before believing it. Write-only attributes must come back
+            null, or the plan fails with "Provider produced invalid plan" and a message that the provider "returned a
+            value for the write-only attribute". The planned value's type must conform to the schema. And
+            <code>objchange.AssertPlanValid</code> must pass. Its doc comment is the clearest statement of what a
+            provider may do during planning (<code>internal/plans/objchange/plan_valid.go</code>:26-37):
+          </p>
+<pre><code>// During planning, a provider may only make changes to attributes that are null
+// (unset) in the configuration and are marked as "computed" in the resource
+// type schema, in order to insert any default values the provider may know
+// about. If the default value cannot be determined until apply time, the
+// provider can return an unknown value. Providers are forbidden from planning a
+// change that disagrees with any non-null argument in the configuration.
+//
+// As a special exception, providers _are_ allowed to provide attribute values
+// conflicting with configuration if and only if the planned value exactly
+// matches the corresponding attribute value in the prior state. The provider
+// can use this to signal that the new value is functionally equivalent to the
+// old and thus no change is required.</code></pre>
+          <p>
+            The exception is how a provider says that a differently spelled value means the same thing: it plans
+            the prior value back, and the plan shows no change <span class="recon">reconstruction</span>. A
+            response may also carry a <code>Deferred</code> reason; if the walk did not allow deferral and the
+            provider returned no error, core turns that into an error itself (<code>tfplugin6.proto</code>:330-348).
+            One class of provider is excused from <code>AssertPlanValid</code>, <code>node_resource_abstract_instance.go</code>:1118-1127:
+          </p>
+<pre><code>		if errs := objchange.AssertPlanValid(schema.Body, unmarkedPriorVal, unmarkedConfigVal, plannedNewVal); len(errs) &gt; 0 {
+			if resp.LegacyTypeSystem {
+				// The shimming of the old type system in the legacy SDK is not precise
+				// enough to pass this consistency check, so we'll give it a pass here,
+				// but we will generate a warning about it so that we are more likely
+				// to notice in the logs if an inconsistency beyond the type system
+				// leads to a downstream provider failure.
+				var buf strings.Builder
+				fmt.Fprintf(&amp;buf,
+					"[WARN] Provider %q produced an invalid plan for %s, but we are tolerating it because it is using the legacy plugin SDK.\n    The following problems may be the cause of any confusing errors from downstream operations:",</code></pre>
+          <p>
+            <code>LegacyTypeSystem</code> is the SDKv2 flag that the protocol file labels "DO NOT USE THIS". If an
+            apply fails with a confusing error from an SDKv2-based resource, the <code>[WARN] … tolerating it</code>
+            line in a <code>TF_LOG=warn</code> log is where the real inconsistency is recorded.
+          </p>
+
+          <h3>Choosing the action</h3>
+          <p>
+            The provider's response lists <code>requires_replace</code> paths. Core keeps only those whose values
+            actually changed, then picks the action from values in <code>getAction</code>,
+            <code>node_resource_abstract_instance.go</code>:3065-3089:
+          </p>
+<pre><code>	switch {
+	case priorVal.IsNull():
+		action = plans.Create
+	case forceReplace || !reqRep.Empty() || !writeOnly.Intersection(reqRep).Empty():
+		// If the user "forced replace" of this instance of if there are any
+		// "requires replace" paths left _after our filtering above_ then this
+		// is a replace action.
+		if createBeforeDestroy {
+			action = plans.CreateThenDelete
+		} else {
+			action = plans.DeleteThenCreate
+		}
+		switch {
+		case forceReplace:
+			actionReason = plans.ResourceInstanceReplaceByRequest
+		case !reqRep.Empty():
+			actionReason = plans.ResourceInstanceReplaceBecauseCannotUpdate
+		}
+	case eq &amp;&amp; !forceReplace:
+		action = plans.NoOp
+	default:
+		action = plans.Update
+		// "Delete" is never chosen here, because deletion plans are always
+		// created more directly elsewhere, such as in "orphan" handling.
+	}</code></pre>
+          <p>
+            Null prior means create. A forced or genuine replace path means replace, ordered by
+            <code>create_before_destroy</code>. Equal means no-op. Anything else is an update. The order of a replace is
+            fixed here, at plan time. The plan stores the action as one of the runes in
+            <code>plans.Action</code> (<code>internal/plans/action.go</code>:6-30): <code>+</code> create,
+            <code>~</code> update, <code>∓</code> delete-then-create, <code>±</code> create-then-delete, <code>-</code>
+            delete, and newer ones such as <code>.</code> forget.
+          </p>
+          <p>
+            A replace triggers a second request. The comment at lines 1207-1217 explains:
+            "we'll ask the provider to plan again here, giving it a null object for the prior, and then we'll meld that
+            with the _actual_ prior state to produce a correctly-shaped replace change." So a replaced instance costs
+            two <code>PlanResourceChange</code> calls in plan. And because apply plans every instance once more
+            (<a href="#p2-plan-apply">section 07</a>), every instance sees at least two across a plan and an apply.
+            Destroys work the other way: a provider without the <code>plan_destroy</code> capability is not asked at
+            all, and the client stub returns the null proposed state as the plan (<code>grpc_provider.go</code>:648-654).
+          </p>
+
+          <figure class="figure wide" id="fig-instance">
+            <div class="figure-head">
+              <span class="figure-label">Figure 11</span>
+              <p class="figure-title">One managed instance from plan to apply, and the RPCs each refresh mode costs</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 530" role="img" aria-label="Two sequence diagrams between core and a provider. Plan: UpgradeResourceState, ReadResource, ProposedNew in core, PlanResourceChange, core validation, getAction, and a second PlanResourceChange with a null prior for replaces. Apply: ConfigureProvider, PlanResourceChange again with known values, the inconsistent final plan check, ApplyResourceChange, and the inconsistent result after apply check. Bottom right: a grid of ReadResource and PlanResourceChange counts per refresh mode for four instances, with and without a change.">
+                <defs>
+                  <marker id="fig-instance-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-instance-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">PLAN · walkPlan</text>
+                <rect x="45" y="40" width="150" height="26" fill="#252525"/>
+                <text x="120" y="58" class="svg-step" text-anchor="middle" style="fill: #ffffff">core</text>
+                <rect x="400" y="40" width="130" height="26" fill="#367f59"/>
+                <text x="465" y="58" class="svg-step" text-anchor="middle" style="fill: #ffffff">provider</text>
+                <line x1="120" y1="66" x2="120" y2="420" stroke="#b8b8b1" stroke-dasharray="4 4"/>
+                <line x1="465" y1="66" x2="465" y2="420" stroke="#b8b8b1" stroke-dasharray="4 4"/>
+                <line x1="196" y1="92" x2="460" y2="92" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-instance-b)"/>
+                <text x="206" y="86" class="svg-sub">UpgradeResourceState · no config</text>
+                <rect x="45" y="104" width="150" height="26" fill="#ece6f3" stroke="#765b98" stroke-dasharray="4 3"/>
+                <text x="58" y="121" class="svg-sub">prevRun + refresh</text>
+                <line x1="196" y1="150" x2="460" y2="150" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-instance-b)"/>
+                <text x="206" y="144" class="svg-sub">ReadResource · no config</text>
+                <rect x="45" y="164" width="150" height="26" fill="#ffffff" stroke="#252525"/>
+                <text x="58" y="181" class="svg-sub">ProposedNew</text>
+                <line x1="196" y1="214" x2="460" y2="214" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-instance-b)"/>
+                <text x="206" y="208" class="svg-sub">PlanResourceChange</text>
+                <text x="206" y="230" class="svg-sub">prior · config · proposed</text>
+                <rect x="45" y="244" width="150" height="40" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="58" y="261" class="svg-sub">write-only null?</text>
+                <text x="58" y="277" class="svg-sub">AssertPlanValid</text>
+                <rect x="45" y="294" width="150" height="40" fill="#ffffff" stroke="#252525"/>
+                <text x="58" y="311" class="svg-sub">RequiresReplace</text>
+                <text x="58" y="327" class="svg-sub">→ getAction</text>
+                <line x1="196" y1="358" x2="460" y2="358" stroke="#3c6f97" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#fig-instance-b)"/>
+                <text x="206" y="352" class="svg-sub">PlanResourceChange again</text>
+                <text x="206" y="374" class="svg-sub">null prior · replace only</text>
+                <rect x="45" y="388" width="150" height="26" fill="#ece6f3" stroke="#765b98" stroke-dasharray="4 3"/>
+                <text x="58" y="405" class="svg-sub">change → plan file</text>
+
+                <line x1="572" y1="30" x2="572" y2="420" stroke="#deded9"/>
+                <text x="600" y="26" class="svg-lane">APPLY · walkApply</text>
+                <rect x="615" y="40" width="170" height="26" fill="#252525"/>
+                <text x="700" y="58" class="svg-step" text-anchor="middle" style="fill: #ffffff">core</text>
+                <rect x="960" y="40" width="130" height="26" fill="#367f59"/>
+                <text x="1025" y="58" class="svg-step" text-anchor="middle" style="fill: #ffffff">provider</text>
+                <line x1="700" y1="66" x2="700" y2="300" stroke="#b8b8b1" stroke-dasharray="4 4"/>
+                <line x1="1025" y1="66" x2="1025" y2="300" stroke="#b8b8b1" stroke-dasharray="4 4"/>
+                <line x1="786" y1="92" x2="1020" y2="92" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-instance-b)"/>
+                <text x="796" y="86" class="svg-sub">ConfigureProvider · once</text>
+                <line x1="786" y1="130" x2="1020" y2="130" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-instance-b)"/>
+                <text x="796" y="124" class="svg-sub">PlanResourceChange</text>
+                <text x="796" y="146" class="svg-sub">inputs now known</text>
+                <rect x="615" y="158" width="170" height="40" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="627" y="175" class="svg-sub">checkPlannedChange</text>
+                <text x="627" y="191" class="svg-sub">"final plan"</text>
+                <line x1="786" y1="216" x2="1020" y2="216" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-instance-b)"/>
+                <text x="796" y="210" class="svg-sub">ApplyResourceChange</text>
+                <text x="796" y="232" class="svg-sub">no create/update/delete flag</text>
+                <rect x="615" y="244" width="170" height="40" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="627" y="261" class="svg-sub">AssertObjectCompatible</text>
+                <text x="627" y="277" class="svg-sub">"result after apply"</text>
+                <line x1="700" y1="284" x2="700" y2="304" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-instance-p)"/>
+                <rect x="615" y="306" width="170" height="26" fill="#ece6f3" stroke="#765b98" stroke-dasharray="4 3"/>
+                <text x="627" y="323" class="svg-sub">state write · serial+1</text>
+
+                <text x="600" y="368" class="svg-lane">RPCS · 4 INSTANCES · TF_LOG=trace</text>
+                <g class="svg-sub">
+                  <text x="600" y="392" class="svg-sub">mode</text>
+                  <text x="830" y="392" class="svg-sub">Read</text>
+                  <text x="900" y="392" class="svg-sub">Plan</text>
+                </g>
+                <text x="600" y="414" class="svg-sub">default, no change</text>
+                <text x="600" y="436" class="svg-sub">-minimal-refresh, no change</text>
+                <text x="600" y="458" class="svg-sub">-refresh-only</text>
+                <text x="600" y="480" class="svg-sub">default, with change</text>
+                <text x="600" y="502" class="svg-sub">-minimal-refresh, change</text>
+                <rect x="820" y="400" width="56" height="20" fill="#c9dbe8"/><text x="848" y="414" class="svg-sub" text-anchor="middle">4</text>
+                <rect x="890" y="400" width="56" height="20" fill="#c9dbe8"/><text x="918" y="414" class="svg-sub" text-anchor="middle">4</text>
+                <rect x="820" y="422" width="56" height="20" fill="#f7f7f5"/><text x="848" y="436" class="svg-sub" text-anchor="middle">0</text>
+                <rect x="890" y="422" width="56" height="20" fill="#c9dbe8"/><text x="918" y="436" class="svg-sub" text-anchor="middle">4</text>
+                <rect x="820" y="444" width="56" height="20" fill="#c9dbe8"/><text x="848" y="458" class="svg-sub" text-anchor="middle">4</text>
+                <rect x="890" y="444" width="56" height="20" fill="#f7f7f5"/><text x="918" y="458" class="svg-sub" text-anchor="middle">0</text>
+                <rect x="820" y="466" width="56" height="20" fill="#c9dbe8"/><text x="848" y="480" class="svg-sub" text-anchor="middle">4</text>
+                <rect x="890" y="466" width="56" height="20" fill="#9dbdd5"/><text x="918" y="480" class="svg-sub" text-anchor="middle">8</text>
+                <rect x="820" y="488" width="56" height="20" fill="#c9dbe8"/><text x="848" y="502" class="svg-sub" text-anchor="middle">4</text>
+                <rect x="890" y="488" width="56" height="20" fill="#f3dfdc" stroke="#ad4b43"/><text x="918" y="502" class="svg-sub" text-anchor="middle">16</text>
+                <text x="962" y="502" class="svg-note">twice the default</text>
+                <text x="30" y="446" class="svg-note">Blue arrows carry msgpack values (requests only drawn).</text>
+                <text x="30" y="464" class="svg-note">Red boxes are core's checks on the provider's answers;</text>
+                <text x="30" y="482" class="svg-note">purple dashed boxes write state copies. A failed check</text>
+                <text x="30" y="500" class="svg-note">is reported as a provider bug, except for SDKv2</text>
+                <text x="30" y="518" class="svg-note">providers, which get a [WARN] log line instead.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              The provider proposes and core decides, twice: once in plan and again at apply with known inputs. The
+              sequence is from <code>node_resource_plan_instance.go</code> and <code>node_resource_abstract_instance.go</code>
+              <span class="src">from the code</span>; the grid counts <code>GRPCProvider</code> lines in trace logs of
+              the engine lab's four gRPC-backed instances, and the "with change" rows follow a <code>random_pet</code>
+              length change that forces replacements downstream <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3><code>-minimal-refresh</code>, counted</h3>
+          <p>
+            v1.17.0 added <code>-minimal-refresh</code> (#35290, <code>137cba0ae</code>). When it is set, the instance
+            node runs a plan <em>before</em> refreshing. If that pre-refresh plan is a no-op, the node reports it and
+            returns without calling <code>ReadResource</code>. If not, it logs "Minimal refresh: refreshing resource as
+            the initial plan produced a … change", refreshes, and plans again
+            (<code>node_resource_plan_instance.go</code>:342-421). It never skips the refresh when the state or
+            identity schema was just upgraded; orphan, deposed and destroy nodes treat it as plain
+            <code>-refresh=false</code>; and on a destroy plan it simply becomes <code>SkipRefresh</code>
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The engine lab counted the RPCs on the configuration from <a href="#p2-plan-graph">section 01</a>, with
+            existing state, four gRPC-backed instances and the two built-in <code>terraform_data</code> instances
+            running in-process and uncounted <span class="recon">measured here</span>:
+          </p>
+<pre><code>mode=''                ReadResource=4 PlanRC=4  Upgrade=4 minimal_skip=0
+mode='-minimal-refresh' ReadResource=0 PlanRC=4  Upgrade=4 minimal_skip=6
+mode='-refresh=false'  ReadResource=0 PlanRC=4  Upgrade=4
+mode='-refresh-only'   ReadResource=4 PlanRC=0  Upgrade=4
+# after changing random_pet length 2-&gt;3 (forces replacement downstream):
+-minimal-refresh       ReadResource=4 PlanRC=16 refreshing=6   Plan: 4 to add, 2 to change, 4 to destroy.
+# same change, default mode:
+(default)              ReadResource=4 PlanRC=8
+$ terraform plan -minimal-refresh -refresh=false
+Error: Incompatible refresh options</code></pre>
+          <p>
+            With nothing to change, the flag removes every <code>ReadResource</code>; the six skip lines include the
+            two built-in instances. With one change, it costs 4 reads and 16 plans against the default's 4 and 8: the pre-refresh
+            plan, the refresh, the real plan, and the replace re-plans on top. Use it on large configurations that are
+            usually unchanged, where refresh dominates; leave it off for runs you expect to change things. It also
+            does not look for drift on instances whose configuration did not change, since it never reads them
+            <span class="recon">reconstruction</span>. Note what the CLI does not catch:
+            <code>-destroy -invoke=…</code> reaches core and fails with "This is a bug in Terraform."; that edge is in
+            <a href="../state-and-features/#p3-query-actions">Part 3</a>.
+          </p>
