@@ -1,0 +1,205 @@
+          <h2 id="p2-plan-apply"><span class="secnum">{{S}}</span>Plan files and the apply re-plan</h2>
+          <p class="lede">
+            A saved plan looks like a script for apply to run. It is not. Apply builds a new graph from the plan's
+            changes, plans every instance again with the inputs that are now known, and checks the new plan against
+            the saved one. The saved plan is a contract the second plan must honour, not a list of steps.
+          </p>
+
+          <h3>What <code>-out</code> writes</h3>
+          <p>
+            <code>terraform plan -out=p.tfplan</code> writes a Deflate ZIP (<code>internal/plans/planfile/writer.go</code>:54-139).
+            It holds a protobuf <code>tfplan</code>, two state snapshots (<code>tfstate</code> and
+            <code>tfstate-prev</code>), a <code>tfconfig/</code> snapshot of every module's source with a
+            <code>modules.json</code> index, and the dependency lock file. The engine lab's plan
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ python3 -I -c "import zipfile; [print(i.filename, i.file_size, i.compress_type) for i in zipfile.ZipFile('p.tfplan').infolist()]"
+tfplan 1276 8 / tfstate 145 8 / tfstate-prev 145 8 / tfconfig/m-/main.tf 589 8
+tfconfig/m-child/main.tf 157 8 / tfconfig/modules.json 130 8 / .terraform.lock.hcl 1229 8
+$ python3 -I tools/pbdump.py p.tfplan tfplan 3      # schema-less protobuf dumper written for this dossier
+#1 varint 3
+#3 msg (158 bytes)
+  #8 str 'provider["terraform.io/builtin/terraform"]'
+  #9 msg  #1 varint 1   #2 msg  #1 bytes (83) 85a26964c7030c8101c2a5696e707574…
+  #13 str 'terraform_data.d["a"]'
+#13 msg  #1 str 'local' … #3 str 'default'
+#14 str '1.17.0'   #21 str '2026-10-23T14:58:28Z'   #25 varint 1   #26 varint 1</code></pre>
+          <p>
+            The file was 3,017 bytes; the verifier's copy of the same plan was 3,012, because ZIP timestamps differ.
+            The lab project's two-environment, three-cloud plan in <a href="../three-clouds/#p4-project">Part 4</a> is
+            about 28.9 KB as a ZIP and 120,110 bytes as <code>show -json</code>. Field 1 is the format version, and the
+            reader is unforgiving about it and about the binary that wrote it,
+            <code>internal/plans/planfile/tfplan.go</code>:57-62:
+          </p>
+<pre><code>	if rawPlan.Version != tfplanFormatVersion {
+		return nil, fmt.Errorf("unsupported plan file format version %d; only version %d is supported", rawPlan.Version, tfplanFormatVersion)
+	}
+
+	if rawPlan.TerraformVersion != version.String() {
+		return nil, fmt.Errorf("plan file was created by Terraform %s, but this is %s; plan files cannot be transferred between different Terraform versions", rawPlan.TerraformVersion, version.String())</code></pre>
+          <p>
+            <code>tfplanFormatVersion</code> is 3. A plan made by v1.17.0 can be applied only by v1.17.0: pin the exact
+            Terraform version in the CI job that plans and the one that applies, or the hand-off fails at the door
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Inside, each resource change records its address as a compact string (field 13; fields 1–6 are retired),
+            its provider configuration (8) and the change (9) with an action and the before and after values. The
+            protobuf <code>Action</code> enum skips 4: <code>NOOP</code> is 0 and <code>UPDATE</code> 3,
+            <code>DELETE</code> 5, up to <code>FORGET_THEN_CREATE</code> 10. A <code>DynamicValue</code> here is
+            "always encoded as msgpack", the same encoding as on the wire, and the provider's opaque
+            <code>private</code> bytes are stored verbatim to be handed back at apply. Only root-module output changes
+            are serialised; outputs of nested modules are recomputed at apply
+            (<code>tfplan.go</code>:642-648). Root variables are stored as values, except ephemeral ones, which are
+            stored only by name and must be supplied again at apply.
+          </p>
+
+          <h3>Three gates before apply starts</h3>
+          <p>
+            Applying a saved plan passes three checks. The format and version check above runs on read. Then the local
+            backend compares the state snapshot embedded in the plan with the current state
+            (<code>internal/backend/local/backend_local.go</code>:320-345). A different lineage gives "Saved plan does
+            not match the given state". A different serial gives "Saved plan is stale": someone, possibly you, wrote
+            state after this plan was made. A first plan embeds an empty state with serial 0 and an empty lineage. In
+            the lab, applying <code>p.tfplan</code> a second time after a successful apply gave exactly
+            <code>Error: Saved plan is stale</code> <span class="recon">measured here</span>. Last, <code>Context.Apply</code>
+            refuses a plan marked <code>Errored</code> with "Cannot apply failed plan", the partial plans that
+            <a href="#p2-walk">section 02</a> showed are still printed.
+          </p>
+          <p>
+            Apply then decodes the changes, walks over a deep copy of the plan's prior state, and always sets
+            <code>DeferralAllowed: true</code> (<code>context_apply.go</code>:198-232). One decision breaks a rule the
+            plan format states for itself. <code>planfile.proto</code>:23-28 says the UI mode "must never be used to
+            make decisions in Terraform Core during the applying of a plan", and <code>context_apply.go</code>:386-396
+            does exactly that:
+          </p>
+<pre><code>	operation := walkApply
+	if plan.UIMode == plans.DestroyMode {
+		// FIXME: Due to differences in how objects must be handled in the
+		// graph and evaluated during a complete destroy, we must continue to
+		// use plans.DestroyMode to switch on this behavior. If all objects
+		// which require special destroy handling can be tracked in the plan,
+		// then this switch will no longer be needed and we can remove the
+		// walkDestroy operation mode.
+		// TODO: Audit that and remove walkDestroy as an operation mode.
+		operation = walkDestroy
+	}</code></pre>
+
+          <h3>The apply graph is built from the diff</h3>
+          <p>
+            The apply builder (Figure 8) starts like the plan builder, then adds <code>DiffTransformer</code>, which
+            creates one <code>NodeApplyableResourceInstance</code> per planned change, plus nodes for planned actions
+            and deferred changes (<code>graph_builder_apply.go</code>:168-187). Instances exist from the start here,
+            because the plan already enumerated them. Destroy ordering is the interesting part.
+            <code>DestroyEdgeTransformer</code> explains itself at <code>transform_destroy_edge.go</code>:30-43:
+          </p>
+<pre><code>// DestroyEdgeTransformer is a GraphTransformer that creates the proper
+// references for destroy resources. Destroy resources are more complex
+// in that they must be depend on the destruction of resources that
+// in turn depend on the CREATION of the node being destroy.
+//
+// That is complicated. Visually:
+//
+//	B_d -&gt; A_d -&gt; A -&gt; B
+//
+// Notice that A destroy depends on B destroy, while B create depends on
+// A create. They're inverted. This must be done for example because often
+// dependent resources will block parent resources from deleting. Concrete
+// example: VPC with subnets, the VPC can't be deleted while there are
+// still subnets.</code></pre>
+          <p>
+            The dependencies it inverts are the ones recorded in state, in each instance's <code>dependencies</code>
+            list, not the ones in the current configuration (<code>transform_destroy_edge.go</code>:126-256). That is
+            the only way to order the destruction of something you have already deleted from your configuration. It
+            also means a destroy follows the dependencies that were true at the last apply. No-op changes are left out.
+            Edges across two providers are added only if they create no cycle, a check the code's own FIXME calls "the
+            blunt hammer of checking for cycles" (lines 59-66).
+          </p>
+
+          <h3>create_before_destroy is an edge reversal</h3>
+          <p>
+            In plan, <code>ForcedCBDTransformer</code> only propagates <code>create_before_destroy</code> to every
+            dependency of a node that has it, so that apply cannot form a cycle. The apply builder runs it again,
+            under a FIXME admitting that the planned information "is lost for newly created instances". Then
+            <code>CBDEdgeTransformer</code> does the actual work, <code>transform_destroy_cbd.go</code>:114-125:
+          </p>
+<pre><code>		// Find the resource edges
+		for src := range g.EdgesTo(v).All() {
+
+			// If source is a create node, invert the edge.
+			// This covers both the node's own creator, as well as reversing
+			// any dependants' edges.
+			if _, ok := src.(GraphNodeCreator); ok {
+				log.Printf("[TRACE] CBDEdgeTransformer: reversing edge %s -&gt; %s", src.Name(), v.Name())
+				g.RemoveEdge(src, v)
+				g.Connect(v, src)
+			}
+		}</code></pre>
+          <p>
+            Every creator that waited for the destroyer now runs before it, so the old object is deleted after the new
+            one exists and after dependents have been updated to point at it. The old object is first "deposed" under a
+            key that <code>DiffTransformer</code> picks at random from unused keys, so the create node and the destroy
+            node agree on it. A two-resource lab shows both shapes <span class="recon">measured here</span>:
+          </p>
+<pre><code># create_before_destroy = false
+"[root] terraform_data.base" -&gt; "[root] terraform_data.base (destroy)"      # create waits for destroy
+# create_before_destroy = true
+"[root] terraform_data.base (destroy deposed 6ac341bf)" -&gt; "[root] terraform_data.dep"   # destroy waits for dependent update
+$ terraform apply p_cbd
+terraform_data.base: Creating...
+terraform_data.dep: Modifying... [id=71f174ec-...]
+terraform_data.base (deposed object 5fd02ba5): Destroying... [id=af5904e8-...]</code></pre>
+          <p>
+            The key in <code>terraform graph -plan</code> (<code>6ac341bf</code>) is not the key the apply used
+            (<code>5fd02ba5</code>), because each graph build allocates its own; the verifier's re-run got two more
+            different keys. Do not script against a deposed key you read from a graph.
+          </p>
+
+          <h3>Planning again, and two checks</h3>
+          <p>
+            Each apply node plans its instance again. The repository's lifecycle document says so plainly:
+            "<code>PlanResourceChange</code> is actually called twice per run for each resource type", and on the
+            second call the configuration is "guaranteed to have a wholly-known <strong>Configuration</strong>"
+            (<code>docs/resource-instance-change-lifecycle.md</code>:160-173). Core compares the result with the saved
+            plan in <code>checkPlannedChange</code>: any change of action, other than an update becoming a no-op, is
+            "Provider produced inconsistent final plan" (<code>node_resource_apply_instance.go</code>:232-253,
+            403-468). The lifecycle document adds the value rule: "Any attribute that had a known value in the
+            <strong>Initial Planned State</strong> must have an identical value in the <strong>Final Planned
+            State</strong>." A provider that is asked to plan with real inputs may fill in unknowns, but may not change anything that was already known. Because the replace order was fixed in
+            plan, a create-before-destroy that flips at apply also lands here, and Terraform calls it a bug.
+          </p>
+          <p>
+            Then comes <code>ApplyResourceChange</code>, with no create, update or delete flag, as
+            <a href="#p2-wire">section 06</a> noted. Its result must agree with the final plan: only values that were
+            unknown may change, or the apply fails with "Provider produced inconsistent result after apply"
+            (<code>objchange.AssertObjectCompatible</code>, <code>node_resource_abstract_instance.go</code>:2872-2916).
+            Legacy-SDK providers again get a <code>[WARN]</code> instead. Applying the engine lab's saved six-create
+            plan made 4 <code>PlanResourceChange</code>, 4 <code>ApplyResourceChange</code> and 1
+            <code>ConfigureProvider</code> gRPC calls; the two <code>terraform_data</code> instances ran in-process
+            and are not counted <span class="recon">measured here</span>.
+          </p>
+          <p>
+            After each resource the local state hook writes state, and it persists on an interval too
+            (<code>internal/backend/local/hook_state.go</code>:42-72). Every write bumps <code>serial</code>, so a
+            fresh six-resource apply ended at serial 7. The file it writes is v4 JSON, sorted, with plaintext values
+            and a path list of sensitive attributes. <a href="../state-and-features/#p3-state-file">Part 3</a> opens
+            it.
+          </p>
+
+          <h3>The JSON view is a view</h3>
+          <p>
+            <code>terraform show -json</code> renders a plan in its own format, <code>format_version</code> "1.2", and
+            state in "1.0" (<code>internal/command/jsonplan/plan.go</code>:34). It is lossy. Where the plan file holds
+            <code>c7 07 0c 82 01 c2 02 a2 61 2d</code> for <code>terraform_data.d["a"].input</code> (unknown, not
+            null, starting <code>a-</code>), the JSON says only <code>"input": true</code> in
+            <code>after_unknown</code> <span class="recon">measured here</span>. Tools that review plans through the
+            JSON see less than core decided with.
+          </p>
+          <p>
+            That closes the engine. A configuration became a resource-level graph; a walker with a goroutine per
+            vertex ran it and isolated failures; instances appeared at walk time; each instance was proposed by core,
+            planned by a provider process, and checked; the result went into a ZIP that apply honours by planning
+            again. Every step after the graph is built puts trust in core and data outside it.
+            <a href="../state-and-features/">Part 3</a> follows the data that outlives the run: the state file, its
+            locks, the refactoring blocks, and the features 1.5 through 1.17 built on this engine.
+          </p>

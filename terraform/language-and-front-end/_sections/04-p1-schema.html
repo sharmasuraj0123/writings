@@ -1,0 +1,267 @@
+          <h2 id="p1-schema"><span class="secnum">{{S}}</span>Decode twice</h2>
+          <p>
+            The parser's output, an <code>*hclsyntax.Body</code>, is exposed to callers as the interface
+            <code>hcl.Body</code>, and that interface is deliberately opaque. Its comment says "the content of a body
+            cannot be meaningfully interpreted without a schema", and it offers exactly three ways in:
+            <code>Content</code>, <code>PartialContent</code> and <code>JustAttributes</code>
+            (<code>hcl/structure.go</code>:38-77) <span class="src">from the code</span>. This is the first of the three
+            design choices from §01, "parse without meaning", and this section is about what Terraform does with it.
+          </p>
+
+          <h3>A schema is a list of names</h3>
+          <p>
+            An <code>hcl.BodySchema</code> is shallow. It lists attribute names, each with a <code>Required</code> flag,
+            and block types, each with its label names. It has no types and no nesting
+            (<code>hcl/schema.go</code>:6-24) <span class="src">from the code</span>. <code>PartialContent(schema)</code>
+            pulls out the attributes and blocks the schema names and returns a second body, the <em>remain</em>, that
+            hides them. <code>Content(schema)</code> is <code>PartialContent</code> plus an error for anything left over:
+            "Unsupported argument" or "Unsupported block type", with a "did you mean" suggestion
+            (<code>hclsyntax/structure.go</code>:30-42, 56-231). Even the number of labels is checked here, not in the
+            parser: "Extraneous label for resource" and "Missing name for resource" come from applying the schema
+            (<code>structure.go</code>:178-218).
+          </p>
+          <p>
+            So a <code>.tf</code> file is understood one level at a time. <code>configs.parseConfigFile</code> first
+            sniffs <code>required_version</code> and <code>experiments</code> with partial schemas, then applies
+            <code>configFileSchema</code> with <code>Content</code>, and hands each block to its own
+            <code>decode*Block</code> function (<code>internal/configs/parser_config.go</code>:98-322)
+            <span class="src">from the code</span>. §06 lists the fifteen block types; §07 explains why the version is
+            sniffed first.
+          </p>
+
+          <h3>The first decode keeps most of the block</h3>
+          <p>
+            A <code>resource</code> block holds two kinds of thing: arguments that mean something to Terraform
+            (<code>count</code>, <code>for_each</code>, <code>provider</code>, <code>depends_on</code>,
+            <code>lifecycle</code>) and arguments that mean something only to the provider (<code>bucket</code>,
+            <code>ami</code>, <code>tags</code>). Terraform does not know the second kind; the provider's schema arrives
+            over gRPC much later. So <code>decodeResourceBlock</code> takes only what it owns and keeps the rest as an
+            undecoded body. <code>internal/configs/resource.go</code>:136-138 and 961-970
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	content, remain, moreDiags := block.Body.PartialContent(ResourceBlockSchema)
+	diags = append(diags, moreDiags...)
+	r.Config = remain
+…
+var ResourceBlockSchema = &amp;hcl.BodySchema{
+	Attributes: commonResourceAttributes,
+	Blocks: []hcl.BlockHeaderSchema{
+		{Type: "locals"}, // reserved for future use
+		{Type: "lifecycle"},
+		{Type: "connection"},
+		{Type: "provisioner", LabelNames: []string{"type"}},
+		{Type: "_"}, // meta-argument escaping block
+	},
+}</code></pre>
+          <p>
+            <code>r.Config</code> is an <code>hcl.Body</code> with the meta-arguments hidden. Nothing checks it at load
+            time. A misspelled provider argument is not an error yet, because nobody can say what the provider's
+            arguments are. The meta-arguments, by contrast, are checked at once. <code>count</code> and
+            <code>for_each</code> are kept as unevaluated expressions for the walk, but having both is rejected during
+            this first decode with "Invalid combination of "count" and "for_each""
+            (<code>resource.go</code>:161-172) <span class="recon">measured here</span>. The third entry point,
+            <code>JustAttributes</code>, is for bodies that have no schema at all: <code>locals</code> is decoded that way,
+            so any name is legal there and only duplicates across <code>locals</code> blocks are errors
+            (<code>named_values.go</code>:525-550).
+          </p>
+
+          <h3>The second decode happens during the walk</h3>
+          <p>
+            When the graph walk reaches a resource (<a href="../engine-and-providers/#p2-instance">Part 2</a>), the
+            provider's schema is available as a <code>configschema.Block</code>. <code>DecoderSpec()</code> turns that
+            schema into an <code>hcldec.ObjectSpec</code>, using tuple or object specs where nested blocks have dynamic
+            types, and caches the spec per schema pointer (<code>internal/configs/configschema/decoder_spec.go</code>:76-182).
+            Then two scope methods do the work. <code>internal/lang/eval.go</code>:33-43
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>func (s *Scope) ExpandBlock(body hcl.Body, schema *configschema.Block) (hcl.Body, tfdiags.Diagnostics) {
+	spec := schema.DecoderSpec()
+
+	traversals := dynblock.ExpandVariablesHCLDec(body, spec)
+	refs, diags := langrefs.References(s.ParseRef, traversals)
+
+	ctx, ctxDiags := s.EvalContext(refs)
+	diags = diags.Append(ctxDiags)
+
+	return dynblock.Expand(body, ctx), diags
+}</code></pre>
+          <p>
+            <code>ExpandBlock</code> finds the references inside any <code>dynamic</code> blocks, builds an evaluation
+            context with their values, and wraps the body in <code>dynblock</code>'s expanding body.
+            <code>EvalBlock</code> then collects the references in the block, builds a context, applies
+            <code>blocktoattr.FixUpBlockAttrs</code> (a compatibility shim that lets list-of-object attributes be written
+            as nested blocks, as in Terraform 0.11), and calls <code>hcldec.Decode(body, spec, ctx)</code>. The result is
+            a <code>cty.Value</code> object of the schema's implied type (<code>eval.go</code>:45-80)
+            <span class="src">from the code</span>. Figure {{fig-decode-twice}} puts the two decodes on one page.
+          </p>
+
+          <figure class="figure wide" id="fig-decode-twice">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One <code>resource</code> block, decoded twice, and the two places it fails</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 468" role="img" aria-label="Top row, at load time: an hcl.Block goes through PartialContent with ResourceBlockSchema; meta-arguments are taken out and lifecycle literals decoded with a nil evaluation context, while the remainder is kept as r.Config. Bottom row, during the graph walk: r.Config plus the provider schema goes through DecoderSpec, ExpandBlock with dynblock, and EvalBlock with hcldec.Decode, producing a cty object. Red callouts mark where dynamic lifecycle and prevent_destroy = var.x fail.">
+                <defs>
+                  <marker id="fig-decode-twice-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-decode-twice-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="10" y="24" class="svg-lane">AT LOAD TIME: NO VALUES, NO PROVIDER SCHEMA</text>
+                <rect x="10" y="40" width="170" height="78" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="20" y="62" class="svg-step">hcl.Block</text>
+                <text x="20" y="82" class="svg-sub">resource "t" "n"</text>
+                <text x="20" y="99" class="svg-sub">type, labels, Body</text>
+                <rect x="210" y="40" width="230" height="78" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="220" y="62" class="svg-step">PartialContent</text>
+                <text x="220" y="82" class="svg-sub">(ResourceBlockSchema)</text>
+                <text x="220" y="99" class="svg-sub">shallow: names only</text>
+                <rect x="480" y="40" width="290" height="78" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="490" y="62" class="svg-step">Meta-arguments → configs.Resource</text>
+                <text x="490" y="82" class="svg-sub">count, for_each: kept as expressions</text>
+                <text x="490" y="99" class="svg-sub">provider, depends_on: static refs</text>
+                <rect x="810" y="40" width="260" height="78" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="820" y="62" class="svg-step">lifecycle literals</text>
+                <text x="820" y="82" class="svg-sub">gohcl.DecodeExpression(</text>
+                <text xml:space="preserve" x="820" y="99" class="svg-sub">  attr.Expr, nil, …)</text>
+                <rect x="480" y="160" width="290" height="60" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="490" y="182" class="svg-step">remain → r.Config</text>
+                <text x="490" y="202" class="svg-sub">hcl.Body, nothing decoded</text>
+                <line x1="180" y1="79" x2="207" y2="79" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-decode-twice-blue)"/>
+                <line x1="440" y1="70" x2="477" y2="70" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-decode-twice-blue)"/>
+                <path d="M440,100 C460,100 455,190 477,190" fill="none" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-decode-twice-blue)"/>
+                <line x1="770" y1="79" x2="807" y2="79" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-decode-twice-blue)"/>
+                <rect x="210" y="160" width="230" height="84" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="220" y="182" class="svg-step" style="fill:#ad4b43">dynamic "lifecycle"</text>
+                <text x="220" y="200" class="svg-sub" style="fill:#252525">Unsupported block type:</text>
+                <text x="220" y="216" class="svg-sub" style="fill:#252525">lifecycle is taken here,</text>
+                <text x="220" y="232" class="svg-sub" style="fill:#252525">dynblock never sees it</text>
+                <rect x="810" y="160" width="260" height="78" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="820" y="182" class="svg-step" style="fill:#ad4b43">prevent_destroy = var.x</text>
+                <text x="820" y="202" class="svg-sub" style="fill:#252525">Variables not allowed:</text>
+                <text x="820" y="219" class="svg-sub" style="fill:#252525">the EvalContext is nil</text>
+
+                <line x1="10" y1="276" x2="1070" y2="276" stroke="#b8b8b1" stroke-dasharray="4 4"/>
+                <text x="124" y="300" class="svg-lane">DURING THE GRAPH WALK: THE PROVIDER SCHEMA HAS ARRIVED OVER GRPC</text>
+                <path d="M625,220 L625,252 L108,252 L108,311" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-decode-twice-purple)"/>
+                <text x="124" y="268" class="svg-sub" style="fill:#765b98">r.Config is held in configs.Resource until the walk</text>
+                <rect x="10" y="314" width="196" height="78" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="20" y="336" class="svg-step">r.Config</text>
+                <text x="20" y="356" class="svg-sub">+ configschema.Block</text>
+                <text x="20" y="373" class="svg-sub">from GetProviderSchema</text>
+                <rect x="226" y="314" width="196" height="78" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="236" y="336" class="svg-step">DecoderSpec()</text>
+                <text x="236" y="356" class="svg-sub">hcldec.ObjectSpec</text>
+                <text x="236" y="373" class="svg-sub">cached per schema</text>
+                <rect x="442" y="314" width="196" height="78" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="452" y="336" class="svg-step">ExpandBlock</text>
+                <text x="452" y="356" class="svg-sub">dynblock.Expand(</text>
+                <text xml:space="preserve" x="452" y="373" class="svg-sub">  body, ctx)</text>
+                <rect x="658" y="314" width="196" height="78" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="668" y="336" class="svg-step">EvalBlock</text>
+                <text x="668" y="356" class="svg-sub">FixUpBlockAttrs, then</text>
+                <text x="668" y="373" class="svg-sub">hcldec.Decode(…, ctx)</text>
+                <rect x="874" y="314" width="196" height="78" rx="4" fill="#f7f7f5" stroke="#252525"/>
+                <text x="884" y="336" class="svg-step">cty.Value</text>
+                <text x="884" y="356" class="svg-sub">object of the schema's</text>
+                <text x="884" y="373" class="svg-sub">implied type</text>
+                <line x1="206" y1="353" x2="223" y2="353" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-decode-twice-blue)"/>
+                <line x1="422" y1="353" x2="439" y2="353" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-decode-twice-blue)"/>
+                <line x1="638" y1="353" x2="655" y2="353" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-decode-twice-blue)"/>
+                <line x1="854" y1="353" x2="871" y2="353" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-decode-twice-blue)"/>
+                <text x="10" y="424" class="svg-note">A dynamic block whose for_each is unknown expands to one placeholder block with an unknownBody,</text>
+                <text x="10" y="442" class="svg-note">so the whole nested block decodes to unknown and the plan still succeeds.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              From <code>resource.go</code>:136-138, 206-229, 961-970 and <code>eval.go</code>:27-80
+              <span class="src">from the code</span>; both red failures reproduced with <code>terraform validate</code>
+              <span class="recon">measured here</span>. Meta-arguments are decoded before anything has a value; the
+              provider's arguments are decoded when everything they reference has one, or is known to be unknown.
+            </p>
+          </figure>
+
+          <h3>Two quirks that fall straight out</h3>
+          <p>
+            <strong><code>dynamic</code> cannot generate <code>lifecycle</code>.</strong> <code>dynamic</code> is not
+            Terraform syntax; it is an HCL extension. <code>dynblock</code> adds a <code>dynamic</code> block type, with
+            one label, to every schema it is asked about, and its body takes <code>for_each</code> (required),
+            <code>iterator</code>, <code>labels</code> and one <code>content</code> block
+            (<code>hcl/ext/dynblock/schema.go</code>:8-53) <span class="src">from the code</span>. Terraform only wraps
+            the provider remainder with it. <code>lifecycle</code> was taken out by <code>ResourceBlockSchema</code>
+            before any <code>dynblock</code> existed, so <code>dynamic "lifecycle"</code> is just an unknown block type
+            at the first decode, and <code>terraform validate</code> says "Unsupported block type"
+            <span class="recon">measured here</span>. The same holds for <code>provisioner</code>,
+            <code>connection</code> and every other meta-argument block.
+          </p>
+          <p>
+            Expansion is lazy: it happens when <code>Content</code> or <code>PartialContent</code> is called on the
+            wrapped body. A known <code>for_each</code> makes one child iteration per element. An unknown one makes a
+            single placeholder. <code>hcl/ext/dynblock/expand_body.go</code>:222-236 <span class="src">from the code</span>:
+          </p>
+<pre><code>			} else {
+				// If our top-level iteration value isn't known then we
+				// substitute an unknownBody, which will cause the entire block
+				// to evaluate to an unknown value.
+				i := b.iteration.MakeChild(spec.iteratorName, cty.DynamicVal, cty.DynamicVal)
+				block, blockDiags := spec.newBlock(i, b.forEachCtx)
+				diags = append(diags, blockDiags...)
+				if block != nil {
+					block.Body = unknownBody{
+						template:   b.expandChild(block.Body, i, marks),
+						valueMarks: marks,
+					}
+					blocks = append(blocks, block)
+				}
+			}</code></pre>
+          <p>
+            Both cases plan <span class="recon">measured here</span>. The cost of the unknown case is that every block the
+            <code>dynamic</code> would have produced is one unknown until its <code>for_each</code> is known.
+          </p>
+          <p>
+            <strong>Meta-arguments must be literals.</strong> Everything Terraform must know before a graph exists is
+            decoded with <code>gohcl.DecodeExpression(attr.Expr, nil, …)</code>: a nil <code>EvalContext</code>. That
+            covers <code>prevent_destroy</code>, <code>create_before_destroy</code>, the <code>destroy</code> flag in
+            <code>lifecycle</code> and in <code>removed</code>, and on variables <code>sensitive</code>,
+            <code>nullable</code>, <code>const</code> and <code>default</code> (<code>resource.go</code>:206-229;
+            <code>named_values.go</code>:114-174) <span class="src">from the code</span>. With no context, any
+            reference fails in HCL's <code>Traversal.TraverseAbs</code> with "Variables not allowed" and "Variables may
+            not be used here." (<code>hcl/traversal.go</code>:96-103). v1.17.0 then adds a second error, "Unsuitable value
+            type" <span class="recon">measured here</span>. Type constraints are stricter still: they are never evaluated
+            at all. <code>typeexpr</code> reads <code>list(string)</code> structurally with
+            <code>hcl.ExprAsKeyword</code> and <code>hcl.ExprCall</code>, so no function named <code>list</code> ever
+            runs, and <code>optional(type, default)</code> evaluates its default with a nil context
+            (<code>hcl/ext/typeexpr/get_type.go</code>:22-70, 195-288).
+          </p>
+          <p>
+            Two lifecycle arguments look like expressions but are read as syntax. <code>ignore_changes</code> is either
+            the keyword <code>all</code> or a list of relative traversals; the legacy quoted-string form is still shimmed,
+            and <code>["*"]</code> is now an error (<code>resource.go</code>:231-290). <code>replace_triggered_by</code>
+            is a static list of resource references in which only <code>count.index</code> and <code>each.key</code> may
+            appear inside index brackets (<code>resource.go</code>:735-800) <span class="src">from the code</span>.
+            Neither is ever evaluated as a value; Terraform inspects the expression's shape, the way
+            <code>typeexpr</code> does, and turns it into addresses.
+          </p>
+          <p>
+            The practical consequence: a value that has to differ per environment cannot go into
+            <code>prevent_destroy</code>, a <code>destroy</code> flag or a type constraint. It has to be written as a
+            literal in each configuration that needs it.
+          </p>
+
+          <h3>The JSON syntax reuses everything after parsing</h3>
+          <p>
+            <code>.tf.json</code> files show how little the decoder depends on syntax. JSON has no distinction between
+            an attribute and a block, so the schema decides: a property is a block if the schema asks for a block of
+            that name. Block labels become nested object levels, arrays allow repeated blocks, and a property named
+            <code>"//"</code> is a comment (<code>hcl/json/spec.md</code>:45-95) <span class="src">from the code</span>.
+            Every JSON string in an expression position is parsed as a native template, so <code>"${ a + b }"</code> is
+            an expression. In static contexts such as <code>depends_on</code> and <code>ignore_changes</code>, the string
+            is parsed as a native expression instead (<code>json/spec.md</code>:327-405). A <code>.tf.json</code> with
+            <code>"count": "${length(var.names)}"</code> planned two instances, and <code>type(local.count_str)</code>
+            was <code>number</code>, because the template unwrapped <span class="recon">measured here</span>.
+          </p>
+          <p>
+            That is the shape of the whole design. The parser builds an untyped tree. Terraform applies a tiny schema
+            for what it owns and defers the rest to whoever owns it. Every new language feature, from <code>import</code>
+            to <code>action</code>, has arrived as one more small schema in <code>internal/configs</code> plus a decoder
+            function, which is what §06 maps <span class="recon">reconstruction</span>.
+          </p>

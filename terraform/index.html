@@ -1,0 +1,1470 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Terraform, taken apart: a four-part teardown of Terraform v1.17.0 read from the source and measured with no cloud credentials — the language and front end, the engine and the providers, state and the feature arc, and one project built on AWS, GCP and Azure."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/terraform/" />
+    <meta property="og:title" content="Terraform, taken apart — XO Research" />
+    <meta property="og:description" content="Terraform v1.17.0 in four parts, read from the source and measured with no cloud credentials: a compiler whose intermediate representation is a dependency graph and whose back end is somebody else's process." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://quirq.ai/terraform/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Terraform, taken apart — XO Research" />
+    <meta name="twitter:description" content="A four-part teardown of Terraform v1.17.0: HCL and the front end, the graph engine and provider processes, state and the 1.5 to 1.17 feature arc, and one three-cloud project planned with no credentials." />
+    <title>Terraform, taken apart — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+
+      /* ── Collection hub ───────────────────────────────────── */
+
+      #fig-map svg { min-width: 760px; }
+      #fig-map a { cursor: pointer; }
+      #fig-map a rect { transition: stroke-width 120ms ease; }
+      #fig-map a:hover rect,
+      #fig-map a:focus-visible rect { stroke-width: 2.4; }
+      #fig-map a:hover .svg-step { text-decoration: underline; }
+
+      .parts {
+        list-style: none;
+        margin: 0.4em 0 1.6em;
+        padding: 0;
+        max-width: var(--text);
+      }
+
+      .prose .parts li {
+        margin: 0;
+        padding: 22px 0 24px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .prose .parts li:first-child {
+        border-top: 1px solid var(--line);
+      }
+
+      .parts .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 14px;
+        margin: 0 0 6px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        color: var(--ink-faint);
+      }
+
+      .parts .meta .dot { color: var(--line-dark); }
+
+      .parts h3 {
+        margin: 0 0 8px;
+        font-family: var(--serif);
+        font-size: 25px;
+        font-weight: 500;
+        line-height: 1.22;
+        letter-spacing: -0.008em;
+      }
+
+      .parts h3 a { text-decoration: none; }
+      .parts h3 a:hover { text-decoration: underline; text-decoration-color: var(--orange); }
+      .prose .parts p { margin: 0; color: var(--ink-soft); }
+
+      .findings {
+        list-style: none;
+        margin: 0.4em 0 1.6em;
+        padding: 0;
+        max-width: var(--text);
+      }
+
+      .prose .findings li {
+        margin: 0;
+        padding: 12px 0 13px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .findings .fid {
+        display: inline-block;
+        min-width: 3.2em;
+        font-family: var(--mono);
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--orange);
+      }
+
+      .findings .where {
+        font-family: var(--mono);
+        font-size: 12.5px;
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · A compiler with somebody else's back end</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#hub-thesis">01 · A compiler with somebody else's back end</a>
+        <a class="toc-parent" href="#hub-map">02 · The map: one plan, seven stops</a>
+        <a class="toc-parent" href="#hub-parts">03 · The four parts</a>
+        <a class="toc-parent" href="#hub-findings">04 · Twelve findings</a>
+        <a class="toc-parent" href="#hub-method">05 · Method</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#hub-thesis">01 · The thesis</a>
+        <a href="#hub-map">02 · The map</a>
+        <a href="#hub-parts">03 · The four parts</a>
+        <a href="#hub-findings">04 · Twelve findings</a>
+        <a href="#hub-method">05 · Method</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Languages & Tools</p>
+        <h1>Terraform, taken apart<span class="status-pill">Collection</span></h1>
+        <p class="dek">
+          Terraform v1.17.0 read from its source and measured on one machine with no cloud credentials, in four parts: the language and the front end, the engine and the providers, state and the feature arc, and one project built on AWS, GCP and Azure.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 24 October 2026 · Subject: <code>terraform@018a99c8</code> (v1.17.0) · A four-part teardown</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#hub-thesis">A compiler with somebody else's back end</a></li>
+          <li><a href="#hub-map">The map: one plan, seven stops</a></li>
+          <li><a href="#hub-parts">The four parts</a></li>
+          <li><a href="#hub-findings">Twelve findings</a></li>
+          <li><a href="#hub-method">Method</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <h2 id="hub-thesis"><span class="secnum">01</span>A compiler with somebody else's back end</h2>
+          <p class="lede">
+            Terraform is a compiler whose intermediate representation is a dependency graph and whose back end is
+            somebody else's process. Each stage hands the next a different data structure: bytes become an HCL syntax
+            tree, the tree becomes a configuration tree, the configuration becomes a resource-level
+            <code>dag.AcyclicGraph</code>, the walk of that graph becomes RPCs to provider processes, and their answers
+            become a plan file and a state document.
+          </p>
+          <p>
+            Three choices explain most of what follows. <strong>Parse without meaning, decode twice.</strong> HCL builds
+            a syntax tree with no schema. Terraform decodes the meta-arguments with its own small schemas and keeps the
+            rest of each block undecoded until the provider's schema arrives over gRPC. That is why
+            <code>dynamic "lifecycle"</code> is impossible, why <code>prevent_destroy</code> must be a literal, and why
+            almost every new feature is a new small schema in <code>internal/configs</code>.
+          </p>
+          <p>
+            <strong>The graph is the program.</strong> Ordering, parallelism, failure isolation, destroy order and
+            create-before-destroy are edges, not code paths. A vertex runs when its dependencies finish, a failure skips
+            only its dependents, and apply builds a fresh graph from the diff and re-plans every instance with known
+            inputs.
+          </p>
+          <p>
+            <strong>Trust lives in core, data lives outside.</strong> Providers are untrusted processes whose answers
+            core checks. Secrets are tracked by marks that may only flow into write-only attributes. The authoritative
+            record is one plaintext JSON document per workspace, and its consistency rests on advisory locks and the
+            backend's own atomic primitive.
+          </p>
+          <p>
+            The surprises sit where those choices meet the outside world: an S3 backend that has no lock unless one is
+            configured, a <code>terraform_remote_state</code> that strips sensitivity, a policy engine that fails open
+            for <code>plan</code> and <code>apply</code>, and a commercial edge (query, actions, Stacks, Policy) reached
+            through second plugin processes or RPCs that OpenTofu's client never calls. The four parts follow one
+            <code>terraform plan</code> from the bytes on disk to a 36-resource plan on AWS, GCP and Azure.
+          </p>
+
+          <h2 id="hub-map"><span class="secnum">02</span>The map: one plan, seven stops</h2>
+          <p>
+            Figure 1 is Part 1's pipeline figure with the clouds added and every stage made a link. Each box opens the
+            section that covers that stage; each bar below opens a part.
+          </p>
+
+          <figure class="figure wide" id="fig-map">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">The collection as one <code>terraform plan</code>: each stage links to the section that covers it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 268" role="img" aria-labelledby="fig-map-title">
+                <title id="fig-map-title">Seven stages left to right, each a link: HCL source (Part 1 sections 2 to 6), configuration tree and init (Part 1 sections 7 to 9), plan graph, the walk and providers (Part 2 sections 1 to 6), plan file (Part 2 section 7) and state (Part 3 sections 1 to 4), and three clouds (Part 4 sections 4 to 7). Providers call the cloud APIs. Below, four bars link to the four parts.</title>
+                <defs>
+                  <marker id="fig-map-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-map-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="11" y="24" class="svg-lane">STAGE · CLICK TO OPEN ITS SECTION</text>
+
+                <path d="M691,52 L691,38 L997,38 L997,50" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-map-purple)"/>
+                <text x="844" y="31" text-anchor="middle" class="svg-sub">providers call the cloud APIs</text>
+
+                <a href="language-and-front-end/#p1-lexing">
+                  <rect x="11" y="52" width="136" height="96" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <text x="21" y="74" class="svg-step">HCL source</text>
+                  <text x="21" y="94" class="svg-sub" style="fill:#252525">scanner, parser</text>
+                  <text x="21" y="110" class="svg-sub">decode twice</text>
+                  <text x="21" y="136" class="svg-num">P1 · §02–§06</text>
+                </a>
+                <a href="language-and-front-end/#p1-loading">
+                  <rect x="164" y="52" width="136" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <text x="174" y="71" class="svg-step">Config tree</text>
+                  <text x="174" y="88" class="svg-num">P1 · §07</text>
+                </a>
+                <a href="language-and-front-end/#p1-init-graph">
+                  <rect x="164" y="104" width="136" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <text x="174" y="123" class="svg-step">init: graph, install</text>
+                  <text x="174" y="140" class="svg-num">P1 · §08–§09</text>
+                </a>
+                <a href="engine-and-providers/#p2-plan-graph">
+                  <rect x="317" y="52" width="136" height="96" rx="4" fill="#dfede5" stroke="#367f59"/>
+                  <text x="327" y="74" class="svg-step">Plan graph</text>
+                  <text x="327" y="94" class="svg-sub" style="fill:#252525">dag.AcyclicGraph</text>
+                  <text x="327" y="110" class="svg-sub">31 transformers</text>
+                  <text x="327" y="136" class="svg-num">P2 · §01, §03</text>
+                </a>
+                <a href="engine-and-providers/#p2-walk">
+                  <rect x="470" y="52" width="136" height="96" rx="4" fill="#dfede5" stroke="#367f59"/>
+                  <text x="480" y="74" class="svg-step">The walk</text>
+                  <text x="480" y="94" class="svg-sub" style="fill:#252525">one goroutine</text>
+                  <text x="480" y="110" class="svg-sub">per vertex</text>
+                  <text x="480" y="136" class="svg-num">P2 · §02, §04</text>
+                </a>
+                <a href="engine-and-providers/#p2-processes">
+                  <rect x="623" y="52" width="136" height="96" rx="4" fill="#dfede5" stroke="#367f59"/>
+                  <text x="633" y="74" class="svg-step">Providers</text>
+                  <text x="633" y="94" class="svg-sub" style="fill:#252525">child processes</text>
+                  <text x="633" y="110" class="svg-sub">36 RPCs, msgpack</text>
+                  <text x="633" y="136" class="svg-num">P2 · §05–§06</text>
+                </a>
+                <a href="engine-and-providers/#p2-plan-apply">
+                  <rect x="776" y="52" width="136" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                  <text x="786" y="71" class="svg-step">Plan file</text>
+                  <text x="786" y="88" class="svg-num">P2 · §07</text>
+                </a>
+                <a href="state-and-features/#p3-state-file">
+                  <rect x="776" y="104" width="136" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                  <text x="786" y="123" class="svg-step">State</text>
+                  <text x="786" y="140" class="svg-num">P3 · §01–§04</text>
+                </a>
+                <a href="three-clouds/#p4-project">
+                  <rect x="929" y="52" width="136" height="96" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="939" y="74" class="svg-step">Three clouds</text>
+                  <text x="939" y="94" class="svg-sub" style="fill:#252525">AWS, GCP, Azure</text>
+                  <text x="939" y="110" class="svg-sub">no credentials</text>
+                  <text x="939" y="136" class="svg-num">P4 · §04–§07</text>
+                </a>
+
+                <line x1="147" y1="74" x2="162" y2="74" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-map-blue)"/>
+                <line x1="300" y1="74" x2="315" y2="74" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-map-blue)"/>
+                <line x1="453" y1="74" x2="468" y2="74" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-map-blue)"/>
+                <line x1="606" y1="74" x2="621" y2="74" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-map-blue)"/>
+                <line x1="759" y1="74" x2="774" y2="74" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-map-blue)"/>
+                <line x1="759" y1="126" x2="774" y2="126" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-map-blue)"/>
+
+                <text x="11" y="178" class="svg-lane">PART · CLICK TO OPEN IT</text>
+                <a href="language-and-front-end/">
+                  <rect x="11" y="188" width="289" height="40" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="21" y="205" class="svg-num">PART 1</text>
+                  <text x="21" y="220" class="svg-sub" style="fill:#252525">The language and the front end</text>
+                </a>
+                <a href="engine-and-providers/">
+                  <rect x="317" y="188" width="442" height="40" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="327" y="205" class="svg-num">PART 2</text>
+                  <text x="327" y="220" class="svg-sub" style="fill:#252525">The engine and the providers</text>
+                </a>
+                <a href="state-and-features/">
+                  <rect x="776" y="188" width="136" height="40" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="786" y="205" class="svg-num">PART 3</text>
+                  <text x="786" y="220" class="svg-sub" style="fill:#252525">State and features</text>
+                </a>
+                <a href="three-clouds/">
+                  <rect x="929" y="188" width="136" height="40" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <text x="939" y="205" class="svg-num">PART 4</text>
+                  <text x="939" y="220" class="svg-sub" style="fill:#252525">Clouds, ecosystem</text>
+                </a>
+                <text x="11" y="256" class="svg-note">Part 3 also covers locks, refactoring and the 1.5 to 1.17 features; Part 4 also covers the licence, OpenTofu and the commercial edge.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Blue stages are the front end, green are the engine and the providers, purple is what persists, and the
+              grey box is outside Terraform. Thin blue arrows carry data from stage to stage; the dashed purple edge is
+              the one effect a plan has outside this machine, and only the provider produces it. The positions and
+              colours are those of Part 1's Figure 1.
+            </p>
+          </figure>
+
+          <h2 id="hub-parts"><span class="secnum">03</span>The four parts</h2>
+          <p>Read in order or alone. Each part is one self-contained HTML file and opens from the same pipeline.</p>
+          <ul class="parts">
+            <li>
+              <p class="meta"><span>Part 1</span><span class="dot">·</span><span>24 October 2026</span><span class="dot">·</span><span>55 min read</span></p>
+              <h3><a href="language-and-front-end/">The language and the front end</a></h3>
+              <p>Terraform is a compiler whose intermediate representation is a dependency graph and whose back end is somebody else's process. This first part of a four-part teardown follows one terraform plan through Terraform v1.17.0's front end: a Ragel scanner with five machines, a schema-less recursive-descent parser, a decoder that runs twice, go-cty values that carry unknowns, refinements and marks, a dozen small block schemas, the init graph that now evaluates module and provider addresses, and the installer that writes the lock file.</p>
+            </li>
+            <li>
+              <p class="meta"><span>Part 2</span><span class="dot">·</span><span>24 October 2026</span><span class="dot">·</span><span>54 min read</span></p>
+              <h3><a href="engine-and-providers/">The engine and the providers</a></h3>
+              <p>Terraform's intermediate representation is a dependency graph, and its back end is somebody else's process. This part follows one plan from a loaded configuration through Terraform v1.17.0's engine: the 31 transformers that build a resource-level graph, the walker that gives every vertex a goroutine and skips only what depends on a failure, instances that appear only at walk time, the per-instance plan in which the provider proposes and core decides, providers as child processes reached through a one-line handshake, the 36-RPC wire contract and its msgpack values, and the apply that re-plans rather than replays the saved plan.</p>
+            </li>
+            <li>
+              <p class="meta"><span>Part 3</span><span class="dot">·</span><span>24 October 2026</span><span class="dot">·</span><span>59 min read</span></p>
+              <h3><a href="state-and-features/">State, refactoring and the feature arc</a></h3>
+              <p>Terraform's record of what exists is one plaintext JSON document per workspace, and its consistency rests on advisory locks rather than compare-and-swap. This third part of a four-part teardown reads Terraform v1.17.0's state managers, the lock each backend builds from its own storage (and the S3 configuration that builds none), workspaces and remote state as non-boundaries, the refactoring blocks that moved state surgery into the plan, and the 1.5 to 1.17 feature arc: import, check, tests with mocks, provider functions, ephemeral values and write-only arguments, list resources, actions, and the surfaces that are still gated or run out of process.</p>
+            </li>
+            <li>
+              <p class="meta"><span>Part 4</span><span class="dot">·</span><span>24 October 2026</span><span class="dot">·</span><span>57 min read</span></p>
+              <h3><a href="three-clouds/">Building on three clouds, and the ecosystem</a></h3>
+              <p>Terraform's open seams are the plugin protocol and the providers, and almost everything outside the core binary now runs out of process. This part reads the licence and the fork from their trees, measures the two one-way doors between Terraform v1.17.0 and OpenTofu v1.13.2, follows Stacks and Policy into downloaded and exec'd plugins, then builds one project on AWS, GCP and Azure and takes it through validate, 7 mocked tests and a 36-resource plan with no cloud credentials at all: where the database password goes, which provider refuses to plan, what mocks really fake, and why local policy is not enforcement. It ends with the collection's register of 101 findings.</p>
+            </li>
+          </ul>
+
+          <h2 id="hub-findings"><span class="secnum">04</span>Twelve findings</h2>
+          <p>
+            Part 4 closes with the register of all 101 findings. These twelve are the ones the collection is built
+            around. Each carries its class (behaviour that bites users, or a CHANGELOG omission) and its status:
+            <em>measured</em> means reproduced with the v1.17.0 binary, <em>code</em> means read in the pinned source,
+            and <em>verified</em> means an adversarial verifier confirmed it. Each links to the section that shows it.
+          </p>
+          <ol class="findings">
+            <li><span class="fid">A1</span>An S3 backend with neither <code>use_lockfile</code> nor <code>dynamodb_table</code> has no lock at all: <code>Lock</code> returns success and locks nothing. <span class="src">behaviour · code, verified</span> <a class="where" href="state-and-features/#p3-locks">Part 3 §02</a></li>
+            <li><span class="fid">A2</span>Terraform Policy fails open for <code>plan</code> and <code>apply</code> (an error is printed, the exit code is 0, the run proceeds) but fails closed for <code>init -policies</code> (exit 1). <span class="src">behaviour · measured, verified</span> <a class="where" href="state-and-features/#p3-gates">Part 3 §08</a></li>
+            <li><span class="fid">A3</span><code>terraform_remote_state</code> reads the producer's whole state and drops sensitivity, so a <code>sensitive</code> output prints in cleartext in the consumer. <span class="src">behaviour · measured, verified</span> <a class="where" href="state-and-features/#p3-workspaces-hcp">Part 3 §03</a></li>
+            <li><span class="fid">A11</span><code>plan -destroy -invoke=…</code> is neither converted nor rejected by the CLI, and core answers "Must be in RefreshOnlyMode when invoking actions. This is a bug in Terraform."; the code is unchanged on origin/main. <span class="src">behaviour · measured by a verifier</span> <a class="where" href="state-and-features/#p3-query-actions">Part 3 §07</a></li>
+            <li><span class="fid">A16</span>An error does not halt the walk: only the dependents of the failed vertex are skipped, independent branches still plan, and the partial plan is shown with <code>Errored = true</code>. <span class="src">behaviour · measured and code, verified</span> <a class="where" href="engine-and-providers/#p2-walk">Part 2 §02</a></li>
+            <li><span class="fid">A28</span><code>terraform init</code> is not offline even with a lock file and a warm cache: default-source installs still ask the registry for versions, and only a <code>filesystem_mirror</code> works with no network. <span class="src">behaviour · measured, verified</span> <a class="where" href="language-and-front-end/#p1-install">Part 1 §09</a></li>
+            <li><span class="fid">A36</span>A trivial plan starts its provider three times, every alias and every provider-function user adds a process per walk, and the three-cloud plan starts 18. <span class="src">behaviour · measured, verified</span> <a class="where" href="engine-and-providers/#p2-processes">Part 2 §05</a></li>
+            <li><span class="fid">A40</span>Write-only does not mean never sent: core sends the value in every <code>PlanResourceChange</code> and <code>ApplyResourceChange</code> config and only demands that null comes back. <span class="src">behaviour · code and measured</span> <a class="where" href="state-and-features/#p3-secrets">Part 3 §06</a></li>
+            <li><span class="fid">A44</span>Identity import cannot be unit-tested: mocks refuse imports, and under <code>override_resource</code> core never sets an identity and then fails its own check. <span class="src">behaviour · measured, verified</span> <a class="where" href="three-clouds/#p4-tests-policy">Part 4 §07</a></li>
+            <li><span class="fid">A55</span>Once OpenTofu's provider <code>for_each</code> or its state and plan encryption is used, Terraform cannot load that state or plan. <span class="src">behaviour · measured, verified</span> <a class="where" href="three-clouds/#p4-opentofu">Part 4 §02</a></li>
+            <li><span class="fid">C1</span>The v1.17 "dag simplification" rewrite of the walker and <code>AlwaysRunVertex</code> (#39030) are not in the CHANGELOG. <span class="src">CHANGELOG · code, verified</span> <a class="where" href="engine-and-providers/#p2-walk">Part 2 §02</a></li>
+            <li><span class="fid">C4</span>The Policy GA entry cites #38970, a replace-action split; the experiment gate was removed by #38996, and the entry's body was rewritten from "plan, apply, and init" to "plan, apply, and query". <span class="src">CHANGELOG · code, verified</span> <a class="where" href="state-and-features/#p3-gates">Part 3 §08</a></li>
+          </ol>
+
+          <h2 id="hub-method"><span class="secnum">05</span>Method</h2>
+          <p>
+            Every claim is pinned to hashicorp/terraform v1.17.0 at <code>018a99c83c5d</code> (21 October 2026) and cited
+            as a file and line, with HCL, go-cty, go-plugin, terraform-plugin-go, terraform-plugin-framework and
+            OpenTofu v1.13.2 pinned the same way. Measurements were made with the v1.17.0 binary on a 2-vCPU Linux box.
+            No cloud credentials existed at any point: the three-cloud project ran on fake credentials, skip flags and
+            mocks, and nothing was applied to a cloud. Counts reproduced exactly; wall-clock times did not, and are given
+            as ranges.
+          </p>
+          <p>
+            The research went through four adversarial verification passes, and where a verifier corrected or
+            downgraded a claim, the verifier's version is the one printed. A mechanical citation pass then re-checked
+            quoted files and lines against the pinned trees. Nothing in the findings was reported upstream.
+          </p>
+          <p>
+            The collection follows the house style of <a href="../git/">Git, taken apart</a> and
+            <a href="../chromium/">the Chromium collection</a>: source-first teardowns with measurements, a
+            findings register, and status on every claim.
+          </p>
+          <p class="footnote">
+            <strong>Provenance.</strong> This page summarises the four parts; the part deks are quoted as written and
+            reading times are measured (words in each part's <code>&lt;main&gt;</code> ÷ 225). Each finding is restated
+            from the collection's register with its status, and every section it links to carries the evidence, the
+            citations and what was not verified. Figure 1 is a navigation diagram built on Part 1's Figure 1; it makes no
+            claim of its own beyond the order of the stages.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Writings</a>
+          <span aria-hidden="true"> · </span>
+          <a href="language-and-front-end/">Part 1: The language and the front end</a>
+          <span aria-hidden="true"> · </span>
+          <a href="engine-and-providers/">Part 2: The engine and the providers</a>
+          <span aria-hidden="true"> · </span>
+          <a href="state-and-features/">Part 3: State, refactoring and the feature arc</a>
+          <span aria-hidden="true"> · </span>
+          <a href="three-clouds/">Part 4: Building on three clouds, and the ecosystem</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

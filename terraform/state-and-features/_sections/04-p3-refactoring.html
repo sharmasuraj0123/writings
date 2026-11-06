@@ -1,0 +1,219 @@
+          <h2 id="p3-refactoring"><span class="secnum">{{S}}</span>Refactoring in configuration</h2>
+          <p class="lede">
+            <code>terraform state mv</code>, <code>rm</code> and <code>import</code> edit the record directly, one command at a
+            time, with nothing to review. Since v1.1 Terraform has been moving each of those edits into a block in the
+            configuration: <code>moved</code>, then <code>import</code> in v1.5, <code>removed</code> in v1.7. The blocks run
+            inside <code>plan</code>, show up in the plan like any change, and reach stored state only when that plan is
+            applied. That is the whole argument for them.
+          </p>
+
+          <h3>Surgery, and what it does not do</h3>
+          <p>
+            The <code>state</code> subcommands only edit records. In the lab, <code>state mv 'random_pet.a["x"]'
+            'random_pet.a["z"]'</code> on a <code>for_each</code> resource succeeded and bumped serial from 4 to 5; the next
+            <code>plan</code> then proposed to create <code>a["x"]</code> and destroy <code>a["z"]</code> "(because key ["z"] is
+            not in for_each map)" <span class="recon">measured here</span>. The configuration still said <code>x</code>, so the
+            move made the record disagree with it. <code>state rm</code> likewise leaves the object running and the next plan
+            re-creates it. Both have <code>-dry-run</code>, and both write a timestamped backup, but only for local state; remote
+            backends get none (<code>internal/command/state_meta.go</code>:29-97). Neither is reviewed by anyone before it lands.
+          </p>
+
+          <h3><code>moved</code>: applied to a copy, before the graph</h3>
+          <p>
+            Moves run at the very start of <code>planWalk</code>, before the plan graph exists, against a deep copy of the
+            prior state, at <code>internal/terraform/context_plan.go</code>:669-680 and 796-801:
+          </p>
+          <pre><code>func (c *Context) prePlanFindAndApplyMoves(config *configs.Config, prevRunState *states.State) ([]refactoring.MoveStatement, refactoring.MoveResults, tfdiags.Diagnostics) {
+	explicitMoveStmts := refactoring.FindMoveStatements(config)
+	implicitMoveStmts := refactoring.ImpliedMoveStatements(config, prevRunState, explicitMoveStmts)
+	var moveStmts []refactoring.MoveStatement
+	if stmtsLen := len(explicitMoveStmts) + len(implicitMoveStmts); stmtsLen &gt; 0 {
+		moveStmts = make([]refactoring.MoveStatement, 0, stmtsLen)
+		moveStmts = append(moveStmts, explicitMoveStmts...)
+		moveStmts = append(moveStmts, implicitMoveStmts...)
+	}
+	moveResults, diags := refactoring.ApplyMoves(moveStmts, prevRunState, c.plugins.ProviderFactories())
+	return moveStmts, moveResults, diags
+}
+…
+	prevRunState = prevRunState.DeepCopy() // don't modify the caller's object when we process the moves
+	moveStmts, moveResults, moveDiags := c.prePlanFindAndApplyMoves(config, prevRunState)
+	diags = diags.Append(moveDiags)
+	if moveDiags.HasErrors() {
+		return nil, nil, diags
+	}</code></pre>
+          <p>
+            Explicit <code>moved</code> blocks are joined by <em>implied</em> moves, which reproduce the pre-1.1 heuristic for
+            adding or removing <code>count</code>: <code>random_pet.single</code> becomes <code>random_pet.single[0]</code>, but
+            only for resources that no explicit statement mentions (<code>internal/refactoring/move_statement.go</code>:104-125).
+            <code>ApplyMoves</code> builds a small DAG of the statements, transitively reduces it and walks it in reverse
+            topological order; if the graph is invalid, no move is applied (<code>move_execute.go</code>:33-104, 217-240). A
+            move never clobbers: an object already at the destination blocks the move and wins
+            (<code>move_execute.go</code>:119-127). A move that touches instances excluded by <code>-target</code> is an error
+            that lists the extra <code>-target=</code> options needed (<code>context_plan.go</code>:682-748)
+            <span class="src">from the code</span>. Because the graph is built afterwards, everything downstream, including the
+            engine walk of <a href="../engine-and-providers/#p2-plan-graph">Part 2</a>, sees the post-move addresses.
+          </p>
+          <p>
+            Since v1.8 a move may change resource type. Core then calls the <em>target</em> provider's
+            <code>MoveResourceState</code> RPC to convert the object (<code>internal/refactoring/cross_provider_move.go</code>:59-200).
+            Terraform's own first cross-type move is <code>null_resource</code> to <code>terraform_data</code> (v1.9.0). random
+            3.9.1 implements none, so <code>moved { from = random_pet.new  to = random_string.new }</code> failed "Unable to Move
+            Resource State … does not include move resource state support" <span class="recon">measured here</span> (not
+            re-run by a verifier). HashiCorp's refactoring guide asks module authors to keep <code>moved</code> blocks forever
+            in shared modules, because a consumer that has not yet applied the move needs them.
+          </p>
+
+          <h3><code>removed</code> and the forget action</h3>
+          <p>
+            <code>removed</code> (v1.7, #34251) is the configuration form of <code>state rm</code>. Its CHANGELOG entry says
+            "Removing an object from state is a new type of action which is planned and applied like any other." The commit
+            added the plan action <code>Forget</code> and two apply nodes, <code>NodeForgetResourceInstance</code> for current
+            objects and <code>NodeForgetDeposedResourceInstanceObject</code> for deposed ones; both only drop the object from
+            state (<code>internal/plans/action.go</code>:16; <code>internal/terraform/node_resource_forget.go</code>:18). Read the
+            default carefully: <code>removed</code> means <strong>destroy</strong> unless it says
+            <code>lifecycle { destroy = false }</code> (<code>internal/configs/removed.go</code>:34-130)
+            <span class="src">from the code</span>. A <code>removed</code> block written to "stop managing" a resource without
+            that line will delete it. The block takes only destroy-time provisioners and <code>connection</code>, and
+            <code>destroy</code> is decoded with a nil evaluation context, so it must be a literal: <code>destroy = var.d</code>
+            fails "Variables not allowed" (<code>removed.go</code>:72-75), the same rule as every meta-argument
+            (<a href="../language-and-front-end/#p1-schema">Part 1</a>).
+          </p>
+          <p>
+            v1.16 (#38784) put <code>destroy = false</code> on ordinary <code>resource</code> blocks too, and routed every would-be
+            destroy of such a resource through forget. For an orphan the check is at
+            <code>internal/terraform/node_resource_plan_orphan.go</code>:147-160:
+          </p>
+          <pre><code>	if n.Config != nil &amp;&amp; n.Config.Managed != nil {
+		if n.Config.Managed.DestroySet &amp;&amp; !n.Config.Managed.Destroy {
+			forget = true
+		}
+	}
+
+	if !n.skipRefresh &amp;&amp; !forget {
+		// Refresh this instance even though it is going to be destroyed, in
+		// order to catch missing resources. If this is a normal plan,
+		// providers expect a Read request to remove missing resources from the
+		// plan before apply, and may not handle a missing resource during
+		// Delete correctly.  If this is a simple refresh, Terraform is
+		// expected to remove the missing resource from the state entirely
+		refreshedState, refreshDeferred, refreshDiags := n.refresh(ctx, states.NotDeposed, oldState, ctx.Deferrals().DeferralAllowed())</code></pre>
+          <p>
+            A forget also skips the refresh, so <code>ReadResource</code> is never called for an object about to be released.
+            Other paths go through <code>resourceLifecycleForget</code> (<code>node_resource_abstract_instance.go</code>:3487-3494).
+            In the lab, a <code>removed</code> block with <code>destroy = false</code> and a <code>count</code> shrink on a
+            <code>destroy = false</code> resource both planned <code>["forget"]</code>, with reasons
+            <code>delete_because_no_resource_config</code> and <code>delete_because_count_index</code>, "0 to destroy", and the
+            warning "Some objects will no longer be managed by Terraform" <span class="recon">measured here</span>. v1.17 adds
+            <code>ForgetThenCreate</code>, so <code>-replace</code> on such a resource plans <code>["forget","create"]</code> and
+            says "must be replaced, but the existing object will not be destroyed"; v1.16 had only
+            <code>CreateThenForget</code>, the create-before-destroy order (<code>plans/action.go</code>:16-18). On origin/main,
+            34210d4b5c rewrites forget handling as "forget removed objects by containment" with unchanged behaviour, and
+            dce44bddf9 "handle forget in combination with CBD nodes" may change the create-before-destroy bookkeeping.
+          </p>
+
+          <h3><code>import</code>: from literal IDs to identities</h3>
+          <p>
+            The <code>import</code> block started in v1.5.0 as "a configuration-driven, plannable action" with a literal
+            <code>id</code>. v1.6 allowed any expression known at plan time, v1.7 added <code>for_each</code>, v1.12 added
+            <code>identity</code> objects (#36703) and v1.16 lifted the root-module-only rule (#38352). At v1.17.0
+            <code>importBlockSchema</code> has five attributes, <code>provider</code>, <code>for_each</code>, <code>id</code>,
+            <code>to</code> (the only required one) and <code>identity</code>; <code>decodeImportBlock</code> requires exactly
+            one of <code>id</code> and <code>identity</code>, so that mistake is caught at load, before any provider starts
+            (<code>internal/configs/import.go</code>:96-137) <span class="src">from the code</span>. Both forms end in one RPC, at
+            <code>internal/terraform/node_resource_plan_instance.go</code>:855-868:
+          </p>
+          <pre><code>		if importTarget.Type().IsObjectType() {
+			// Identity-based import
+			resp = provider.ImportResourceState(providers.ImportResourceStateRequest{
+				TypeName:           addr.Resource.Resource.Type,
+				Identity:           importTarget,
+				ClientCapabilities: ctx.ClientCapabilities(),
+			})
+		} else {
+			// ID-based/string import
+			resp = provider.ImportResourceState(providers.ImportResourceStateRequest{
+				TypeName:           addr.Resource.Resource.Type,
+				ID:                 importTarget.AsString(),
+				ClientCapabilities: ctx.ClientCapabilities(),
+			})</code></pre>
+          <p>
+            An import plans like any change and can be replaced in the same plan. The lab imported two <code>random_id</code>s
+            with <code>for_each</code>; <code>"aGVsbG8"</code> is base64url for the five bytes "hello" and cannot fit
+            <code>byte_length = 4</code>, so the plan said <code>random_id.imported["b"] must be replaced</code> with "Warning:
+            this will destroy the imported resource", and "Plan: 2 to import, 1 to add, 0 to change, 1 to destroy."
+            <span class="recon">measured here</span>. Read the import lines of a plan as carefully as the destroy lines.
+          </p>
+          <p>
+            <code>plan -generate-config-out=PATH</code> writes resource blocks for imports that have none. It asks the provider
+            through <code>GenerateResourceConfig</code> (v1.14) when the provider advertises that capability, and otherwise
+            guesses from the imported state with <code>genconfig.ExtractLegacyConfigFromState</code>
+            (<code>node_resource_plan_instance.go</code>:1192-1209). random 3.9.1 does not, so the lab got
+            <code>keepers = null</code> and <code>prefix = null</code> lines. At v1.17.0, three years after import went GA, the
+            flag still prints "Warning: Config generation is experimental" whenever it writes a file
+            (<code>internal/backend/local/backend_plan.go</code>:281-286), and the warning is unchanged on main. Generating
+            config needs a target that is not expanded: a keyed <code>to</code> with no matching <code>for_each</code> resource
+            fails "The target resource does not use for_each."
+          </p>
+
+          <h3>All three in one plan</h3>
+          <p>
+            The lab combined a rename, a <code>count</code>-to-<code>for_each</code> conversion with two <code>moved</code>
+            blocks, a <code>removed</code> with <code>destroy = false</code>, a resource that gained <code>count = 1</code> with
+            no <code>moved</code> block, and an <code>import</code> <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform plan -out p.tfplan
+random_id.imp: Preparing import... [id=p-9hUg]
+  # random_id.imp will be imported
+ # random_pet.gone will no longer be managed by Terraform, but will not be destroyed
+  # random_pet.multi[0] has moved to random_pet.multi["a"]
+  # random_pet.old has moved to random_pet.new
+  # random_pet.single has moved to random_pet.single[0]        ← implied move
+Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.
+$ terraform state list            → still the OLD addresses, serial 6 (plan did not write)
+$ terraform state rm random_pet.single; terraform apply p.tfplan → Error: Saved plan is stale
+$ (restore state) terraform apply p.tfplan → Apply complete! Resources: 1 imported, 0 added, 0 changed, 0 destroyed.  serial 8</code></pre>
+          <p>
+            In <code>show -json</code> the moves appear as <code>previous_address</code> on a <code>no-op</code> change, the
+            removal as <code>["forget"]</code>, the import as <code>importing.id</code> on a <code>no-op</code>. Nothing reached
+            stored state until apply, and a <code>state rm</code> in between made the saved plan stale, which is the
+            lineage-and-serial gate of §01 doing its job. Figure 17 sets the two styles side by side.
+          </p>
+
+          <figure class="figure wide" id="fig-refactoring">
+            <div class="figure-head">
+              <span class="figure-label">Figure 17</span>
+              <p class="figure-title">Refactoring with <code>terraform state</code> versus refactoring blocks, and what <code>destroy = false</code> turns into</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th></th><th><code>state mv</code> / <code>rm</code> / <code>push</code></th><th><code>moved</code> / <code>removed</code> / <code>import</code></th></tr></thead>
+                <tbody>
+                  <tr><td>when it writes</td><td style="background: var(--red-soft)">immediately: one lock, one write, one persist per command</td><td style="background: var(--green-soft)">at apply, with the rest of the plan</td></tr>
+                  <tr><td>reviewed in a plan</td><td style="background: var(--red-soft)">no; <code>-dry-run</code> for <code>mv</code> and <code>rm</code></td><td style="background: var(--green-soft)">yes: <code>previous_address</code>, <code>forget</code>, <code>importing</code></td></tr>
+                  <tr><td>several edits at once</td><td>one per command; a cross-state <code>mv</code> is two persists</td><td>all statements in one plan; moves as a DAG on a deep copy</td></tr>
+                  <tr><td>backup</td><td>timestamped, local state only, one-second resolution</td><td>the normal state write path</td></tr>
+                  <tr><td>change of type</td><td>not covered here</td><td><code>moved</code> across types via <code>MoveResourceState</code> (v1.8)</td></tr>
+                  <tr><td>default that bites</td><td>the record and the config can disagree</td><td><code>removed</code> destroys unless <code>destroy = false</code></td></tr>
+                </tbody>
+              </table>
+              <table style="font-size: 13px; margin-top: 16px">
+                <thead><tr><th>a resource with <code>lifecycle { destroy = false }</code>, or a <code>removed</code> block with it</th><th>planned actions</th><th>refresh</th><th>since</th></tr></thead>
+                <tbody>
+                  <tr><td><code>removed { … destroy = false }</code></td><td style="background: var(--purple-soft)"><code>["forget"]</code>, reason <code>delete_because_no_resource_config</code></td><td>skipped</td><td>v1.7 (<code>removed</code>)</td></tr>
+                  <tr><td><code>count</code> shrinks</td><td style="background: var(--purple-soft)"><code>["forget"]</code>, reason <code>delete_because_count_index</code></td><td>skipped</td><td>v1.16</td></tr>
+                  <tr><td>resource block deleted (orphan)</td><td style="background: var(--purple-soft)">forget (<code>DestroySet &amp;&amp; !Destroy</code>)</td><td>skipped</td><td>v1.16</td></tr>
+                  <tr><td><code>-replace</code></td><td style="background: var(--purple-soft)"><code>["forget","create"]</code> (<code>ForgetThenCreate</code>)</td><td>not covered</td><td>v1.17</td></tr>
+                  <tr><td><code>-replace</code> with <code>create_before_destroy</code></td><td style="background: var(--purple-soft)"><code>["create","forget"]</code> (<code>CreateThenForget</code>)</td><td>not covered</td><td>v1.16</td></tr>
+                  <tr><td><code>removed</code> without <code>destroy = false</code></td><td style="background: var(--red-soft)"><code>["delete"]</code>: the default</td><td>not covered</td><td>v1.7</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              The top table is drawn from <code>internal/command/state_*.go</code> and <code>internal/refactoring</code>
+              <span class="src">from the code</span>; the first, second and fourth rows of the lower table are
+              <span class="recon">measured here</span>, and the orphan row and the skipped refreshes are read from
+              <code>node_resource_plan_orphan.go</code>. Purple marks an action that changes only the record. The blocks win
+              on review and on atomicity; the price is a default that destroys.
+            </p>
+          </figure>

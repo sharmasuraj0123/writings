@@ -1,0 +1,168 @@
+          <h2 id="p3-gates"><span class="secnum">{{S}}</span>What is still gated</h2>
+          <p class="lede">
+            Three surfaces at the front of the arc are not finished in the open-source CLI. Deferred actions have been in core
+            since v1.8 and still need an experimental build. Stacks is GA, but only as an HCP Terraform product, and the CLI
+            command downloads a plugin to run it. Terraform Policy is GA in the v1.17 CLI, runs as a separate executable, and
+            fails open for <code>plan</code> and <code>apply</code>. The newest surfaces are Terraform-only and partly run
+            outside the <code>terraform</code> process.
+          </p>
+
+          <h3>Deferral: in core, not in the CLI</h3>
+          <p>
+            The <code>deferring</code> package (db07b905e, 26 January 2024, first tagged in v1.8.0) tracks resources whose plan
+            must wait, so that a partial plan can be applied and the rest planned later
+            (<code>internal/plans/deferring/doc.go</code>:4-10). Deferral is transitive: anything that depends on a deferred
+            object is deferred too, and the whole mechanism is a no-op when deferral is not allowed
+            (<code>deferred.go</code>:288-330). With deferral on, unknown <code>count</code> or <code>for_each</code> keys become
+            <code>nodePlannablePartialExpandedResource</code> nodes addressed like <code>module.x[*].res</code>, and a plan file
+            can record five reasons, from <code>INSTANCE_COUNT_UNKNOWN</code> to <code>DEFERRED_PREREQ</code>
+            (<code>internal/plans/planproto/planfile.proto</code>:438-445) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The switch is <code>-allow-deferral</code>, added on 3 April 2024 and first tagged in v1.9.0. Every release binary
+            through v1.17.0 rejects it, as a belated flag-parse error at <code>internal/command/plan.go</code>:195-207: "The
+            -allow-deferral flag is only valid in experimental builds of Terraform." <span class="recon">measured here</span>.
+            Two runtimes turn it on in code: the Stacks runtime always sets <code>DeferralAllowed: true</code>
+            (<code>internal/stacks/stackruntime/internal/stackeval/client_capabilities.go</code>:12), and
+            <code>terraform test</code> passes it through (<code>internal/command/test.go</code>:178). A plain CLI apply sets it
+            only to honour deferrals already recorded. So in the CLI an unknown <code>count</code> still fails "Invalid count
+            argument" (<a href="../engine-and-providers/#p2-expansion">Part 2</a>), and if a provider answers
+            <code>PlanAction</code> with <code>Deferred</code> anyway, core reports <code>UnexpectedProviderDeferralDiagnostic</code>.
+            The v1.17 experiments footer describes the feature as permitting unknown <code>count</code> and
+            <code>for_each</code> in <code>module</code>, <code>resource</code> and <code>data</code> blocks. On origin/main it is
+            still under EXPERIMENTS. In practice, deferral is GA only inside Stacks.
+          </p>
+
+          <h3>Stacks: a product with a CLI shim</h3>
+          <p>
+            HashiCorp announced Stacks GA at HashiConf on 25 September 2025, "for all new HCP Terraform plans based on resources
+            under management (RUM)". It is an HCP product. <code>terraform stacks</code> (v1.13.0, #36931) "delegates all
+            execution to an internal plugin": the CLI discovers the <code>stacksplugin.v1</code> service on
+            <code>app.terraform.io</code>, downloads the plugin and talks to it over go-plugin gRPC with the cookie key
+            <code>TF_STACKS_MAGIC_COOKIE</code> (<code>internal/command/stacks.go</code>:58-77) <span class="src">from the code</span>.
+            The first <code>terraform stacks -help</code>, run under <code>HOME=$PWD</code>, downloaded <code>tfstacks</code>
+            1.4.0, 22,585,528 bytes, into <code>.terraform.d/stacksplugin/</code>; a verifier later deleted it. A tiny stack of
+            one <code>random</code> component passed <code>stacks init</code> and <code>validate</code> locally once a
+            <code>.terraform-version</code> file existed, a rule the plugin enforces and this repository does not
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The language and runtime are not hidden: they live in <code>internal/stacks/*</code>, driven over
+            <code>terraform rpcapi</code>, which v1.13.0 declared GA while saying it is "not intended for public consumption".
+            Core carries a few Stacks-only switches, such as <code>AllowRootEphemeralOutputs</code> (§06) and always-on deferral,
+            and some CHANGELOG lines are Stacks work in core: input-variable validation (#38240) and component no-op reporting
+            (#38049) in v1.15.
+            <a href="../three-clouds/#p4-commercial-edge">Part 4</a> places this in the commercial edge.
+          </p>
+
+          <h3>Terraform Policy: GA, out of process, fail-open</h3>
+          <p>
+            Policy is a second plugin protocol. <code>policy.Connect</code> execs <code>tfpolicy-plugin rpcapi</code>, found on
+            <code>$PATH</code> or through <code>TF_POLICY_PLUGIN</code>, as a go-plugin child with AutoMTLS and magic cookie
+            value <code>6F11ED78A2AB</code> (<code>internal/policy/client.go</code>:31, 116-145; added in #38514, first tagged
+            v1.16.0). The service has <code>Setup</code>, <code>EvaluateResource</code>, <code>EvaluateProvider</code> and
+            <code>EvaluateModule</code>, plus a reverse <code>CallbackService</code> through which the plugin asks core for
+            <code>GetResources</code> and <code>GetDataSource</code>; <code>Setup</code> returns version constraints checked
+            against Terraform (<code>internal/policy/proto/policy.proto</code>:14-29) <span class="src">from the code</span>.
+          </p>
+          <p>
+            It runs at three stages, <code>InitEvaluationStage</code>, <code>PlanEvaluationStage</code> and
+            <code>ApplyEvaluationStage</code> (<code>internal/policy/evaluation_stage.go</code>:10-16). At init, the module and
+            provider installers ask it about each source and version and refuse to download on an error
+            (<code>internal/command/meta_policy.go</code>:83-180). At plan and apply, each instance's attributes and prior
+            attributes go to <code>EvaluateResource</code> from a separate policy subgraph whose nodes run even after their
+            dependencies fail, under a semaphore of <code>TF_POLICY_PARALLELISM</code> or <code>GOMAXPROCS</code>, independent of
+            <code>-parallelism</code> (<code>internal/terraform/policy.go</code>:27-52; <code>graph_policy.go</code>:11-60). The lab's
+            apply trace from §01, with no policy configured, logs "Using GOMAXPROCS=2 for policy evaluation parallelism"
+            <span class="recon">measured here</span>. <a href="../engine-and-providers/#p2-walk">Part 2</a> shows the walker's
+            <code>AlwaysRunVertex</code> that makes those nodes run.
+          </p>
+          <p>
+            Setup is where the asymmetry lives. <code>plan</code> logs a failed setup and carries on, at
+            <code>internal/command/plan.go</code>:106-116:
+          </p>
+          <pre><code>	if len(args.PolicyPaths) &gt; 0 {
+		client, policyDiags, stopClient := c.PolicyClient(c.CommandContext(), args.PolicyPaths, backendPolicyEntitlement(be, policy.PlanEvaluationStage))
+		// if there has been any errors when setting up the policy client, we log them but
+		// we still proceed with the operation, as a failure to set up the policy client
+		// should not prevent the plan operation from running
+		if opReq.View != nil &amp;&amp; policyDiags != nil {
+			opReq.View.PolicyDiagnostics(policyDiags)
+		}
+		opReq.PolicyClient = client
+		defer stopClient()
+	}</code></pre>
+          <p>
+            <code>init</code> stops on the same diagnostics, at <code>internal/command/init_run.go</code>:286-299:
+          </p>
+          <pre><code>	if len(initArgs.PolicyPaths) &gt; 0 {
+		var policyDiags policy.Diagnostics
+		var stopClient func()
+		policyClient, policyDiags, stopClient = c.PolicyClient(ctx, initArgs.PolicyPaths, backendPolicyEntitlement(back, policy.InitEvaluationStage))
+		defer stopClient()
+		// Stream any policy setup diagnostics (e.g. a failure to connect to the
+		// policy engine).
+		view.PolicyDiagnostics(policyDiags)
+		if policyDiags.HasErrors() {
+			diags = diags.Append(earlyConfDiags)
+			diags = diags.Append(backDiags)
+			view.Diagnostics(diags)
+			return 1
+		}</code></pre>
+          <p>
+            With no <code>tfpolicy-plugin</code> on the path, the lab saw both halves <span class="recon">measured here</span>:
+          </p>
+          <pre><code>$ terraform plan -policies=policies -out=p.bin       (policies/ is an empty dir; no tfpolicy-plugin on PATH)
+Error: Failed to connect to policy engine
+Failed to connect to policy engine: failed to connect to plugin: exec: "tfpolicy-plugin": executable file not found in $PATH.
+Terraform will perform the following actions: … Plan: 1 to add …                                  plan_rc=0
+$ terraform apply -policies=policies p.bin  → Error: Failed to connect … / Apply complete! Resources: 1 added   apply_rc=0
+$ terraform plan -policies=nope    → Terraform cannot find the policy path at nope. …
+$ terraform query -policies=f.hcl  → … path of a policy set directory, not an individual policy file.</code></pre>
+          <p>
+            An "Error:" was printed, the plan and the apply both went ahead, and both exited 0; <code>init -policies</code> exits 1
+            (behaviour, measured, verified by a re-run of plan and apply). The fail-open is deliberate, as the comment says, and
+            it has a second form. With the real plugin 0.5.0 installed, a local backend sends a nil entitlement, which
+            <code>internal/policy/policy.go</code>:71-74 says means "the plugin skips the check"; the plugin instead rejected it
+            with "entitlement check failed: client did not supply entitlement information.", and the plan again proceeded with
+            exit 0. So a local <code>plan -policies</code> never enforced anything here
+            (<a href="../three-clouds/#p4-tests-policy">Part 4</a> has that run). In CI, do not treat exit 0 from
+            <code>plan -policies</code> as a pass; check that policy results were actually reported.
+          </p>
+
+          <p>
+            Paths are checked before any of this: <code>plan</code>, <code>apply</code> and <code>init</code> accept a policy
+            file or a directory (<code>validatePolicyPaths</code>), while <code>query</code> requires a policy-set directory
+            (#39238) (<code>internal/command/policy.go</code>:13-80). The pieces that arrived in v1.16 faced HCP first: run
+            policy summaries (#38715) and plugin credentials taken from the <code>cloud</code> or <code>remote</code> backend
+            (#38716). The local <code>-policies</code> path stayed experimental until v1.17.
+          </p>
+
+          <h3>Which "GA"</h3>
+          <p>
+            The v1.17.0 CHANGELOG says <code>-policies</code> on plan, apply and query no longer needs an experimental build, and
+            cites #38970. That PR is a replace-action split from 10 August 2026. The gate was removed by c0a2efe291 (#38996,
+            1 September 2026), whose changie entry carries <code>Issue: "38970"</code>, and whose body was rewritten from "plan,
+            apply, and init" to "plan, apply, and query" (CHANGELOG mistake, code, verified). The flag itself appears only in
+            <code>query -help</code>. The entry says nothing about fail-open setup or the local entitlement failure. HCP's policy
+            documentation still says "beta" and "requires v1.16alpha"; the install page says beta and "requires Terraform v1.16 or
+            later"; HCP's public beta started on 16 July 2026. On origin/main, the 1.18.0 Unreleased CHANGELOG still lists
+            <code>terraform query -policies</code> as experimental (CHANGELOG, code, per a verifier). Three surfaces, three
+            maturity labels, for one flag.
+          </p>
+          <p>
+            Policies are <code>*.policy.hcl</code> files of <code>resource_policy "TYPE" "NAME"</code> blocks with
+            <code>enforce { condition, error_message, info_message }</code>, <code>filter</code>, <code>locals</code>,
+            <code>operations</code> and an <code>enforcement_level</code> of advisory, mandatory_overridable or mandatory, the
+            default, according to HashiCorp's reference for v0.5.x. What a running plugin does with a
+            <code>mandatory_overridable</code> failure in the local CLI, which has no override UI, could not be tested without an
+            entitled engine.
+          </p>
+          <p>
+            Taken together, what is still gated at v1.17.0 is machinery rather than language: the <code>cloud</code>,
+            <code>test cleanup</code> and <code>state migrate</code> commands, <code>-allow-deferral</code>, test
+            <code>backend</code> and <code>skip_cleanup</code>, and provider <code>state_store</code> all need an experimental
+            build (<code>commands.go</code>:453-466). The commercial engines, Stacks and Policy, ship as separate executables that
+            the CLI downloads or execs. That is the same seam as the providers of Part 2, used this time for HashiCorp's own
+            products <span class="recon">reconstruction</span>.
+          </p>

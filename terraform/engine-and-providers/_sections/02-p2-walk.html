@@ -1,0 +1,278 @@
+          <h2 id="p2-walk"><span class="secnum">{{S}}</span>Walking the DAG</h2>
+          <p class="lede">
+            A built graph does nothing until something walks it. Terraform's walker gives every vertex its own
+            goroutine, runs a vertex as soon as its dependencies finish, and treats an error as a local event: only
+            the dependents of a failed vertex are skipped. The <code>-parallelism</code> flag does not limit any of
+            those goroutines. It limits one function call.
+          </p>
+
+          <h3>What a walk carries</h3>
+          <p>
+            <code>Context.walk</code> builds a <code>ContextGraphWalker</code>, starts a stop-watcher that turns Ctrl-C
+            into provider <code>Stop()</code> calls, and blocks in <code>graph.Walk(walker)</code>
+            (<code>internal/terraform/context_walk.go</code>:94-110) <span class="src">from the code</span>. Plan-like
+            walks (<code>walkPlan</code>, <code>walkPlanDestroy</code>, <code>walkImport</code>) carry three deep copies
+            of state: the working <code>State</code>, a <code>RefreshState</code> and a <code>PrevRunState</code>.
+            Validate walks start from empty states, and apply carries only <code>State</code>
+            (<code>context_walk.go</code>:112-158). Every walk also gets a fresh <code>instances.Expander</code>,
+            <code>namedvals.State</code>, <code>ephemeral.Resources</code>, <code>deferring.Deferred</code>,
+            <code>checks.State</code> and its own provider and schema caches (<code>context_walk.go</code>:187-222).
+            Nothing in those structures survives from one walk to the next, which is why
+            <a href="#p2-processes">section 05</a> finds a new provider process in every walk.
+          </p>
+          <p>
+            There are eight kinds of walk: apply, plan, plan-destroy, validate, destroy, import, eval and, since
+            v1.15.0, init (<code>graph_walk_operation.go</code>:11-21). One <code>terraform plan</code> performs four
+            of them. It walks an init graph for the root module, which expands into a nested init graph for the child
+            module; then it walks a validate graph and the plan graph. If the plan has changes, it then <em>builds but does not walk</em> the apply graph,
+            so that create-before-destroy cycles that exist only at apply time are reported now
+            (<code>checkApplyGraph</code>, <code>context_plan.go</code>:478-496) <span class="recon">measured here</span>
+            in a trace of the lab configuration.
+          </p>
+
+          <h3>A goroutine per vertex</h3>
+          <p>
+            The walker itself lives in <code>internal/dag/walk.go</code>. Its doc comment states the cost plainly
+            (<code>walk.go</code>:16-25):
+          </p>
+<pre><code>// Walker is used to walk every vertex of a graph in parallel.
+//
+// A vertex will only be walked when the dependencies of that vertex have
+// been walked. If two vertices can be walked at the same time, they will be.
+//
+// Non-parallelism can be enforced by introducing a lock in your callback
+// function. However, the goroutine overhead of a walk will remain.
+// Walker will create V*2 goroutines (one for each vertex, and dependency
+// waiter for each vertex). In general this should be of no concern unless
+// there are a huge number of vertices.</code></pre>
+          <p>
+            Each vertex gets <code>walkVertex</code>, and each vertex with dependencies also gets a
+            <code>waitDeps</code>. The waiter selects on every dependency's <code>DoneCh</code> in turn and logs
+            <code>vertex %q is waiting for %q</code> at TRACE level every five seconds while it waits
+            (<code>walk.go</code>:291-310). Because edges point from dependent to dependency, "everything I have an
+            edge to" is exactly "everything that must finish first".
+          </p>
+          <p>
+            A <code>DoneCh</code> closes whether its vertex succeeded or not. Success is a separate question, answered
+            by reading the walker's <code>diagsMap</code> after all the channels have closed. This is the whole
+            scheduling rule, <code>walk.go</code>:312-332:
+          </p>
+<pre><code>	// If the vertex implements [AlwaysRunVertex], then
+	// return ignore the errored dependecies and return success.
+	if _, ok := v.(AlwaysRunVertex); ok {
+		doneCh &lt;- true
+		return
+	}
+
+	// Dependencies satisfied! We need to check if any errored
+	w.diagsLock.Lock()
+	defer w.diagsLock.Unlock()
+	for dep := range deps {
+		if w.diagsMap[dep].HasErrors() {
+			// One of our dependencies failed, so return false
+			doneCh &lt;- false
+			return
+		}
+	}
+
+	// All dependencies satisfied and successful
+	doneCh &lt;- true
+}</code></pre>
+          <p>
+            When the waiter answers <code>false</code>, <code>walkVertex</code> does not run the callback. It records a
+            synthetic error, <code>upstream dependencies failed</code> (<code>walk.go</code>:264), which is filtered
+            out of what the user sees. The vertex's own <code>DoneCh</code> then closes with an error recorded, and the
+            skip propagates to its dependents in turn. Nothing else is affected <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-walker">
+            <div class="figure-head">
+              <span class="figure-label">Figure 9</span>
+              <p class="figure-title">One vertex's goroutines and the semaphore, and a failure that skips only its dependents</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 460" role="img" aria-label="Left: a vertex's waitDeps goroutine waits on three dependency DoneCh channels, reads diagsMap, and either lets walkVertex run the callback or records upstream dependencies failed. The callback picks an EvalContext, runs Execute inside a ten-slot semaphore, then DynamicExpand and a nested walk outside it. Right: a plan graph where one resource errors; the output that depends on it and the root are skipped, a sibling resource is planned, and the policy node runs anyway because it is an AlwaysRunVertex.">
+                <defs>
+                  <marker id="fig-walker-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-walker-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                  <marker id="fig-walker-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b8b8b1"/></marker>
+                </defs>
+                <text x="32" y="30" class="svg-lane">ONE VERTEX · internal/dag/walk.go</text>
+                <rect x="32" y="52" width="130" height="36" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="46" y="75" class="svg-sub">dep A · DoneCh</text>
+                <rect x="32" y="102" width="130" height="36" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="46" y="125" class="svg-sub">dep B · DoneCh</text>
+                <rect x="32" y="152" width="130" height="36" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="46" y="175" class="svg-sub">dep C · DoneCh</text>
+                <line x1="162" y1="70" x2="214" y2="108" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <line x1="162" y1="120" x2="214" y2="120" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <line x1="162" y1="170" x2="214" y2="132" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <rect x="218" y="92" width="170" height="56" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="232" y="114" class="svg-step">waitDeps goroutine</text>
+                <text x="232" y="134" class="svg-sub">select on each DoneCh</text>
+                <rect x="218" y="192" width="170" height="48" fill="#ece6f3" stroke="#765b98" stroke-dasharray="4 3"/>
+                <text x="232" y="212" class="svg-sub">diagsMap[dep]</text>
+                <text x="232" y="230" class="svg-sub">.HasErrors()</text>
+                <line x1="303" y1="190" x2="303" y2="152" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#fig-walker-p)"/>
+                <text x="232" y="260" class="svg-note">AlwaysRunVertex skips this check</text>
+                <line x1="388" y1="112" x2="436" y2="112" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <text x="394" y="104" class="svg-sub">true</text>
+                <rect x="440" y="88" width="150" height="48" fill="#dfede5" stroke="#367f59"/>
+                <text x="454" y="109" class="svg-step">walkVertex</text>
+                <text x="454" y="127" class="svg-sub">runs the callback</text>
+                <path d="M 388 136 L 412 136 L 412 186 L 436 186" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <text x="368" y="176" class="svg-sub">false</text>
+                <rect x="440" y="164" width="170" height="48" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="454" y="185" class="svg-step">skipped</text>
+                <text x="454" y="203" class="svg-sub">upstream deps failed</text>
+
+                <text x="32" y="300" class="svg-lane">THE CALLBACK · internal/terraform/graph.go</text>
+                <rect x="32" y="318" width="150" height="48" fill="#ffffff" stroke="#252525"/>
+                <text x="46" y="339" class="svg-step">EvalContext</text>
+                <text x="46" y="357" class="svg-sub">enterScope(module)</text>
+                <line x1="182" y1="342" x2="214" y2="342" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <rect x="218" y="306" width="180" height="96" fill="#f7e3c8" stroke="#d98226" stroke-dasharray="6 4"/>
+                <text x="230" y="324" class="svg-sub">parallelSem · 10 slots</text>
+                <rect x="232" y="334" width="152" height="44" fill="#ffffff" stroke="#252525"/>
+                <text x="246" y="353" class="svg-step">Execute</text>
+                <text x="246" y="370" class="svg-sub">provider RPCs here</text>
+                <text x="230" y="394" class="svg-sub">-parallelism</text>
+                <line x1="398" y1="342" x2="436" y2="342" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <rect x="440" y="318" width="150" height="48" fill="#ffffff" stroke="#252525"/>
+                <text x="454" y="339" class="svg-step">DynamicExpand</text>
+                <text x="454" y="357" class="svg-sub">no slot held</text>
+                <line x1="515" y1="366" x2="515" y2="388" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <rect x="440" y="392" width="150" height="48" fill="#ffffff" stroke="#252525"/>
+                <text x="454" y="413" class="svg-step">nested Walk</text>
+                <text x="454" y="431" class="svg-sub">instance subgraph</text>
+
+                <line x1="620" y1="40" x2="620" y2="440" stroke="#deded9"/>
+                <text x="648" y="30" class="svg-lane">A FAILURE IN A PLAN WALK</text>
+                <rect x="660" y="56" width="170" height="40" fill="#f3dfdc" stroke="#ad4b43" stroke-dasharray="4 3"/>
+                <text x="674" y="80" class="svg-sub">root · skipped</text>
+                <rect x="900" y="56" width="180" height="40" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="914" y="80" class="svg-sub">policy eval · runs</text>
+                <rect x="660" y="150" width="170" height="40" fill="#f3dfdc" stroke="#ad4b43" stroke-dasharray="4 3"/>
+                <text x="674" y="174" class="svg-sub">output.ids · skipped</text>
+                <rect x="660" y="244" width="170" height="40" fill="#f3dfdc" stroke="#ad4b43" stroke-width="2"/>
+                <text x="674" y="268" class="svg-sub">res.many · ERROR</text>
+                <rect x="900" y="244" width="180" height="40" fill="#dfede5" stroke="#367f59"/>
+                <text x="914" y="268" class="svg-sub">res.other · planned</text>
+                <rect x="780" y="346" width="180" height="40" fill="#ffffff" stroke="#252525"/>
+                <text x="794" y="370" class="svg-sub">provider · configured</text>
+                <line x1="745" y1="96" x2="745" y2="146" stroke="#b8b8b1" stroke-width="2" marker-end="url(#fig-walker-g)"/>
+                <line x1="745" y1="190" x2="745" y2="240" stroke="#b8b8b1" stroke-width="2" marker-end="url(#fig-walker-g)"/>
+                <line x1="990" y1="96" x2="990" y2="240" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <line x1="960" y1="96" x2="790" y2="240" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <line x1="745" y1="284" x2="830" y2="342" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <line x1="990" y1="284" x2="910" y2="342" stroke="#252525" stroke-width="2" marker-end="url(#fig-walker-k)"/>
+                <text x="648" y="420" class="svg-note">Edges point dependent → dependency. Grey edges lead into</text>
+                <text x="648" y="438" class="svg-note">skipped vertices; the sibling branch and the policy node continue.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              An error is local. The waiter decides from <code>diagsMap</code>, after the channels close, whether its
+              vertex may run; only dependents of the failure are skipped, and <code>AlwaysRunVertex</code> (the policy
+              nodes only) ignores the check. The semaphore wraps <code>Execute</code> alone. The right panel is
+              schematic, drawn from <code>walk.go</code>:254-332; the names are illustrative.
+            </p>
+          </figure>
+
+          <h3>An error does not halt the walk</h3>
+          <p>
+            The consequence for a user is that a failed plan is still a partial plan. <code>PlanAndEval</code> returns
+            it with <code>Errored = true</code>, the UI prints "Terraform planned the following actions, but then
+            encountered a problem", and <code>Apply</code> refuses it with "Cannot apply failed plan"
+            (<code>context_plan.go</code>:467-476, <code>context_apply.go</code>:127-134). In the engine lab, a
+            <code>terraform_data.many</code> whose <code>count</code> came from another resource's unknown output
+            failed with "Invalid count argument", and the plan still printed <code>terraform_data.seed will be
+            created</code> above the error <span class="recon">measured here</span>. That run shows the partial plan
+            surviving; in it, <code>seed</code> is <code>many</code>'s dependency. The stronger claim, that an
+            unrelated branch keeps planning, rests on the code above: only a dependent's waiter ever reads the failed
+            vertex's diagnostics.
+          </p>
+          <p>
+            Terraform's own architecture document says otherwise. <code>docs/architecture.md</code>:307-310 reads:
+            "Evaluation can fail with one or more errors, in which case the graph walk is halted and the errors are
+            returned to the user." The code skips dependents and keeps walking. The same document describes an
+            <code>EnterPath</code> method at lines 238-244 that no longer exists; the walker now caches one
+            <code>BuiltinEvalContext</code> per module instance through <code>enterScope</code>
+            (<code>graph_walk_context.go</code>:95-112). Both are documentation drift, and the code wins
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>The callback, and the semaphore around one call</h3>
+          <p>
+            The function the walker calls for each vertex is <code>Graph.walk</code>'s <code>walkFn</code>
+            (<code>internal/terraform/graph.go</code>:37-188). It applies test overrides, picks the module-scoped
+            evaluation context, calls <code>Execute</code> if the vertex is a <code>GraphNodeExecutable</code>, then
+            calls <code>DynamicExpand</code> if it is expandable, validates the returned subgraph and walks it
+            recursively. A subgraph that fails validation is reported as a Terraform bug: "Graph node has invalid
+            dynamic subgraph" (<code>graph.go</code>:161).
+          </p>
+          <p>
+            Only <code>Execute</code> takes a slot from the parallelism semaphore
+            (<code>graph_walk_context.go</code>:169-175):
+          </p>
+<pre><code>func (w *ContextGraphWalker) Execute(ctx EvalContext, n GraphNodeExecutable) tfdiags.Diagnostics {
+	// Acquire a lock on the semaphore
+	w.Context.parallelSem.Acquire()
+	defer w.Context.parallelSem.Release()
+
+	return n.Execute(ctx, w.Operation)
+}</code></pre>
+          <p>
+            The semaphore is a buffered channel (<code>semaphore.go</code>:13-25). Its size comes from
+            <code>-parallelism</code>: 0 means the default of 10, and a negative value is rejected with "Invalid
+            parallelism value" (<code>context.go</code>:141-157). The comment there gives two reasons for the limit:
+            "to limit CPU pressure but also to have an extra guard against rate throttling from providers".
+            <code>DynamicExpand</code> and the nested walk run outside the semaphore, so an expanding node holds no
+            slot while its instances run. The dossier's guess is that this avoids a deadlock between a parent holding
+            a slot and children waiting for one; that rationale is not written in the code
+            <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            In practice, <code>-parallelism=N</code> caps how many vertices are inside <code>Execute</code> at once,
+            which is where provider RPCs happen. It does not cap goroutines, graph size or memory: a walk with 10,000
+            vertices still starts about 20,000 goroutines, and they block on the channel. Lower it to stay under a
+            cloud API's rate limit. Raising it will not make a slow provider start faster.
+          </p>
+          <p>
+            Policy evaluation has a semaphore of its own, sized by <code>TF_POLICY_PARALLELISM</code> or else
+            <code>GOMAXPROCS</code> and independent of <code>-parallelism</code> (<code>context.go</code>:171-230). It
+            was wired into core in v1.16 behind experiments and is GA in the v1.17.0 CLI. Its two node types,
+            <code>nodePolicyEval</code> and <code>nodePolicyEvalFinish</code>, are the only implementers of
+            <code>dag.AlwaysRunVertex</code> (<code>node_policy_eval.go</code>:21, 56), added in #39030: they run even
+            when what they depend on failed. <a href="../state-and-features/#p3-gates">Part 3</a> covers what policy
+            does with that: <code>plan</code> and <code>apply</code> fail open when the policy engine cannot start,
+            <code>init -policies</code> fails closed, and HCP's documentation still calls the feature beta.
+          </p>
+
+          <h3>Watching a walk, and stopping one</h3>
+          <p>
+            The callback logs <code>vertex %q: starting visit (%T)</code> on entry and <code>visit complete</code> on
+            exit (<code>graph.go</code>:47, 65-67), so a <code>TF_LOG=trace</code> log is a full record of the walk order,
+            with the Go type of every node. Grepping it for <code>starting visit</code> is the quickest way to see
+            which instance nodes a <code>DynamicExpand</code> produced; <a href="#p2-expansion">section 03</a> reads
+            one such log. A vertex stuck behind a slow dependency shows up as the five-second
+            <code>is waiting for</code> lines.
+          </p>
+          <p>
+            Ctrl-C does not cancel the walk. The stop-watcher copies the walk's provider cache and calls
+            <code>Stop()</code> on each provider, which sends <code>StopProvider</code>. The comment at
+            <code>context.go</code>:359-361 is frank about what that buys: "the stop is still advisory: Terraform
+            will exit once the graph node completes." Whatever the provider is doing when you press it, Terraform
+            waits for that node to finish <span class="src">from the code</span>.
+          </p>
+
+          <h3>A rewrite the CHANGELOG does not mention</h3>
+          <p>
+            The walker in v1.17.0 is new. A "dag simplification" series by James Bardin, dated 2026-07-31 to
+            2026-08-04 and ending at <code>882f39051</code>, turned it into a single-shot <code>Walk(g)</code>. It
+            removed mid-walk graph mutation (<code>Update</code>/<code>Wait</code>), the <code>Reverse</code> flag, the
+            single-root check, edge sets and the <code>Hasher</code>. A second call on one walker now panics with
+            "graph walker already started" (<code>walk.go</code>:100-108). Neither the rewrite nor
+            <code>AlwaysRunVertex</code> appears in the v1.17.0 CHANGELOG <span class="src">from the code</span>.
+            Whether it changed any observable ordering or speed would need a v1.16 binary to compare against, and none
+            was measured.
+          </p>

@@ -1,0 +1,321 @@
+          <h2 id="p3-query-actions"><span class="secnum">{{S}}</span>List resources and actions</h2>
+          <p class="lede">
+            v1.14 shipped two features that stretch the model. List resources let Terraform ask a cloud what exists and write
+            configuration to adopt it. Actions let a configuration run an imperative operation, such as invoking a Lambda
+            function, when a resource changes or on demand. Both were in the v1.13 code behind the experiments gate, both are
+            GA in the v1.17 CLI, and both are built from the same recipe as everything else: a schema, a node, and an RPC.
+            Their edges are rougher than the rest, and one of them is an internal error that the CLI lets users reach.
+          </p>
+
+          <h3>Query files and <code>ListResource</code></h3>
+          <p>
+            List resources live in their own file type. A <code>.tfquery.hcl</code> file may contain only <code>list</code>
+            blocks (two labels), <code>provider</code>, <code>locals</code> and <code>variable</code>
+            (<code>internal/configs/query_file.go</code>:219-237), and it is loaded only by <code>terraform query</code>:
+            <code>plan</code> and <code>validate</code> ignore it, and <code>validate -query</code> (v1.14, #37671) checks it
+            offline <span class="recon">measured here</span>. The loader's <code>default:</code> branch, "This block type is not
+            valid within a query file", is unreachable, because the schema has already rejected the block with HCL's generic
+            "Unsupported block type" (<code>query_file.go</code>:83-91). A <code>list</code> block decodes to a
+            <code>configs.Resource</code> with <code>Mode: addrs.ListResourceMode</code>; it takes <code>count</code>,
+            <code>for_each</code>, a mandatory <code>provider</code>, <code>include_resource</code> and <code>limit</code>, with
+            the filter in one nested <code>config</code> block (<code>query_file.go</code>:97-125, 153-214)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            <code>terraform query</code> is a plan operation with <code>Query = true</code>
+            (<code>internal/command/query.go</code>:84, 123-126). Per list instance, <code>listResourceExecute</code> requires a
+            wholly known configuration, calls <code>ValidateListResourceConfig</code>, then the streaming
+            <code>ListResource</code> RPC, at <code>internal/terraform/node_resource_plan_instance_query.go</code>:99-103 and
+            126-133:
+          </p>
+          <pre><code>	// if we are generating config, we implicitly set include_resource to true
+	if n.generateConfigPath != "" {
+		includeRscCty = cty.True
+		includeRsc = true
+	}
+	…
+	// If we get down here then our configuration is complete and we're ready
+	// to actually call the provider to list the data.
+	resp := provider.ListResource(providers.ListResourceRequest{
+		TypeName:              n.Config.Type,
+		Config:                unmarkedBlockVal,
+		Limit:                 limit,
+		IncludeResourceObject: includeRsc,
+	})</code></pre>
+          <p>
+            Core stops reading the stream at <code>limit</code> and requires a resource identity on every non-warning event
+            (<code>internal/plugin6/grpc_provider.go</code>:1360-1455). That is what <code>-generate-config-out</code> uses:
+            each result becomes an <code>import { identity = … }</code> block plus a <code>resource</code> block
+            (<code>node_resource_plan_instance.go</code>:1114-1152), with the resource body written by the provider's
+            <code>GenerateResourceConfig</code> where it has one. So bulk adoption stands on three releases: identity import
+            (1.12), provider-written config (1.14), and list resources (1.14). Figure 19 draws that chain under the table of
+            features <span class="src">from the code</span>.
+          </p>
+          <p>
+            The chain has a hard limit: it needs a real cloud. With fake AWS credentials, <code>terraform query -json</code>
+            emitted <code>list_start</code> and then failed inside <code>ListResource</code> with an EC2
+            <code>DescribeInstances</code> "401 … AuthFailure"; no file was written <span class="recon">measured here</span>
+            (not re-run by a verifier; the request is listed in §09). Only <code>validate -query</code> works offline. The
+            cached schemas count 259 list resource types in aws 6.70.0, 153 in google 8.8.0, 122 in azurerm 5.10.0 and none in
+            random. HashiConf 2025 launched HCP Terraform's "Terraform search" as a public beta for AWS and Azure; whether
+            <code>plans.QueryInstance</code> results are ever persisted is open, because <code>query</code> has no
+            <code>-out</code>.
+          </p>
+
+          <figure class="figure wide" id="fig-feature-recipe">
+            <div class="figure-head">
+              <span class="figure-label">Figure 19</span>
+              <p class="figure-title">Feature, schema, node, RPC: the recipe behind nine features, and the identity chain under query</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>feature</th><th>HCL</th><th><code>internal/configs</code></th><th><code>internal/terraform</code></th><th>RPC</th><th>since</th><th>at v1.17.0</th></tr></thead>
+                <tbody>
+                  <tr><td>import</td><td><code>import</code></td><td><code>importBlockSchema</code></td><td><code>importState</code> on the plan instance</td><td><code>ImportResourceState</code></td><td>1.5</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>check</td><td><code>check</code></td><td><code>checkBlockSchema</code></td><td><code>nodeCheckAssert</code>, warning severity</td><td>none new</td><td>1.5</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>test, mocks</td><td><code>.tftest.hcl</code></td><td><code>test_file.go</code>, <code>mock_provider.go</code></td><td>a graph over <code>run</code> blocks; <code>providers.Mock</code></td><td>none new</td><td>1.6, 1.7</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>provider functions</td><td><code>provider::n::f()</code></td><td>a scope namespace</td><td><code>functionProvider</code>, unconfigured</td><td><code>GetFunctions</code>, <code>CallFunction</code></td><td>1.8</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>ephemeral</td><td><code>ephemeral</code></td><td>ephemeral resource mode</td><td><code>ephemeralResourceOpen</code>, <code>(close)</code></td><td>Validate, Open, Renew, Close</td><td>1.10</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>write-only</td><td>an attribute flag</td><td><code>Attribute.WriteOnly</code></td><td><code>ValidateWriteOnlyAttributes</code></td><td>schema field 10 / 11</td><td>1.11</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>list, query</td><td><code>list</code> in <code>.tfquery.hcl</code></td><td><code>ListResourceMode</code></td><td><code>listResourceExecute</code></td><td><code>ListResource</code> (stream)</td><td>1.14</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>actions</td><td><code>action</code>, <code>action_trigger</code></td><td><code>configs.Action</code></td><td><code>invokeActions</code>, <code>invokeDestroyActions</code></td><td><code>PlanAction</code>, <code>InvokeAction</code> (stream)</td><td>1.14</td><td style="background: var(--green-soft)">GA</td></tr>
+                  <tr><td>policy</td><td><code>-policies</code> paths</td><td><code>validatePolicyPaths</code></td><td><code>policySubgraph</code>, runs after failures</td><td>a separate plugin, <code>policy.proto</code></td><td>1.16, 1.17</td><td style="background: var(--orange-soft)">GA in CLI, beta in HCP docs</td></tr>
+                </tbody>
+              </table>
+              <svg viewBox="0 0 1000 150" role="img" aria-label="The identity chain: provider identity schemas, then import blocks with identity in 1.12, then the ListResource stream returning identities, then GenerateResourceConfig in 1.14, then a generated import and resource pair. Counts: identity schemas aws 558, google 942, azurerm 196; list resource types aws 259, google 153, azurerm 122." style="margin-top: 18px">
+                <defs>
+                  <marker id="fig-feature-recipe-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="10" y="18" class="svg-lane">THE IDENTITY CHAIN UNDER TERRAFORM QUERY</text>
+                <rect x="10" y="32" width="176" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="54" class="svg-step">identity schema</text>
+                <text x="20" y="74" class="svg-sub">aws 558 · google 942</text>
+                <text x="20" y="90" class="svg-sub">azurerm 196</text>
+                <rect x="212" y="32" width="176" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="222" y="54" class="svg-step">import { identity }</text>
+                <text x="222" y="74" class="svg-sub">1.12, #36703</text>
+                <text x="222" y="90" class="svg-sub">ImportResourceState</text>
+                <rect x="414" y="32" width="176" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="424" y="54" class="svg-step">ListResource</text>
+                <text x="424" y="74" class="svg-sub">aws 259 · google 153</text>
+                <text x="424" y="90" class="svg-sub">azurerm 122 list types</text>
+                <rect x="616" y="32" width="176" height="70" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="626" y="54" class="svg-step">GenerateResourceConfig</text>
+                <text x="626" y="74" class="svg-sub">1.14, #37515</text>
+                <text x="626" y="90" class="svg-sub">else a state guess</text>
+                <rect x="818" y="32" width="172" height="70" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="828" y="54" class="svg-step">generated files</text>
+                <text x="828" y="74" class="svg-sub">import { identity }</text>
+                <text x="828" y="90" class="svg-sub">+ resource { … }</text>
+                <line x1="186" y1="67" x2="209" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-feature-recipe-blue)"/>
+                <line x1="388" y1="67" x2="411" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-feature-recipe-blue)"/>
+                <line x1="590" y1="67" x2="613" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-feature-recipe-blue)"/>
+                <line x1="792" y1="67" x2="815" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-feature-recipe-blue)"/>
+                <text x="10" y="132" class="svg-note">Every step but the first needs the provider to implement an RPC; every step from ListResource on needs a cloud that answers.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Names are read from the v1.17.0 tree <span class="src">from the code</span>; the schema counts come from
+              <code>providers schema -json</code> over the cached aws 6.70.0, google 8.8.0 and azurerm 5.10.0
+              <span class="recon">measured here</span>. Two rows add no RPC, and the policy row adds a whole second plugin
+              protocol instead (§08). The rest each cost one or more RPCs that a provider must implement before the feature
+              does anything for its resources.
+            </p>
+          </figure>
+
+          <h3>Actions</h3>
+          <p>
+            <code>action "TYPE" "NAME"</code> takes <code>count</code>, <code>for_each</code>, <code>provider</code> and at most
+            one <code>config</code> block, decoded to <code>configs.Action</code> and evaluated against the provider's action
+            schema (<code>internal/configs/action.go</code>:27-41, 224-318). A resource triggers it from
+            <code>lifecycle { action_trigger { … } }</code>, which requires <code>events</code> and <code>actions</code> and
+            takes an optional <code>condition</code> and <code>on_failure</code>; events are bare keywords
+            (<code>action.go</code>:115-222). v1.14.0 accepted only before and after create and update; destroy events and
+            <code>on_failure</code> arrived in v1.16 (#38668, #38722). <code>on_failure</code> defaults to <code>halt</code>,
+            because <code>ActionOnFailureHalt</code> is the enum's zero value (<code>action.go</code>:56-72)
+            <span class="src">from the code</span>. The cached schemas count 12 action types in aws 6.70.0, for example
+            <code>aws_lambda_invoke</code>, eight in azurerm and none in google <span class="recon">measured here</span>.
+          </p>
+          <p>
+            At plan time each triggered invocation costs one <code>ValidateActionConfig</code> and one <code>PlanAction</code>,
+            and the plan lists it under <code>action_invocations</code>. <code>InvokeAction</code> runs only at apply, with the
+            planned config unmarked, and streams <code>Progress</code> and <code>Completed</code> events into the UI hooks; a
+            response with no event stream is an error (<code>internal/terraform/action_trigger_instance_apply.go</code>:114-166).
+            <code>caller</code> refers to the triggering resource. It is a core <code>addrs.SelfType</code> value
+            (<code>internal/addrs/self.go</code>:10-13) and works in any configuration; the lab's offline plan resolved
+            <code>function_name</code> through it. The v1.16 CHANGELOG files it under "stacks:", which is misleading.
+          </p>
+          <p>
+            What happens on failure depends on the event. <code>invokeDestroyActions</code> (first block) knows only continue
+            or error, and forces continue during a full destroy walk; <code>invokeActions</code> (second block) has the three-way
+            switch, at <code>internal/terraform/node_resource_abstract_instance.go</code>:3380-3387 and 3423-3438:
+          </p>
+          <pre><code>		invokeDiags := trigger.Invoke(ctx, n.Addr.Resource, cty.DynamicVal, true)
+
+		// a full destroy walk must never be blocked
+		onFailureContinue := op == walkDestroy || trigger.ActionInvocation.ActionTrigger.OnFailure() == configs.ActionOnFailureContinue
+	…
+		invokeDiags := trigger.Invoke(ctx, n.Addr.Resource, callerVal, false)
+		if invokeDiags.HasErrors() {
+			switch onFailure {
+			case configs.ActionOnFailureHalt:
+				return false, diags.Append(invokeDiags)
+			case configs.ActionOnFailureTaint:
+				// We can only taint a newly created resource, because that's
+				// the only action which can be re-done from scratch. Recording
+				// other action events which need to be reinvoked will require
+				// new data to be saved in the state.
+				return event == configs.AfterCreate, diags.Append(invokeDiags)
+			case configs.ActionOnFailureContinue:
+				// The resource still needs to use the usual failure mechanisms
+				// in the graph walk, so in order to continue all diagnostics
+				// must only be warnings.
+				diags = diags.Append(tfdiags.OverrideAll(invokeDiags, tfdiags.Warning, nil))</code></pre>
+          <p>
+            So <code>taint</code> taints only on <code>after_create</code>, and never for a destroy event. The lab ran one
+            action end to end <span class="recon">measured here</span>. <strong>This run sent real HTTPS requests to AWS
+            Lambda with a fake key, which AWS rejected; §09 lists it.</strong> The configuration was an
+            <code>aws_lambda_invoke</code> action triggered by a <code>terraform_data.release</code> on
+            <code>after_create</code> and <code>after_update</code>, with <code>on_failure = continue</code>:
+          </p>
+          <pre><code>$ terraform plan -out=p.bin                     (10.7 s)
+    # Actions to be invoked after this change in order:
+    # action.aws_lambda_invoke.warm
+Plan: 1 to add, 0 to change, 0 to destroy. Actions: 1 to invoke.
+$ terraform plan -invoke=action.aws_lambda_invoke.warm
+Plan: 0 to add, 0 to change, 0 to destroy. Actions: 1 to invoke.
+$ terraform apply p.bin                         (31.7 s; real HTTPS call with fake key)
+Action started: action.aws_lambda_invoke.warm (triggered by terraform_data.release)
+Action failed: … api error UnrecognizedClientException: The security token included in the request is invalid.
+Warning: Failed to Invoke Lambda Function
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed. Actions: 1 invoked, 1 failed.   (exit=0)
+# change input to "v43", delete on_failure (→ halt), apply -auto-approve:
+Error: Failed to Invoke Lambda Function                                                        (exit=1)
+$ terraform show -json | jq '.values.root_module.resources[0].values.input'  → "v43"</code></pre>
+          <p>
+            Three findings sit in that transcript. With <code>continue</code>, the failure became a warning and the run exited
+            0. With the default <code>halt</code>, the run exited 1, but the triggering change stayed: state held
+            <code>input = "v43"</code> and no taint, and its backup held "v42". <code>halt</code> stops the run; it does not
+            roll anything back. These lines were not re-run by a verifier, under the offline rule; the recorded state file
+            corroborates the halt result. The third finding is the <code>-invoke</code> plan.
+          </p>
+
+          <h3>The <code>-invoke</code> dead end</h3>
+          <p>
+            <code>-invoke=action.X.Y</code> runs one action ad hoc. The CLI accepts one only ("Only one action can be invoked at a
+            time.") and quietly changes the plan mode, at <code>internal/command/arguments/extended.go</code>:232-237:
+          </p>
+          <pre><code>	default:
+		if len(o.ActionTargets) &gt; 0 {
+			o.PlanMode = plans.RefreshOnlyMode
+		} else {
+			o.PlanMode = plans.NormalMode
+		}</code></pre>
+          <p>
+            A normal plan with <code>-invoke</code> becomes refresh-only, which is why the pending <code>terraform_data</code>
+            create vanished from the second plan above: "Plan: 0 to add". Nothing says so. The <code>default:</code> arm is the
+            last in the switch, and the <code>case o.destroyRaw:</code> arm before it sets <code>DestroyMode</code> first
+            (<code>extended.go</code>:221-222), so <code>plan -destroy -invoke=…</code> reaches core unconverted. Core's guard at
+            <code>internal/terraform/context_plan.go</code>:299-309 then fires:
+          </p>
+          <pre><code>	if len(opts.ActionTargets) &gt; 0 {
+		if opts.Mode != plans.RefreshOnlyMode {
+			// The CLI layer (and other similar callers) should prevent this
+			// combination of options.
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Incompatible plan options",
+				"Must be in RefreshOnlyMode when invoking actions. This is a bug in Terraform.",
+			))
+			return nil, nil, diags
+		}</code></pre>
+          <p>
+            A verifier re-ran <code>plan -destroy -invoke=…</code> and got exactly that error, and it is still present on
+            origin/main (behaviour, measured, verified). The comment assumes the CLI prevents the combination; the CLI neither
+            converts nor rejects it. If you want an action and pending changes in one run, trigger it from a lifecycle event;
+            <code>-invoke</code> plans nothing else. One older edge completes the picture: in v1.13 the root schema already
+            accepted <code>action</code> blocks while their decoding was experiment-gated, so a stable 1.13 binary silently
+            dropped them. Figure 20 draws the whole life.
+          </p>
+
+          <figure class="figure wide" id="fig-action-life">
+            <div class="figure-head">
+              <span class="figure-label">Figure 20</span>
+              <p class="figure-title">An action's life from plan to apply, and the two <code>-invoke</code> side paths</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 420" role="img" aria-label="Sequence between Terraform core and the provider. At plan: ValidateActionConfig, then PlanAction, then the invocation is recorded in action_invocations. At apply: the resource change is applied, then InvokeAction streams progress and completed events; on error the on_failure value decides: halt fails the run without rollback, taint only for after_create, continue downgrades to warnings. Destroy events go through invokeDestroyActions with continue or error only. Side paths: -invoke turns a normal plan into refresh-only; -destroy with -invoke reaches core's internal error.">
+                <defs>
+                  <marker id="fig-action-life-black" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-action-life-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="10" y="22" class="svg-lane">CORE</text>
+                <text x="10" y="252" class="svg-lane">PROVIDER</text>
+                <line x1="10" y1="226" x2="1070" y2="226" stroke="#deded9"/>
+                <text x="120" y="22" class="svg-lane">PLAN</text>
+                <text x="520" y="22" class="svg-lane">APPLY</text>
+                <line x1="500" y1="10" x2="500" y2="400" stroke="#b8b8b1" stroke-dasharray="4 4"/>
+
+                <rect x="20" y="40" width="200" height="54" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="30" y="62" class="svg-step">action_trigger fires</text>
+                <text x="30" y="80" class="svg-sub">event and condition matched</text>
+                <rect x="250" y="40" width="230" height="54" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="260" y="62" class="svg-step">action_invocations</text>
+                <text x="260" y="80" class="svg-sub">"Actions: 1 to invoke"</text>
+                <rect x="20" y="262" width="200" height="40" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="30" y="287" class="svg-sub" style="fill:#252525">ValidateActionConfig</text>
+                <rect x="250" y="262" width="230" height="40" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="260" y="287" class="svg-sub" style="fill:#252525">PlanAction</text>
+                <line x1="120" y1="94" x2="120" y2="258" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <line x1="220" y1="282" x2="246" y2="282" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <line x1="365" y1="262" x2="365" y2="98" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-action-life-blue)"/>
+
+                <rect x="520" y="40" width="160" height="54" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="530" y="62" class="svg-step">resource change</text>
+                <text x="530" y="80" class="svg-sub">the triggering CRUD</text>
+                <rect x="520" y="262" width="160" height="58" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="530" y="284" class="svg-sub" style="fill:#252525">InvokeAction</text>
+                <text x="530" y="302" class="svg-sub">streams Progress,</text>
+                <text x="530" y="316" class="svg-sub">Completed</text>
+                <line x1="600" y1="94" x2="600" y2="258" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <rect x="712" y="40" width="170" height="54" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="722" y="62" class="svg-step">invokeActions</text>
+                <text x="722" y="80" class="svg-sub">on error: on_failure</text>
+                <line x1="680" y1="290" x2="700" y2="290" stroke="#3c6f97" stroke-width="1.5"/>
+                <line x1="700" y1="290" x2="700" y2="67" stroke="#3c6f97" stroke-width="1.5"/>
+                <line x1="700" y1="67" x2="708" y2="67" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-action-life-blue)"/>
+                <rect x="912" y="40" width="158" height="40" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="922" y="58" class="svg-sub" style="fill:#252525">halt (default)</text>
+                <text x="922" y="73" class="svg-sub">exit 1, no rollback</text>
+                <rect x="912" y="88" width="158" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="922" y="106" class="svg-sub" style="fill:#252525">taint</text>
+                <text x="922" y="121" class="svg-sub">after_create only</text>
+                <rect x="912" y="136" width="158" height="40" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="922" y="154" class="svg-sub" style="fill:#252525">continue</text>
+                <text x="922" y="169" class="svg-sub">warnings, exit 0</text>
+                <line x1="882" y1="60" x2="908" y2="60" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <line x1="896" y1="60" x2="896" y2="156" stroke="#252525" stroke-width="2.5"/>
+                <line x1="896" y1="108" x2="908" y2="108" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <line x1="896" y1="156" x2="908" y2="156" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-action-life-black)"/>
+                <rect x="712" y="120" width="170" height="70" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="722" y="140" class="svg-step">invokeDestroyActions</text>
+                <text x="722" y="158" class="svg-sub">destroy events</text>
+                <text x="722" y="174" class="svg-sub">continue or error only</text>
+
+                <text x="20" y="352" class="svg-lane">SIDE PATHS, PLAN TIME</text>
+                <rect x="20" y="364" width="300" height="40" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="30" y="389" class="svg-sub" style="fill:#252525">plan -invoke → silently refresh-only</text>
+                <rect x="340" y="364" width="400" height="40" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="350" y="389" class="svg-sub" style="fill:#252525">plan -destroy -invoke → "This is a bug in Terraform."</text>
+                <text x="760" y="382" class="svg-note">neither converted nor</text>
+                <text x="760" y="398" class="svg-note">rejected by the CLI</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Thick black arrows are control flow, thin blue arrows carry the provider's answer back to core. The branches are
+              read from <code>node_resource_abstract_instance.go</code> and <code>arguments/extended.go</code> at v1.17.0
+              <span class="src">from the code</span>; the RPC counts, the exit codes and the kept <code>"v43"</code> are
+              <span class="recon">measured here</span> with fake AWS credentials. Why the CLI prints "Action started" before
+              the resource's creation completes for an <code>after_create</code> trigger is an open question.
+            </p>
+          </figure>

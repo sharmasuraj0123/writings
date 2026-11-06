@@ -1,0 +1,278 @@
+          <h2 id="p1-init-graph"><span class="secnum">{{S}}</span>The init graph and early evaluation</h2>
+          <p>
+            Through v1.14, a module's <code>source</code> was decoded at parse time with a nil evaluation context,
+            <code>gohcl.DecodeExpression(attr.Expr, nil, …)</code>, so only a literal string worked
+            (<code>git show v1.14.0:internal/configs/module_call.go</code>, lines 74-87) <span class="src">from the code</span>.
+            Three releases changed that. v1.15.0 (29 April 2026, #38217) let module <code>source</code> and
+            <code>version</code> use variables and locals, and gave most commands a <code>-var</code> flag (#38276). v1.17.0
+            (#39153) did the same for provider requirements. Its commit, <code>03847224e</code>, is also the point where the
+            v1.17 branch left main. To evaluate an expression before any module is installed, Terraform needed an
+            evaluator that runs before the configuration tree exists. It reused the one it had: a graph walk.
+          </p>
+
+          <h3>Building the tree by walking a graph</h3>
+          <p>
+            The init graph arrived on 26 February 2026 (<code>28b76c110</code>, first tagged in v1.15.0), and on
+            4 September 2026 <code>c6e867653</code> deleted <code>configs.BuildConfig</code>, the old recursive builder.
+            In v1.17.0 every command builds its tree with <code>terraform.BuildConfigWithGraph</code>: an init-graph walk
+            for the root, a separate walk for each <code>run { module {} }</code> in test files, then
+            <code>configs.FinalizeConfig</code> (<code>internal/terraform/config_graph_build.go</code>:15-38). The walk
+            itself runs in a fresh <code>Context</code>. <code>config_graph_build.go</code>:97-112
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>func initConfigWithGraph(rootMod *configs.Module, walker configs.ModuleWalker, vars InputValues, modulePathPrefix addrs.Module) (*configs.Config, tfdiags.Diagnostics) {
+	ctx, ctxDiags := NewContext(&amp;ContextOpts{
+		// To avoid access issues with manifest and lock files, we don't want to
+		// parallelize module installation/loading here
+		Parallelism: 1,
+	})
+	if ctxDiags.HasErrors() {
+		return nil, ctxDiags
+	}
+
+	return ctx.Init(rootMod, InitOpts{
+		Walker:           walker,
+		SetVariables:     vars,
+		ModulePathPrefix: modulePathPrefix,
+	})
+}</code></pre>
+          <p>
+            <code>Context.Init</code> seeds a root <code>configs.Config</code> with an empty <code>Children</code> map,
+            builds the init graph, and walks it with operation <code>walkInit</code>; the walk fills in the children
+            (<code>context_init.go</code>:27-55). <code>InitGraphBuilder.Steps</code> is eight transformers: root (or
+            module) variables, <code>ModuleTransformer</code>, <code>ProviderRequirementExprTransformer</code>,
+            <code>LocalTransformer</code>, <code>ReferenceTransformer</code>, a filter, variable validation and transitive
+            reduction (<code>graph_builder_init.go</code>:36-96). The filter is what keeps the graph tiny.
+            <code>internal/terraform/graph_builder_init.go</code>:70-86 <span class="src">from the code</span>:
+          </p>
+<pre><code>		// Filters out any vertices that aren't relevant to the init graph
+		&amp;TransformFilter{
+			Keep: func(v dag.Vertex) bool {
+				switch n := v.(type) {
+				case *nodeInstallModule:
+					return true
+				case *nodeResolveProviderRequirements:
+					return true
+				case *NodeRootVariable:
+					return n.Config.Const
+				case *nodeExpandModuleVariable:
+					return n.Config.Const
+				default:
+					return false
+				}
+			},
+		},</code></pre>
+          <p>
+            Install nodes, provider-requirement nodes and const variables survive, plus everything they depend on, so a
+            local is evaluated during init only if some source, version or requirement reaches it
+            (<code>transform_filter.go</code>:17-42). <code>ModuleTransformer</code> adds one <code>nodeInstallModule</code>
+            per <code>module</code> block, keyed <code>addrs.NoKey</code>, not one per <code>count</code> instance. Each
+            install node references its source, its version and every input argument, because a child may use an input as
+            a const variable in its own nested source. <code>Execute</code> evaluates the version, then the source, asks the
+            walker to load the module, and splices the child <code>*configs.Config</code> into its parent. Then the node
+            <code>DynamicExpand</code>s into a fresh <code>InitGraphBuilder</code> graph for that child, which is how
+            grandchildren get installed (<code>node_module_install.go</code>:59-227) <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-init-graph">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The init graph, measured and recursive, and what each early field may contain</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 318" role="img" aria-label="Left: the measured three-vertex init graph for a configuration with variable provider requirements: var.random_version and local.ns feed nodeResolveProviderRequirements. Right: a root init graph whose nodeInstallModule expands into the child module's own init graph, with non-const variables, resources and outputs filtered out.">
+                <defs>
+                  <marker id="fig-init-graph-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-init-graph-black" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="10" y="24" class="svg-lane">MEASURED: TF_LOG=trace terraform init (W5)</text>
+                <rect x="10" y="40" width="200" height="50" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="20" y="60" class="svg-sub" style="fill:#252525">var.random_version</text>
+                <text x="20" y="78" class="svg-sub">NodeRootVariable, const</text>
+                <rect x="230" y="40" width="190" height="50" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="240" y="60" class="svg-sub" style="fill:#252525">local.ns (expand)</text>
+                <text x="240" y="78" class="svg-sub">nodeExpandLocal</text>
+                <rect x="40" y="140" width="350" height="50" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="50" y="160" class="svg-sub" style="fill:#252525">nodeResolveProviderRequirements ("")</text>
+                <text x="50" y="178" class="svg-sub">writes RequiredProviders</text>
+                <line x1="110" y1="90" x2="160" y2="137" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-init-graph-blue)"/>
+                <line x1="325" y1="90" x2="270" y2="137" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-init-graph-blue)"/>
+                <text x="10" y="224" class="svg-note">Three vertices; walked with parallelism 1.</text>
+                <text x="10" y="242" class="svg-note">One terraform init builds and walks it twice:</text>
+                <text x="10" y="260" class="svg-note">early root load, then full load after modules.</text>
+
+                <line x1="450" y1="36" x2="450" y2="300" stroke="#deded9"/>
+                <text x="470" y="24" class="svg-lane">RECURSION: ONE INIT GRAPH PER MODULE</text>
+                <rect x="470" y="40" width="270" height="190" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="482" y="60" class="svg-step">root init graph</text>
+                <rect x="482" y="72" width="120" height="26" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="490" y="89" class="svg-sub" style="fill:#252525">var.env, const</text>
+                <rect x="612" y="72" width="116" height="26" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="620" y="89" class="svg-sub" style="fill:#252525">local.dir</text>
+                <rect x="482" y="120" width="246" height="40" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="492" y="137" class="svg-sub" style="fill:#252525">nodeInstallModule</text>
+                <text x="492" y="153" class="svg-sub">module.net, NoKey</text>
+                <line x1="542" y1="98" x2="542" y2="117" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-init-graph-blue)"/>
+                <line x1="670" y1="98" x2="670" y2="117" stroke="#3c6f97" stroke-width="1.5" marker-end="url(#fig-init-graph-blue)"/>
+                <rect x="482" y="176" width="120" height="44" rx="3" fill="#fff" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="490" y="194" class="svg-sub">var.region</text>
+                <text x="490" y="210" class="svg-sub">not const</text>
+                <rect x="612" y="176" width="116" height="44" rx="3" fill="#fff" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="620" y="194" class="svg-sub">resources,</text>
+                <text x="620" y="210" class="svg-sub">outputs</text>
+                <rect x="790" y="40" width="280" height="190" rx="5" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="802" y="60" class="svg-step">module.net's init graph</text>
+                <rect x="802" y="72" width="256" height="26" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="810" y="89" class="svg-sub" style="fill:#252525">its const variables (from inputs)</text>
+                <rect x="802" y="120" width="256" height="40" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="812" y="137" class="svg-sub" style="fill:#252525">nodeInstallModule</text>
+                <text x="812" y="153" class="svg-sub">module.net.module.sub</text>
+                <text x="802" y="190" class="svg-note">…which expands again, so</text>
+                <text x="802" y="208" class="svg-note">grandchildren install too</text>
+                <path d="M728,140 C760,140 760,140 799,140" fill="none" stroke="#252525" stroke-width="2.5" marker-end="url(#fig-init-graph-black)"/>
+                <text x="759" y="130" class="svg-sub" text-anchor="middle" style="fill:#252525">Dynamic</text>
+                <text x="759" y="166" class="svg-sub" text-anchor="middle" style="fill:#252525">Expand</text>
+                <text x="470" y="262" class="svg-note">Dashed boxes are vertices TransformFilter removes: a non-const variable, resources and outputs</text>
+                <text x="470" y="280" class="svg-note">never reach the init walk, and evaluate to unknown if anything there references them.</text>
+              </svg>
+              <table>
+                <thead>
+                  <tr><th>field</th><th>literal</th><th>const var</th><th>plain var</th><th>local</th><th><code>path.*</code></th><th>resource</th><th>sensitive</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>module <code>source</code></td><td style="background: var(--green-soft)">yes</td><td style="background: var(--green-soft)">yes</td><td style="background: var(--red-soft)">Unknown</td><td style="background: var(--green-soft)">yes*</td><td style="background: var(--green-soft)">yes</td><td style="background: var(--red-soft)">Invalid</td><td style="background: var(--red-soft)">rejected</td></tr>
+                  <tr><td>module <code>version</code></td><td style="background: var(--green-soft)">yes</td><td style="background: var(--green-soft)">yes</td><td style="background: var(--red-soft)">Unknown</td><td style="background: var(--green-soft)">yes*</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">rejected</td></tr>
+                  <tr><td>provider <code>source</code></td><td style="background: var(--green-soft)">yes</td><td style="background: var(--green-soft)">yes</td><td style="background: var(--red-soft)">Unknown</td><td style="background: var(--green-soft)">yes*</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">rejected</td></tr>
+                  <tr><td>provider <code>version</code></td><td style="background: var(--green-soft)">yes</td><td style="background: var(--green-soft)">yes</td><td style="background: var(--red-soft)">Unknown</td><td style="background: var(--green-soft)">yes*</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">rejected</td></tr>
+                  <tr><td><code>backend</code> arguments</td><td style="background: var(--green-soft)">yes</td><td style="background: var(--red-soft)">Variables not allowed</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">no</td><td style="background: var(--red-soft)">no</td></tr>
+                  <tr><td>OpenTofu <code>backend</code></td><td style="background: var(--green-soft)">yes</td><td>—</td><td style="background: var(--green-soft)">yes</td><td>not measured</td><td>not measured</td><td>not measured</td><td>not measured</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Left graph from a <code>TF_LOG=trace</code> run; "Unknown", "Invalid" and "Variables not allowed" are the
+              messages <code>terraform init</code> printed <span class="recon">measured here</span>. The other cells come
+              from <code>node_module_install.go</code>:229-293, 351-378, <code>node_resolve_provider_requirement.go</code>:102-267
+              and <code>backend.go</code>:43-59 <span class="src">from the code</span>; the right-hand diagram is drawn from
+              <code>node_module_install.go</code>:201-227 <span class="recon">reconstruction</span>. *A local counts only if
+              it is built from literals and const variables. A null <code>version</code>, for a module or a provider, is
+              accepted as "no constraint"; a null <code>source</code> is rejected.
+            </p>
+          </figure>
+
+          <h3>What the evaluator knows during init</h3>
+          <p>
+            The restriction is not a list of rules; it is what the evaluator returns. In <code>walkInit</code> a non-const
+            variable is an unknown of its type. <code>internal/terraform/evaluate.go</code>:305-316
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	if d.Operation == walkValidate || (d.Operation == walkInit &amp;&amp; !config.Const) {
+		// We should still capture the statically-configured marks during
+		// the validate walk.
+		ret := cty.UnknownVal(config.Type)
+		if config.Sensitive {
+			ret = ret.Mark(marks.Sensitive)
+		}
+		if config.Ephemeral {
+			ret = ret.Mark(marks.Ephemeral)
+		}
+		return ret, diags
+	}</code></pre>
+          <p>
+            Resources, module outputs, <code>count</code>, <code>each</code> and <code>terraform.*</code> are
+            <code>cty.DynamicVal</code> during init (<code>evaluate.go</code>:407-411, 648-652, 1204-1208). Const variables
+            get real values from <code>-var</code>, <code>TF_VAR_*</code> or an auto-loaded <code>terraform.tfvars</code>,
+            and their <code>validation</code> blocks run during init; non-const validations are skipped there. The module
+            install node then gates the result: first a whitelist of reference types (<code>var</code>,
+            <code>local</code>, <code>path</code> for a source; <code>var</code> and <code>local</code> for a version),
+            then evaluation, then checks that the value is not null, is wholly known, and is neither sensitive nor
+            ephemeral, failing with "Only literal values and const variables can be evaluated during init."
+            (<code>node_module_install.go</code>:240-293).
+          </p>
+          <p>
+            Two quieter relaxations apply during the init walk. The evaluator skips static reference validation, and it
+            tolerates calls to provider-defined functions it cannot resolve yet (<code>IgnoreUnknownProviderFunctions</code>),
+            since the providers that define them are not installed (<code>evaluate.go</code>:105, 169-175)
+            <span class="src">from the code</span>. And only a const variable that is required and unset is an error at
+            load time; a plain required variable can stay unset until <code>plan</code>. What is <em>not</em> allowed
+            looks like this <span class="recon">measured here</span>:
+          </p>
+<pre><code>variable "dir" { type = string  default = "./m" }      # not const
+module "a" { source = var.dir }
+
+Error: Unknown module source
+  on main.tf line 6, in module "a":
+   6:   source = var.dir
+Only literal values and const variables can be evaluated during init.
+
+resource "terraform_data" "x" {}
+module "a" { source = "./${terraform_data.x.id}" }
+
+Error: Invalid module source
+The module source can only reference constant input variables and local values.</code></pre>
+          <p>
+            The two messages come from the two gates: "Invalid" is the reference whitelist, before evaluation; "Unknown"
+            is the wholly-known check, after it. When a child module is installed, init also checks what it found: a
+            <code>list</code> block in a child module is rejected, and a <code>backend</code> or <code>cloud</code> block
+            there only warns "Backend configuration ignored" (<code>node_module_install.go</code>:168-199). Because each
+            install node references every input argument, a const value passed into a child should be able to steer a
+            grandchild's source; the code implies it, but it was not measured.
+          </p>
+          <p>
+            Here a const variable picks the module <span class="recon">measured here</span>:
+          </p>
+<pre><code>variable "net_version" {
+  type    = string
+  default = "v2"
+  const   = true
+}
+locals {
+  mod_dir = "./modules/net-${var.net_version}"
+}
+module "net" {
+  source = local.mod_dir
+  name   = var.region          # non-const is fine as an *input*
+}</code></pre>
+<pre><code>$ terraform init -var net_version=v1
+{"Modules":[...,{"Key":"net","Source":"./modules/net-v1","Dir":"modules/net-v1"}]}
+$ terraform plan -var net_version=v1
+Changes to Outputs:
+  + which = "v1:us-east-1"
+$ terraform plan            # forgot the -var
+Error: Module source has changed
+  on main.tf line 17, in module "net":
+  17:   source = local.mod_dir</code></pre>
+          <p>
+            The last error is the one that bites. Every non-init command loads modules with a walker that never downloads
+            and compares each evaluated source against <code>.terraform/modules/modules.json</code>
+            (<code>configload/loader_load.go</code>:37-111). Const values are therefore part of the working directory's
+            identity: whatever <code>-var</code> or <code>TF_VAR_</code> you gave <code>init</code>, give every later
+            command too, or put it in <code>terraform.tfvars</code>.
+          </p>
+
+          <h3>Provider requirements in 1.17, and the backend that stayed literal</h3>
+          <p>
+            <code>decodeRequiredProvidersBlock</code> still decodes the legacy string form at once, but any object-form
+            entry with <code>source</code> or <code>version</code> becomes a deferred <code>ProviderRequirementExpr</code>,
+            even a pure literal. A comment in <code>module.go</code>:40-44 says these are resolved in the init graph
+            "regardless of whether they contain variables"; only Stacks resolves them statically
+            (<code>provider_requirements.go</code>:57-79, 99-209) <span class="src">from the code</span>. One
+            <code>nodeResolveProviderRequirements</code> per module evaluates them with the same checks as module
+            sources, except that <code>path.*</code> is not allowed and a null version is treated, in the code's words,
+            "like an empty constraint set". The measured three-vertex graph in Figure {{fig-init-graph}} came from a
+            configuration with <code>source = "${local.ns}/random"</code> and
+            <code>version = "~&gt; ${var.random_version}"</code>; the lock file recorded the evaluated
+            <code>constraints = "~&gt; 3.9.1"</code>. With a plain variable instead, <code>init</code> failed with "Unknown
+            provider version" <span class="recon">measured here</span>. The <code>variable</code> documentation, as fetched on
+            23 October 2026, describes <code>const</code> only for module <code>source</code> and <code>version</code>; the
+            1.17 code also accepts it here.
+          </p>
+          <p>
+            Backends were left out. A <code>backend</code> block is decoded with a nil <code>EvalContext</code>, so even a
+            const variable fails with HCL's "Variables not allowed" (<code>internal/configs/backend.go</code>:43-59)
+            <span class="recon">measured here</span>. OpenTofu v1.13.2 takes the other road: its
+            <code>StaticEvaluator</code> evaluates backend blocks, and <code>path = var.p</code> configured the backend
+            (<code>opentofu:internal/configs/backend.go</code>:92-104). In Terraform the per-environment backend route is
+            still <code>-backend-config</code>. Why one <code>init</code> builds the init graph twice, and what that costs
+            on a large module tree, is still open; the trace shows that it does, not why.
+          </p>

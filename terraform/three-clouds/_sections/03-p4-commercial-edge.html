@@ -1,0 +1,195 @@
+          <h2 id="p4-commercial-edge"><span class="secnum">{{S}}</span>The commercial edge, and the ecosystem around it</h2>
+          <p>
+            Providers were always separate processes. What changed after 1.13 is that the commercial features joined
+            them. Terraform Stacks and Terraform Policy are both reached from the CLI, and both run as plugins that core
+            starts with go-plugin, the same machinery <a href="../engine-and-providers/#p2-processes">Part 2</a> took
+            apart for providers. Neither engine is in the repository as an engine you can run locally. This section's
+            claim: Terraform's direction is open core plus out-of-process commercial engines.
+          </p>
+
+          <h3>Stacks: a shim and a download</h3>
+          <p>
+            <code>terraform stacks</code> is a shim. The command's doc comment says it "delegates all execution to an
+            internal plugin" (<code>internal/command/stacks.go</code>:34-35). The plugin is found by service discovery,
+            <code>stackspluginServiceID = "stacksplugin.v1"</code> on <code>defaultHostname = "app.terraform.io"</code>,
+            reached over go-plugin with the cookie key <code>TF_STACKS_MAGIC_COOKIE</code>, and the command has its own
+            exit codes: 98 if the plugin cannot be downloaded, 99 for an RPC error (<code>stacks.go</code>:46-75)
+            <span class="src">from the code</span>. The first <code>terraform stacks -help</code>, run with
+            <code>HOME</code> pointed at a scratch directory, downloaded <code>tfstacks</code> 1.4.0, 22,585,528 bytes,
+            into <code>~/.terraform.d/stacksplugin/</code>, and printed sub-commands such as <code>init</code>,
+            <code>validate</code>, <code>create</code>, <code>list</code> and <code>fmt</code>
+            <span class="recon">measured here</span>. The downloaded binary was deleted afterwards.
+          </p>
+          <p>
+            The odd part is that the Stacks language and runtime are public. <code>internal/stacks</code> holds about
+            31,260 non-test Go lines in the BUSL tree, with <code>stackconfig</code>, <code>stackplan</code>,
+            <code>stackruntime</code> and the <code>.tfcomponent.hcl</code> file type. A hidden <code>rpcapi</code>
+            command bypasses the CLI's <code>command</code> package entirely; its README still calls the API experimental
+            for the "Stacks private preview", although Stacks went GA on HCP Terraform in September 2025. The README is
+            stale <span class="src">from the code</span>.
+          </p>
+
+          <h3>Policy: an engine from <code>$PATH</code></h3>
+          <p>
+            Terraform Policy is GA in the v1.17.0 CLI (<a href="../state-and-features/#p3-gates">Part 3</a> traces how it
+            got there), and its engine is still not in the repository. <code>internal/policy/client.go</code>:128-142
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	cmd := exec.CommandContext(ctx, pgm, "rpcapi")
+	plugin := plugin.NewClient(&amp;plugin.ClientConfig{
+		HandshakeConfig: plugin.HandshakeConfig{
+			ProtocolVersion:  1,
+			MagicCookieKey:   "TF_POLICY_PLUGIN",
+			MagicCookieValue: "6F11ED78A2AB",
+		},
+		Plugins: map[string]plugin.Plugin{
+			"policy": new(policy),
+		},
+		Cmd:      cmd,
+		AutoMTLS: true,
+		AllowedProtocols: []plugin.Protocol{
+			plugin.ProtocolGRPC,
+		},</code></pre>
+          <p>
+            <code>pgm</code> defaults to <code>"tfpolicy-plugin"</code> on <code>$PATH</code>, or the path in
+            <code>TF_POLICY_PLUGIN</code> (<code>client.go</code>:116-126). The environment variable's name doubles as the
+            magic-cookie key. The CLI never downloads the plugin. tfpolicy and tfpolicy-plugin 0.5.0 are separate
+            releases on <code>releases.hashicorp.com</code>, each shipped with <code>EULA.txt</code> and
+            <code>TermsOfEvaluation.txt</code>, and the plugin's help says it "executes Sentinel as an RPC API server"
+            <span class="recon">measured here</span> (not re-run by a verifier). The protocol is small:
+            <code>Setup</code>, <code>EvaluateResource</code>, <code>EvaluateProvider</code>,
+            <code>EvaluateModule</code>, and a reverse <code>CallbackService</code> through which the engine can ask core
+            for resources and data sources. It runs at three stages. At init, module- and provider-install hooks send each
+            source and version to the engine and block the download on an error. In plan and apply, each instance's
+            <code>attrs</code> and <code>prior_attrs</code> go to <code>EvaluateResource</code> from a separate policy
+            subgraph whose nodes run even after their dependencies fail, under a <code>TF_POLICY_PARALLELISM</code> (or
+            <code>GOMAXPROCS</code>) semaphore <span class="src">from the code</span>.
+          </p>
+          <p>
+            Whether a failure stops the run depends on the stage. That asymmetry, and the entitlement check that makes
+            local enforcement impossible with plugin 0.5.0, are measured on the project in
+            <a href="#p4-tests-policy">section 7</a>. <a href="#fig-commercial-edge">Figure 23</a> puts the three kinds of
+            plugin side by side.
+          </p>
+
+          <figure class="figure wide" id="fig-commercial-edge">
+            <div class="figure-head">
+              <span class="figure-label">Figure 23</span>
+              <p class="figure-title">The commercial edge runs out of process: three kinds of go-plugin child, and what happens when each fails</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 430" role="img" aria-label="Terraform core in the middle starts three kinds of child process with go-plugin. Left: provider plugins, aws, google, azurerm and random, over tfplugin5 or tfplugin6, chosen by the lock file and plugin cache. Top right: tfpolicy-plugin rpcapi 0.5.0, found on PATH or through TF_POLICY_PLUGIN, never downloaded, cookie TF_POLICY_PLUGIN equals 6F11ED78A2AB, shipped with a EULA; a setup failure is printed and plan and apply continue with exit 0, while init with policies exits 1. Bottom right: tfstacks 1.4.0, downloaded through the stacksplugin.v1 service from app.terraform.io; exit 98 if it cannot be downloaded, 99 on an RPC error. Bottom middle: a local backend supplies a nil entitlement; the code comment says nil means the plugin skips the check, but plugin 0.5.0 rejects it.">
+                <defs>
+                  <marker id="fig-ce-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-ce-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="30" y="24" class="svg-lane">ONE CLIENT, THREE KINDS OF CHILD · ALL GO-PLUGIN, GRPC, AUTOMTLS</text>
+                <rect x="420" y="150" width="280" height="96" rx="4" fill="#252525"/>
+                <text x="436" y="176" class="svg-step" style="fill: #ffffff">terraform v1.17.0</text>
+                <text x="436" y="196" class="svg-sub" style="fill: #deded9">core, BUSL · go-plugin client</text>
+                <text x="436" y="214" class="svg-sub" style="fill: #deded9">internal/stacks: ~31,260 Go lines,</text>
+                <text x="436" y="230" class="svg-sub" style="fill: #deded9">public; no policy engine inside</text>
+
+                <rect x="30" y="140" width="300" height="116" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="44" y="164" class="svg-step">provider plugins</text>
+                <text x="44" y="184" class="svg-sub">aws · google · azurerm · random</text>
+                <text x="44" y="202" class="svg-sub">tfplugin5 or tfplugin6, 36 RPCs</text>
+                <text x="44" y="220" class="svg-sub">picked by lock file + plugin cache</text>
+                <text x="44" y="242" class="svg-sub" style="fill: #ad4b43">start failure: an error diagnostic</text>
+
+                <rect x="790" y="40" width="300" height="168" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="804" y="64" class="svg-step">tfpolicy-plugin rpcapi 0.5.0</text>
+                <text x="804" y="84" class="svg-sub">$PATH or TF_POLICY_PLUGIN</text>
+                <text x="804" y="100" class="svg-sub">never downloaded by the CLI</text>
+                <text x="804" y="116" class="svg-sub">cookie TF_POLICY_PLUGIN=6F11ED78A2AB</text>
+                <text x="804" y="132" class="svg-sub">EULA + Terms of Evaluation</text>
+                <rect x="804" y="142" width="272" height="26" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="814" y="159" class="svg-sub" style="fill: #252525">plan, apply: Error printed, exit 0</text>
+                <rect x="804" y="174" width="272" height="26" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="814" y="191" class="svg-sub" style="fill: #252525">init -policies: exit 1</text>
+
+                <rect x="790" y="246" width="300" height="140" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="804" y="270" class="svg-step">tfstacks 1.4.0 (22,585,528 B)</text>
+                <text x="804" y="290" class="svg-sub">downloaded via stacksplugin.v1</text>
+                <text x="804" y="306" class="svg-sub">from app.terraform.io into</text>
+                <text x="804" y="322" class="svg-sub">~/.terraform.d/stacksplugin/</text>
+                <text x="804" y="338" class="svg-sub">cookie key TF_STACKS_MAGIC_COOKIE</text>
+                <text x="804" y="358" class="svg-sub" style="fill: #ad4b43">no plugin: exit 98</text>
+                <text x="804" y="374" class="svg-sub" style="fill: #ad4b43">RPC error: exit 99</text>
+
+                <g stroke="#252525" stroke-width="2.5" fill="none">
+                  <line x1="420" y1="186" x2="334" y2="186" marker-end="url(#fig-ce-k)"/>
+                  <line x1="700" y1="170" x2="786" y2="126" marker-end="url(#fig-ce-k)"/>
+                  <line x1="700" y1="226" x2="786" y2="300" marker-end="url(#fig-ce-k)"/>
+                </g>
+                <g stroke="#3c6f97" stroke-width="1.2" fill="none">
+                  <line x1="334" y1="214" x2="418" y2="214" marker-end="url(#fig-ce-b)"/>
+                  <line x1="788" y1="150" x2="704" y2="192" marker-end="url(#fig-ce-b)"/>
+                  <line x1="788" y1="330" x2="704" y2="242" marker-end="url(#fig-ce-b)"/>
+                </g>
+                <text x="350" y="178" class="svg-sub">exec</text>
+                <text x="350" y="232" class="svg-sub">gRPC</text>
+                <text x="708" y="112" class="svg-sub">exec rpcapi</text>
+                <text x="720" y="296" class="svg-sub">exec</text>
+
+                <rect x="420" y="296" width="280" height="96" rx="4" fill="#f7f7f5" stroke="#ad4b43" stroke-dasharray="4 3"/>
+                <text x="434" y="318" class="svg-step">local backend: Entitlement nil</text>
+                <text x="434" y="338" class="svg-sub">policy.go:71-74 "Nil means</text>
+                <text x="434" y="354" class="svg-sub">the plugin skips the check"</text>
+                <text x="434" y="374" class="svg-sub" style="fill: #ad4b43">0.5.0: entitlement check failed</text>
+                <line x1="700" y1="330" x2="786" y2="182" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 4"/>
+                <text x="30" y="300" class="svg-note">Thick black: core starts the child. Thin blue: answers over gRPC.</text>
+                <text x="30" y="318" class="svg-note">Dashed purple: the entitlement that the plugin checks at Setup.</text>
+                <text x="30" y="350" class="svg-note">The provider seam is MPL and shared with OpenTofu;</text>
+                <text x="30" y="368" class="svg-note">the two commercial seams are Terraform-only.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Core is the client for every engine, and the two commercial engines arrive separately: one from
+              <code>$PATH</code> under its own EULA, one downloaded on first use. A policy engine that fails to start stops
+              <code>init</code> but not <code>plan</code> or <code>apply</code>. Wiring and exit codes are
+              <span class="src">from the code</span>; the download size, the 0.5.0 entitlement failure and both exit
+              statuses are <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>What the big providers are made of</h3>
+          <p>
+            The providers on the shared seam are hybrids. The aws 6.70.0 and google 8.8.0 binaries link
+            terraform-plugin-sdk/v2 v2.40.1 and terraform-plugin-framework v1.19.0, joined by terraform-plugin-mux
+            v0.23.1, and azurerm 5.10.0's symbol paths show the same mix (framework 354 paths, sdk/v2 62, mux 34,
+            plugin-go 73; built with go1.26.9); random 3.9.1 is framework-only <span class="recon">measured here</span>.
+            HashiCorp's plugin docs send new providers to the framework and call SDKv2 the "legacy SDK"; mux exists so a
+            provider can move from one to the other resource by resource <span class="src">from the docs</span>. SDKv2
+            2.41.0 came out on 2026-10-06, so the three cached clouds are one SDK release behind.
+          </p>
+
+          <h3>Scale, dated</h3>
+          <p>
+            On 2026-10-23 the Terraform Registry's v2 API reported 7,536 providers (34 official, 394 partner, 7,093
+            community, which sums to 7,521 for a reason not found) and about 24.9 thousand modules, 233 of them verified.
+            hashicorp/aws showed about 8.1 billion downloads across 513 versions. The author's tally of the OpenTofu
+            Registry's index files gives 4,804 provider entries, 226 of them aliases, and 24,140 modules (not re-checked).
+            GitHub showed about 50.1 thousand stars for hashicorp/terraform and 30.6 thousand for opentofu/opentofu. All
+            of these are live counters; they changed during the day they were read <span class="src">from the docs</span>.
+          </p>
+
+          <h3>The neighbours</h3>
+          <p>
+            Around Terraform sit tools that either reuse its providers or read its files
+            <span class="src">from the docs</span>. Pulumi (Apache-2.0) supports general-purpose languages and loads
+            Terraform and OpenTofu providers through its bridge. Crossplane (Apache-2.0, graduated in CNCF on 2025-10-28)
+            reconciles continuously in a cluster and gets providers from Upjet. CloudFormation is AWS-only and Bicep
+            compiles to ARM JSON. Around the CLI: TFLint (MPL-2.0) catches cloud-specific errors <code>validate</code>
+            cannot, Checkov and Trivy (Apache-2.0; tfsec was folded into Trivy) scan configurations and plan JSON,
+            Terragrunt (MIT, v1.0.0 on 2026-03-30) orchestrates Terraform or OpenTofu, Terratest (Apache-2.0) tests real
+            infrastructure where <code>mock_provider</code> tests none, and Infracost, Atlantis and terraform-docs cover
+            cost, pull-request automation and module docs. Of the tools surveyed, only Terraform core is BUSL.
+          </p>
+          <p>
+            The stated direction matches the plugin picture. Terraform 1.14 added list resources, <code>query</code> and
+            actions; HashiConf 2025 announced Stacks GA and public betas of search and actions in HCP Terraform; tfpolicy
+            entered an HCP public beta on 2026-07-16 and went GA in the v1.17.0 CLI; HashiCorp's Terraform MCP server, an MPL-2.0 repository, was announced GA in June 2026. OpenTofu, for its part, says it plans
+            to fold policy enforcement into its experimental built-in linting, inside the binary
+            <span class="src">from the docs</span>. HashiConf 2026 (26 to 29 October) falls after these sources were read.
+          </p>

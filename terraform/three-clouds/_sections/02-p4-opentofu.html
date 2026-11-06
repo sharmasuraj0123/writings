@@ -1,0 +1,330 @@
+          <h2 id="p4-opentofu"><span class="secnum">{{S}}</span>The fork, measured</h2>
+          <p>
+            OpenTofu began as Terraform 1.5 with a different licence. Three years on it is a different tool. It still
+            loads <code>.tf</code> files, builds the same kind of graph and drives the same provider binaries, but its
+            language, its state format and its CLI have each moved in directions Terraform did not follow, and Terraform
+            has moved in directions it did not follow either. This section compares Terraform v1.17.0 with OpenTofu
+            v1.13.2 (<code>765062032c46</code>, released 2026-10-21) with both binaries on the same box. Its claim: the
+            two share the providers but not the newest RPCs, and two of OpenTofu's features are one-way doors.
+          </p>
+
+          <h3>The project, from its tree</h3>
+          <p>
+            The repository says what it is. <code>LICENSE</code> is MPL 2.0 with a dual copyright, the OpenTofu Authors
+            and HashiCorp's from 2014, and forked files keep HashiCorp's MPL header under OpenTofu's. v1.13.x is
+            supported until 1 August 2027. <code>MAINTAINERS.md</code> lists, among others, Martin Atkins, the go-cty
+            author, and Spacelift's James Humphries <span class="src">from the code</span>. The dependency pins have
+            drifted: OpenTofu replaces <code>hashicorp/hcl/v2</code> v2.20.1 with its own <code>opentofu/hcl</code> fork,
+            while Terraform uses upstream v2.24.0, and OpenTofu is ahead on go-cty (v1.19.0 against v1.18.1) and
+            go-plugin (v1.8.0 against v1.7.0). OpenTofu defaults to <code>urfave/cli/v3</code> and keeps
+            <code>mitchellh/cli</code> only behind <code>TOFU_EXPERIMENTAL_CLI_ENABLED=false</code>. It has a second
+            execution engine under <code>internal/engine</code>, selectable only in nightly or dev builds through
+            <code>TOFU_X_EXPERIMENTAL_RUNTIME</code>; releases still run the inherited graph engine. And it has no
+            telemetry: Terraform's <code>main.go</code>:244-245 starts <code>go runCheckpoint(ctx, config)</code> on every
+            run, which calls HashiCorp Checkpoint unless the CLI config disables it, and OpenTofu has no checkpoint code
+            at all <span class="src">from the code</span>.
+          </p>
+
+          <h3>Door one: providers with <code>for_each</code></h3>
+          <p>
+            Terraform reserves <code>for_each</code> on a <code>provider</code> block. OpenTofu allows it, but only on an
+            aliased configuration ("Alias required when using "for_each"",
+            <code>opentofu:internal/configs/provider.go</code>:110-117), and it expands the instances at configuration load,
+            before any graph exists. <code>opentofu:internal/configs/provider.go</code>:172-195
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	if p.ForEach != nil {
+		forEachRefsFunc := func(refs []*addrs.Reference) (*hcl.EvalContext, tfdiags.Diagnostics) {
+			var diags tfdiags.Diagnostics
+			evalContext, evalDiags := eval.EvalContext(ctx, StaticIdentifier{
+				Module:    eval.call.addr,
+				Subject:   fmt.Sprintf("provider.%s.%s.for_each", p.Name, p.Alias),
+				DeclRange: p.ForEach.Range(),
+			}, refs)
+			return evalContext, diags.Append(evalDiags)
+		}
+
+		forVal, evalDiags := evalchecks.EvaluateForEachExpression(p.ForEach, forEachRefsFunc, nil)
+		diags = append(diags, evalDiags.ToHCL()...)
+		if evalDiags.HasErrors() {
+			return diags
+		}
+
+		p.Instances = make(map[addrs.InstanceKey]instances.RepetitionData)
+		for k, v := range forVal {
+			p.Instances[addrs.StringKey(k)] = instances.RepetitionData{
+				EachKey:   cty.StringVal(k),
+				EachValue: v,
+			}
+		}</code></pre>
+          <p>
+            The evaluation context is the static one, so the keys may come from variables and locals but never from a
+            resource attribute. Here is the smallest configuration that uses it, run through <code>tofu apply</code> with
+            random 3.7.2 from <code>registry.opentofu.org</code>, then handed to Terraform
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>terraform { required_providers { random = { source = "hashicorp/random", version = "3.7.2" } } }
+variable "regions" { type = set(string)  default = ["eu", "us"] }
+provider "random" {
+  alias    = "by_region"
+  for_each = var.regions
+}
+resource "random_id" "x" {
+  for_each    = var.regions
+  provider    = random.by_region[each.key]
+  byte_length = 4
+}</code></pre>
+<pre><code>$ tofu apply -auto-approve
+Warning: Provider configuration for_each matches resource
+...
+Apply complete! Resources: 2 added
+$ jq '.resources[0].instances[0].provider' terraform.tfstate
+"provider[\"registry.opentofu.org/hashicorp/random\"].by_region[\"eu\"]"
+$ cp terraform.tfstate ../m3tf/ &amp;&amp; cd ../m3tf &amp;&amp; terraform state list
+Failed to load state: Variable name required: Must begin with a variable name.</code></pre>
+          <p>
+            The warning is OpenTofu's own advice: a provider instance must outlive its resources, so sharing the
+            resource's <code>for_each</code> makes later removals awkward. The state difference is structural. Both tools
+            write state version 4, but the per-resource struct differs. Terraform's has a required resource-level
+            provider (<code>internal/states/statefile/version4.go</code>:695-702); OpenTofu's makes it optional and adds
+            one per instance (<code>opentofu:internal/states/statefile/version4.go</code>:851-866)
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>// Terraform v1.17.0, resourceStateV4
+	ProviderConfig string                  `json:"provider"`
+	Instances      []instanceObjectStateV4 `json:"instances"`
+// OpenTofu v1.13.2, resourceStateV4 and instanceObjectStateV4
+	ProviderInstance string                  `json:"provider,omitempty"`
+	Instances        []instanceObjectStateV4 `json:"instances"`
+	…
+	IndexKey         interface{} `json:"index_key,omitempty"`
+	Status           string      `json:"status,omitempty"`
+	Deposed          string      `json:"deposed,omitempty"`
+	ProviderInstance string      `json:"provider,omitempty"`</code></pre>
+          <p>
+            Terraform's loader finds no provider address where it expects one and fails to parse what it does find. After
+            that apply there is no way back to Terraform short of editing state by hand.
+          </p>
+
+          <h3>Door two: encrypted state and plans</h3>
+          <p>
+            OpenTofu's <code>terraform {}</code> block accepts an <code>encryption</code> block. It holds labelled
+            <code>key_provider</code> and <code>method</code> blocks plus three targets, <code>state</code>,
+            <code>plan</code> and <code>remote_state_data_sources</code>, each with a <code>method</code>, an optional
+            <code>fallback</code> for rotation, and <code>enforced</code>. v1.13.2 ships the key providers
+            <code>pbkdf2</code>, <code>aws_kms</code>, <code>gcp_kms</code>, <code>azure_vault</code>, <code>openbao</code>
+            and <code>external</code> (plus test-only ones) and the methods <code>aes_gcm</code>, <code>unencrypted</code>
+            and <code>external</code>. <code>pbkdf2</code> defaults to SHA-512, 600,000 iterations, a 32-byte salt and a
+            32-byte key <span class="src">from the code</span>. The cipher is Go's GCM with a fresh nonce per write,
+            <code>opentofu:internal/encryption/method/aesgcm/aesgcm.go</code>:25-45:
+          </p>
+<pre><code>func (a aesgcm) Encrypt(data []byte) ([]byte, error) {
+	result, err := handlePanic(
+		func() ([]byte, error) {
+			gcm, err := a.getGCM(a.encryptionKey)
+			if err != nil {
+				return nil, &amp;method.ErrEncryptionFailed{Cause: err}
+			}
+
+			nonce := make([]byte, gcm.NonceSize())
+			if _, err := rand.Read(nonce); err != nil {
+				return nil, &amp;method.ErrEncryptionFailed{Cause: &amp;method.ErrCryptoFailure{
+					Message: "could not generate nonce",
+					Cause:   err,
+				}}
+			}
+
+			encrypted := gcm.Seal(nil, nonce, data, a.aad)
+
+			return append(nonce, encrypted...), nil
+		},
+	)</code></pre>
+          <p>
+            With a 28-character passphrase, <code>aes_gcm</code>, <code>state { enforced = true }</code> and a
+            <code>plan</code> target, one <code>terraform_data</code> apply gives this <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ tofu apply -auto-approve &amp;&amp; python3 -c 'import json;d=json.load(open("terraform.tfstate"));print(list(d),d["encryption_version"])'
+['serial', 'lineage', 'meta', 'encrypted_data', 'encryption_version'] v0
+$ tofu plan -out p.bin &amp;&amp; head -c 40 p.bin
+{"meta":{"key_provider.pbkdf2.k":"eyJzYW
+$ terraform init   → Error: Unsupported block type ... Blocks of type "encryption" are not expected here.</code></pre>
+          <p>
+            The state file is a JSON envelope of about 1.4 kB (1,407 bytes in one run, 1,411 in a re-run; salt and base64
+            vary). <code>serial</code> and <code>lineage</code> stay in plaintext and are cross-checked after decryption,
+            so backends and locks keep working. The saved plan is no longer a ZIP but the same envelope, 3,315 bytes, and
+            <code>tofu show</code> decrypts it. Handed the encrypted state alone, Terraform says "Unsupported state file
+            format: The state file does not have a "version" attribute". <a href="#fig-two-tools">Figure 22</a> lays the
+            envelope out. If your team might ever run Terraform against the same state, do not turn on either feature.
+          </p>
+
+          <h3>Smaller divergences, all measured</h3>
+          <p>
+            <strong>Version constraints.</strong> OpenTofu ignores <code>required_version</code> in a plain
+            <code>.tf</code> file, on the assumption that it was written for "our predecessor", and enforces it only in
+            <code>.tofu</code> files or through <code>language { compatible_with }</code>. With
+            <code>required_version = "&gt;= 99.0.0"</code> in <code>main.tf</code>, <code>terraform init</code> fails
+            "Unsupported Terraform Core version" while <code>tofu init</code> and <code>plan</code> succeed; the same line
+            in <code>main.tofu</code> makes tofu fail "Incompatible module" <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <strong>Shadow files.</strong> When <code>name.tf</code> and <code>name.tofu</code> sit side by side, tofu
+            silently ignores the <code>.tf</code> twin; the same holds for <code>.tofu.json</code> and
+            <code>.tofutest.hcl</code>. With <code>output "who"</code> in both <code>main.tf</code> and
+            <code>main.tofu</code>, tofu plans "tofu file", Terraform plans "tf file", and neither reports a duplicate.
+            Code review that reads only <code>.tf</code> files can miss what tofu actually runs.
+          </p>
+          <p>
+            <strong>Exclusion.</strong> <code>tofu plan -exclude</code> is targeting by complement, and it removes graph
+            descendants too. The comment on <code>removeExcludedNodes</code> says so
+            (<code>opentofu:internal/tofu/transform_targets.go</code>:105-108):
+          </p>
+<pre><code>// removeExcludedNodes goes over a list of excluded resources and modules, and returns a set of targeted nodes to be
+// used for resource targeting. An excluded resource is either addressed directly, addressed indirectly via its
+// container, or it's dependent on an excluded node. The rest are the targeted nodes used for resource targeting
+func (t *TargetingTransformer) removeExcludedNodes(g *Graph, excludes []addrs.Targetable) dag.Set {</code></pre>
+          <p>
+            <code>tofu plan -exclude=terraform_data.b</code> planned neither <code>b</code> nor the dependent
+            <code>c</code>; Terraform answers "flag provided but not defined".
+          </p>
+          <p>
+            <strong>Lifecycle.</strong> OpenTofu 1.11 added <code>lifecycle { enabled = &lt;bool&gt; }</code>, a zero-or-one
+            repetition that excludes <code>count</code> and <code>for_each</code>; with <code>enabled = var.on</code>
+            (default false) tofu planned two of three resources, and <code>terraform validate</code> failed "Unsupported
+            argument". Both tools have <code>lifecycle { destroy = false }</code>, but they decode it differently
+            (<code>internal/configs/resource.go</code>:225-229 against <code>opentofu:internal/configs/resource.go</code>:221-223;
+            the two labels are mine):
+          </p>
+<pre><code>// Terraform v1.17.0
+			if attr, exists := lcContent.Attributes["destroy"]; exists {
+				valDiags := gohcl.DecodeExpression(attr.Expr, nil, &amp;r.Managed.Destroy)
+				diags = append(diags, valDiags...)
+				r.Managed.DestroySet = true
+			}
+// OpenTofu v1.13.2
+			if attr, exists := lcContent.Attributes["destroy"]; exists {
+				r.Managed.Destroy = attr.Expr
+			}</code></pre>
+          <p>
+            A nil <code>EvalContext</code> means Terraform accepts only a literal; <code>destroy = !var.keep</code> works
+            only in tofu. The same split runs through static evaluation in general. OpenTofu evaluates backend blocks
+            with its <code>StaticEvaluator</code>, so <code>path = var.p</code> works; Terraform decodes backends with a
+            nil context, so even a <code>const</code> variable fails "Variables not allowed"
+            (<a href="../language-and-front-end/#p1-init-graph">Part 1</a>). A module <code>source</code> computed from a
+            non-const variable works in tofu and fails in Terraform 1.17 with "Only literal values and const variables can
+            be evaluated during init." OpenTofu parses Terraform's <code>const</code> attribute only for compatibility,
+            calling it, in a source comment, an "imitation of our static eval concept".
+          </p>
+          <p>
+            <strong>Functions.</strong> <code>metadata functions -json</code> lists 134 names in tofu and 119 in
+            Terraform; every Terraform function exists in tofu, which adds fifteen: twelve <code>assume*</code>,
+            <code>base64gunzip</code>, <code>cidrcontains</code> and <code>urldecode</code>. Both have
+            <code>convert(value, type)</code>, Terraform since v1.15.0 (#38160) and tofu since 1.13 (#4449), and both
+            consoles evaluate it, yet neither tool's <code>metadata functions</code> lists it
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <strong>Distribution.</strong> A bare <code>hashicorp/random</code> resolves to
+            <code>registry.terraform.io</code> in Terraform and <code>registry.opentofu.org</code> in tofu, and tofu
+            rewrites in-memory state addresses from the first to the second unless the configuration uses the full form.
+            tofu installs providers and modules from OCI registries; Terraform's <code>oci</code> backend is Oracle
+            Object Storage, unrelated, and is the one backend tofu lacks. tofu takes a global <code>flock</code> per
+            provider, version and platform beside the plugin cache, so parallel inits can share
+            <code>TF_PLUGIN_CACHE_DIR</code>; Terraform has none, which bit this lab (<a href="#p4-real-apply">section 8</a>).
+          </p>
+
+          <figure class="figure wide" id="fig-two-tools">
+            <div class="figure-head">
+              <span class="figure-label">Figure 22</span>
+              <p class="figure-title">Two tools, one protocol, two one-way doors</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>item</th><th>Terraform v1.17.0</th><th>OpenTofu v1.13.2</th><th>evidence</th><th>one-way door?</th></tr></thead>
+                <tbody>
+                  <tr style="background: var(--red-soft)"><td>provider <code>for_each</code></td><td>reserved name</td><td>allowed with <code>alias</code>, static keys</td><td>both binaries</td><td><strong>yes</strong>: state unloadable</td></tr>
+                  <tr style="background: var(--red-soft)"><td>state and plan encryption</td><td>none; rejects block and files</td><td>pbkdf2 or KMS keys + <code>aes_gcm</code></td><td>both binaries</td><td><strong>yes</strong>: no <code>version</code> key</td></tr>
+                  <tr><td><code>required_version</code> in .tf</td><td>enforced</td><td>ignored</td><td>both binaries</td><td>no, config only</td></tr>
+                  <tr><td>.tofu twin files</td><td>ignored</td><td>shadow the .tf file silently</td><td>both binaries</td><td>no, config only</td></tr>
+                  <tr><td><code>lifecycle { enabled }</code></td><td>Unsupported argument</td><td>since 1.11</td><td>both binaries</td><td>no, config only</td></tr>
+                  <tr><td><code>lifecycle { destroy }</code></td><td>literal, since 1.16</td><td>expression, since 1.12</td><td>code + tofu run</td><td>no</td></tr>
+                  <tr><td><code>-exclude</code></td><td>no such flag</td><td>drops descendants too</td><td>both binaries</td><td>no</td></tr>
+                  <tr><td>backend expressions</td><td>literals only</td><td>static evaluation</td><td>both binaries</td><td>no</td></tr>
+                  <tr><td>module source from a variable</td><td>literals, <code>const</code> (1.15)</td><td>any static variable</td><td>both, not re-checked</td><td>no</td></tr>
+                  <tr><td>functions listed</td><td>119</td><td>134</td><td>both binaries</td><td>no</td></tr>
+                  <tr style="background: var(--green-soft)"><td><code>convert(value, type)</code></td><td>yes, v1.15.0; unlisted</td><td>yes, 1.13; unlisted</td><td>both consoles</td><td>shared</td></tr>
+                  <tr><td>default registry</td><td>registry.terraform.io</td><td>registry.opentofu.org</td><td>code + lock file</td><td>no; tofu rewrites addresses</td></tr>
+                  <tr><td>plugin-cache lock</td><td>none</td><td>global <code>flock</code></td><td>code</td><td>no</td></tr>
+                  <tr><td><code>action</code>, list, <code>state_store</code></td><td>yes</td><td>rejects <code>action</code>; never calls the RPCs</td><td>tofu run + code</td><td>no</td></tr>
+                  <tr><td>tfplugin6 RPCs called</td><td>34 of 36</td><td>21 of 36</td><td>code</td><td>no</td></tr>
+                  <tr><td>telemetry</td><td>Checkpoint each run</td><td>none</td><td>code</td><td>no</td></tr>
+                </tbody>
+              </table>
+              <svg viewBox="0 0 1080 300" role="img" aria-label="Two door panels. Left: provider for_each. OpenTofu writes the provider address per instance, provider registry.opentofu.org hashicorp random by_region eu, with no resource-level provider; Terraform's state list then fails: Failed to load state: Variable name required: Must begin with a variable name. Right: encrypted state. The file is a JSON envelope with keys serial, lineage, meta, encrypted_data and encryption_version v0; meta decodes to salt, 600,000 iterations, sha512 and key length 32; encrypted_data is 830 bytes, a 12-byte nonce, 802 bytes of ciphertext and a 16-byte tag, in a file of about 1.4 kilobytes. Terraform rejects it: Unsupported state file format, the state file does not have a version attribute." style="margin-top: 20px">
+                <defs>
+                  <marker id="fig-tt-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="0" y="16" class="svg-lane">DOOR 1 · PROVIDER FOR_EACH (TOFU APPLY, THEN TERRAFORM)</text>
+                <rect x="0" y="30" width="520" height="104" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="14" y="52" class="svg-step">terraform.tfstate written by tofu</text>
+                <text x="14" y="72" class="svg-sub" xml:space="preserve">resources[0]: "provider" omitted (omitempty)</text>
+                <text x="14" y="90" class="svg-sub" xml:space="preserve">  instances[0].provider =</text>
+                <text x="14" y="108" class="svg-sub" xml:space="preserve">  provider["registry.opentofu.org/hashicorp/random"]</text>
+                <text x="14" y="124" class="svg-sub" xml:space="preserve">    .by_region["eu"]</text>
+                <line x1="260" y1="134" x2="260" y2="170" stroke="#252525" stroke-width="2" marker-end="url(#fig-tt-k)"/>
+                <text x="272" y="157" class="svg-sub">terraform state list</text>
+                <rect x="0" y="174" width="520" height="66" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="14" y="196" class="svg-step">Terraform v1.17.0</text>
+                <text x="14" y="214" class="svg-sub">Failed to load state: Variable name required:</text>
+                <text x="14" y="230" class="svg-sub">Must begin with a variable name.</text>
+                <text x="0" y="262" class="svg-note">Terraform's struct requires "provider" on the resource;</text>
+                <text x="0" y="278" class="svg-note">tofu moved it to each instance.</text>
+
+                <text x="560" y="16" class="svg-lane">DOOR 2 · ENCRYPTED STATE (PBKDF2 + AES_GCM)</text>
+                <rect x="560" y="30" width="520" height="104" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="574" y="52" class="svg-step">terraform.tfstate, about 1.4 kB (1,407 / 1,411 B)</text>
+                <text x="574" y="72" class="svg-sub">serial · lineage (plaintext, re-checked)</text>
+                <text x="574" y="90" class="svg-sub">meta → salt, iterations 600000, sha512, key_length 32</text>
+                <text x="574" y="108" class="svg-sub">encryption_version "v0"</text>
+                <text x="574" y="126" class="svg-sub">encrypted_data → 830 bytes, below</text>
+                <text x="560" y="154" class="svg-sub">nonce 12</text>
+                <text x="1080" y="154" class="svg-sub" text-anchor="end">tag 16</text>
+                <rect x="560" y="160" width="7" height="22" fill="#d98226"/>
+                <rect x="567" y="160" width="504" height="22" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="1071" y="160" width="9" height="22" fill="#d98226"/>
+                <text x="819" y="175" class="svg-sub" text-anchor="middle" style="fill: #252525">ciphertext 802 B (to scale)</text>
+                <rect x="560" y="196" width="520" height="66" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="574" y="218" class="svg-step">Terraform v1.17.0</text>
+                <text x="574" y="236" class="svg-sub">Unsupported state file format: The state file</text>
+                <text x="574" y="252" class="svg-sub">does not have a "version" attribute</text>
+                <text x="560" y="284" class="svg-note">A tofu plan file becomes the same JSON envelope (3,315 B), not a ZIP.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Most differences are configuration-level and can be undone by editing files. Two change what is written to
+              disk, and Terraform cannot read the result: those are the doors. Rows and errors are
+              <span class="recon">measured here</span> with both binaries except where the evidence column says code;
+              the module-source row was not re-checked by a verifier. The 12 + 802 + 16 split of the 830 ciphertext bytes
+              is arithmetic from the GCM nonce and tag sizes <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <h3>One protocol, two clients</h3>
+          <p>
+            Both trees carry the same 36 RPCs. OpenTofu's <code>tfplugin6.10.proto</code> defines everything in
+            Terraform's 6.11 except the 6.11 computed-block and planned-private fields; as
+            <a href="../engine-and-providers/#p2-wire">Part 2</a> showed, the labels no longer track the contents in
+            either project. The difference is in the client. Terraform core calls 34 of the 36. OpenTofu's
+            <code>internal/plugin6/grpc_provider.go</code> calls 21: schemas, validation, configure, the managed-resource
+            and ephemeral RPCs and functions, and never the list-resource, action, state-store or
+            <code>GenerateResourceConfig</code> RPCs, although their messages exist in its proto file. The CLI says the
+            same thing from the outside: <code>modules</code>, <code>query</code> and <code>stacks</code> are
+            Terraform-only commands, and the other 24 are common.
+          </p>
+          <p>
+            The direction of travel is visible in that gap. Every surface Terraform added since 1.13 (list resources and
+            <code>query</code>, actions, <code>state_store</code>, Stacks, Policy) sits on an RPC or a plugin that
+            OpenTofu does not call. OpenTofu's additions (encryption, provider iteration, <code>-exclude</code>,
+            <code>enabled</code>, OCI) sit in the language, state and distribution, where Terraform cannot read them.
+            The providers are the shared ground. Whether OpenTofu will add client support for the newer RPCs was not
+            established.
+          </p>

@@ -1,0 +1,287 @@
+          <h2 id="p2-expansion"><span class="secnum">{{S}}</span>Expansion and evaluation</h2>
+          <p class="lede">
+            The static graph knows <code>random_pet.p</code>; it does not know <code>random_pet.p[0]</code>. Instances
+            are created during the walk, when a resource's <code>(expand)</code> node finally knows its
+            <code>count</code> or <code>for_each</code>. They fan out in a small subgraph of their own, outside the
+            parallelism semaphore.
+          </p>
+
+          <h3>The expander</h3>
+          <p>
+            Every walk gets one <code>instances.Expander</code>. Its doc comment calls it "a coordination point for
+            gathering object repetition values (count and for_each in configuration) and then later making use of
+            them to fully enumerate all of the instances of an object" (<code>internal/instances/expander.go</code>:18-47).
+            It is guarded by a <code>sync.RWMutex</code>, and it expects a strict order: "each object must have its
+            repetition mode set exactly once, and this must be done before any calls that depend on the repetition
+            mode … If this ordering is violated, the methods will panic." The graph's edges are what guarantee that
+            order <span class="src">from the code</span>.
+          </p>
+          <p>
+            An expansion has one of four modes (<code>expansion_mode.go</code>:35-124). <code>expansionSingle</code>
+            yields one instance with <code>NoKey</code>. <code>expansionCount</code> yields <code>IntKey</code>s 0 to
+            n−1. <code>expansionForEach</code> yields <code>StringKey</code>s sorted lexically.
+            <code>expansionDeferred</code> stands for keys that are not known yet. For each key, the mode also returns
+            the <code>RepetitionData</code> that becomes <code>count.index</code>, <code>each.key</code> and
+            <code>each.value</code> during evaluation.
+          </p>
+
+          <h3>Module expansion, then resource expansion</h3>
+          <p>
+            A module's <code>(expand)</code> node evaluates the call's <code>count</code> or <code>for_each</code> once
+            per instance of the parent module, and registers the result (<code>node_module_expand.go</code>:118-176).
+            The expander's comment warns that "module expansion in particular has a recursive effect that can cause
+            deep objects to expand exponentially", and it assumes "that all instances of a module have the same static
+            objects inside, and that they differ only in the repetition count for some of those objects". That
+            assumption is why the static graph can stay resource-level: the shape of a module is fixed, only the
+            counts vary. If the value is unknown, the node may register it as unknown only when deferrals are
+            allowed.
+          </p>
+          <p>
+            A resource's <code>(expand)</code> node does its work in <code>DynamicExpand</code>. It first checks
+            <code>count</code> and <code>for_each</code> for references to the resource itself
+            (<code>validateMetaSelfRef</code>), then iterates every instance of its containing module, records the
+            repetition with <code>recordResourceData</code>, and builds a subgraph with a miniature
+            <code>BasicGraphBuilder</code> named <code>nodeExpandPlannableResource</code>
+            (<code>node_resource_plan.go</code>:99-131, 666-812). The subgraph has five steps: three
+            <code>DynamicTransformer</code>s, <code>AttachStateTransformer</code> and <code>TargetsTransformer</code>.
+            The first two are <code>node_resource_plan.go</code>:732-753:
+          </p>
+<pre><code>		DynamicTransformer(func(graph *Graph) error {
+			// We'll add a node for all the known instance keys.
+			for _, key := range knownInstKeys {
+				graph.Add(n.concreteResource(ctx, knownImports, unknownImports, n.skipPlanChanges)(NewNodeAbstractResourceInstance(addr.Instance(key))))
+			}
+			return nil
+		}),
+
+		DynamicTransformer(func(graph *Graph) error {
+			// We'll add a node if there are unknown instance keys.
+			if haveUnknownKeys {
+				addr := addr.Module.UnexpandedResource(addr.Resource)
+
+				graph.Add(&amp;nodePlannablePartialExpandedResource{
+					addr:              addr,
+					config:            n.Config,
+					resolvedProvider:  n.ResolvedProvider,
+					skipPlanChanges:   n.skipPlanChanges,
+					preDestroyRefresh: n.preDestroyRefresh,
+				})
+			}
+			return nil
+		}),</code></pre>
+          <p>
+            The third adds orphans: state instances whose key is no longer in the expansion become
+            <code>concreteResourceOrphan</code> nodes and plan a delete. When some keys are unknown, an unmatched
+            state instance is only a "maybe orphan", planned with <code>skipPlanChanges=true</code> so it is
+            refreshed but not deleted (<code>node_resource_plan.go</code>:768-793). No transformer in the list adds an
+            edge between instances, so <code>random_pet.p[0]</code> and <code>random_pet.p[1]</code> plan concurrently.
+            One practical effect: a resource whose <code>for_each</code> keys are partly unknown never plans a delete
+            for an unmatched instance in that run; the delete can only come in a later run, once the keys are known
+            <span class="recon">reconstruction</span>.
+            And because <a href="#p2-walk">section 02</a> showed that the nested walk runs outside the semaphore, the
+            expanding node itself holds no slot while they do <span class="src">from the code</span>.
+          </p>
+          <p>
+            A trace of the lab plan shows the order this produces <span class="recon">measured here</span>:
+            <code>module.child (expand)</code>, then <code>module.child.var.seed (expand)</code> and its two instances
+            <code>module.child[0].var.seed</code> and <code>module.child[1].var.seed</code>, then
+            <code>module.child.random_id.r (expand)</code> and its instances, then the outputs, then
+            <code>module.child (close)</code> and <code>root</code>. Figure 10 puts the two graphs side by side.
+          </p>
+
+          <figure class="figure wide" id="fig-config-vs-expanded">
+            <div class="figure-head">
+              <span class="figure-label">Figure 10</span>
+              <p class="figure-title">The plan graph has no instances; the walk creates them, one subgraph per (expand) node</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1120 560" role="img" aria-label="Left: the engine lab's plan graph as printed by terraform graph -type=plan, sixteen vertices and eighteen edges, none of them an instance. Right: the instance vertices that appeared during the walk, grouped under the expand node that created them. Bottom right: the lab project's 115-vertex plan graph broken down by kind.">
+                <defs>
+                  <marker id="fig-cve-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="26" class="svg-lane">CONFIG GRAPH · graph -type=plan · 16 V, 18 E</text>
+                <g stroke="#252525" stroke-width="1.6" fill="none" marker-end="url(#fig-cve-k)">
+                  <line x1="290" y1="69" x2="90" y2="96"/>
+                  <line x1="290" y1="69" x2="220" y2="96"/>
+                  <line x1="290" y1="69" x2="350" y2="96"/>
+                  <line x1="290" y1="69" x2="490" y2="96"/>
+                  <line x1="90" y1="123" x2="146" y2="276"/>
+                  <line x1="220" y1="123" x2="220" y2="156"/>
+                  <line x1="220" y1="183" x2="160" y2="276"/>
+                  <line x1="350" y1="123" x2="350" y2="156"/>
+                  <line x1="350" y1="183" x2="350" y2="216"/>
+                  <line x1="370" y1="243" x2="470" y2="276"/>
+                  <line x1="500" y1="123" x2="500" y2="276"/>
+                  <line x1="490" y1="303" x2="490" y2="336"/>
+                  <line x1="480" y1="363" x2="470" y2="396"/>
+                  <line x1="440" y1="363" x2="280" y2="396"/>
+                  <line x1="120" y1="303" x2="60" y2="396"/>
+                  <line x1="170" y1="303" x2="240" y2="396"/>
+                  <line x1="140" y1="303" x2="114" y2="456"/>
+                  <line x1="270" y1="423" x2="320" y2="456"/>
+                </g>
+                <g fill="#ffffff" stroke="#252525">
+                  <rect x="240" y="44" width="100" height="25" fill="#f7f7f5"/>
+                  <rect x="30" y="98" width="120" height="25" fill="#f7f7f5"/>
+                  <rect x="160" y="98" width="120" height="25"/>
+                  <rect x="290" y="98" width="120" height="25"/>
+                  <rect x="430" y="98" width="120" height="25" fill="#f7f7f5"/>
+                  <rect x="160" y="158" width="120" height="25"/>
+                  <rect x="285" y="158" width="130" height="25" fill="#f7f7f5"/>
+                  <rect x="290" y="218" width="120" height="25"/>
+                  <rect x="90" y="278" width="120" height="25" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <rect x="425" y="278" width="130" height="25" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <rect x="430" y="338" width="120" height="25"/>
+                  <rect x="5" y="398" width="90" height="25"/>
+                  <rect x="200" y="398" width="120" height="25" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <rect x="395" y="398" width="150" height="25" fill="#f7f7f5"/>
+                  <rect x="50" y="458" width="130" height="25" fill="#dfede5" stroke="#367f59"/>
+                  <rect x="265" y="458" width="130" height="25" fill="#dfede5" stroke="#367f59"/>
+                </g>
+                <text x="290" y="61" class="svg-sub" text-anchor="middle">root</text>
+                <text x="90" y="115" class="svg-sub" text-anchor="middle">builtin (close)</text>
+                <text x="220" y="115" class="svg-sub" text-anchor="middle">output.joined</text>
+                <text x="350" y="115" class="svg-sub" text-anchor="middle">output.child_ids</text>
+                <text x="490" y="115" class="svg-sub" text-anchor="middle">random (close)</text>
+                <text x="220" y="175" class="svg-sub" text-anchor="middle">local.joined</text>
+                <text x="350" y="175" class="svg-sub" text-anchor="middle">module.child (close)</text>
+                <text x="350" y="235" class="svg-sub" text-anchor="middle">child.output.id</text>
+                <text x="150" y="295" class="svg-sub" text-anchor="middle">terraform_data.d</text>
+                <text x="490" y="295" class="svg-sub" text-anchor="middle">child.random_id.r</text>
+                <text x="490" y="355" class="svg-sub" text-anchor="middle">child.var.seed</text>
+                <text x="50" y="415" class="svg-sub" text-anchor="middle">var.names</text>
+                <text x="260" y="415" class="svg-sub" text-anchor="middle">random_pet.p</text>
+                <text x="470" y="415" class="svg-sub" text-anchor="middle">module.child (expand)</text>
+                <text x="115" y="475" class="svg-sub" text-anchor="middle">provider builtin</text>
+                <text x="330" y="475" class="svg-sub" text-anchor="middle">provider random</text>
+                <text x="20" y="512" class="svg-note">Blue: resource (expand) nodes. Green: providers. Grey: closers and root.</text>
+                <text x="20" y="530" class="svg-note">child.* is module.child.*; every local, output and module variable is (expand) too.</text>
+                <text x="20" y="548" class="svg-note">Edges point dependent → dependency, after transitive reduction.</text>
+
+                <line x1="580" y1="20" x2="580" y2="540" stroke="#deded9"/>
+                <text x="604" y="26" class="svg-lane">INSTANCES CREATED DURING THE WALK · TF_LOG=trace</text>
+                <g fill="#ffffff" stroke="#252525">
+                  <rect x="604" y="44" width="230" height="24"/>
+                  <rect x="604" y="128" width="230" height="24"/>
+                  <rect x="604" y="212" width="230" height="24"/>
+                  <rect x="604" y="296" width="230" height="24"/>
+                </g>
+                <g fill="#e0ebf2" stroke="#3c6f97">
+                  <rect x="640" y="74" width="200" height="20"/>
+                  <rect x="640" y="98" width="200" height="20"/>
+                  <rect x="640" y="158" width="200" height="20"/>
+                  <rect x="640" y="182" width="200" height="20"/>
+                  <rect x="640" y="242" width="240" height="20"/>
+                  <rect x="640" y="266" width="240" height="20"/>
+                  <rect x="640" y="326" width="240" height="20"/>
+                  <rect x="640" y="350" width="240" height="20"/>
+                </g>
+                <g stroke="#b8b8b1" stroke-width="1.2" fill="none">
+                  <path d="M 620 68 L 620 108 L 640 108"/><line x1="620" y1="84" x2="640" y2="84"/>
+                  <path d="M 620 152 L 620 192 L 640 192"/><line x1="620" y1="168" x2="640" y2="168"/>
+                  <path d="M 620 236 L 620 276 L 640 276"/><line x1="620" y1="252" x2="640" y2="252"/>
+                  <path d="M 620 320 L 620 360 L 640 360"/><line x1="620" y1="336" x2="640" y2="336"/>
+                </g>
+                <text x="614" y="61" class="svg-sub">random_pet.p (expand)</text>
+                <text x="650" y="88" class="svg-sub">random_pet.p[0]</text>
+                <text x="650" y="112" class="svg-sub">random_pet.p[1]</text>
+                <text x="614" y="145" class="svg-sub">terraform_data.d (expand)</text>
+                <text x="650" y="172" class="svg-sub">terraform_data.d["a"]</text>
+                <text x="650" y="196" class="svg-sub">terraform_data.d["b"]</text>
+                <text x="614" y="229" class="svg-sub">module.child.var.seed (expand)</text>
+                <text x="650" y="256" class="svg-sub">module.child[0].var.seed</text>
+                <text x="650" y="280" class="svg-sub">module.child[1].var.seed</text>
+                <text x="614" y="313" class="svg-sub">child.random_id.r (expand)</text>
+                <text x="650" y="340" class="svg-sub">module.child[0].random_id.r</text>
+                <text x="650" y="364" class="svg-sub">module.child[1].random_id.r</text>
+                <text x="900" y="88" class="svg-note">no edges between</text>
+                <text x="900" y="104" class="svg-note">siblings: they plan</text>
+                <text x="900" y="120" class="svg-note">concurrently</text>
+                <text x="900" y="256" class="svg-note">module.child (expand)</text>
+                <text x="900" y="272" class="svg-note">ran first: count = 2</text>
+                <text x="614" y="392" class="svg-note">The two module.child[*].output.id instances follow the same pattern.</text>
+
+                <text x="604" y="432" class="svg-lane">LAB PROJECT PLAN GRAPH · 115 V, 217 E</text>
+                <rect x="604" y="446" width="350" height="22" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="954" y="446" width="63" height="22" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="1017" y="446" width="33" height="22" fill="#dfede5" stroke="#367f59"/>
+                <rect x="1050" y="446" width="17" height="22" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="1067" y="446" width="17" height="22" fill="#ece6f3" stroke="#765b98"/>
+                <text x="614" y="462" class="svg-sub">84 (expand)</text>
+                <text x="604" y="490" class="svg-sub">orange 15: 12 var.* + 3 (validation) · green 8: 4 providers + 4 closers</text>
+                <text x="604" y="508" class="svg-sub">grey 4: 3 module closers + 1 ephemeral close</text>
+                <text x="604" y="526" class="svg-sub">purple 4: 2 check (report), 1 action (config), root</text>
+                <text x="604" y="548" class="svg-note">Resource-only terraform graph of the same project: 37 V, 39 E.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Instances exist only at walk time. Left, the engine lab's <code>graph -type=plan</code> output redrawn
+              vertex for vertex; right, instance vertices named in a <code>TF_LOG=trace</code> plan of the same
+              configuration, grouped under the node whose <code>DynamicExpand</code> made them; bottom, the Part 4 lab
+              project's plan graph by vertex kind. All three are <span class="recon">measured here</span>; the layout
+              is mine.
+            </p>
+          </figure>
+
+          <h3>When the keys are unknown</h3>
+          <p>
+            Expansion needs known keys. If <code>count</code> depends on something that will be known only after
+            apply, and deferral is off, <code>eval_count.go</code>:42-43 raises the diagnostic most Terraform users
+            have seen:
+          </p>
+<pre><code>Summary:  "Invalid count argument",
+Detail:   `The "count" value depends on resource attributes that cannot be determined until apply, so Terraform cannot predict how many instances will be created. To work around this, use the -target argument to first apply only the resources that the count depends on.`,</code></pre>
+          <p>
+            A <code>count</code> derived from an ephemeral value is rejected separately, because it could not be
+            persisted between plan and apply. The comment just above the diagnostic (<code>eval_count.go</code>:34-39)
+            calls it "a rather bad outcome from a UX standpoint" and leaves a FIXME: "implement a built-in mechanism
+            for deferring changes that can't yet be predicted, and use it to guide the user through several
+            plan/apply steps". Until that ships, the workaround the message names is the only one a release build
+            offers: apply the dependency first with <code>-target</code>, then plan the rest. A <code>for_each</code>
+            whose keys are written in configuration expands even when its values are unknown: the lab's
+            <code>terraform_data.d</code> had two known keys, <code>"a"</code> and <code>"b"</code>, and inputs that
+            were still unknown at plan time <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Core has had a better answer since v1.8.0. The <code>deferring</code> package tracks deferred changes so
+            that a partial plan can be applied and the rest planned later (<code>internal/plans/deferring/doc.go</code>:4-10).
+            Deferral is transitive, plan files record five reasons for it (<code>INSTANCE_COUNT_UNKNOWN</code>,
+            <code>RESOURCE_CONFIG_UNKNOWN</code>, <code>PROVIDER_CONFIG_UNKNOWN</code>, <code>ABSENT_PREREQ</code>,
+            <code>DEFERRED_PREREQ</code>), and a resource with unknown keys becomes one
+            <code>nodePlannablePartialExpandedResource</code> addressed like <code>module.x[*].res</code>. But the
+            release CLI rejects <code>-allow-deferral</code> on <code>plan</code>, <code>apply</code>,
+            <code>refresh</code> and <code>test</code> with "The -allow-deferral flag is only valid in experimental
+            builds of Terraform." (<code>internal/command/plan.go</code>:204), and it is still behind the experiment
+            gate on origin/main. Stacks always set <code>DeferralAllowed</code>. The evaluator's own comment
+            (<code>evaluate.go</code>:656-662) says unknown instance keys should arise "only … in the stacks runtime
+            (not the "normal terraform" modules runtime)", which overlooks that the test runtime carries a
+            <code>DeferralAllowed</code> field too (<code>internal/command/test.go</code>:178)
+            <span class="src">from the code</span>. <a href="../state-and-features/#p3-gates">Part 3</a> lists
+            deferral among the surfaces that are still gated.
+          </p>
+
+          <h3>Evaluating an expression</h3>
+          <p>
+            Every expression in a node goes through <code>lang.Scope</code>, a facade holding the data source
+            (<code>Data</code>), <code>SelfAddr</code>, <code>BaseDir</code>, <code>PureOnly</code>, the function
+            results table and the plan timestamp (<code>internal/lang/scope.go</code>:17-93). Its
+            <code>lang.Data</code> is one getter per reference kind: <code>GetResource</code>,
+            <code>GetLocalValue</code>, and so on to <code>GetRunBlock</code>. An errored getter yields an unknown of the
+            right type rather than nothing (<code>internal/lang/eval.go</code>:544-553). The
+            <code>hcl.EvalContext</code> is built lazily from the expression's own references: they are statically
+            validated, instance subjects are widened to their resource or module call, and the whole resource
+            object goes into the variable table (<code>eval.go</code>:285-420). <code>self</code> indexes that object
+            by instance key.
+          </p>
+          <p>
+            <code>GetResource</code> assembles the value of a resource from three layers, in priority order
+            (<code>internal/terraform/evaluate.go</code>:746-800). Deferred instances come first. Pending changes come
+            next, with planned deletions hidden unless the operation is a destroy. State comes last, and an instance
+            with no current object becomes <code>cty.UnknownVal(ty)</code>. That is how
+            <code>random_pet.p[0].id</code> is a known string in a second plan and an unknown string in the first.
+            If the resource's <code>(expand)</code> node has not run at all, the result is "Reference to uninitialized
+            resource"; during <code>walkInit</code>, every resource reference is simply <code>cty.DynamicVal</code>,
+            because no state or schemas exist yet (<code>evaluate.go</code>:648-652, 668-686). Unknown values and
+            their refinements are the subject of <a href="../language-and-front-end/#p1-values">Part 1</a>; here they
+            are what lets the walk proceed before anything has been created.
+          </p>

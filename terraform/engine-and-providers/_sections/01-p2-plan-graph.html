@@ -1,0 +1,210 @@
+          <h2 id="p2-plan-graph"><span class="secnum">{{S}}</span>Building the plan graph</h2>
+          <p class="lede">
+            Terraform is a compiler whose intermediate representation is a dependency graph and whose back end is
+            somebody else's process. <a href="../language-and-front-end/#p1-pipeline">Part 1</a> followed a directory
+            of <code>.tf</code> files as far as a loaded <code>configs.Config</code>. This part takes that tree through
+            the engine: a graph built by 31 transformers, a walker with a goroutine per vertex, instances that appear
+            only at walk time, a provider that proposes while core decides, child processes reached through a one-line
+            handshake, a 36-RPC wire contract, and an apply that plans again instead of replaying the plan.
+          </p>
+          <p>
+            Two claims carry the part. The graph is the program: ordering, parallelism, failure isolation, destroy
+            order and create-before-destroy are all edges, not code paths. And trust lives in core: providers are
+            untrusted processes, and core checks every answer they give. This first section builds the graph. Its
+            claim is narrow. The graph that <code>terraform plan</code> builds is resource-level. Instances do not
+            exist in it yet.
+          </p>
+
+          <h3>From the command to <code>planWalk</code></h3>
+          <p>
+            <code>terraform plan</code> runs <code>Context.Validate</code> first and <code>Context.Plan</code> second.
+            <code>Plan</code> is a thin wrapper around <code>PlanAndEval</code>
+            (<code>internal/terraform/context_plan.go</code>:204, 218). <code>PlanAndEval</code> takes the context's
+            run lock (<code>acquireRun</code>, a <code>sync.Cond</code> wait), checks that the option combination is
+            legal, and dispatches to a normal, destroy or refresh-only plan <span class="src">from the code</span>.
+            The option checks are where some flags quietly constrain each other: <code>-replace</code> is allowed only
+            in normal mode, <code>-invoke</code> only in refresh-only mode, and <code>-minimal-refresh</code> only in
+            normal or destroy mode and never with <code>-refresh=false</code> (<code>context_plan.go</code>:280-333).
+          </p>
+          <p>
+            All three modes end in <code>planWalk</code> (<code>context_plan.go</code>:792-938). It deep-copies the
+            prior state, applies <code>moved</code> blocks to the copy with <code>prePlanFindAndApplyMoves</code>,
+            builds the plan graph, walks it into a fresh <code>plans.Changes</code>, validates the moves, computes
+            drift, and encodes the changes against the provider schemas into a <code>plans.Plan</code>. Moves are
+            applied before any graph exists but validated only after the walk. The authors explain why at
+            <code>context_plan.go</code>:867-873:
+          </p>
+<pre><code>		// If any of the move statements are invalid then those errors take
+		// precedence over any other errors because an incomplete move graph
+		// is quite likely to be the _cause_ of various errors. This oddity
+		// comes from the fact that we need to apply the moves before we
+		// actually validate them, because validation depends on the result
+		// of first trying to plan.</code></pre>
+          <p>
+            So a bad <code>moved</code> block replaces every other error in the output. If a plan reports only move
+            errors, fix those first; the rest may be consequences. <a href="../state-and-features/#p3-refactoring">Part
+            3</a> covers what the move graph does to state.
+          </p>
+
+          <h3>One builder, 31 steps</h3>
+          <p>
+            A single <code>PlanGraphBuilder</code> serves plan, plan-destroy, validate and import. It swaps the
+            concrete node factories (<code>initPlan</code>, <code>initDestroy</code>, <code>initValidate</code>,
+            <code>initImport</code>) and keeps the pipeline (<code>graph_builder_plan.go</code>:159-172). Its
+            <code>Steps</code> method returns 31 top-level <code>GraphTransformer</code>s, 36 if you count the five
+            provider sub-steps inside one <code>GraphTransformMulti</code> (<code>graph_builder_plan.go</code>:174-331)
+            <span class="src">from the code</span>. <code>BasicGraphBuilder.Build</code> runs them in order, logs
+            <code>Executing graph transform %T</code> for each, dumps changed graphs when <code>TF_GRAPH_TRACE</code> is
+            set, and validates the result at the end (<code>graph_builder.go</code>:36-90). A <code>TF_LOG=trace</code>
+            plan prints the same 31 names in the same order <span class="recon">measured here</span>. Figure 8 lists
+            them beside the apply builder's.
+          </p>
+          <p>
+            Read in order of effect, the pipeline does six things.
+          </p>
+          <ul>
+            <li><strong>Nodes from configuration.</strong> <code>ConfigTransformer</code> adds one resource-level
+              <code>(expand)</code> node per <code>resource</code>, <code>data</code> and <code>action</code> block.
+              Variables, locals, outputs, checks, orphans from state and removed modules follow as their own
+              transformers.</li>
+            <li><strong>Provider wiring.</strong> Five sub-steps attach every consumer to exactly one provider
+              configuration (<code>transform_provider.go</code>:20-43). <code>MissingProviderTransformer</code> always
+              adds implied default configurations in the root module. <code>ProviderTransformer</code> walks up the
+              module tree through <code>Inherited()</code> and falls back to those defaults.
+              <code>PruneProviderTransformer</code> then removes providers nothing uses, so an unused provider is
+              never launched or configured. A provider configuration that survives only in state fails with
+              "Provider configuration not present".</li>
+            <li><strong>Schemas before references.</strong> <code>AttachSchemaTransformer</code> runs before
+              <code>ReferenceTransformer</code> because finding the references inside a resource body needs that
+              body's schema. This is the second decode from <a href="../language-and-front-end/#p1-schema">Part 1</a>:
+              the undecoded <code>hcl.Body</code> meets the provider's schema here.</li>
+            <li><strong>Module brackets.</strong> <code>ModuleExpansionTransformer</code> gives each module call an
+              <code>(expand)</code> and a <code>(close)</code> node. Members depend on the expander; the closer
+              depends on all members; outer closers depend on inner ones (<code>transform_module_expansion.go</code>:32-150).
+              References to a module's outputs go through its closer.</li>
+            <li><strong>Reference edges.</strong> <code>ReferenceTransformer</code> builds a map from every vertex's
+              <code>ReferenceableAddrs()</code> and connects each <code>References()</code> target. Static references
+              resolve at whole-resource granularity: <code>aws_x.a[0]</code> falls back to <code>aws_x.a</code>,
+              because no instance nodes exist yet (<code>transform_reference.go</code>:566-619). A data source gets an
+              implicit <code>depends_on</code> on any managed resource it references. Actions, new in v1.14, are
+              connected in a second pass so an action may reference the resource that triggers it; any other loop
+              is "action reference cycle involving …" (<code>transform_reference.go</code>:128-188).</li>
+            <li><strong>Destroy, targets, closers.</strong> <code>DestroyEdgeTransformer</code>, the destroy-only
+              pruner, <code>TargetsTransformer</code> and <code>QueryTransformer</code> follow.
+              <code>ForcedCBDTransformer</code> only <em>detects</em> create-before-destroy here; the edges that
+              implement it exist only in the apply builder (<a href="#p2-plan-apply">section 07</a>).
+              <code>CloseProviderTransformer</code> adds one <code>(close)</code> node per provider configuration
+              that depends on all of its consumers. <code>CloseRootModuleTransformer</code> adds an empty-address
+              <code>nodeCloseModule</code>, rendered <code>[root] root</code>, connected to every vertex with no
+              in-edges. There is no single-root requirement in v1.17 (<code>transform_root.go</code>:6-29).
+              <code>TransitiveReductionTransformer</code> runs last and deletes every direct edge that is also
+              reachable another way, documented as O(V(V+E)) (<code>dag.go</code>:172-200).</li>
+          </ul>
+
+          <figure class="figure wide" id="fig-transformers">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">The two transformer pipelines, aligned by name: what each step does to the graph</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Transformer</th><th>plan</th><th>apply</th><th>effect</th><th>what it does</th></tr></thead>
+                <tbody>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ConfigTransformer</td><td>1</td><td>1</td><td style="background: var(--blue-soft)">nodes</td><td>one <code>(expand)</code> per resource or action block</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">RootVariable / ModuleVariable</td><td>2–3</td><td>2–3</td><td style="background: var(--blue-soft)">nodes</td><td>input variables</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">variableValidationTransformer</td><td>4</td><td>4</td><td style="background: var(--blue-soft)">nodes</td><td><code>(validation)</code> vertices</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">Local / Output</td><td>5–6</td><td>5–6</td><td style="background: var(--blue-soft)">nodes</td><td>locals and outputs</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">Diff / ActionDiff / Deferred</td><td>–</td><td>7–9</td><td style="background: var(--blue-soft)">nodes</td><td>one node per planned change; deposed keys allocated</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">checkTransformer</td><td>7</td><td>10</td><td style="background: var(--blue-soft)">nodes</td><td><code>check</code> assertions (none during destroy)</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">OrphanResourceInstance / State</td><td>8–9</td><td>–</td><td style="background: var(--blue-soft)">nodes</td><td>objects in state whose resource left the config</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">AttachState / OrphanOutput / AttachResourceConfig</td><td>10–12</td><td>11–13</td><td>attach, nodes</td><td>state and config hung on nodes; orphan outputs</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">transformProviders (5 sub-steps)</td><td>13</td><td>14</td><td style="background: var(--blue-soft)">nodes, edges, removes</td><td>external placeholders → config providers → implied root defaults → consumer edges → prune unused</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">RemovedModuleTransformer</td><td>14</td><td>15</td><td style="background: var(--blue-soft)">nodes</td><td>modules gone from config</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">AttachSchemaTransformer</td><td>15</td><td>16</td><td>attach</td><td>provider schemas, needed before references</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ActionInvokePlanTransformer</td><td>16</td><td>–</td><td style="background: var(--blue-soft)">nodes</td><td>only for <code>plan -invoke</code></td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ModuleExpansionTransformer</td><td>17</td><td>17</td><td style="background: var(--green-soft)">nodes, edges</td><td>module <code>(expand)</code> / <code>(close)</code> brackets</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ExternalReferenceTransformer</td><td>18</td><td>18</td><td style="background: var(--blue-soft)">nodes</td><td>references from an external caller such as <code>terraform test</code></td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ReferenceTransformer</td><td>19</td><td>19</td><td style="background: var(--green-soft)">edges</td><td>dependent → dependency, widened to resources; actions in a second pass</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">AttachDependencies / attachDataResourceDependsOn</td><td>20–21</td><td>20</td><td>attach</td><td>dependency lists, later written to state for destroy order</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">checkStartTransformer</td><td>–</td><td>21</td><td style="background: var(--blue-soft)">nodes</td><td>delays nested <code>check</code> data sources</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ForcedCBDTransformer</td><td>26</td><td>22</td><td>flags</td><td>propagates <code>create_before_destroy</code> to dependencies</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">DestroyEdgeTransformer</td><td>22</td><td>23</td><td style="background: var(--green-soft)">edges</td><td>destroy edges inverted from create edges</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">CBDEdgeTransformer</td><td>–</td><td>24</td><td style="background: var(--green-soft)">edges</td><td>reverses creator → destroyer edges</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">pruneUnusedNodes / Targets</td><td>23–24</td><td>25–26</td><td style="background: var(--red-soft)">removes</td><td>destroy-only pruning; <code>-target</code></td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">QueryTransformer</td><td>25</td><td>–</td><td style="background: var(--red-soft)">removes</td><td>keeps list resources and their ancestors (<code>terraform query</code>)</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">ephemeralResourceClose / CloseProvider</td><td>27–28</td><td>27–28</td><td style="background: var(--green-soft)">nodes, edges</td><td>a <code>(close)</code> per ephemeral resource and per provider configuration</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">policyEvalTransformer</td><td>29</td><td>29</td><td style="background: var(--green-soft)">nodes, edges</td><td>policy nodes after everything planned; keeps providers open</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">CloseRootModuleTransformer</td><td>30</td><td>30</td><td style="background: var(--green-soft)">node, edges</td><td><code>[root] root</code> over every vertex without in-edges</td></tr>
+                  <tr><td style="font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere">TransitiveReductionTransformer</td><td>31</td><td>31</td><td style="background: var(--red-soft)">removes edges</td><td>drops redundant edges; skipped if the graph has a cycle</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Both builders have 31 top-level steps and share 26 of them. The plan builder adds orphans,
+              <code>-invoke</code> and query pruning; the apply builder adds the diff nodes and the CBD edge reversal.
+              Order is from <code>graph_builder_plan.go</code>:174-331 and <code>graph_builder_apply.go</code>:136-278,
+              confirmed by the <code>Executing graph transform</code> lines in a trace <span class="recon">measured here</span>
+              (the research ledger counted 30 apply steps; the code and the trace both list 31). The "effect" column
+              is my summary of each transformer's doc comment <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <h3>Cycles, and the direction of an edge</h3>
+          <p>
+            Edges point from dependent to dependency. The final <code>Validate</code> runs Tarjan's strongly
+            connected components; any component with more than one vertex is a cycle, and a self-edge is reported
+            separately as "Self reference" (<code>internal/dag/dag.go</code>:202-265). The cycle text is normalised so
+            the same loop always prints the same way: names reversed, rotated to start at the shortest name, one per
+            line. Two <code>terraform_data</code> resources that read each other's <code>output</code> fail
+            <code>validate</code> and <code>plan</code> alike with <code>Cycle:</code> followed by
+            <code>terraform_data.a</code> and <code>terraform_data.b</code>, exit 1 <span class="recon">measured here</span>.
+            <code>TransitiveReductionTransformer</code> silently skips a cyclic graph, so the cycle reaches you from
+            <code>Validate</code>, not from the reducer.
+          </p>
+
+          <h3>What the graph looks like</h3>
+          <p>
+            The engine lab's small configuration has two <code>random_pet</code>s by <code>count</code>, two
+            <code>terraform_data</code>s by <code>for_each</code>, and a child module called twice:
+          </p>
+<pre><code>variable "names" {
+  type    = set(string)
+  default = ["a", "b"]
+}
+resource "random_pet" "p" {
+  count  = 2
+  length = 2
+}
+resource "terraform_data" "d" {
+  for_each = var.names
+  input    = "${each.key}-${random_pet.p[0].id}"
+}
+module "child" {
+  source = "./modules/child"
+  count  = 2
+  seed   = random_pet.p[count.index].id
+}</code></pre>
+          <p>
+            Since v1.7 (#34288) plain <code>terraform graph</code> prints a reduced, resources-only view; the real
+            graph needs <code>-type=plan</code> (<code>internal/command/graph.go</code>:108-180). The two differ a lot
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ terraform graph            # resource-only (v1.7+ default): 3 nodes, 2 edges
+  "terraform_data.d" -&gt; "random_pet.p";
+  "module.child.random_id.r" -&gt; "random_pet.p";
+$ terraform graph -type=plan  # 16 distinct vertices, 18 edges after transitive reduction
+  "[root] module.child.var.seed (expand)" -&gt; "[root] module.child (expand)"
+  "[root] module.child.var.seed (expand)" -&gt; "[root] random_pet.p (expand)"
+  "[root] output.child_ids (expand)" -&gt; "[root] module.child (close)"
+  "[root] random_pet.p (expand)" -&gt; "[root] provider[\"registry.terraform.io/hashicorp/random\"]"
+  "[root] root" -&gt; "[root] output.joined (expand)"</code></pre>
+          <p>
+            Sixteen vertices and eighteen edges, and not one of them is <code>random_pet.p[0]</code>. Every resource
+            node is an <code>(expand)</code> node. <code>module.child.random_id.r</code> has no direct edge to its
+            provider: the reducer removed it, because the node already reaches the provider through
+            <code>random_pet.p</code>. The lab project in <a href="../three-clouds/#p4-project">Part 4</a> has a
+            115-vertex, 217-edge plan graph, 84 of them <code>(expand)</code> nodes, and a 37-vertex resource-only
+            view. Figure 10 in <a href="#p2-expansion">section 03</a> draws both graphs. If you debug ordering with
+            <code>terraform graph</code>, pass <code>-type=plan</code>; the default hides every variable, local,
+            output, provider and closer that actually orders the walk.
+          </p>

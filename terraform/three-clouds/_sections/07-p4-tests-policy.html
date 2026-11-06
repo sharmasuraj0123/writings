@@ -1,0 +1,207 @@
+          <h2 id="p4-tests-policy"><span class="secnum">{{S}}</span>Tests and policy on the project</h2>
+          <p>
+            Two features promise to check a configuration before anything is applied: <code>terraform test</code> with
+            mock providers, and Terraform Policy. Both ran on the project with no credentials. Both did something, and
+            neither did quite what its name suggests. The claim of this section: mocks are not isolation, and local
+            policy is not enforcement.
+          </p>
+
+          <h3>The suite</h3>
+          <p>
+            Seven runs in three files. <code>tests/plan.tftest.hcl</code> has five plan-only runs: the default shapes,
+            a two-environment fan-out asserting two instances of each cloud module, a bad CIDR and an online-mode project
+            id that must fail validation (<code>expect_failures = [var.environments]</code> and
+            <code>[var.gcp_project]</code>), and two environments with the same CIDR, which must only warn
+            (<code>expect_failures = [check.environment_cidrs_disjoint]</code> passes because a failing check is a
+            warning). <code>tests/apply.tftest.hcl</code> runs one mocked apply of all three clouds and asserts on
+            provider-function outputs. <code>tests/override.tftest.hcl</code> holds one run with an
+            <code>override_resource</code>. The result is "Success! 7 passed, 0 failed." in about 42 to 65 seconds on two
+            vCPUs <span class="recon">measured here</span>.
+          </p>
+
+          <h3>A mock wraps the real binary</h3>
+          <p>
+            <code>mock_provider</code> does not replace the provider. Its doc comment says the mock "wraps an instance of
+            an actual provider so it can return the correct schema and validate the configuration accurately", and only
+            intercepts creating resources and reading data sources (<code>internal/providers/mock.go</code>:18-25). The
+            mock empties the provider's own configuration schema, so <code>mock_provider "aws"</code> needs no region or
+            keys, and keeps every resource, data source and ephemeral schema. Some calls go straight through,
+            <code>mock.go</code>:314-321 and 410-416 <span class="src">from the code</span>:
+          </p>
+<pre><code>func (m *Mock) ImportResourceState(request ImportResourceStateRequest) (response ImportResourceStateResponse) {
+	// You can't import via mock providers. The users should write specific
+	// `override_resource` blocks for any resources they want to import, so we
+	// just make them think about it rather than performing a blanket import
+	// of all resources that are backed by mock providers.
+	response.Diagnostics = response.Diagnostics.Append(tfdiags.Sourceless(tfdiags.Error, "Invalid import request", "Cannot import resources from mock providers. Use an `override_resource` block to targeting the specific resource being imported instead."))
+	return response
+}
+…
+func (m *Mock) CallFunction(request CallFunctionRequest) CallFunctionResponse {
+	return m.Provider.CallFunction(request)
+}
+
+func (m *Mock) ListResource(request ListResourceRequest) ListResourceResponse {
+	return m.Provider.ListResource(request)
+}</code></pre>
+          <p>
+            In a traced test, the real plugin started once to serve its schema; no <code>ConfigureProvider</code>,
+            plan or apply call crossed the wire, but <code>ValidateResourceConfig</code> did
+            (<a href="../engine-and-providers/#p2-processes">Part 2</a>). The project ran into all three consequences
+            <span class="recon">measured here</span>:
+          </p>
+          <ul>
+            <li><strong>Mock values must pass real validation.</strong> The mock invents random strings for computed
+              attributes, and the real provider then validated them where they flowed into arguments. Random strings
+              failed azurerm's ARM-id parsing, google's network-URL pattern and aws's IAM policy JSON until the
+              <code>tests/mocks/*/*.tfmock.hcl</code> files supplied realistic defaults.</li>
+            <li><strong>Functions run for real.</strong> Because <code>CallFunction</code> is forwarded, a test asserting
+              on <code>provider::aws::trim_iam_role_path</code> exercised the real implementation, which is how the
+              ARN-not-name behaviour of <a href="#p4-project">section 4</a> was found.</li>
+            <li><strong>A <code>list</code> block in a test would call the cloud.</strong> <code>ListResource</code> is
+              forwarded too, so the project keeps list blocks out of its tests. That one is read from the code, not
+              exercised.</li>
+          </ul>
+          <p>
+            Actions are faked in the other direction: the mock's <code>PlanAction</code> returns an empty response and
+            <code>InvokeAction</code> yields one <code>Completed</code> event, so a mocked <code>action_trigger</code>
+            always "succeeds" (<code>mock.go</code>:450-461). The lower table of
+            <a href="#fig-no-creds">Figure 26</a> summarises the boundary. A test with every provider mocked still needs
+            the real provider binaries, still validates against real rules, and is not proof that anything would work
+            against a cloud.
+          </p>
+
+          <h3>Runs share state, and overrides only fill computed values</h3>
+          <p>
+            Runs in one test file share one state per module. The project's first attempt put an
+            <code>override_resource</code> on the VPC in a later apply run of <code>apply.tftest.hcl</code>; the VPC
+            already existed from the earlier run, kept its mocked id, and the assertion failed. Moved to its own file it
+            passed, <code>tests/override.tftest.hcl</code>:22-37:
+          </p>
+<pre><code>run "override_one_resource" {
+  command = apply
+
+  # override_resource pins values for one address, beating mock defaults.
+  override_resource {
+    target = module.aws["dev"].aws_vpc.this
+    values = {
+      id = "vpc-0123456789abcdef0"
+    }
+  }
+
+  assert {
+    condition     = output.aws["dev"].vpc_id == "vpc-0123456789abcdef0"
+    error_message = "override_resource should fix the VPC id."
+  }
+}</code></pre>
+          <p>
+            Ephemeral resources are mockable since v1.17 (#38928, commit <code>61ef933f6f</code> of 2026-09-04): <code>mock_ephemeral "random_password"</code> in
+            <code>tests/mocks/random/random.tfmock.hcl</code> supplies <code>result = "mock-password-not-secret"</code>, the
+            mock's <code>OpenEphemeralResource</code> fills from those defaults, and renew and close are no-ops.
+          </p>
+
+          <h3>Identity import cannot be unit-tested</h3>
+          <p>
+            The AWS module adopts existing buckets with an <code>import</code> block that sets <code>for_each = var.adopt_buckets</code>
+            and <code>identity = { bucket = each.value }</code>, an identity import (1.12) inside a child module (1.16). Under a mock that import is
+            refused, as the excerpt above shows. The documented workaround is an <code>override_resource</code> on the
+            target, and that fails too. The override branch builds the imported object with no identity, and the identity
+            check a few lines later rejects it, <code>internal/terraform/node_resource_plan_instance.go</code>:840-853 and
+            950-953 <span class="src">from the code</span>:
+          </p>
+<pre><code>		override, overrideDiags := mocking.ComputedValuesForDataSource(configVal, &amp;mocking.MockedData{
+			Value:             n.override.Values,
+			Range:             n.override.Range,
+			ComputedAsUnknown: false,
+		}, schema.Body)
+		resp = providers.ImportResourceStateResponse{
+			ImportedResources: []providers.ImportedResource{
+				{
+					TypeName: addr.Resource.Resource.Type,
+					State:    ephemeral.StripWriteOnlyAttributes(override, schema.Body),
+				},
+			},
+			Diagnostics: overrideDiags.InConfigBody(n.Config.Config, absAddr.String()),
+		}
+…
+	// Providers are supposed to return an identity when importing by identity
+	if importTarget.Type().IsObjectType() &amp;&amp; imported[0].Identity.IsNull() {
+		diags = diags.Append(fmt.Errorf("import of %s didn't return an identity", n.Addr.String()))
+		return nil, deferred, diags</code></pre>
+          <p>
+            The run <code>adopt_existing_bucket</code> failed with "import of … didn't return an identity" and was
+            removed; ID imports under an override pass <span class="recon">measured here</span>. The same lines are still
+            on origin/main <code>a060ad5a1b</code>. Until that changes, an identity-based adopt path can be exercised
+            only by a real plan.
+          </p>
+
+          <h3>Policy offline, and policy in <code>plan</code></h3>
+          <p>
+            <code>policies/storage.policy.hcl</code> has one rule per cloud. The AWS rule, lines 22-27:
+          </p>
+<pre><code>resource_policy "aws_s3_bucket_public_access_block" "all_blocked" {
+  enforce {
+    condition     = attrs.block_public_acls &amp;&amp; attrs.block_public_policy &amp;&amp; attrs.ignore_public_acls &amp;&amp; attrs.restrict_public_buckets
+    error_message = "S3 public access block must enable all four switches."
+  }
+}</code></pre>
+          <p>
+            The language is HCL with its own blocks: a <code>policy</code> block with its own
+            <code>required_providers</code>, then <code>resource_policy</code> and <code>module_policy</code> blocks whose
+            <code>enforce</code> blocks pair a <code>condition</code> with an <code>error_message</code>, plus
+            <code>filter</code>, <code>enforcement_level</code>, <code>input</code> and <code>locals</code>; a rule reads the
+            planned values through <code>attrs</code>, the prior ones through <code>prior_attrs</code>, and metadata
+            through <code>meta</code> <span class="src">from the docs</span>. The project's Azure rule is marked
+            <code>enforcement_level = "advisory"</code>, the GCP rule has two <code>enforce</code> blocks.
+          </p>
+          <p>
+            The standalone <code>tfpolicy</code> CLI evaluates that offline against its own tests, and the same policy
+            handed to <code>terraform plan</code> is not evaluated at all <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ tfpolicy test --policies=policies --tests=policies/tests
+Acquiring schemas for 3 provider(s) declared in required_providers...
+ # policies/tests/storage.policytest.hcl... running
+   # resource.aws_s3_bucket_public_access_block.fail_open_policy... pass
+   …
+ # policies/tests/storage.policytest.hcl... pass
+$ TF_POLICY_PLUGIN=…/tfpolicy-plugin $T plan -policies=policies
+Error: Failed to setup Terraform Policy connection
+Failed to setup Terraform Policy connection: rpc error: code = Unknown desc =
+entitlement check failed: client did not supply entitlement information.
+…Plan: 36 to add…                                  # exit code 0</code></pre>
+          <p>
+            The six policy tests (three pass, three expected failures) took 12.9 to 24.2 seconds. <code>--policies</code>
+            and <code>--tests</code> must name directories; the docs' single-file form failed "not a directory". The first
+            runs installed both the lowest and the highest provider version matching each constraint, about 2.2 GB, after
+            which a 17 MB schema cache sufficed. A verifier did not re-run the <code>tfpolicy</code> side; the
+            <code>plan</code> side is confirmed from the recorded run.
+          </p>
+          <p>
+            The <code>plan</code> result has two causes. The fail-open is deliberate, <code>internal/command/plan.go</code>:106-116:
+          </p>
+<pre><code>	if len(args.PolicyPaths) &gt; 0 {
+		client, policyDiags, stopClient := c.PolicyClient(c.CommandContext(), args.PolicyPaths, backendPolicyEntitlement(be, policy.PlanEvaluationStage))
+		// if there has been any errors when setting up the policy client, we log them but
+		// we still proceed with the operation, as a failure to set up the policy client
+		// should not prevent the plan operation from running
+		if opReq.View != nil &amp;&amp; policyDiags != nil {
+			opReq.View.PolicyDiagnostics(policyDiags)
+		}
+		opReq.PolicyClient = client
+		defer stopClient()
+	}</code></pre>
+          <p>
+            <code>apply</code> behaves the same, while <code>init -policies</code> returns 1 on the same setup
+            diagnostics (<code>internal/command/init_run.go</code>:294-299). And the setup fails because a local backend
+            supplies no entitlement. Core's comment on the field says "Nil means the plugin skips the check"
+            (<code>internal/policy/policy.go</code>:71-74); tfpolicy-plugin 0.5.0 does not skip it. Real enforcement appears
+            to need a <code>cloud</code> or <code>remote</code> backend with an entitled organization; that is inferred
+            from <code>backendPolicyEntitlement</code>, not measured. Whether any plugin version honours the nil comment
+            is open; only 0.5.0 was tested.
+          </p>
+          <p>
+            The practical rule: in CI, a zero exit code from <code>plan -policies</code> proves nothing about policy. Run
+            <code>tfpolicy test</code> as its own step, or check the output for "Failed to setup Terraform Policy
+            connection". <a href="#fig-commercial-edge">Figure 23</a> shows where the plugin sits, and
+            <a href="../state-and-features/#p3-gates">Part 3</a> traces the GA entry and its PR-number mismatch.
+          </p>

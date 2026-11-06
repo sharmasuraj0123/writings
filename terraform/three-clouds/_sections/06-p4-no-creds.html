@@ -1,0 +1,161 @@
+          <h2 id="p4-no-creds"><span class="secnum">{{S}}</span>Planning without credentials</h2>
+          <p>
+            A plan of an empty state has nothing to refresh, so in principle it needs no cloud at all. In practice every
+            provider runs <code>ConfigureProvider</code> first, and what each one does there decides whether a
+            credential-free plan is possible. The usual advice is "fake credentials plus skip flags". On these three
+            clouds that advice is three different stories, and on one of them it does not work. This section measures
+            each provider alone, then the full offline plan.
+          </p>
+
+          <h3>The probe</h3>
+          <p>
+            Each provider was planned on its own with no credentials and every ambient identity source blocked:
+            <code>AWS_EC2_METADATA_DISABLED=true</code>, the GCE metadata server pointed at the closed port
+            <code>127.0.0.1:9</code>, and no <code>az</code> on <code>PATH</code> <span class="recon">measured here</span>.
+          </p>
+          <ul>
+            <li><strong>aws 6.70.0 refuses.</strong> <code>ConfigureProvider</code> fails "No valid credential sources
+              found", exit 1, after 9.5 seconds.</li>
+            <li><strong>google 8.8.0 plans.</strong> Exit 0 after 13.9 seconds. Its authentication is lazy: it logs
+              "Authenticating using DefaultClient", fails the universe-domain lookup, and fails the userinfo lookup
+              locally, because the token fetch from the blocked metadata server is refused. No request reaches Google in
+              this mode, and the plan never needs an API call.</li>
+            <li><strong>azurerm 5.10.0 refuses.</strong> It must build an authorizer during configure, and with nothing
+              else available it tries the CLI: <code>exec: "az": executable file not found in $PATH</code>, exit 1, after
+              2.3 seconds.</li>
+            <li><strong>random 3.9.1</strong> needs nothing.</li>
+          </ul>
+
+          <h3>AWS: a fake key and four switches</h3>
+          <p>
+            AWS is the easy case. The project's <code>providers.tf</code>:7-15 gives it a placeholder key pair and turns on
+            every skip the provider offers when <code>var.offline</code> is true:
+          </p>
+<pre><code>provider "aws" {
+  region = var.aws_region
+
+  access_key                  = var.offline ? "AKIAOFFLINEOFFLINE00" : null
+  secret_key                  = var.offline ? "offline-secret-key-not-real" : null
+  skip_credentials_validation = var.offline
+  skip_requesting_account_id  = var.offline
+  skip_metadata_api_check     = var.offline
+  skip_region_validation      = var.offline</code></pre>
+          <p>
+            With those four switches the provider never calls STS or the instance metadata service, and the
+            <code>TF_LOG=DEBUG</code> log of the full plan has zero <code>HTTP Request Sent</code> lines for aws. The two
+            data sources the module uses, <code>aws_region</code> and <code>aws_iam_policy_document</code>, compute locally
+            <span class="recon">measured here</span>. This shows the set is sufficient, not that every switch is
+            necessary. One caution comes from the lab's own history: an earlier run with a plausible bucket name reached a
+            real bucket, which is why every globally unique name now ends in <code>-invalid</code> when
+            <code>offline</code> is set. Fake credentials do not stop a provider from sending a request; they only make it
+            fail.
+          </p>
+
+          <h3>Google: one real call, and five minutes without a network</h3>
+          <p>
+            Google would plan with nothing at all, but the project gives it <code>access_token = "offline-token-not-real"</code>
+            so the provider skips its metadata probe. That mode has a cost. During <code>ConfigureProvider</code> the
+            provider makes one real HTTPS request to <code>openidconnect.googleapis.com/v1/userinfo</code> with the fake
+            token. Google answers 401 "Invalid Credentials"; the provider logs it at INFO, carries on with an empty
+            identity, and the plan succeeds. The six <code>www.googleapis.com</code> URLs elsewhere in the log are OAuth
+            scope strings, not requests <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Take the network away and the same request becomes expensive. Run inside a network namespace with no network
+            (<code>unshare -rn</code>), the full plan still succeeds with the same 36 creates and 1 action, but takes about
+            5 minutes 15 seconds instead of about 35: google retries the userinfo call about 68 times, logging "Dismissed
+            an error as retryable", before it gives up. The provider work itself is about 15 seconds of that. No supported
+            switch to suppress the call was found. If you plan in an air-gapped CI runner with the google provider, that
+            retry loop is where the time goes.
+          </p>
+
+          <h3>Azure: Entra ID says no, so fake the CLI</h3>
+          <p>
+            azurerm cannot configure without a token. The obvious fake, client-secret authentication with all-zero ids,
+            is not offline: the provider sends the ids to the Microsoft Entra ID token endpoint, which rejects them with
+            HTTP 400 and "AADSTS700038: 00000000-0000-0000-0000-000000000000 is not a valid application identifier"
+            <span class="recon">measured here</span>. So the project uses CLI authentication against a fake
+            <code>az</code>, <code>providers.tf</code>:36-49:
+          </p>
+<pre><code>provider "azurerm" {
+  features {}
+
+  subscription_id                 = var.azure_subscription_id
+  tenant_id                       = var.azure_tenant_id
+  resource_provider_registrations = "none"
+
+  # azurerm cannot be configured without a token: client-secret auth with fake
+  # ids is rejected by Entra ID (AADSTS700038). Offline we use CLI auth against
+  # tools/fakeaz/az (an unsigned placeholder token, put it first on PATH);
+  # online we use OIDC workload identity federation from CI.
+  use_cli  = var.offline
+  use_oidc = !var.offline
+}</code></pre>
+          <p>
+            <code>tools/fakeaz/az</code> is a 21-line shell script. It answers exactly four commands, <code>az
+            version</code>, <code>az account show</code>, <code>az account list</code> and <code>az account
+            get-access-token</code>, the last with a JWT whose header is <code>{"alg":"none","typ":"JWT"}</code>, and
+            exits 1 on anything else. Its own comment says it "grants nothing: any real ARM call with it fails with
+            401". During the plan the provider called it exactly four times, the last time asking for a Microsoft Graph
+            token (<code>--scope https://graph.microsoft.com/.default</code>), and made no network calls. The first version
+            of the shim lacked <code>account list</code>, and configure failed until it was added
+            <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-no-creds">
+            <div class="figure-head">
+              <span class="figure-label">Figure 26</span>
+              <p class="figure-title">How far you get with no credentials, per provider, and where the mock boundary sits</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>provider</th><th>no credentials at all</th><th>offline mode used</th><th>network during the offline plan</th><th>air-gapped</th></tr></thead>
+                <tbody>
+                  <tr><td>aws 6.70.0</td><td style="background: var(--red-soft)">refuses: "No valid credential sources found"</td><td>fake key + 4 <code>skip_*</code> switches</td><td style="background: var(--green-soft)">0 requests</td><td>no effect</td></tr>
+                  <tr><td>google 8.8.0</td><td style="background: var(--green-soft)">plans; userinfo fails locally, no request leaves</td><td>fake <code>access_token</code></td><td style="background: var(--orange-soft)">1 HTTPS call to openidconnect.googleapis.com, answered 401</td><td style="background: var(--orange-soft)">≈ 68 retries, plan ≈ 5 min 15 s</td></tr>
+                  <tr><td>azurerm 5.10.0</td><td style="background: var(--red-soft)">refuses: no <code>az</code> on PATH</td><td>fake client secret rejected by Entra ID (400); fake <code>az</code>, 4 commands</td><td style="background: var(--green-soft)">0 requests (4 local <code>az</code> calls)</td><td>no effect</td></tr>
+                  <tr><td>random 3.9.1</td><td style="background: var(--green-soft)">needs nothing</td><td>none</td><td style="background: var(--green-soft)">0 requests</td><td>no effect</td></tr>
+                </tbody>
+              </table>
+              <table style="font-size: 13px; margin-top: 18px">
+                <thead><tr><th>under <code>mock_provider</code></th><th>calls</th><th>consequence</th></tr></thead>
+                <tbody>
+                  <tr><td style="background: var(--green-soft)">faked by the mock</td><td><code>ConfigureProvider</code>, plan and apply of resources, <code>OpenEphemeralResource</code>, <code>PlanAction</code>, <code>InvokeAction</code></td><td>no credentials needed; a mocked action "succeeds"</td></tr>
+                  <tr><td style="background: var(--red-soft)">refused</td><td><code>ImportResourceState</code></td><td>"Cannot import resources from mock providers"</td></tr>
+                  <tr><td style="background: var(--orange-soft)">forwarded to the real binary</td><td>schemas, <code>Validate*</code>, <code>CallFunction</code>, <code>ListResource</code></td><td>real validation; a <code>list</code> block in a test would call the cloud</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              "Fake credentials plus skip flags" works for aws, works for google at the price of one real request, and
+              does not work for azurerm, which needs a fake CLI instead. Each provider was probed alone and the full plan
+              was audited under <code>TF_LOG=DEBUG</code> and again with no network <span class="recon">measured here</span>;
+              the mock boundary is <code>internal/providers/mock.go</code> <span class="src">from the code</span>. Every
+              request that reached a real endpoint was refused at authentication; nothing was created or read.
+            </p>
+          </figure>
+
+          <h3>The audit, and what cannot be faked</h3>
+          <p>
+            Put together, the offline plan's traffic is small and fully accounted for. aws sends nothing: no STS, no IMDS,
+            no API call, because state is empty and nothing refreshes. google sends one HTTPS request and gets a 401.
+            azurerm runs four local <code>az</code> commands. random does nothing. Re-running the plan with no network at
+            all confirmed it: only google attempted a connection <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <code>terraform query</code> is the command no fake can rescue. A <code>list</code> block calls the provider's
+            <code>ListResource</code> RPC, which makes live API calls by design. With the aws <code>s3</code> and
+            <code>sts</code> endpoints pointed at the closed port, the run logged nine <code>HTTP Request Sent …
+            tf_rpc=ListResource</code> lines, turned <code>limit = 5</code> into <code>max-buckets=5</code> on S3
+            <code>ListBuckets</code>, and failed after 58 seconds with "exceeded maximum number of attempts, 9". In another
+            lab, a query against the real AWS endpoint with fake keys got "401 … AuthFailure" and wrote no configuration.
+            Offline, only <code>terraform validate -query</code> is available, and it checks the file, not the cloud.
+            <a href="../state-and-features/#p3-query-actions">Part 3</a> covers what <code>query</code> does with real
+            credentials.
+          </p>
+          <p>
+            The general lesson is about where authentication happens. aws checks credentials only if asked to, google
+            checks them lazily and tolerates failure, and azurerm cannot build a client without a token. None of that is
+            in Terraform core; it is each provider's <code>ConfigureProvider</code>, one RPC from
+            <a href="../engine-and-providers/#p2-wire">Part 2</a>'s table, doing what its SDK and authors chose.
+          </p>

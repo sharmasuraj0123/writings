@@ -1,0 +1,192 @@
+          <h2 id="p4-project"><span class="secnum">{{S}}</span>The multicloud project</h2>
+          <p>
+            The rest of this part is one project, <code>~/terraform-ref/lab/multicloud/</code>, written for Terraform
+            v1.17.0 and the four cached providers. It builds the same shape on each cloud: a network, private artifact
+            storage, a container runtime, and a Postgres database whose password, in the README's words, "never touches
+            state or plan files". It uses the newest language features on purpose, and it was taken as far as a machine
+            with no cloud account can take it. Its claim: every one of those features can be exercised offline on all
+            three clouds, except the ones that must talk to a cloud.
+          </p>
+
+          <h3>The shape</h3>
+          <p>
+            A root module calls three cloud modules. <code>aws-stack</code> builds a VPC with two private subnets, a
+            security group, a versioned and public-access-blocked S3 bucket, RDS Postgres, a Secrets Manager secret, an
+            IAM role and a container-image Lambda that triggers an action. <code>gcp-stack</code> builds a VPC with two
+            subnets, a GCS bucket with public access prevention enforced, a service account, a Cloud Run v2 service,
+            Cloud SQL Postgres with a <code>google_sql_user</code>, and a Secret Manager secret. <code>azure-stack</code>
+            builds a resource group, a VNet with two delegated subnets (from a <code>dynamic</code> block), a ZRS storage
+            account with TLS 1.2, a Log Analytics workspace, a Container Apps environment and app, a Postgres flexible
+            server and an RBAC Key Vault with one secret. Around them: three test files, four mock-data directories, a
+            <code>.tfquery.hcl</code> file, one policy file with its tests, and a fake <code>az</code> script.
+          </p>
+          <p>
+            Every module call fans out over environments. The password is per environment and cloud, built from a
+            flattened key set (<code>multicloud/main.tf</code>:8-10):
+          </p>
+<pre><code>  db_keys = toset(flatten([
+    for env in keys(var.environments) : [for c in local.clouds : "${env}-${c}"]
+  ]))</code></pre>
+          <p>
+            and then, <code>main.tf</code>:17-36, an ephemeral resource over those keys and the first of the three
+            module calls:
+          </p>
+<pre><code>ephemeral "random_password" "db" {
+  for_each = local.db_keys
+
+  length           = 28
+  special          = true
+  override_special = "-_~"
+}
+
+module "aws" {
+  source   = "./modules/aws-stack"
+  for_each = var.environments
+
+  name                = "${var.project}-${each.key}${local.name_suffix}"
+  cidr_block          = each.value.cidr_block
+  db_size             = each.value.db_size
+  db_password         = ephemeral.random_password.db["${each.key}-aws"].result
+  db_password_version = var.db_password_version
+  lambda_image_uri    = var.lambda_image_uri
+  adopt_buckets       = var.adopt_buckets
+}</code></pre>
+          <p>
+            <code>var.environments</code> is a <code>map(object({ cidr_block = string, db_size = optional(string,
+            "small") }))</code> with two validation rules, one built on <code>can(cidrnetmask(...))</code>.
+            <code>local.name_suffix</code> is <code>"-invalid"</code> whenever <code>var.offline</code> is true, so that no
+            fake-credential run can name a real bucket, vault or account. <code>gcp_project</code> carries a
+            cross-object rule (1.9) that reads another variable: <code>var.offline || var.gcp_project !=
+            "xolab-offline-000000"</code>. The provider versions come from a local, which Terraform 1.17 allows in
+            <code>required_providers</code> (#39153) as long as it is statically known, <code>multicloud/versions.tf</code>:3-19:
+          </p>
+<pre><code>locals {
+  provider_pins = {
+    aws     = "6.70.0"
+    google  = "8.8.0"
+    azurerm = "5.10.0"
+    random  = "3.9.1"
+  }
+}
+
+terraform {
+  required_version = "&gt;= 1.17.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = local.provider_pins.aws
+    }</code></pre>
+          <p>
+            Only const variables and locals built from them or from literals work there. A plain variable fails
+            <code>init</code> with "Only literal values and const variables can be evaluated during init."
+            (<a href="../language-and-front-end/#p1-init-graph">Part 1</a> has the init graph that enforces it). The rest
+            of the root holds two <code>check</code> blocks, three <code>moved</code> blocks recording the move from
+            <code>module.aws_dev</code> to <code>module.aws["dev"]</code>, and provider-defined functions on literals.
+          </p>
+
+          <h3>The schemas are the ground truth</h3>
+          <p>
+            Nothing in the project was written from memory of what a provider supports. It was checked against
+            <code>terraform providers schema -json</code> for the cached versions, a 32.8 MB dump that a census script
+            counted and a verifier re-ran byte for byte. <a href="#fig-three-clouds">Figure 24</a> is that census. Two of its
+            rows decided the design. Every cloud has a write-only database password, so the same ephemeral pattern
+            works on all three. And the list-resource coverage is uneven: google 8.8.0 has a list type for
+            <code>google_storage_bucket</code> but none for <code>google_compute_network</code>,
+            <code>google_cloud_run_v2_service</code> or <code>google_sql_database_instance</code>, which is why
+            <code>discover.tfquery.hcl</code> lists buckets on GCP and resource groups on Azure.
+          </p>
+
+          <figure class="figure wide" id="fig-three-clouds">
+            <div class="figure-head">
+              <span class="figure-label">Figure 24</span>
+              <p class="figure-title">Three clouds by schema: what the cached providers declare, and the six write-only arguments the project uses</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>capability</th><th>aws 6.70.0</th><th>google 8.8.0</th><th>azurerm 5.10.0</th><th>random 3.9.1</th></tr></thead>
+                <tbody>
+                  <tr><td>resources</td><td>1,742</td><td>1,381</td><td>1,106</td><td>10</td></tr>
+                  <tr><td>data sources</td><td>685</td><td>472</td><td>396</td><td>0</td></tr>
+                  <tr><td>ephemeral resources</td><td>11</td><td>6</td><td>2</td><td>2</td></tr>
+                  <tr><td>list resources</td><td>259</td><td>153</td><td>122</td><td>0</td></tr>
+                  <tr><td>actions</td><td>12</td><td>0</td><td>8</td><td>0</td></tr>
+                  <tr><td>provider functions</td><td>4</td><td>6</td><td>2</td><td>0</td></tr>
+                  <tr><td>identity schemas</td><td>558</td><td>942</td><td>196</td><td>0</td></tr>
+                  <tr><td>write-only attributes</td><td>37 on 18 resources</td><td>31 on 21</td><td>8 on 7 (one nested)</td><td>0</td></tr>
+                  <tr style="background: var(--orange-soft)"><td>DB password, write-only</td><td>aws_db_&#8203;instance <code>password_wo</code>, sensitive</td><td>google_sql_&#8203;user <code>password_wo</code></td><td>azurerm_&#8203;postgresql_&#8203;flexible_&#8203;server <code>administrator_&#8203;password_wo</code>, <strong>not</strong> sensitive</td><td>—</td></tr>
+                  <tr style="background: var(--orange-soft)"><td>secret, write-only</td><td>aws_&#8203;secretsmanager_&#8203;secret_version <code>secret_&#8203;string_wo</code></td><td>google_&#8203;secret_manager_&#8203;secret_version <code>secret_&#8203;data_wo</code></td><td>azurerm_&#8203;key_vault_&#8203;secret <code>value_wo</code></td><td>—</td></tr>
+                  <tr><td><code>*_wo_version</code> type</td><td>number</td><td>number on the SQL user, <strong>string</strong> on the secret</td><td>number</td><td>—</td></tr>
+                  <tr><td>schema JSON</td><td>19.7 MB</td><td>9.8 MB</td><td>3.2 MB</td><td>23 KB</td></tr>
+                  <tr><td>binary</td><td>832.5 MB</td><td>136.8 MB</td><td>226.7 MB</td><td>18.3 MB</td></tr>
+                  <tr><td>built with</td>
+                    <td><div style="display: flex; gap: 3px; flex-wrap: wrap; font-size: 11.5px"><span style="background: var(--blue-soft); padding: 1px 5px">SDKv2 2.40.1</span><span style="background: var(--green-soft); padding: 1px 5px">framework 1.19.0</span><span style="background: var(--purple-soft); padding: 1px 5px">mux 0.23.1</span></div></td>
+                    <td><div style="display: flex; gap: 3px; flex-wrap: wrap; font-size: 11.5px"><span style="background: var(--blue-soft); padding: 1px 5px">SDKv2 2.40.1</span><span style="background: var(--green-soft); padding: 1px 5px">framework 1.19.0</span><span style="background: var(--purple-soft); padding: 1px 5px">mux 0.23.1</span></div></td>
+                    <td><div style="display: flex; height: 14px; margin-top: 3px"><span style="width: 67.7%; background: var(--green-soft); border: 1px solid var(--green)"></span><span style="width: 11.9%; background: var(--blue-soft); border: 1px solid var(--blue)"></span><span style="width: 6.5%; background: var(--purple-soft); border: 1px solid var(--purple)"></span><span style="width: 14%; background: var(--paper-soft); border: 1px solid var(--line-dark)"></span></div><div style="font-size: 11.5px">symbol paths: framework 354, sdk/v2 62, mux 34, plugin-go 73</div></td>
+                    <td><div style="display: flex; gap: 3px; flex-wrap: wrap; font-size: 11.5px"><span style="background: var(--green-soft); padding: 1px 5px">framework only</span></div></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              The census is from <code>providers schema -json</code> over the cached builds, all four of them protocol-5
+              <span class="recon">measured here</span>. The tinted rows are the six write-only arguments the project feeds
+              from one ephemeral password per cloud; note that write-only does not imply sensitive on azurerm, and that
+              google types the version trigger differently on two resources, so the GCP module wraps it in
+              <code>tostring()</code>. azurerm's eighth write-only attribute is nested,
+              <code>connection_string_wo</code> inside an IoT Hub resource. The azurerm bar is proportional to symbol-path
+              counts in the binary, which measure linkage, not code size; for aws and google only the linked versions were
+              read.
+            </p>
+          </figure>
+
+          <h3>What passes, and what it costs</h3>
+          <p>
+            All of the following ran on 2026-10-23 on the 2-vCPU box, from a shared plugin cache, with fake credentials
+            where a provider demanded something <span class="recon">measured here</span>. Times vary with page cache and
+            load, so they are ranges.
+          </p>
+          <ul>
+            <li><code>init</code> passes in about 20 seconds and reports "Using … from the shared cache directory" for
+              all four providers, but it is not offline: inside a network namespace with no network it fails "could not
+              connect to registry.terraform.io".</li>
+            <li><code>validate</code> takes 16 to 33 seconds, with one cold run at 1 minute 57; <code>validate -query</code>,
+              which also checks the <code>.tfquery.hcl</code> file, takes 16 to 49 seconds and is not intrinsically
+              slower. <code>fmt -check -recursive</code> passes, including test and query files.</li>
+            <li><code>terraform test</code>: "Success! 7 passed, 0 failed." in about 42 to 65 seconds, every provider
+              mocked (<a href="#p4-tests-policy">section 7</a>).</li>
+            <li><code>terraform plan</code> for one environment: "Plan: 36 to add, 0 to change, 0 to destroy. Actions: 1
+              to invoke." in about 35 seconds with the network up, under <code>TF_LOG=DEBUG</code>. Two environments
+              plan 72 creates and 2 actions, 20.3 seconds on a warm run without debug logging. Fully air-gapped, the
+              single-environment plan still succeeds and takes about 5 minutes 15 seconds
+              (<a href="#p4-no-creds">section 6</a> explains why).</li>
+          </ul>
+          <p>
+            The plan's costs are the ones <a href="../engine-and-providers/#p2-processes">Part 2</a> predicted. It started
+            18 provider processes, 5 each for aws, google and azurerm and 3 for random; each cloud provider was first
+            started alone to serve its schema, which took about 7.2 seconds and about 580 MB for aws. At peak 7 providers
+            were alive at once, about 1.38 GB of resident memory. The plan graph has 115 vertices and 217 edges, 84 of
+            them <code>(expand)</code> nodes, plus 12 variables and 3 <code>(validation)</code> vertices, four providers
+            and their four closers, three module closers, one ephemeral <code>(close)</code>, two check
+            <code>(report)</code> vertices, the action's <code>(config)</code> vertex and the root. The apply graph has
+            113 and 215; the default resource graph 37 and 39. There are still no instance nodes in it
+            (<a href="../engine-and-providers/#p2-plan-graph">Part 2</a>). The saved plan is 28,866 to 28,900 bytes, and
+            its <code>show -json</code> form 120,110 bytes, with a top-level <code>action_invocations</code> array beside
+            <code>resource_changes</code>.
+          </p>
+
+          <h3>Functions that run offline, and one that surprises</h3>
+          <p>
+            Provider-defined functions run inside the provider process over <code>CallFunction</code>, on an unconfigured
+            instance, so with literal arguments they evaluate at plan time without credentials. The root's
+            <code>function_demo</code> output calls <code>provider::aws::arn_parse</code>, <code>arn_build</code>,
+            <code>provider::google::region_from_zone("us-central1-a")</code>, which returns <code>"us-central1"</code>, and
+            <code>provider::azurerm::parse_resource_id</code>. Functions on computed attributes stay "(known after apply)"
+            in a plan; under mocks they return real results because the mocks supply realistic ids.
+          </p>
+          <p>
+            One function does not do what its name suggests. <code>provider::aws::trim_iam_role_path</code> returns the
+            role ARN with its path removed, not the role name; a test expecting <code>"xolab-dev-api"</code> failed, and the
+            final assertion is <code>"arn:aws:iam::123456789012:role/xolab-dev-invalid-api"</code>
+            <span class="recon">measured here</span>. If you need a role name, parse the ARN.
+          </p>

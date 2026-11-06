@@ -1,0 +1,207 @@
+          <h2 id="p4-real-apply"><span class="secnum">{{S}}</span>What was not run, and the register</h2>
+          <p>
+            Everything so far stopped before a cloud. That was the constraint, not a choice: no AWS, GCP, Azure or HCP
+            credentials existed at any point. So the project's last chapter is a checklist that was written and never
+            executed. It is worth reading for what it says about where the remaining risk sits. The claim of this
+            section: the hard parts left are identity and networking, and no plan can test either.
+          </p>
+
+          <h3>The real-apply checklist, unexecuted</h3>
+          <p>
+            Setting <code>-var offline=false</code> is the switch. Every fake credential in <code>providers.tf</code>
+            collapses to <code>null</code>, so each provider falls back to its normal credential chain, azurerm switches
+            to <code>use_oidc = true</code>, and the <code>gcp_project</code> validation then demands a real project id.
+            Only that last step was measured, by the test that expects the validation to fail. The rest comes from the
+            project README and provider documentation, and none of it was run or verified here
+            <span class="recon">reconstruction</span>:
+          </p>
+          <ul>
+            <li><strong>All clouds.</strong> A remote backend with locking: S3 with <code>use_lockfile = true</code>, GCS,
+              or azurerm blob leases (<a href="../state-and-features/#p3-locks">Part 3</a> shows why the S3 switch matters).
+              HCP Terraform is the only route found to real <code>-policies</code> enforcement, and that is inferred from
+              code. When applying a saved plan, re-supply the ephemeral input variables.</li>
+            <li><strong>AWS.</strong> CI authentication through GitHub Actions OIDC into a deploy role with
+              <code>sts:AssumeRoleWithWebIdentity</code>; permissions for VPC, S3, RDS, Secrets Manager, IAM and Lambda; a
+              real ECR image instead of the placeholder URI; globally unique bucket names. The Lambda runs in two private
+              subnets with no NAT gateway and no VPC endpoint, so at runtime it cannot reach ECR, Secrets Manager or STS
+              until one is added. Whether a Lambda <em>function</em> error, as opposed to an API error, fails the smoke
+              action and so halts under the default <code>on_failure</code> is unknown.</li>
+            <li><strong>GCP.</strong> Workload Identity Federation instead of JSON keys; six APIs enabled (compute,
+              sqladmin, run, secretmanager, iam, servicenetworking); <code>roles/secretmanager.secretAccessor</code> for the
+              Cloud Run service account. Cloud SQL with a private IP needs a private services access range and a
+              <code>google_service_networking_connection</code>, which the module does not model, so a real apply would
+              fail at the SQL instance as written.</li>
+            <li><strong>Azure.</strong> OIDC workload identity federation with <code>ARM_CLIENT_ID</code>,
+              <code>ARM_TENANT_ID</code> and <code>ARM_SUBSCRIPTION_ID</code>; real ids in place of the all-zero
+              defaults; the resource providers registered, since the project sets
+              <code>resource_provider_registrations = "none"</code>; <code>Key Vault Secrets Officer</code> for the deploy
+              identity. Purge protection leaves a destroyed vault soft-deleted. The flexible server sits on a delegated
+              subnet with public access off but no <code>private_dns_zone_id</code>, which Azure is believed to require for
+              VNet-integrated servers; the schema says only optional and computed. Whether the <code>/23</code>
+              Container Apps subnet matches the environment type Azure creates was not checked.</li>
+          </ul>
+          <p>
+            Read the list by kind. Every cloud's first item is an identity federation set-up, and most of the rest is
+            network plumbing: private DNS, private service access, NAT or endpoints, delegated subnets. A plan cannot
+            catch any of it. It checks schemas, types and the graph; it does not ask a cloud whether a subnet can reach
+            a registry or whether a role may assume another. Those are the failures that would appear first on a real
+            apply, and they are the ones this lab could not reach.
+          </p>
+
+          <h3>Hazards found while building</h3>
+          <p>
+            The one class of failure the lab did hit was local: the shared plugin cache. Terraform has no lock on
+            <code>TF_PLUGIN_CACHE_DIR</code>. Concurrent <code>init</code> runs, including the lab's own credential probe,
+            rewrote all four cached providers twice within about five minutes, and a plan that ran during the rewrite
+            failed its lock-file checksum check. One <code>init</code> that coincided with a rewrite downloaded aws again,
+            about 830 MB, despite a pinned lock file; afterwards all four entries matched the lock's <code>h1:</code>
+            hashes. A verifier's no-lock <code>init</code> in another lab failed "text file busy" because a different
+            process was running the binary it tried to replace <span class="recon">measured here</span>. OpenTofu's
+            per-package <code>flock</code> exists for exactly this case (<a href="#p4-opentofu">section 2</a>). If several
+            jobs share one cache directory, serialise their <code>init</code> steps.
+          </p>
+
+          <h3>The thesis, once more</h3>
+          <p>
+            Terraform is a compiler whose intermediate representation is a dependency graph and whose back end is
+            somebody else's process. The four parts followed that sentence from bytes to state. Part 1 showed a parser
+            that builds structure without meaning and a decoder that runs twice. Part 2 showed a graph that is the
+            program and providers that are untrusted processes behind a 36-RPC contract. Part 3 showed a single plaintext
+            document held together by advisory locks, and a decade of features that each arrived as a small schema, a
+            graph node and an RPC. This part showed the same seams from outside. The licence leaves the protocol and the
+            providers open. The fork shares them and diverges everywhere else. The commercial engines run as separate
+            plugins. And a three-cloud project can be validated, tested and planned without a single credential, up to
+            the point where a cloud must answer.
+          </p>
+          <p>
+            The register below lists every finding of the collection, grouped as the dossier groups them: behaviour that
+            bites (A), documentation drift (B), CHANGELOG omissions (C) and changes on origin/main after the tag (D). Each
+            row carries the evidence class and the verifier's verdict from the research, and links to the section that
+            explains it. "Register only" marks the few items no section expands on. Nothing here was reported upstream.
+          </p>
+
+          <figure class="figure wide" id="fig-register">
+            <div class="figure-head">
+              <span class="figure-label">Findings register</span>
+              <p class="figure-title">All 101 findings of Terraform, taken apart, with evidence and where each is explained</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 12.5px">
+                <thead><tr><th>id</th><th>finding</th><th>evidence · verdict</th><th>explained in</th></tr></thead>
+                <tbody>
+                  <tr style="background: var(--paper-soft)"><td colspan="4"><strong>A. Behaviour that surprises or bites users</strong> (57)</td></tr>
+                  <tr><td>A1</td><td>S3 has no lock unless use_lockfile or DynamoDB is set</td><td>code · verified</td><td><a href="../state-and-features/#p3-locks">p3-locks</a></td></tr>
+                  <tr><td>A2</td><td>Policy: plan and apply fail open, init fails closed; local plan never enforces</td><td>measured · verified</td><td><a href="#p4-tests-policy">p4-tests-policy</a></td></tr>
+                  <tr><td>A3</td><td>terraform_remote_state returns outputs with sensitivity dropped</td><td>measured · verified</td><td><a href="../state-and-features/#p3-workspaces-hcp">p3-workspaces-hcp</a></td></tr>
+                  <tr><td>A4</td><td>Sensitive values are plaintext in state; terraform_data.output is not even marked</td><td>measured · verified</td><td><a href="../state-and-features/#p3-state-file">p3-state-file</a></td></tr>
+                  <tr><td>A5</td><td>-lock-timeout defaults to 0, and plan takes the lock too</td><td>measured · verified</td><td><a href="../state-and-features/#p3-locks">p3-locks</a></td></tr>
+                  <tr><td>A6</td><td>HTTP backend Unlock never sends the lock ID</td><td>measured; unverifiable (code confirmed)</td><td><a href="../state-and-features/#p3-locks">p3-locks</a></td></tr>
+                  <tr><td>A7</td><td>-migrate-state and state push -force skip lineage and serial checks</td><td>code · verified</td><td><a href="../state-and-features/#p3-state-file">p3-state-file</a></td></tr>
+                  <tr><td>A8</td><td>state_store lock errors would never be retried (experimental)</td><td>code; consequence inferred</td><td><a href="../state-and-features/#p3-locks">p3-locks</a></td></tr>
+                  <tr><td>A9</td><td>Workspaces are not isolation; a TF_WORKSPACE typo creates one</td><td>measured · verified</td><td><a href="../state-and-features/#p3-workspaces-hcp">p3-workspaces-hcp</a></td></tr>
+                  <tr><td>A10</td><td>-invoke silently turns a plan refresh-only</td><td>measured · verified</td><td><a href="../state-and-features/#p3-query-actions">p3-query-actions</a></td></tr>
+                  <tr><td>A11</td><td>plan -destroy -invoke hits &quot;This is a bug in Terraform&quot;</td><td>measured (verifier)</td><td><a href="../state-and-features/#p3-query-actions">p3-query-actions</a></td></tr>
+                  <tr><td>A12</td><td>on_failure = halt fails the run but does not roll back</td><td>measured; unverifiable</td><td><a href="../state-and-features/#p3-query-actions">p3-query-actions</a></td></tr>
+                  <tr><td>A13</td><td>taint applies only to after_create; destroy actions continue or error</td><td>code</td><td><a href="../state-and-features/#p3-query-actions">p3-query-actions</a></td></tr>
+                  <tr><td>A14</td><td>A stable 1.13 binary silently drops action blocks</td><td>code · verified</td><td><a href="../state-and-features/#p3-query-actions">p3-query-actions</a></td></tr>
+                  <tr><td>A15</td><td>check never blocks; a second failing assert goes unreported</td><td>measured · verified</td><td><a href="../state-and-features/#p3-arc">p3-arc</a></td></tr>
+                  <tr><td>A16</td><td>An error skips only dependents; independent branches still plan</td><td>measured + code · verified</td><td><a href="../engine-and-providers/#p2-walk">p2-walk</a></td></tr>
+                  <tr><td>A17</td><td>PlanResourceChange runs at least twice per instance</td><td>measured · verified</td><td><a href="../engine-and-providers/#p2-instance">p2-instance</a></td></tr>
+                  <tr><td>A18</td><td>-minimal-refresh costs more RPCs when something changes</td><td>measured · verified</td><td><a href="../engine-and-providers/#p2-instance">p2-instance</a></td></tr>
+                  <tr><td>A19</td><td>Destroy order comes from dependencies in state, not config</td><td>code · verified</td><td><a href="../engine-and-providers/#p2-plan-apply">p2-plan-apply</a></td></tr>
+                  <tr><td>A20</td><td>show -json drops refinements the plan file keeps</td><td>measured · verified</td><td><a href="../engine-and-providers/#p2-plan-apply">p2-plan-apply</a></td></tr>
+                  <tr><td>A21</td><td>graph -plan shows a deposed key the real apply does not use</td><td>measured · verified</td><td><a href="../engine-and-providers/#p2-plan-apply">p2-plan-apply</a></td></tr>
+                  <tr><td>A22</td><td>Deferral is in core since 1.8, but the CLI rejects -allow-deferral</td><td>measured · verified</td><td><a href="../engine-and-providers/#p2-expansion">p2-expansion</a></td></tr>
+                  <tr><td>A23</td><td>&amp;&amp; and || evaluate both operands</td><td>measured + code · verified</td><td><a href="../language-and-front-end/#p1-values">p1-values</a></td></tr>
+                  <tr><td>A24</td><td>Conditional branches must unify even with a constant predicate</td><td>measured · verified</td><td><a href="../language-and-front-end/#p1-values">p1-values</a></td></tr>
+                  <tr><td>A25</td><td>dynamic cannot generate lifecycle; meta-arguments are literal-only</td><td>measured · verified</td><td><a href="../language-and-front-end/#p1-schema">p1-schema</a></td></tr>
+                  <tr><td>A26</td><td>Operators convert implicitly; == never does</td><td>measured · verified</td><td><a href="../language-and-front-end/#p1-values">p1-values</a></td></tr>
+                  <tr><td>A27</td><td>An operator at end of line fails at body level</td><td>measured · verified</td><td><a href="../language-and-front-end/#p1-parsing">p1-parsing</a></td></tr>
+                  <tr><td>A28</td><td>init is not offline even with a lock file and a warm cache</td><td>measured · verified</td><td><a href="../language-and-front-end/#p1-install">p1-install</a></td></tr>
+                  <tr><td>A29</td><td>A no-lock init rewrites the shared plugin cache</td><td>measured</td><td><a href="../language-and-front-end/#p1-install">p1-install</a></td></tr>
+                  <tr><td>A30</td><td>const values are part of the working directory&#x27;s identity</td><td>measured · verified</td><td><a href="../language-and-front-end/#p1-init-graph">p1-init-graph</a></td></tr>
+                  <tr><td>A31</td><td>Object-form required_providers is deferred to the init graph; null version allowed</td><td>code + measured</td><td><a href="../language-and-front-end/#p1-init-graph">p1-init-graph</a></td></tr>
+                  <tr><td>A32</td><td>A malformed registry address falls through to go-getter</td><td>code · verified</td><td><a href="../language-and-front-end/#p1-install">p1-install</a></td></tr>
+                  <tr><td>A33</td><td>One override block hides all base blocks of its type</td><td>code · verified</td><td><a href="../language-and-front-end/#p1-loading">p1-loading</a></td></tr>
+                  <tr><td>A34</td><td>Module versions are never locked</td><td>code + measured · verified</td><td><a href="../language-and-front-end/#p1-install">p1-install</a></td></tr>
+                  <tr><td>A35</td><td>Filesystem mirrors are unauthenticated; expired signing keys only warn</td><td>code + measured · verified</td><td><a href="../language-and-front-end/#p1-install">p1-install</a></td></tr>
+                  <tr><td>A36</td><td>A trivial plan starts its provider 3 times; the lab plan 18</td><td>measured · verified</td><td><a href="../engine-and-providers/#p2-processes">p2-processes</a></td></tr>
+                  <tr><td>A37</td><td>Provider functions run unconfigured and need no credentials</td><td>measured · verified</td><td><a href="../engine-and-providers/#p2-processes">p2-processes</a></td></tr>
+                  <tr><td>A38</td><td>Refinements never reach terraform-plugin-go providers</td><td>measured · verified</td><td><a href="../engine-and-providers/#p2-wire">p2-wire</a></td></tr>
+                  <tr><td>A39</td><td>plugin-go&#x27;s &quot;6.11&quot; lacks the v1.16 computed-block fields</td><td>code</td><td><a href="../engine-and-providers/#p2-wire">p2-wire</a></td></tr>
+                  <tr><td>A40</td><td>Write-only values are sent in every plan and apply; core only demands null back</td><td>code + measured</td><td><a href="#p4-secrets">p4-secrets</a></td></tr>
+                  <tr><td>A41</td><td>Write-only does not imply sensitive; *_wo_version is typed per provider</td><td>measured · verified</td><td><a href="#p4-secrets">p4-secrets</a></td></tr>
+                  <tr><td>A42</td><td>terraform_data.store persists an ephemeral secret</td><td>measured · verified</td><td><a href="#p4-secrets">p4-secrets</a></td></tr>
+                  <tr><td>A43</td><td>mock_provider execs the real binary and forwards functions and lists</td><td>measured + code · verified</td><td><a href="#p4-tests-policy">p4-tests-policy</a></td></tr>
+                  <tr><td>A44</td><td>Identity import cannot be unit-tested</td><td>measured · verified</td><td><a href="#p4-tests-policy">p4-tests-policy</a></td></tr>
+                  <tr><td>A45</td><td>Runs in one test file share state</td><td>measured · verified</td><td><a href="#p4-tests-policy">p4-tests-policy</a></td></tr>
+                  <tr><td>A46</td><td>In release builds, terraform test cleanup runs terraform test</td><td>code · verified</td><td><a href="../state-and-features/#p3-arc">p3-arc</a></td></tr>
+                  <tr><td>A47</td><td>google: one real 401 call offline, about 5 min of retries air-gapped</td><td>measured</td><td><a href="#p4-no-creds">p4-no-creds</a></td></tr>
+                  <tr><td>A48</td><td>Fake azurerm client-secret ids are rejected by Entra ID</td><td>measured · verified</td><td><a href="#p4-no-creds">p4-no-creds</a></td></tr>
+                  <tr><td>A49</td><td>terraform query cannot run without credentials</td><td>measured; unverifiable</td><td><a href="#p4-no-creds">p4-no-creds</a></td></tr>
+                  <tr><td>A50</td><td>aws::trim_iam_role_path returns an ARN, not a role name</td><td>measured · verified</td><td><a href="#p4-project">p4-project</a></td></tr>
+                  <tr><td>A51</td><td>Local state is rewritten in place; local serial counts writes</td><td>code + measured · verified</td><td><a href="../state-and-features/#p3-state-file">p3-state-file</a></td></tr>
+                  <tr><td>A52</td><td>state push lands at serial+1; a cross-state mv is not atomic</td><td>measured · verified</td><td><a href="../state-and-features/#p3-state-file">p3-state-file</a></td></tr>
+                  <tr><td>A53</td><td>removed defaults to destroying the resource</td><td>code · verified</td><td><a href="../state-and-features/#p3-refactoring">p3-refactoring</a></td></tr>
+                  <tr><td>A54</td><td>An HCP workspace stays locked after a failed state upload</td><td>code · verified</td><td><a href="../state-and-features/#p3-workspaces-hcp">p3-workspaces-hcp</a></td></tr>
+                  <tr><td>A55</td><td>After tofu provider for_each or encryption, Terraform cannot load state</td><td>measured · verified</td><td><a href="#p4-opentofu">p4-opentofu</a></td></tr>
+                  <tr><td>A56</td><td>.tofu twins shadow .tf files; tofu ignores required_version in .tf</td><td>measured · verified</td><td><a href="#p4-opentofu">p4-opentofu</a></td></tr>
+                  <tr><td>A57</td><td>Terraform calls Checkpoint on every run unless disabled</td><td>code · verified</td><td><a href="#p4-opentofu">p4-opentofu</a></td></tr>
+                  <tr style="background: var(--paper-soft)"><td colspan="4"><strong>B. Documentation drift (the code wins)</strong> (18)</td></tr>
+                  <tr><td>B1</td><td>HCL spec forbids a BOM and tabs; the scanner accepts both</td><td>measured + code · verified</td><td><a href="../language-and-front-end/#p1-lexing">p1-lexing</a></td></tr>
+                  <tr><td>B2</td><td>HCL spec&#x27;s Identifier excludes a leading _; the scanner allows it</td><td>code · verified</td><td><a href="../language-and-front-end/#p1-lexing">p1-lexing</a></td></tr>
+                  <tr><td>B3</td><td>&quot;Arbitrary precision&quot; is 512-bit; pow and log use float64</td><td>code + measured · verified</td><td><a href="../language-and-front-end/#p1-values">p1-values</a></td></tr>
+                  <tr><td>B4</td><td>spec.md&#x27;s FunctionCall grammar omits :: namespaces</td><td>code · verified</td><td><a href="../language-and-front-end/#p1-parsing">p1-parsing</a></td></tr>
+                  <tr><td>B5</td><td>architecture.md says the walk halts on error; EnterPath is gone</td><td>code · verified</td><td><a href="../engine-and-providers/#p2-walk">p2-walk</a></td></tr>
+                  <tr><td>B6</td><td>UI mode drives an apply decision despite planfile.proto</td><td>code · verified</td><td><a href="../engine-and-providers/#p2-plan-apply">p2-plan-apply</a></td></tr>
+                  <tr><td>B7</td><td>Policy: CHANGELOG says GA, HCP docs say beta</td><td>web + code</td><td><a href="../state-and-features/#p3-gates">p3-gates</a></td></tr>
+                  <tr><td>B8</td><td>Core says a nil entitlement skips the check; plugin 0.5.0 rejects it</td><td>measured · verified</td><td><a href="#p4-tests-policy">p4-tests-policy</a></td></tr>
+                  <tr><td>B9</td><td>Docs date protocol 6 to 1.0; it shipped in v0.15.0</td><td>measured + web · verified</td><td><a href="../engine-and-providers/#p2-wire">p2-wire</a></td></tr>
+                  <tr><td>B10</td><td>Variable docs omit const in required_providers</td><td>web; unverifiable</td><td><a href="../language-and-front-end/#p1-init-graph">p1-init-graph</a></td></tr>
+                  <tr><td>B11</td><td>Docs call the lock ID a nonce; the HTTP backend never sends it</td><td>code; half verified</td><td><a href="../state-and-features/#p3-locks">p3-locks</a></td></tr>
+                  <tr><td>B12</td><td>HCP docs put OPA before cost estimation; the CLI renders the reverse</td><td>code verified; web unverifiable</td><td><a href="../state-and-features/#p3-workspaces-hcp">p3-workspaces-hcp</a></td></tr>
+                  <tr><td>B13</td><td>-generate-config-out still prints &quot;experimental&quot;</td><td>measured · verified</td><td><a href="../state-and-features/#p3-refactoring">p3-refactoring</a></td></tr>
+                  <tr><td>B14</td><td>metadata functions omits convert in both tools</td><td>measured (verifier)</td><td><a href="#p4-opentofu">p4-opentofu</a></td></tr>
+                  <tr><td>B15</td><td>rpcapi README still says Stacks &quot;private preview&quot;</td><td>code · verified</td><td><a href="#p4-commercial-edge">p4-commercial-edge</a></td></tr>
+                  <tr><td>B16</td><td>evaluate.go says unknown keys occur only in Stacks; test too</td><td>code</td><td><a href="../engine-and-providers/#p2-expansion">p2-expansion</a></td></tr>
+                  <tr><td>B17</td><td>The lab README implied init works offline</td><td>measured</td><td><a href="../language-and-front-end/#p1-install">p1-install</a></td></tr>
+                  <tr><td>B18</td><td>-invoke docs say workspace only; single-file --policies fails</td><td>web; partly unverifiable</td><td><a href="#p4-tests-policy">p4-tests-policy</a></td></tr>
+                  <tr style="background: var(--paper-soft)"><td colspan="4"><strong>C. CHANGELOG omissions and mistakes</strong> (14)</td></tr>
+                  <tr><td>C1</td><td>The v1.17 walker rewrite and AlwaysRunVertex are not listed</td><td>code · verified</td><td><a href="../engine-and-providers/#p2-walk">p2-walk</a></td></tr>
+                  <tr><td>C2</td><td>const variables appear in no CHANGELOG</td><td>measured · verified</td><td><a href="../language-and-front-end/#p1-language">p1-language</a></td></tr>
+                  <tr><td>C3</td><td>The _ meta-argument escape block has no entry</td><td>code · verified</td><td><a href="../language-and-front-end/#p1-language">p1-language</a></td></tr>
+                  <tr><td>C4</td><td>Policy GA cites #38970; the gate was removed by #38996</td><td>code · verified</td><td><a href="../state-and-features/#p3-gates">p3-gates</a></td></tr>
+                  <tr><td>C5</td><td>#38468 (validate&#x27;s backend check) is missing from v1.16.0</td><td>code · verified</td><td>register only</td></tr>
+                  <tr><td>C6</td><td>caller is filed under &quot;stacks:&quot; though it is core</td><td>measured · verified</td><td><a href="../state-and-features/#p3-query-actions">p3-query-actions</a></td></tr>
+                  <tr><td>C7</td><td>The v1.12 &quot;short-circuit&quot; entry is easy to misread</td><td>measured + code</td><td><a href="../language-and-front-end/#p1-values">p1-values</a></td></tr>
+                  <tr><td>C8</td><td>v1.16 advertises an experiment-only skip_cleanup</td><td>code</td><td><a href="../state-and-features/#p3-arc">p3-arc</a></td></tr>
+                  <tr><td>C9</td><td>oci backend listed in v1.12.0; first shipped in v1.13.0</td><td>code · verified</td><td><a href="../state-and-features/#p3-locks">p3-locks</a></td></tr>
+                  <tr><td>C10</td><td>#36705 (state identities) is missing from v1.12.0</td><td>code · verified</td><td>register only</td></tr>
+                  <tr><td>C11</td><td>.tfmigrate.hcl is absent from the 1.17.0 CHANGELOG</td><td>code · verified</td><td><a href="../language-and-front-end/#p1-language">p1-language</a></td></tr>
+                  <tr><td>C12</td><td>The protocol label was not bumped as RPCs went 28 → 36</td><td>measured · verified</td><td><a href="../engine-and-providers/#p2-wire">p2-wire</a></td></tr>
+                  <tr><td>C13</td><td>1.18.0 Unreleased still calls query -policies experimental</td><td>code (verifier)</td><td><a href="../state-and-features/#p3-gates">p3-gates</a></td></tr>
+                  <tr><td>C14</td><td>The Policy GA entry is silent on fail-open and entitlement</td><td>inference</td><td><a href="../state-and-features/#p3-gates">p3-gates</a></td></tr>
+                  <tr style="background: var(--paper-soft)"><td colspan="4"><strong>D. Upstream changes on origin/main after v1.17.0 (a060ad5a1b, 2026-10-23)</strong> (12)</td></tr>
+                  <tr><td>D1</td><td>Target patterns; TargetsTransformer moves into dynamicExpand</td><td>code (verifier)</td><td>register only</td></tr>
+                  <tr><td>D2</td><td>Targeted-away instance keys now evaluate as unknown</td><td>code (verifier)</td><td>register only</td></tr>
+                  <tr><td>D3</td><td>Forget by containment; State.MoveModule deleted</td><td>code (verifier)</td><td><a href="../state-and-features/#p3-refactoring">p3-refactoring</a></td></tr>
+                  <tr><td>D4</td><td>forget with create_before_destroy bookkeeping may change</td><td>code (verifier)</td><td><a href="../state-and-features/#p3-refactoring">p3-refactoring</a></td></tr>
+                  <tr><td>D5</td><td>Workspace commands move to views</td><td>code (verifier)</td><td>register only</td></tr>
+                  <tr><td>D6</td><td>import to parsing rewritten; test overrides keyed by target pattern</td><td>code (verifier)</td><td>register only</td></tr>
+                  <tr><td>D7</td><td>Deferral calls around actions simplified</td><td>code (verifier)</td><td>register only</td></tr>
+                  <tr><td>D8</td><td>console stops removing unknown marks (#39407)</td><td>code (verifier); not re-tested</td><td><a href="../language-and-front-end/#p1-values">p1-values</a></td></tr>
+                  <tr><td>D9</td><td>plan and query print their version first</td><td>code (verifier)</td><td>register only</td></tr>
+                  <tr><td>D10</td><td>Still present: -destroy -invoke, identity override, fail-open, &quot;experimental&quot;</td><td>code (verifiers)</td><td><a href="#p4-tests-policy">p4-tests-policy</a></td></tr>
+                  <tr><td>D11</td><td>No graduations: deferral, state_store, state migrate</td><td>code (verifiers)</td><td>register only</td></tr>
+                  <tr><td>D12</td><td>HCL v2.25.0 is tagged; Terraform still pins v2.24.0</td><td>code (verifier)</td><td><a href="../language-and-front-end/#p1-parsing">p1-parsing</a></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Evidence: "measured" was reproduced with the v1.17.0 binary on this box, "code" was read in the pinned tree,
+              "web" was a fetched page; "verified" means an adversarial verifier confirmed it, "unverifiable" that the
+              verifier could not re-run it. D-items were read on origin/main <code>a060ad5a1b</code> and describe code that
+              may change before 1.18. A finding is an observation about the pinned versions, not a bug report: none was
+              filed upstream.
+            </p>
+          </figure>
