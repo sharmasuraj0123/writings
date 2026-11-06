@@ -1,0 +1,2530 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Docker Engine 29.9.2 taken apart, part 2: the OCI image as a tree of hashes, digest vs DiffID vs ChainID, tar layers and whiteouts, a measured Docker Hub pull, credentials, containerd's content store and snapshots, the two image stores, and a local registry's push path and GC."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/docker/images/" />
+    <meta property="og:title" content="Images, layers and the registry" />
+    <meta property="og:description" content="Part 2 of a four-part Docker teardown at Engine 29.9.2 (0367cbeb): alpine:latest's 9,218-byte index and its 16 entries, three hashes of one layer reproduced from real bytes, whiteouts as tar entries and as kernel overlay objects, an anonymous Hub pull with hop timings, credential helpers, containerd's content store and snapshot GC labels, two meanings of &quot;image ID&quot;, and a distribution v3.1.2 push and garbage-collection lab." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/docker/images/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Images, layers and the registry" />
+    <meta name="twitter:description" content="Docker 29.9.2 taken apart, part 2: images as hash trees, digest/DiffID/ChainID, whiteouts, a Hub pull request by request, containerd's store, and a registry's GC, with real bytes." />
+    <title>Images, layers and the registry — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · An image is a tree of hashes</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#p2-lede">01 · An image is a tree of hashes</a>
+        <a class="toc-parent" href="#p2-hashes">02 · Digest, DiffID, ChainID</a>
+        <a class="toc-parent" href="#p2-layers">03 · Layers are tar changesets</a>
+        <a class="toc-parent" href="#p2-wire">04 · Pulling alpine, request by request</a>
+        <a class="toc-parent" href="#p2-credentials">05 · Credentials, and dockerd as the client</a>
+        <a class="toc-parent" href="#p2-store">06 · Content store, snapshots and unpack</a>
+        <a class="toc-parent" href="#p2-two-stores">07 · Two image stores, two meanings of "image ID"</a>
+        <a class="toc-parent" href="#p2-server">08 · Push, and inside a registry</a>
+        <a class="toc-parent" href="#p2-sources">09 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#p2-lede">01 · A tree of hashes</a>
+        <a href="#p2-hashes">02 · Digest, DiffID, ChainID</a>
+        <a href="#p2-layers">03 · Tar changesets</a>
+        <a href="#p2-wire">04 · Pulling, by request</a>
+        <a href="#p2-credentials">05 · Credentials</a>
+        <a href="#p2-store">06 · Content and snapshots</a>
+        <a href="#p2-two-stores">07 · Two image stores</a>
+        <a href="#p2-server">08 · Push and the registry</a>
+        <a href="#p2-sources">09 · Sources</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Languages & Tools</p>
+        <h1>Images, layers and the registry<span class="status-pill">Teardown</span></h1>
+        <p class="dek">
+          An image is a Merkle tree of JSON documents and tarballs, each named by the sha256 of its exact bytes. This second part of a four-part Docker teardown pulls alpine:latest from Docker Hub request by request, takes its 9,218-byte index, its config and its one layer apart byte by byte, derives the three hashes of the same layer (digest, DiffID, ChainID), follows the layer into containerd's content store and overlay snapshots, compares Docker 29's two image stores, and pushes into a local registry to watch its storage, its Accept rules and its garbage collector.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 23 October 2026 · Subject: <code>moby@0367cbeb</code> (Docker Engine 29.9.2) · Part 2 of 4 · Read from the source and the specs; measured where this machine allows</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#p2-lede">An image is a tree of hashes</a></li>
+          <li><a href="#p2-hashes">Digest, DiffID, ChainID</a></li>
+          <li><a href="#p2-layers">Layers are tar changesets</a></li>
+          <li><a href="#p2-wire">Pulling alpine, request by request</a></li>
+          <li><a href="#p2-credentials">Credentials, and dockerd as the client</a></li>
+          <li><a href="#p2-store">Content store, snapshots and unpack</a></li>
+          <li><a href="#p2-two-stores">Two image stores, two meanings of "image ID"</a></li>
+          <li><a href="#p2-server">Push, and inside a registry</a></li>
+          <li><a href="#p2-sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from the pinned sources, cited as
+              <code>repo/path:line</code>: moby <code>docker-v29.9.2</code> (<code>0367cbeb</code>), docker/cli v29.9.2,
+              containerd v2.4.2 (the version moby vendors), distribution v3.1.2, and the OCI image-spec v1.1.1 and
+              distribution-spec v1.1.1. <span class="recon">measured here</span> marks bytes, digests, headers and timings
+              observed on 23 October 2026 from a 2-vCPU Linux box: anonymous pulls from Docker Hub and other public
+              registries with <code>curl</code>, layer bytes hashed and listed locally, a hand-built two-layer image, the
+              release binary of distribution v3.1.2 on <code>127.0.0.1:5055</code>, a fake credential helper driven by the
+              machine's docker CLI 29.8.2, and this host's own mount table. No container ran on that box: it lacks
+              <code>CAP_SYS_ADMIN</code>, so <code>dockerd</code> could not start, and nothing here is a trace of
+              <code>dockerd</code> or containerd pulling. Where their behaviour is described, it is read from the code and
+              applied to the measured bytes. <span class="recon">reconstruction</span> marks a judgement I drew from
+              those sources rather than read in one place.
+            </p>
+            <p>
+              This is Part 2 of 4 of <a href="../">Docker, taken apart</a>. <a href="../run-path/">Part 1</a> follows
+              <code>docker run</code> to a process; <a href="../builds/">Part 3</a> covers how BuildKit builds;
+              <a href="../network-and-lifecycle/">Part 4</a> covers networks, I/O and the long run, and ends with the
+              findings register.
+            </p>
+          </div>
+
+          <h2 id="p2-lede"><span class="secnum">01</span>An image is a tree of hashes</h2>
+          <p class="lede">
+            A container is an ordinary Linux process, and Docker is five programs that agree on names made of sha256
+            hashes. This part is about those names. An image is a tree of JSON documents and tarballs. Every node is
+            named by the sha256 of its exact bytes, so a name you trust fixes everything below it. The registry is
+            trusted at one point only: the response header that turns a tag into a digest. Everything after that is
+            checked on arrival.
+          </p>
+          <p>
+            The unit is the <em>descriptor</em>: a <code>mediaType</code>, a <code>digest</code> and a
+            <code>size</code>, with optional <code>urls</code>, <code>annotations</code> and <code>data</code>
+            (<code>image-spec/descriptor.md:27-60</code>) <span class="src">from the code</span>. A digest is
+            <code>&lt;alg&gt;:&lt;encoded&gt;</code> over the exact bytes; for sha256 that is 64 lowercase hex
+            characters. The spec asks a consumer to check <code>size</code> before hashing, which bounds the read.
+            Three document types use descriptors. An <em>index</em> points at one manifest per platform. A
+            <em>manifest</em> points at one config and an ordered list of layers, base first. The <em>config</em> is
+            the runtime defaults plus the list of uncompressed layer hashes. Its sha256 is the OCI ImageID
+            (<code>image-spec/config.md:85-89</code>). Both index and manifest carry <code>schemaVersion: 2</code>,
+            which the spec says exists only for Docker compatibility and will never change. Each index entry carries a
+            <code>platform</code>. containerd's matcher normalises the arm64 variant <code>v8</code> to the empty
+            string, so <code>linux/arm64</code> and <code>linux/arm64/v8</code> select the same entry
+            (<code>moby/vendor/github.com/containerd/platforms/database.go:87-94</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>alpine:latest, fetched on 23 October 2026</h3>
+          <p>
+            Fetched anonymously from Docker Hub at 14:38 UTC, the tag resolves to an OCI index of 9,218 bytes. Its
+            sha256 equals the <code>docker-content-digest</code> header the registry sent
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>content-type: application/vnd.oci.image.index.v1+json
+content-length: 9218
+docker-content-digest: sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+
+$ sha256sum index.json
+be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a  index.json</code></pre>
+          <p>
+            The index holds 16 descriptors: eight platforms (amd64, arm/v6, arm/v7, arm64/v8, 386, ppc64le, riscv64,
+            s390x), each followed by a second manifest whose platform is <code>unknown/unknown</code>. Half the entries
+            are not runnable images. They are BuildKit attestations: an SPDX SBOM and SLSA provenance, stored as two
+            uncompressed <code>application/vnd.in-toto+json</code> "layers" of 79,673 and 5,639 bytes. Seven
+            attestation manifests are 838 bytes; the arm/v6 one is 566. The amd64 path is short. Its manifest
+            <code>c26612752c78…</code> is 1,022 bytes and names a 611-byte config <code>b92841763c5c…</code> and one gzip
+            layer <code>7b229517ed22…</code> of 3,853,109 bytes <span class="recon">measured here</span>.
+            Figure 1 draws the tree.
+          </p>
+
+          <figure class="figure wide" id="fig-alpine-dag">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">alpine:latest on Docker Hub as a tree of digests, with real sizes</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 430" role="img" aria-label="The tag latest resolves through a HEAD request to an OCI index of 9,218 bytes with 16 entries. The amd64 manifest of 1,022 bytes points at a 611-byte config and a 3,853,109-byte gzip layer. Beside it, an attestation manifest with platform unknown/unknown points at two in-toto layers and refers back to the amd64 manifest through an annotation, not through the subject field.">
+                <defs>
+                  <marker id="dag-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="dag-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="dag-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">TAG</text>
+                <text x="210" y="26" class="svg-lane">INDEX</text>
+                <text x="470" y="26" class="svg-lane">MANIFESTS</text>
+                <text x="780" y="26" class="svg-lane">CONFIG AND LAYERS</text>
+
+                <rect x="30" y="60" width="140" height="64" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="84" class="svg-step">alpine:latest</text>
+                <text x="42" y="104" class="svg-sub">a mutable name</text>
+                <line x1="172" y1="92" x2="206" y2="92" stroke="#252525" stroke-width="2" marker-end="url(#dag-ctl)"/>
+                <text x="30" y="148" class="svg-note">HEAD → one trusted</text>
+                <text x="30" y="164" class="svg-note">header names the index</text>
+
+                <rect x="210" y="52" width="220" height="150" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="222" y="76" class="svg-step">OCI image index</text>
+                <text x="222" y="96" class="svg-sub">sha256:be2656061b53…</text>
+                <text x="222" y="114" class="svg-sub">9,218 B · 16 descriptors</text>
+                <text x="222" y="138" class="svg-sub">8 platforms, each followed</text>
+                <text x="222" y="154" class="svg-sub">by an attestation manifest</text>
+                <text x="222" y="178" class="svg-sub">+7 platform pairs not drawn</text>
+
+                <rect x="470" y="52" width="260" height="96" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="482" y="76" class="svg-step">image manifest · linux/amd64</text>
+                <text x="482" y="96" class="svg-sub">sha256:c26612752c78…</text>
+                <text x="482" y="114" class="svg-sub">1,022 B · oci.image.manifest.v1</text>
+                <text x="482" y="132" class="svg-sub">1 config + 1 layer</text>
+
+                <rect x="470" y="236" width="260" height="110" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="482" y="260" class="svg-step">attestation manifest</text>
+                <text x="482" y="280" class="svg-sub">sha256:964745728d17…</text>
+                <text x="482" y="298" class="svg-sub">838 B · platform unknown/unknown</text>
+                <text x="482" y="316" class="svg-sub">vnd.docker.reference.type:</text>
+                <text x="482" y="332" class="svg-sub" style="white-space:pre">  attestation-manifest</text>
+
+                <line x1="432" y1="100" x2="466" y2="100" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+                <path d="M432,170 L450,170 L450,280 L466,280" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+
+                <path d="M600,234 L600,152" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#dag-state)"/>
+                <text x="608" y="170" class="svg-sub" style="fill:#765b98">vnd.docker.</text>
+                <text x="608" y="186" class="svg-sub" style="fill:#765b98">reference.digest</text>
+                <text x="608" y="202" class="svg-sub">= c26612752c78…</text>
+                <text x="608" y="222" class="svg-note">annotation, not subject</text>
+
+                <rect x="770" y="40" width="280" height="70" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="782" y="62" class="svg-step">config · oci.image.config.v1</text>
+                <text x="782" y="82" class="svg-sub">sha256:b92841763c5c… · 611 B</text>
+                <text x="782" y="98" class="svg-sub">diff_ids: [sha256:75c137aedfb2…]</text>
+
+                <rect x="770" y="124" width="280" height="70" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="782" y="146" class="svg-step">layer · tar+gzip</text>
+                <text x="782" y="166" class="svg-sub">sha256:7b229517ed22…</text>
+                <text x="782" y="182" class="svg-sub">3,853,109 B → 8,709,632 B tar</text>
+
+                <line x1="732" y1="80" x2="766" y2="76" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+                <line x1="732" y1="120" x2="766" y2="154" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+
+                <rect x="770" y="236" width="280" height="54" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="258" class="svg-step">in-toto · SPDX document</text>
+                <text x="782" y="276" class="svg-sub">sha256:3ec36f3670df… · 79,673 B</text>
+                <rect x="770" y="300" width="280" height="54" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="782" y="322" class="svg-step">in-toto · SLSA provenance v0.2</text>
+                <text x="782" y="340" class="svg-sub">sha256:3da1513d2124… · 5,639 B</text>
+                <line x1="732" y1="262" x2="766" y2="262" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+                <line x1="732" y1="320" x2="766" y2="326" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dag-data)"/>
+
+                <text x="30" y="392" class="svg-note">Every arrow is a descriptor: mediaType + digest + size. Each child's bytes must hash to the digest its parent holds,</text>
+                <text x="30" y="410" class="svg-note">so the 64 hex characters of the index digest pin all of the 3,853,109 + 611 + 1,022 bytes of the amd64 image.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured here on 23 October 2026. Blue arrows are descriptors from parent to child. The dashed purple
+              arrow is an annotation the attestation carries; OCI 1.1's <code>subject</code> field, which Hub's
+              referrers API would index, is not set, so that API returns an empty index for the amd64 digest.
+            </p>
+          </figure>
+
+          <p>
+            The config is 611 bytes of BuildKit output. Its two history entries are the Dockerfile lines with
+            <code># buildkit</code> appended, and the second is marked <code>empty_layer</code>, so
+            <code>history</code> has two entries and <code>diff_ids</code> one <span class="recon">measured here</span>:
+          </p>
+<pre><code>"created_by":"ADD alpine-minirootfs-3.24.3-x86_64.tar.gz / # buildkit"
+"created_by":"CMD [\"/bin/sh\"]","comment":"buildkit.dockerfile.v0","empty_layer":true
+"rootfs":{"type":"layers","diff_ids":["sha256:75c137aedfb2760f88629236cb7b797630aed0c3d91d626d1d1bb694878fc2ba"]}</code></pre>
+          <p>
+            The attestations point at their image through the annotation <code>vnd.docker.reference.digest</code>, not
+            through <code>subject</code>. Hub does implement the OCI referrers endpoint. Asked for the amd64 digest, it
+            returns 200 with an empty index <span class="recon">measured here</span>. A tool that finds SBOMs only
+            through referrers finds none (register D29). That is the legacy layout: since v0.32, BuildKit's image
+            exporter also writes each attestation manifest as an OCI artifact with <code>subject</code> by default,
+            so images built that way can be found through referrers on registries that index it
+            (<code>exporter/containerimage/writer.go</code>:613-678) <span class="src">from the code</span>. Older tags show the format before BuildKit:
+            <code>alpine:3.10</code> and <code>3.15</code> are still served as Docker manifest lists, and their configs
+            carry the Docker-only keys <code>container</code>, <code>container_config</code> and
+            <code>docker_version</code>. The two families map one to one: the manifest list is the index, and the
+            Docker gzip layer type is "interchangeable and fully compatible" with OCI's
+            (<code>image-spec/media-types.md:41-64</code>). <a href="../builds/#p3-export">Part 3</a> shows where
+            BuildKit writes the attestations.
+          </p>
+
+          <h2 id="p2-hashes"><span class="secnum">02</span>Digest, DiffID, ChainID</h2>
+          <p>
+            "The same layer" has three hashes, and they answer three different questions. The <em>digest</em> in the
+            manifest is the sha256 of the bytes as stored and shipped, which are usually gzip. The <em>DiffID</em> in the
+            config is the sha256 of the uncompressed tar (<code>image-spec/config.md:26-31</code>). The
+            <em>ChainID</em> names a stack of layers applied in order (<code>config.md:42-53</code>)
+            <span class="src">from the code</span>. The first is for transport, the second pins content, the third
+            names a filesystem state.
+          </p>
+          <p>
+            Each exists because one consumer needs it. A registry and a downloader verify a blob by its digest without
+            decompressing anything. A runtime verifies what it extracted by the DiffID, whatever compression arrived.
+            A snapshotter asks "do I already have exactly this filesystem?" by ChainID, without knowing which image
+            or registry the layers came from <span class="recon">reconstruction</span>. Mixing them up is the usual
+            source of "why are these two digests different?"
+          </p>
+          <h3>One tar, many digests</h3>
+          <p>
+            The alpine layer checks out at both ends. The 3,853,109 bytes served by the CDN hash to the manifest's
+            <code>7b229517…</code>. Inflated, they are an 8,709,632-byte tar that hashes to the config's
+            <code>75c137ae…</code> <span class="recon">measured here</span>. Recompressing that tar breaks the first
+            hash and keeps the second:
+          </p>
+<pre><code># same tar, different compressors -&gt; different digest, same diffID
+75c137aedfb2760f88629236cb7b797630aed0c3d91d626d1d1bb694878fc2ba  diffID (uncompressed tar)
+7b229517ed222597277036d94892173207d01a731ab3a88eeb1de2e963a2c788  registry blob (gzip as published)
+112b2e6f53918c25745148597450376649b5b7f41a2e0fe78d1e3ab13b2422fd  gzip -9 -n recompress
+11bb4b9d8a07090f1d678ade19e579845d0ffe39eec23557d3f79f69081b19fb  gzip -1 -n recompress</code></pre>
+          <p>
+            So two registries, or two builders, can hold the same image content under different manifest digests. The
+            gzip header shows what the builder did to stay reproducible. Hub's alpine layer starts
+            <code>1f 8b 08 00 00 00 00 00 00 ff</code>: deflate, no flags, MTIME zero, OS <code>0xff</code> (unknown).
+            The distroless layers also zero MTIME but write OS <code>0x03</code> (Unix)
+            <span class="recon">measured here</span>. A zero timestamp is what lets the same input give the same
+            bytes.
+          </p>
+          <p>
+            Inside the gzip is a POSIX ustar archive: <code>ustar\0</code> and version <code>00</code> at offset 257
+            of the first header. It has 515 entries, of which 335 are symlinks, 96 directories and 84 regular files,
+            with no hardlinks and no PAX headers. Nearly every applet is a symlink to <code>/bin/busybox</code>
+            (804,616 bytes). Every entry is owned 0/0 except <code>etc/shadow</code>, which is 0/42
+            <span class="recon">measured here</span>.
+          </p>
+          <h3>The padding is part of the name</h3>
+          <p>
+            A tar ends with two 512-byte zero blocks, and writers pad further to a record size. The alpine tar ends
+            with 1,192 zero bytes after its last non-zero byte, and all of them are inside the 8,709,632 hashed bytes
+            <span class="recon">measured here</span>. An extractor that stops reading at the end-of-archive marker
+            hashes fewer bytes and computes the wrong DiffID. containerd's applier drains the stream after the tar
+            reader stops, in <code>containerd/core/diff/apply/apply.go:134-137</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	// Read any trailing data
+	if _, err := io.Copy(io.Discard, rc); err != nil {
+		return emptyDesc, err
+	}</code></pre>
+          <p>
+            The same fact makes DiffIDs fragile across tools. Python's <code>tarfile</code> pads to a 10,240-byte
+            record (20 × 512), so the five-entry layer of the hand-built image in §03 is 10,240 bytes of tar
+            <span class="recon">measured here</span>. Another writer would pad differently and produce another
+            DiffID for the same files. The spec asks for reproducible packing and suggests tar-split to keep the
+            original headers (<code>image-spec/config.md:29</code>), and moby's legacy store does exactly that
+            (§07).
+          </p>
+          <h3>ChainID is one line of string concatenation</h3>
+          <p>
+            ChainID(L0) is DiffID(L0). Each later ChainID is the sha256 of the previous ChainID, one ASCII space, and
+            the next DiffID, with the <code>sha256:</code> prefixes included in the hashed string. The reference
+            implementation is <code>image-spec/identity/chainid.go:56-67</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>func ChainIDs(dgsts []digest.Digest) []digest.Digest {
+	if len(dgsts) &lt; 2 {
+		return dgsts
+	}
+
+	parent := digest.FromBytes([]byte(dgsts[0] + " " + dgsts[1]))
+	next := dgsts[1:]
+	next[0] = parent
+	ChainIDs(next)
+
+	return dgsts
+}</code></pre>
+          <p>
+            Because each rung hashes the one below, a ChainID names an ordered <em>application</em>. Layer C on top of
+            A and B has a different ChainID from C alone, although both end in the same changeset
+            (<code>config.md:65-83</code>). Alpine has one layer, so its ChainID equals its DiffID. The
+            <code>gcr.io/distroless/static-debian12</code> amd64 image has twelve. Recomputed by hand, every layer
+            digest and DiffID matched its manifest and config, and the ladder ends at
+            <code>sha256:5e555e7975e2…80db</code> <span class="recon">measured here</span>. Figure
+            2 draws both halves.
+          </p>
+
+          <figure class="figure wide" id="fig-hash-derivation">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">Three hashes of a layer: transport digests, one DiffID, and the ChainID ladder</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 500" role="img" aria-label="Left: three gzip encodings of the alpine tar with three different digests all inflate to one 8,709,632-byte tar whose sha256 is the DiffID 75c137ae. Right: the ChainID ladder for distroless static-debian12, where each rung hashes the previous ChainID, a space, and the next DiffID, ending at 5e555e7975e2.">
+                <defs>
+                  <marker id="hd-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="hd-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">ALPINE: ONE TAR, THREE ENCODINGS</text>
+                <text x="580" y="26" class="svg-lane">DISTROLESS: THE CHAINID LADDER</text>
+                <line x1="556" y1="16" x2="556" y2="480" stroke="#deded9"/>
+
+                <rect x="30" y="44" width="160" height="62" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="66" class="svg-step">as published</text>
+                <text x="42" y="84" class="svg-sub">7b229517ed22…</text>
+                <text x="42" y="98" class="svg-sub">3,853,109 B</text>
+                <rect x="204" y="44" width="160" height="62" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="216" y="66" class="svg-step">gzip -9 -n</text>
+                <text x="216" y="84" class="svg-sub">112b2e6f5391…</text>
+                <rect x="378" y="44" width="160" height="62" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="390" y="66" class="svg-step">gzip -1 -n</text>
+                <text x="390" y="84" class="svg-sub">11bb4b9d8a07…</text>
+                <text x="390" y="98" class="svg-sub">4,006,599 B</text>
+                <text x="30" y="124" class="svg-note">three manifest digests: the sha256 of the bytes as shipped</text>
+
+                <line x1="110" y1="134" x2="230" y2="166" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#hd-data)"/>
+                <line x1="284" y1="134" x2="284" y2="166" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#hd-data)"/>
+                <line x1="458" y1="134" x2="338" y2="166" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#hd-data)"/>
+                <text x="300" y="150" class="svg-sub">inflate</text>
+
+                <rect x="120" y="170" width="330" height="150" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="134" y="194" class="svg-step">uncompressed tar · 8,709,632 B</text>
+                <text x="134" y="214" class="svg-sub">header 1 · offset 257: ustar\0 00</text>
+                <text x="134" y="232" class="svg-sub">515 entries: 335 symlinks,</text>
+                <text x="134" y="248" class="svg-sub">96 dirs, 84 regular files</text>
+                <rect x="134" y="262" width="302" height="44" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="146" y="280" class="svg-step">last 1,192 bytes: 00 00 00 …</text>
+                <text x="146" y="296" class="svg-sub">end blocks + padding, all hashed</text>
+
+                <line x1="284" y1="322" x2="284" y2="358" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <text x="294" y="344" class="svg-sub">sha256 over every byte</text>
+                <rect x="120" y="362" width="330" height="56" rx="4" fill="#ffffff" stroke="#367f59" stroke-width="1.6"/>
+                <text x="134" y="384" class="svg-step">DiffID = config.rootfs.diff_ids[0]</text>
+                <text x="134" y="402" class="svg-sub">sha256:75c137aedfb2…  (= ChainID)</text>
+                <text x="30" y="448" class="svg-note">An extractor that stops at the end-of-archive marker</text>
+                <text x="30" y="464" class="svg-note">hashes 1,192 bytes too few and gets the wrong DiffID.</text>
+
+                <text x="580" y="56" class="svg-num">L0</text>
+                <text x="612" y="56" class="svg-sub">ChainID = DiffID = 7223ea1323e8…</text>
+                <line x1="640" y1="66" x2="640" y2="86" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <rect x="580" y="90" width="470" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="590" y="110" class="svg-num">L1</text>
+                <text x="612" y="110" class="svg-sub">sha256("sha256:7223ea13…" + " " + "sha256:8fa10c01…")</text>
+                <text x="612" y="132" class="svg-sub">= 5217b01660b5…</text>
+                <line x1="640" y1="148" x2="640" y2="168" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <rect x="580" y="172" width="470" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="590" y="192" class="svg-num">L2</text>
+                <text x="612" y="192" class="svg-sub">sha256("sha256:5217b016…" + " " + "sha256:35b5ba6e…")</text>
+                <text x="612" y="214" class="svg-sub">= 32a12b65383d…</text>
+                <line x1="640" y1="230" x2="640" y2="250" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <rect x="580" y="254" width="470" height="74" rx="4" fill="#ffffff" stroke="#deded9" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="590" y="274" class="svg-num">L3–L10</text>
+                <text x="648" y="274" class="svg-sub">7f73eafc… fdaace00… 14b282df… 492c6420…</text>
+                <text x="648" y="292" class="svg-sub">85d9b4c1… c7b875d3… af4a1140… 2a080d78…</text>
+                <text x="648" y="314" class="svg-note">L4 is 67 gzip bytes: a 1,536-byte tar holding only "."</text>
+                <line x1="640" y1="330" x2="640" y2="350" stroke="#252525" stroke-width="2" marker-end="url(#hd-ctl)"/>
+                <rect x="580" y="354" width="470" height="60" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="590" y="374" class="svg-num">L11</text>
+                <text x="612" y="374" class="svg-sub">sha256("sha256:2a080d78…" + " " + "sha256:5904c32f…")</text>
+                <text x="612" y="398" class="svg-step">= sha256:5e555e7975e2…80db</text>
+                <text x="580" y="448" class="svg-note">The space and both "sha256:" prefixes are hashed. Change one DiffID,</text>
+                <text x="580" y="464" class="svg-note">or the order, and every rung above it changes.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              All values measured here. The three left-hand digests differ only in compression; the DiffID does not
+              move. On the right the left operand of each rung is the previous ChainID and the right operand is that
+              layer's DiffID, read from <code>distroless-config.json</code>. The final ChainID names the whole
+              twelve-layer filesystem.
+            </p>
+          </figure>
+
+          <p>
+            distroless shows two more things a consumer must tolerate. Bazel writes every timestamp at the epoch, and
+            the layers mix path styles: some entries are <code>./etc/passwd</code>, others
+            <code>etc/nsswitch.conf</code>. Appliers clean names before use; containerd calls
+            <code>filepath.Clean(hdr.Name)</code> (<code>containerd/pkg/archive/tar.go:248-249</code>)
+            <span class="src">from the code</span>. The smallest layer is 67 gzip bytes. It inflates to 1,536 bytes:
+            one header for <code>.</code> and the two end blocks. It is a real layer whose only content is the root
+            directory's metadata <span class="recon">measured here</span>. The ChainID's job comes in §06: it is the
+            name under which an unpacked filesystem is stored and shared.
+          </p>
+
+          <h2 id="p2-layers"><span class="secnum">03</span>Layers are tar changesets</h2>
+          <p>
+            A layer is a tar of changes against the layers below it. Additions and modifications look the same: the
+            file is simply in the tar. Duplicate paths are forbidden (<code>image-spec/layer.md:22-34</code>). When an
+            entry lands on an existing path, two directories merge their attributes; in every other case the old path
+            is unlinked and recreated, so a file can replace a directory (<code>layer.md:235-242</code>)
+            <span class="src">from the code</span>. Removals need a marker, because a tar cannot hold an absence.
+          </p>
+          <p>
+            The marker is a <em>whiteout</em>: an empty regular file named <code>.wh.&lt;name&gt;</code>. It hides only
+            lower layers, so a whiteout and a same-named file in the same layer do not cancel, and no image may contain
+            a real file whose name starts with <code>.wh.</code> (<code>layer.md:245-252</code>). An <em>opaque</em>
+            marker, <code>.wh..wh..opq</code>, hides every lower child of its directory. It takes effect before any
+            sibling entry in the same layer, wherever it sits in the stream (<code>layer.md:336</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>A hand-built image with both kinds</h3>
+          <p>
+            To see real bytes I built a two-layer OCI image with Python's <code>tarfile</code>, <code>gzip</code> and
+            <code>hashlib</code> alone: <code>oci-layout</code>, <code>index.json</code> and four blobs under
+            <code>blobs/sha256/</code>. The second layer deletes <code>etc/motd</code> and replaces the contents of
+            <code>app/</code> <span class="recon">measured here</span>:
+          </p>
+<pre><code>layer 1  sha256:77c9762db241…  177 B gzip  DiffID fc4a8d294103…
+drwxr-xr-x 0/0     0 1970-01-01 00:00 etc/
+-rw-r--r-- 0/0    19 1970-01-01 00:00 etc/motd
+drwxr-xr-x 0/0     0 1970-01-01 00:00 app/
+-rw-r--r-- 0/0     2 1970-01-01 00:00 app/a.txt
+-rw-r--r-- 0/0     2 1970-01-01 00:00 app/b.txt
+
+layer 2  sha256:0c0d1c0ad60e…  168 B gzip  DiffID c9d16d2ea637…
+drwxr-xr-x 0/0     0 1970-01-01 00:00 etc/
+-rw-r--r-- 0/0     0 1970-01-01 00:00 etc/.wh.motd          whiteout: hide etc/motd
+drwxr-xr-x 0/0     0 1970-01-01 00:00 app/
+-rw-r--r-- 0/0     0 1970-01-01 00:00 app/.wh..wh..opq      opaque: hide all of lower app/
+-rw-r--r-- 0/0     2 1970-01-01 00:00 app/c.txt
+
+ChainID(layer1|layer2) = sha256:08744fd6f937…f407</code></pre>
+          <p>
+            Applied in order, the two layers give <code>{etc/, app/, app/c.txt}</code>. Each tar is 10,240 bytes,
+            Python's record size, for five entries.
+          </p>
+          <h3>What the kernel sees instead</h3>
+          <p>
+            The kernel's overlayfs has its own whiteout forms: a character device with device number 0/0 (or a
+            zero-size file with <code>trusted.overlay.whiteout</code>), and an opaque directory carrying
+            <code>trusted.overlay.opaque=y</code> (kernel <code>Documentation/filesystems/overlayfs.rst:147-156</code>).
+            containerd translates while it untars. <code>containerd/pkg/archive/tar_opts_linux.go:29-52</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	// if a directory is marked as opaque, we need to translate that to overlay
+	if base == whiteoutOpaqueDir {
+		// don't write the file itself
+		return false, unix.Setxattr(dir, "trusted.overlay.opaque", []byte{'y'}, 0)
+	}
+
+	// if a file was deleted and we are using overlay, we need to create a character device
+	if strings.HasPrefix(base, whiteoutPrefix) {
+		originalBase := base[len(whiteoutPrefix):]
+		originalPath := filepath.Join(dir, originalBase)
+
+		if err := unix.Mknod(originalPath, unix.S_IFCHR, 0); err != nil {
+			return false, err
+		}
+		// don't write the file itself
+		return false, os.Chown(originalPath, hdr.Uid, hdr.Gid)
+	}</code></pre>
+          <p>
+            The marker files are never written. Figure 3 shows the same deletion three ways. The
+            conversion step is read from the code; I could not mount overlayfs on this box.
+          </p>
+
+          <figure class="figure wide" id="fig-overlay-whiteouts">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">One deletion three ways: tar entries, overlay upperdir objects, the merged view</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 450" role="img" aria-label="Panel a lists the hand-built image's tar entries, including etc/.wh.motd and app/.wh..wh..opq. Panel b shows the snapshot directories after conversion: in the upper snapshot etc/motd is a 0/0 character device and app/ carries trusted.overlay.opaque=y. Panel c shows the merged view etc/, app/ and app/c.txt. A mount line and a copy-up arrow run along the bottom.">
+                <defs>
+                  <marker id="ow-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="ow-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">(A) IN THE LAYER TARS</text>
+                <text x="390" y="26" class="svg-lane">(B) ON DISK AFTER UNPACK</text>
+                <text x="770" y="26" class="svg-lane">(C) WHAT THE CONTAINER SEES</text>
+
+                <rect x="30" y="40" width="310" height="110" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="62" class="svg-step">layer 1 · fc4a8d29…</text>
+                <text x="42" y="82" class="svg-sub" style="white-space:pre">etc/motd          19 B</text>
+                <text x="42" y="100" class="svg-sub" style="white-space:pre">app/a.txt          2 B</text>
+                <text x="42" y="118" class="svg-sub" style="white-space:pre">app/b.txt          2 B</text>
+                <text x="42" y="138" class="svg-sub">(+ dirs etc/, app/)</text>
+
+                <rect x="30" y="166" width="310" height="122" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="42" y="188" class="svg-step">layer 2 · c9d16d2e…</text>
+                <text x="42" y="208" class="svg-sub" style="white-space:pre">etc/.wh.motd       0 B  regular</text>
+                <text x="42" y="226" class="svg-sub" style="white-space:pre">app/.wh..wh..opq   0 B  regular</text>
+                <text x="42" y="244" class="svg-sub" style="white-space:pre">app/c.txt          2 B</text>
+                <text x="42" y="266" class="svg-note">markers are ordinary empty files</text>
+
+                <line x1="342" y1="227" x2="384" y2="227" stroke="#252525" stroke-width="2" marker-end="url(#ow-ctl)"/>
+                <text x="344" y="216" class="svg-sub">untar</text>
+
+                <rect x="390" y="40" width="330" height="110" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="402" y="62" class="svg-step">lower snapshot · snapshots/A/fs</text>
+                <text x="402" y="82" class="svg-sub" style="white-space:pre">etc/motd       regular, 19 B</text>
+                <text x="402" y="100" class="svg-sub" style="white-space:pre">app/a.txt      regular</text>
+                <text x="402" y="118" class="svg-sub" style="white-space:pre">app/b.txt      regular</text>
+
+                <rect x="390" y="166" width="330" height="122" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="402" y="188" class="svg-step">upper snapshot · snapshots/B/fs</text>
+                <text x="402" y="208" class="svg-sub" style="white-space:pre">etc/motd       char dev, c 0 0</text>
+                <text x="402" y="226" class="svg-sub" style="white-space:pre">app/           xattr</text>
+                <text x="402" y="242" class="svg-sub" style="white-space:pre">  trusted.overlay.opaque = "y"</text>
+                <text x="402" y="260" class="svg-sub" style="white-space:pre">app/c.txt      regular, 2 B</text>
+                <text x="402" y="280" class="svg-note">mknod + setxattr; no .wh. files</text>
+
+                <line x1="722" y1="160" x2="764" y2="160" stroke="#252525" stroke-width="2" marker-end="url(#ow-ctl)"/>
+                <text x="726" y="150" class="svg-sub">mount</text>
+
+                <rect x="770" y="40" width="280" height="248" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="782" y="62" class="svg-step">merged view</text>
+                <text x="782" y="86" class="svg-sub" style="white-space:pre">etc/           (motd hidden)</text>
+                <text x="782" y="106" class="svg-sub" style="white-space:pre">app/           (a.txt, b.txt hidden)</text>
+                <text x="782" y="126" class="svg-sub">app/c.txt</text>
+                <text x="782" y="158" class="svg-note">a 0/0 char device in an upper</text>
+                <text x="782" y="174" class="svg-note">layer reads as "no such file";</text>
+                <text x="782" y="190" class="svg-note">an opaque dir stops the lookup</text>
+                <text x="782" y="206" class="svg-note">from descending into lowers</text>
+
+                <rect x="30" y="314" width="1020" height="52" rx="4" fill="#ffffff" stroke="#252525" stroke-width="1.2"/>
+                <text x="42" y="336" class="svg-lane">MOUNT (containerd overlay snapshotter, Active snapshot)</text>
+                <text x="42" y="356" class="svg-sub" style="white-space:pre">overlay  lowerdir=&lt;parent fs dirs joined by ":", immediate parent first = top&gt;,upperdir=&lt;id&gt;/fs,workdir=&lt;id&gt;/work</text>
+
+                <path d="M520,400 C600,386 700,386 780,400" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ow-state)"/>
+                <text x="30" y="404" class="svg-step">copy-up</text>
+                <text x="100" y="404" class="svg-sub">first write-open of a lower file:</text>
+                <text x="30" y="424" class="svg-sub">the whole file is copied into the upperdir</text>
+                <text x="800" y="404" class="svg-sub">container's own upperdir</text>
+                <text x="800" y="424" class="svg-note">(rw snapshot, leased by container ID)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Panel (a) is measured here from the hand-built image. Panels (b) and (c) are read from containerd's
+              <code>OverlayConvertWhiteout</code> and the kernel's overlayfs documentation, not run: no overlay mount
+              was possible on this box. Snapshot numbers A and B stand for the numeric IDs containerd allocates.
+            </p>
+          </figure>
+
+          <h3>Producers disagree on the details</h3>
+          <p>
+            The spec says producers SHOULD emit explicit whiteouts rather than opaque markers
+            (<code>layer.md:315</code>). Overlay-native differs still emit <code>.wh..wh..opq</code> whenever they find
+            <code>trusted.overlay.opaque=y</code> in an upperdir: moby's go-archive
+            (<code>archive_linux.go:69-93</code>) and continuity (<code>fs/diff_linux.go:60-75</code>). An applier that
+            handles only <code>.wh.&lt;name&gt;</code> leaks lower files (register D27). The header bytes differ too.
+            moby turns a 0/0 device back into a whiteout with mode <code>0o600</code>
+            (<code>go-archive/archive_linux.go:54-63</code>), while containerd's differ writes mode 0 and epoch-zero
+            times "since containerd v2.0" (<code>containerd/pkg/archive/tar.go:557-580</code>). The same deletion
+            yields different tar bytes, so different DiffIDs (D28) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Overlay's semantics leak into containers. Copy-up copies the whole file on the first write-access open,
+            even if nothing is written (<code>overlayfs.rst:265-288</code>). Renaming a lower directory fails with
+            <code>EXDEV</code> unless <code>redirect_dir</code> is on; this host's module has it off, and
+            <code>metacopy</code> too <span class="recon">measured here</span>. In a user namespace moby's converter switches to
+            <code>user.overlay.*</code> xattrs, while containerd skips its fast path and mounts and deletes instead (D32).
+          </p>
+
+          <h2 id="p2-wire"><span class="secnum">04</span>Pulling alpine, request by request</h2>
+          <p>
+            A pull is a short conversation over HTTPS. The client pings the registry, gets a token from a different
+            host, asks once which digest the tag means, and from then on asks for content only by digest. The trace
+            below is <code>curl</code> on 23 October 2026, anonymous, from this box to Docker Hub, issuing the same
+            requests containerd's resolver issues <span class="recon">measured here</span>. It is not
+            <code>dockerd</code>'s own traffic: <code>dockerd</code> could not run here, so its request shapes are
+            read from the code.
+          </p>
+          <p>
+            <code>docker.io</code> is not a host that serves the API. containerd hard-codes the mapping to
+            <code>registry-1.docker.io</code> (<code>containerd/core/remotes/docker/resolver.go:141-146</code>)
+            <span class="src">from the code</span>. The first request, <code>GET /v2/</code>, gets a 401 whose
+            challenge names where to go next:
+          </p>
+<pre><code>&lt; HTTP/2 401
+&lt; www-authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io"
+--timing-- dns=0.008915 connect=0.038051 tls=0.074767 ttfb=0.105519 total=0.105744 code=401
+{"errors":[{"code":"UNAUTHORIZED","message":"authentication required","detail":null}]}</code></pre>
+          <p>
+            The challenge has no <code>scope</code>, because nothing has been asked for yet; distribution's challenge
+            builder only appends one when the access set is non-empty
+            (<code>distribution/registry/auth/token/accesscontroller.go:125-146</code>). The client then asks
+            <code>auth.docker.io</code> for <code>scope=repository:library/alpine:pull</code>. Hub returns a
+            2,698-character RS256 JWT with an <code>x5c</code> certificate chain, <code>aud registry.docker.io</code>,
+            an empty <code>sub</code> and a 300-second life, with <code>nbf</code> back-dated 300 seconds. It sends the
+            same value under both <code>token</code> and <code>access_token</code>, the compatibility mode the token
+            spec allows <span class="recon">measured here</span>. The token endpoint sits behind Cloudflare with its own
+            limit (<code>x-ratelimit-limit: 3000, 3000;w=60</code>).
+          </p>
+          <h3>The one trusted header</h3>
+          <p>
+            With the token, the client sends <code>HEAD /v2/library/alpine/manifests/latest</code>. The answer is a
+            content type, a length of 9,218 and a <code>docker-content-digest</code>, with an <code>etag</code> equal to
+            the quoted digest. That is all a resolver needs. containerd takes the header as the image's identity and
+            only GETs and hashes the manifest itself when the header or the length is missing.
+            <code>containerd/core/remotes/docker/resolver.go:391-405</code> says so in a comment
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>// trusted registry was contacted, in this case use
+// the digest header (or content from GET)
+if dgst == "" {
+	// this is the only point at which we trust the registry. we use the
+	// content headers to assemble a descriptor for the name. when this becomes
+	// more robust, we mostly get this information from a secure trust store.
+	dgstHeader := digest.Digest(resp.Header.Get("Docker-Content-Digest"))
+
+	if dgstHeader != "" &amp;&amp; size != -1 {
+		if err := dgstHeader.Validate(); err != nil {
+			return "", ocispec.Descriptor{}, fmt.Errorf("%q in header not a valid digest: %w", dgstHeader, err)
+		}
+		dgst = dgstHeader
+	}
+}</code></pre>
+          <p>
+            Everything after this point is checked. Integrity is enforced at the content store rather than in HTTP:
+            <code>content.Copy</code> commits with the expected digest and the local writer fails on a mismatch
+            (<code>containerd/plugins/content/local/writer.go:134-136</code>). A registry that lies in the HEAD can
+            name the wrong image, but cannot serve bytes that disagree with the name it gave
+            <span class="recon">reconstruction</span>. Resolution also caps manifests at <code>MaxManifestSize</code>,
+            defined as <code>4 * 1048 * 1048</code>: 4,393,216 bytes, a harmless typo for 1024 (register D42).
+          </p>
+          <p>
+            The resolver's <code>Accept</code> lists Docker schema2 manifest, Docker manifest list, OCI manifest, OCI
+            index and <code>*/*</code>, in that order (<code>resolver.go:171-178</code>). Hub ignores it for this tag:
+            seven different Accept values, including none at all, all got the same OCI index with the same digest
+            <span class="recon">measured here</span>. §08 shows a registry that does not.
+          </p>
+          <h3>By digest, then to the CDN</h3>
+          <p>
+            The client fetches the index and the amd64 manifest by digest, then the blobs. A blob GET on Hub is a 307
+            with an empty body. The <code>Location</code> is on <code>production.cloudfront.docker.com</code>, and its
+            path is distribution's blob layout under a <code>/registry-v2</code> root, signed with CloudFront
+            parameters:
+          </p>
+<pre><code>location: https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/7b/
+          7b229517ed222597277036d94892173207d01a731ab3a88eeb1de2e963a2c788/data?&lt;signed-query-redacted&gt;</code></pre>
+          <p>
+            The CDN answered from S3 (<code>server: AmazonS3</code>, <code>x-cache: Hit from cloudfront</code>), with
+            <code>age: 141278</code> on the layer: cached for about 39 hours. A <code>Range: bytes=0-15</code> request
+            through the same redirect got a 206 with <code>content-range: bytes 0-15/3853109</code> and the gzip magic
+            <code>1f 8b 08</code> <span class="recon">measured here</span>. curl sent no <code>Authorization</code> on the
+            CDN hop because it drops credentials on cross-host redirects. containerd sends none either: it follows up to
+            10 redirects and re-runs its authorizer on each, and the authorizer is keyed by host
+            (<code>resolver.go:703-712</code>, <code>authorizer.go:121-125</code>) <span class="src">from the code</span>.
+            Figure 4 lays out the whole exchange.
+          </p>
+
+          <figure class="figure wide" id="fig-pull-wire">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">An anonymous pull of alpine:latest from Docker Hub, with measured times per request</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 640" role="img" aria-label="Sequence diagram across four hosts: the client, registry-1.docker.io, auth.docker.io and production.cloudfront.docker.com. Ping 401 in 106 ms, token 87 ms, HEAD of the tag 180 ms returning the trusted digest header, index GET 163 ms, manifest GET 161 ms, blob GET redirected with 307 in 97 ms, config from the CDN 173 ms, layer from the CDN 214 ms, and a range request 206 in 145 ms. Below, the rate limit in the token's claims (100 per 21600 seconds) is set against the response header (100 per 3600).">
+                <style>.pw-halo{paint-order:stroke;stroke:#ffffff;stroke-width:4px;stroke-linejoin:round}</style>
+                <defs>
+                  <marker id="pw-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="pw-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="110" y="26" text-anchor="middle" class="svg-lane">CLIENT</text>
+                <text x="520" y="26" text-anchor="middle" class="svg-lane">REGISTRY-1.DOCKER.IO</text>
+                <text x="760" y="26" text-anchor="middle" class="svg-lane">AUTH.DOCKER.IO</text>
+                <text x="960" y="26" text-anchor="middle" class="svg-lane">CLOUDFRONT</text>
+                <line x1="110" y1="36" x2="110" y2="500" stroke="#b8b8b1" stroke-width="1.2"/>
+                <line x1="520" y1="36" x2="520" y2="500" stroke="#b8b8b1" stroke-width="1.2"/>
+                <line x1="760" y1="36" x2="760" y2="500" stroke="#b8b8b1" stroke-width="1.2"/>
+                <line x1="960" y1="36" x2="960" y2="500" stroke="#b8b8b1" stroke-width="1.2"/>
+
+                <text x="30" y="62" class="svg-num">106 ms</text>
+                <text x="120" y="56" class="svg-sub pw-halo">GET /v2/</text>
+                <line x1="112" y1="62" x2="516" y2="62" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="76" x2="114" y2="76" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="90" class="svg-sub pw-halo">401 · Bearer realm=auth.docker.io/token (no scope)</text>
+
+                <text x="30" y="118" class="svg-num">87 ms</text>
+                <text x="120" y="112" class="svg-sub pw-halo">GET /token?service=registry.docker.io&amp;scope=repository:library/alpine:pull</text>
+                <line x1="112" y1="118" x2="756" y2="118" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="758" y1="132" x2="114" y2="132" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="146" class="svg-sub pw-halo">200 · RS256 JWT, 2,698 chars, exp − iat = 300 s</text>
+
+                <rect x="112" y="156" width="406" height="54" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="30" y="174" class="svg-num">180 ms</text>
+                <text x="120" y="172" class="svg-sub">HEAD /v2/library/alpine/manifests/latest</text>
+                <line x1="112" y1="178" x2="516" y2="178" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="190" x2="114" y2="190" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="204" class="svg-sub">200 · docker-content-digest: sha256:be2656061b53…</text>
+                <text x="530" y="186" class="svg-step">the one trusted header</text>
+                <text x="530" y="204" class="svg-note">tag → digest; all later requests by digest</text>
+
+                <text x="30" y="236" class="svg-num">163 ms</text>
+                <text x="120" y="230" class="svg-sub pw-halo">GET …/manifests/sha256:be2656061b53…</text>
+                <line x1="112" y1="236" x2="516" y2="236" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="248" x2="114" y2="248" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="262" class="svg-sub pw-halo">200 · OCI index, 9,218 B</text>
+
+                <text x="30" y="288" class="svg-num">161 ms</text>
+                <text x="120" y="282" class="svg-sub pw-halo">GET …/manifests/sha256:c26612752c78…</text>
+                <line x1="112" y1="288" x2="516" y2="288" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="300" x2="114" y2="300" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="314" class="svg-sub pw-halo">200 · amd64 manifest, 1,022 B</text>
+
+                <text x="30" y="340" class="svg-num">97 ms</text>
+                <text x="120" y="334" class="svg-sub pw-halo">GET …/blobs/sha256:b92841763c5c…</text>
+                <line x1="112" y1="340" x2="516" y2="340" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="518" y1="352" x2="114" y2="352" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="366" class="svg-sub pw-halo">307 · Location: production.cloudfront.docker.com/…/data</text>
+
+                <text x="30" y="392" class="svg-num">173 ms</text>
+                <text x="530" y="386" class="svg-sub pw-halo">GET …/blobs/sha256/b9/…/data (no Authorization)</text>
+                <line x1="112" y1="392" x2="956" y2="392" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="958" y1="404" x2="114" y2="404" stroke="#3c6f97" stroke-width="1.2" marker-end="url(#pw-data)"/>
+                <text x="120" y="418" class="svg-sub pw-halo">200 · config, 611 B · x-cache: Hit · age 141277</text>
+
+                <text x="30" y="444" class="svg-num">214 ms</text>
+                <text x="530" y="438" class="svg-sub pw-halo">GET …/blobs/sha256/7b/…/data</text>
+                <line x1="112" y1="444" x2="956" y2="444" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <line x1="958" y1="456" x2="114" y2="456" stroke="#3c6f97" stroke-width="2.4" marker-end="url(#pw-data)"/>
+                <text x="120" y="470" class="svg-sub pw-halo">200 · layer, 3,853,109 B · first byte at 140 ms</text>
+
+                <text x="30" y="496" class="svg-num">145 ms</text>
+                <text x="530" y="490" class="svg-sub pw-halo">Range: bytes=0-15 (via the same 307)</text>
+                <line x1="112" y1="496" x2="956" y2="496" stroke="#252525" stroke-width="2" marker-end="url(#pw-ctl)"/>
+                <text x="580" y="514" class="svg-sub pw-halo">206 · bytes 0-15/3853109 · 1f 8b 08 …</text>
+
+                <rect x="30" y="540" width="490" height="84" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="42" y="562" class="svg-lane">IN THE JWT'S ACCESS CLAIM</text>
+                <text x="42" y="584" class="svg-sub">"pull_limit": "100",</text>
+                <text x="42" y="602" class="svg-sub">"pull_limit_interval": "21600"   (6 hours)</text>
+                <rect x="560" y="540" width="490" height="84" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="572" y="562" class="svg-lane">IN THE HEAD RESPONSE HEADERS</text>
+                <text x="572" y="584" class="svg-sub">ratelimit-limit: 100;w=3600       (1 hour)</text>
+                <text x="572" y="602" class="svg-sub">ratelimit-remaining: 96;w=3600</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured here with curl on 23 October 2026; each time is the <code>total</code> from that request's
+              saved <code>--timing--</code> line, so each includes its own DNS, TCP and TLS setup. Thick black arrows are
+              requests, blue arrows responses. The two boxes at the bottom disagree on the rate-limit window;
+              Docker's documentation sides with the JWT.
+            </p>
+          </figure>
+
+          <p>
+            Added up, the eight requests before the range probe take about 1.18 seconds; the 3.85 MB layer body
+            itself arrived in the 74 ms between its first byte and its last. For a small image a pull is bound by
+            round trips, not bandwidth <span class="recon">reconstruction</span>. How the client handles failures
+            matters on that path. In containerd every request goes through <code>doWithRetries</code> with
+            <code>maxAttempts = 5</code> total. A 401 feeds the authorizer; 408 and 429 retry at once, with no
+            backoff and no reading of <code>Retry-After</code> (<code>resolver.go:772</code>, <code>:884-885</code>).
+            Only transport errors sleep, a fixed 50 ms (<code>:816-844</code>) <span class="src">from the code</span>.
+            Against a registry that is rate-limiting, each retried GET may count (register D43).
+          </p>
+          <h3>The rate limit's window</h3>
+          <p>
+            Hub's manifest responses carry both <code>x-ratelimit-*</code> and IETF-draft <code>ratelimit-*</code>
+            headers. Docker's documentation says anonymous users get 100 pulls per 6 hours and shows
+            <code>w=21600</code>; the JWT says <code>pull_limit_interval: 21600</code>; the live header says
+            <code>w=3600</code>, re-probed at 15:20:40 UTC with the same result. Which is authoritative is unresolved
+            (D45). The docs also say HEAD does not count and GET does. On <code>ratelimitpreview/test</code>, two HEADs
+            left <code>remaining</code> at 92, one GET dropped it to 91, and a HEAD after it stayed at 91
+            <span class="recon">measured here</span>. The egress IP is shared, so others may have pulled too.
+          </p>
+          <p>
+            Other registries differ in small ways <span class="recon">measured here</span>. ghcr.io issues an opaque
+            56-character token instead of a JWT, 404s the referrers endpoint, and redirects blobs to Azure Blob SAS
+            URLs. public.ecr.aws uses realm <code>https://public.ecr.aws/token/</code>, and the slash-less URL 301s.
+            mcr.microsoft.com answers <code>GET /v2/</code> with 200 and needs no token at all.
+          </p>
+
+          <h2 id="p2-credentials"><span class="secnum">05</span>Credentials, and dockerd as the client</h2>
+          <p>
+            Credentials live with the CLI, not the daemon. The <code>docker</code> CLI looks them up, encodes them into
+            one request header, and hands them to <code>dockerd</code> for that request only. <code>dockerd</code> then
+            speaks HTTP to the registry itself. containerd's daemon never sees the registry; it stores what
+            <code>dockerd</code> fetched.
+          </p>
+          <h3>Where the CLI looks</h3>
+          <p>
+            For each registry the CLI picks a store: a per-registry <code>credHelpers[host]</code> entry, else the
+            global <code>credsStore</code>, else the plaintext file store in <code>config.json</code>. If
+            <code>DOCKER_AUTH_CONFIG</code> is set, an in-memory store built from it is layered on top, with the chosen
+            store as fallback. <code>cli/cli/config/configfile/file.go:395-402</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>func getConfiguredCredentialStore(c *ConfigFile, registryHostname string) string {
+	if c.CredentialHelpers != nil &amp;&amp; registryHostname != "" {
+		if helper, exists := c.CredentialHelpers[registryHostname]; exists {
+			return helper
+		}
+	}
+	return c.CredentialsStore
+}</code></pre>
+          <p>
+            Docker Hub's key is still the historical <code>https://index.docker.io/v1/</code>; every other registry is
+            keyed by its bare hostname (<code>file.go:27-49</code>). A helper is an external program named
+            <code>docker-credential-&lt;suffix&gt;</code>. It gets the action (<code>get</code>, <code>store</code>,
+            <code>erase</code>, <code>list</code>) as <code>argv[1]</code> and the payload on stdin. <code>get</code>
+            reads a server URL and prints <code>{ServerURL,Username,Secret}</code>; "not found" is the exact text
+            <code>credentials not found in native keychain</code> with a non-zero exit. OAuth identity tokens are
+            stored under the fake username <code>&lt;token&gt;</code> (<code>native_store.go:11</code>). Without a
+            helper, the file store writes <code>auth: base64(user:password)</code> into <code>config.json</code> and
+            warns once.
+          </p>
+          <p>
+            To watch the protocol I put a fake <code>docker-credential-xolab</code> on <code>PATH</code> that logs its
+            argv and stdin, and drove it with the machine's docker CLI, version 29.8.2 rather than the 29.9.2 pin
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ docker manifest inspect alpine:latest   (rc=0)
+    argv=[get] stdin=[https://index.docker.io/v1/]
+    argv=[get] stdin=[https://index.docker.io/v1/]
+$ docker pull alpine:latest   (rc=1)
+    argv=[get] stdin=[https://index.docker.io/v1/]
+    stderr: failed to connect to the docker API at unix:///var/run/docker.sock; …
+$ docker logout ghcr.io   (rc=0)
+    argv=[erase] stdin=[ghcr.io]
+    argv=[erase] stdin=[ghcr.io]
+    argv=[erase] stdin=[http://ghcr.io]
+    argv=[erase] stdin=[https://ghcr.io]</code></pre>
+          <p>
+            Three things show. <code>docker pull</code> asked the helper before it tried the daemon socket, so the
+            lookup is client-side. <code>manifest inspect</code> asks twice per image and <code>logout</code> erases
+            four spellings of one host (register D48); <code>buildx imagetools inspect</code> asked once. And
+            <code>manifest inspect</code> succeeded with no daemon at all: it talks to the registry from the CLI
+            process.
+          </p>
+          <h3>One header to the daemon</h3>
+          <p>
+            <code>docker pull</code> reaches the daemon as <code>POST /images/create?fromImage=…&amp;tag=…</code>, with
+            a digest reference carried in the <code>tag</code> parameter. The credentials ride in
+            <code>X-Registry-Auth</code>: base64url of the JSON <code>AuthConfig</code>, with fields username, password,
+            auth, serveraddress, identitytoken and registrytoken
+            (<code>cli/vendor/github.com/moby/moby/api/pkg/authconfig/authconfig.go:18-29</code>). It is encoded, not
+            encrypted. <a href="../run-path/#p1-client">Part 1</a> shows the socket it travels on. On a pull, the daemon
+            ignores a header it cannot decode, in <code>moby/daemon/server/router/image/image_routes.go:102-106</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>		// For a pull it is not an error if no auth was given. Ignore invalid
+		// AuthConfig to increase compatibility with the existing API.
+		//
+		// TODO(thaJeztah): accept empty values but return an error when failing to decode.
+		authConfig, _ := authconfig.Decode(r.Header.Get(registry.AuthHeader))</code></pre>
+          <p>
+            A broken helper therefore produces an anonymous, rate-limited pull rather than an error (D47).
+          </p>
+          <p>
+            With the containerd store, <code>pullTag</code> builds a containerd resolver from that
+            <code>AuthConfig</code> and calls <code>containerd.Client.Pull</code> inside <code>dockerd</code>
+            (<code>moby/daemon/containerd/image_pull.go:99-257</code>). A <code>registrytoken</code> becomes a static
+            Bearer; an <code>identitytoken</code> becomes a refresh-token grant; Hub's <code>index.docker.io</code> key
+            maps to <code>registry-1.docker.io</code>. The static Bearer never retries on 401, because its
+            <code>AddResponses</code> returns <code>ErrNotImplemented</code>, so an expired token fails the pull
+            outright (<code>moby/daemon/containerd/resolver.go:125-128</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Concurrency is capped per daemon. The defaults are 3 concurrent downloads and 5 uploads, and the download
+            limiter is a single <code>semaphore.Weighted</code> on the <code>ImageService</code>
+            (<code>moby/daemon/containerd/service.go:127-131</code>, <code>daemon/config/config.go:28-40</code>). Each
+            open blob stream holds one unit until its body closes. Two parallel <code>docker pull</code>s share three
+            slots (D44). containerd can also split one blob into parallel Range requests, but <code>dockerd</code> never
+            sets <code>ConcurrentLayerFetchBuffer</code>, so that path stays off <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="p2-store"><span class="secnum">06</span>Content store, snapshots and unpack</h2>
+          <p>
+            On a Docker 29 host using the containerd image store, a pulled image lives in three places. Blobs sit in
+            containerd's content store, named by digest. Unpacked layers sit in the overlayfs snapshotter, named by
+            ChainID. A bbolt database ties them together with labels that the garbage collector follows.
+            <code>dockerd</code> keeps all of its objects in the containerd namespace <code>moby</code>
+            (<code>moby/daemon/config/config.go:58</code>) <span class="src">from the code</span>.
+          </p>
+          <h3>Blobs land by rename</h3>
+          <p>
+            A committed blob lives at <code>&lt;root&gt;/blobs/&lt;alg&gt;/&lt;encoded&gt;</code>, which is exactly the OCI
+            image-layout rule: the content store is an image layout without an <code>index.json</code>. A write in
+            progress lives under <code>ingest/</code>, in a directory named by a hash of the ref string, not of the
+            content. <code>containerd/plugins/content/local/store.go:646-658</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>func (s *store) blobPath(dgst digest.Digest) (string, error) {
+	if err := dgst.Validate(); err != nil {
+		return "", fmt.Errorf("cannot calculate blob path from invalid digest: %v: %w", err, errdefs.ErrInvalidArgument)
+	}
+
+	return filepath.Join(s.root, "blobs", dgst.Algorithm().String(), dgst.Encoded()), nil
+}
+
+func (s *store) ingestRoot(ref string) string {
+	// we take a digest of the ref to keep the ingest paths constant length.
+	// Note that this is not the current or potential digest of incoming content.
+	dgst := digest.FromString(ref)
+	return filepath.Join(s.root, "ingest", dgst.Encoded())</code></pre>
+          <p>
+            The ingest directory holds <code>data</code>, <code>ref</code>, <code>startedat</code>,
+            <code>updatedat</code> and optionally <code>total</code>. Opening a writer for a digest that already exists
+            fails fast with <code>ErrAlreadyExists</code>; that is how a pull skips blobs it has. An interrupted ingest
+            resumes by re-reading <code>data</code> to rebuild the digester. Commit is fsync, stat, size check, digest
+            check, <code>os.Rename</code> into <code>blobs/</code>, fsync of the directory, optional fs-verity, and a
+            chmod that strips write bits (<code>writer.go:79-200</code>). A blob is never visible half-written
+            <span class="src">from the code</span>.
+          </p>
+          <h3>Labels are the reference graph</h3>
+          <p>
+            All metadata lives in one bbolt file, bucketed under <code>v1/&lt;namespace&gt;/</code> into <code>labels</code>,
+            <code>images</code>, <code>containers</code>, <code>snapshots</code>, <code>content</code>,
+            <code>sandboxes</code> and <code>leases</code>. The schema comment calls the bucket <code>image</code>; the
+            code says <code>images</code> (<code>core/metadata/buckets.go:65</code> vs <code>:150</code>, D33). Blob
+            files are shared across namespaces; only the metadata is namespaced. GC is a tri-colour mark from roots
+            over an explicit graph, then one sweep in a single write transaction. The edges are labels. During a pull
+            each parent blob is labelled with its children by role: <code>containerd.io/gc.ref.content.m.&lt;i&gt;</code>
+            for manifests, <code>.config</code>, <code>.l.&lt;i&gt;</code> for layers. After unpack, the config blob gets
+            <code>containerd.io/gc.ref.snapshot.overlayfs=&lt;top ChainID&gt;</code>
+            (<code>core/unpack/unpacker.go:751-765</code>), so the unpacked filesystem lives as long as the image record
+            does <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two leases cover the gaps. <code>dockerd</code> wraps every pull in a random-ID lease with an expiry, so
+            half-downloaded blobs survive a GC during the pull and become collectible if it is abandoned. Each
+            container's read-write snapshot is held by a lease whose ID is the container ID, because a container can be
+            removed and recreated with nothing else holding the snapshot in between
+            (<code>moby/daemon/containerd/image_snapshot.go:59-68</code>). Figure 5 puts the
+            three directories and the edges together.
+          </p>
+
+          <figure class="figure wide" id="fig-content-store-layout">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">alpine:latest in containerd's three stores, and the labels the GC follows</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 560" role="img" aria-label="Left, three directories under /var/lib/containerd: the content store with blobs and ingest, the bolt metadata database with images, content, snapshots and leases buckets, and the overlayfs snapshotter with metadata.db and numbered snapshot directories. Right, the GC graph: the image record points at the index blob, which points by gc.ref.content.m label at the manifest, which points at the config and the layer; the config points by gc.ref.snapshot.overlayfs at the snapshot named by the ChainID. Leases pin a pull in progress and each container's rw snapshot. Bottom, this host's root mount with 23 lowerdirs.">
+                <defs>
+                  <marker id="cs-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="cs-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">/VAR/LIB/CONTAINERD/</text>
+                <text x="560" y="26" class="svg-lane">GC GRAPH (NAMESPACE MOBY)</text>
+
+                <rect x="30" y="40" width="480" height="128" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="62" class="svg-step">io.containerd.content.v1.content/</text>
+                <text x="300" y="62" class="svg-note">path inferred</text>
+                <text x="54" y="84" class="svg-sub" style="white-space:pre">blobs/sha256/be2656061b53…   index</text>
+                <text x="54" y="100" class="svg-sub" style="white-space:pre">blobs/sha256/c26612752c78…   manifest</text>
+                <text x="54" y="116" class="svg-sub" style="white-space:pre">blobs/sha256/b92841763c5c…   config</text>
+                <text x="54" y="132" class="svg-sub" style="white-space:pre">blobs/sha256/7b229517ed22…   layer (gzip, kept)</text>
+                <text x="54" y="154" class="svg-sub">ingest/&lt;sha256(ref)&gt;/{data,ref,startedat,updatedat}</text>
+
+                <rect x="30" y="182" width="480" height="128" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="42" y="204" class="svg-step">io.containerd.metadata.v1.bolt/meta.db</text>
+                <text x="330" y="204" class="svg-note">path inferred</text>
+                <text x="54" y="226" class="svg-sub">v1/moby/images/docker.io/library/alpine:latest</text>
+                <text x="54" y="242" class="svg-sub" style="white-space:pre">v1/moby/content/blob/&lt;digest&gt;  + labels</text>
+                <text x="54" y="258" class="svg-sub">v1/moby/snapshots/overlayfs/&lt;key&gt;</text>
+                <text x="54" y="274" class="svg-sub">v1/moby/leases/&lt;id&gt;</text>
+                <text x="54" y="296" class="svg-note">one bbolt file; blobs shared, metadata namespaced</text>
+
+                <rect x="30" y="324" width="480" height="104" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="42" y="346" class="svg-step">io.containerd.snapshotter.v1.overlayfs/</text>
+                <text x="350" y="346" class="svg-note">measured</text>
+                <text x="54" y="368" class="svg-sub" style="white-space:pre">metadata.db      name (ChainID) → numeric id</text>
+                <text x="54" y="384" class="svg-sub" style="white-space:pre">snapshots/N/fs   unpacked layer = upperdir</text>
+                <text x="54" y="400" class="svg-sub">snapshots/N/work overlay workdir</text>
+                <text x="54" y="418" class="svg-note">N comes from bolt: global allocation order</text>
+
+                <rect x="560" y="40" width="200" height="50" rx="4" fill="#ffffff" stroke="#252525" stroke-width="1.2"/>
+                <text x="572" y="60" class="svg-step">image record (GC root)</text>
+                <text x="572" y="78" class="svg-sub">target → be2656061b53…</text>
+                <rect x="560" y="122" width="200" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="572" y="142" class="svg-step">index blob</text>
+                <text x="572" y="158" class="svg-sub">be2656061b53…</text>
+                <rect x="560" y="210" width="200" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="572" y="230" class="svg-step">manifest blob</text>
+                <text x="572" y="246" class="svg-sub">c26612752c78…</text>
+                <rect x="820" y="160" width="230" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="832" y="180" class="svg-step">config blob</text>
+                <text x="832" y="196" class="svg-sub">b92841763c5c…</text>
+                <rect x="820" y="256" width="230" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="832" y="276" class="svg-step">layer blob</text>
+                <text x="832" y="292" class="svg-sub">7b229517ed22…</text>
+                <rect x="820" y="350" width="230" height="60" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="832" y="370" class="svg-step">committed snapshot</text>
+                <text x="832" y="386" class="svg-sub">name = ChainID 75c137aedfb2…</text>
+                <text x="832" y="402" class="svg-sub">→ snapshots/N/fs</text>
+
+                <line x1="660" y1="92" x2="660" y2="118" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <line x1="660" y1="168" x2="660" y2="206" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <text x="652" y="192" text-anchor="end" class="svg-sub">gc.ref.content.m.&lt;i&gt;</text>
+                <path d="M762,226 L800,226 L800,182 L816,182" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <text x="842" y="226" class="svg-sub">gc.ref.content.config</text>
+                <path d="M762,240 L800,240 L800,278 L816,278" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <text x="842" y="244" class="svg-sub">gc.ref.content.l.0</text>
+                <path d="M1052,182 L1066,182 L1066,380 L1054,380" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#cs-state)"/>
+                <text x="880" y="332" class="svg-sub">gc.ref.snapshot.overlayfs</text>
+                <line x1="860" y1="302" x2="860" y2="346" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#cs-data)"/>
+                <text x="852" y="326" text-anchor="end" class="svg-note">unpack</text>
+
+                <rect x="560" y="300" width="230" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="572" y="320" class="svg-step">pull lease</text>
+                <text x="572" y="338" class="svg-sub">random id, gc.expire</text>
+                <rect x="560" y="372" width="230" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="572" y="392" class="svg-step">container lease</text>
+                <text x="572" y="410" class="svg-sub">id = container ID → rw snapshot</text>
+
+                <rect x="30" y="450" width="1020" height="94" rx="4" fill="#ffffff" stroke="#252525" stroke-width="1.2"/>
+                <text x="42" y="472" class="svg-lane">THIS HOST'S OWN ROOT, FROM /PROC/SELF/MOUNTINFO (MEASURED)</text>
+                <text x="42" y="494" class="svg-sub">overlay / · lowerdir=…/snapshots/600/fs:599:598:…:590:589:574:573:…:565:564 (23 dirs, top first)</text>
+                <text x="42" y="512" class="svg-sub">upperdir=…/snapshots/619/fs,workdir=…/snapshots/619/work</text>
+                <text x="42" y="532" class="svg-note">The jump from 589 to 574 shows the ids are allocated across all images on the node, not per image.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Dashed purple edges are GC references stored as labels; read from containerd v2.4.2. The content and
+              metadata paths follow the plugin <code>&lt;type&gt;.&lt;id&gt;</code> naming and are inferred; the
+              snapshotter directory and the mount line are measured on this host, which is itself a container built by
+              containerd's overlayfs snapshotter.
+            </p>
+          </figure>
+
+          <h3>Unpack: ChainIDs name the snapshots</h3>
+          <p>
+            The unpacker computes every ChainID up front from <code>rootfs.diff_ids</code> and refuses an image whose
+            layer count differs from its DiffID count. Each layer is extracted into an Active snapshot keyed
+            <code>extract-&lt;nanos&gt;-&lt;rand&gt; &lt;chainID&gt;</code>. If Prepare reports that the ChainID already
+            exists, extraction is skipped. That is deduplication across images: two images on the same base share the
+            base's snapshots (<code>unpacker.go:503-528</code>). Decompression is a chain of stream processors chosen
+            by media type, running until it reaches a plain tar. For gzip containerd shells out to <code>igzip</code> or
+            <code>unpigz</code> if either is on <code>PATH</code>. The plain tar is teed into a sha256 digester and
+            checked against the config as it lands. <code>core/unpack/unpacker.go:653-658</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>			if diff.Digest != diffIDs[i] {
+				cleanup.Do(ctx, abort)
+				status.err = fmt.Errorf("wrong diff id %q calculated on extraction %q, desc %q", diff.Digest, diffIDs[i], desc.Digest)
+				resCh &lt;- status
+				return
+			}</code></pre>
+          <p>
+            On Linux, when the target is one overlay mount and not in a user namespace, the applier does not mount at
+            all. It untars straight into the snapshot's <code>upperdir</code> with <code>OverlayConvertWhiteout</code>
+            (<code>core/diff/apply/apply_linux.go:34-73</code>). Commit then only records disk usage and flips
+            metadata; no data is copied, so the committed layer is the directory the extraction wrote into. The overlay
+            mount is built as in §03: parents' <code>fs</code> dirs joined by <code>:</code>, immediate parent first,
+            which matches the kernel's leftmost-is-top order. The snapshotter appends <code>index=off</code> when the
+            kernel has that parameter <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two costs follow. <code>dockerd</code> pulls with <code>WithUnpackFetchAllContent</code>, so every layer
+            blob is fetched and kept even when its snapshot exists, "so the pulled image can also be saved or pushed";
+            disk use is compressed plus uncompressed (<code>image_pull.go:228-237</code>, D25). And it never sets an
+            unpack limiter, so layers unpack one at a time, each Prepared on its parent's ChainID
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The box this was written on shows the result from inside. Files on its overlay root report the overlay's
+            device, 133, while the bind-mounted <code>/etc/hostname</code> reports 2049: a different filesystem laid
+            over the rootfs one file at a time, the per-file bind mount that Docker and Kubernetes place over a container's
+            root <span class="recon">measured here</span>.
+          </p>
+
+          <h2 id="p2-two-stores"><span class="secnum">07</span>Two image stores, two meanings of "image ID"</h2>
+          <p>
+            Docker 29 ships two image stores and picks one at daemon start. On Linux the default is containerd's store,
+            the one §06 described (<code>moby/daemon/image_store_choice.go:105-108</code>). But if the data root
+            already holds a non-empty prior graphdriver directory other than <code>vfs</code>, the choice flips to
+            <code>graphdriver-prior</code>, and the host stays on overlay2 (<code>:130-134</code>, register D24).
+            Setting <code>storage-driver</code> or <code>$DOCKER_DRIVER</code> also selects the graphdriver
+            <span class="src">from the code</span>. Engine 29.0.0 (10 November 2025) made the containerd store the
+            default for fresh installs; it had been experimental since 24.0.0. So an upgraded host and a fresh one,
+            running the same binary, store images differently.
+          </p>
+          <p>
+            The feature flag has a quiet asymmetry. Docker's storage docs show only
+            <code>"containerd-snapshotter": true</code>, which the code now answers with a warning that it is the
+            default. <code>false</code> is the explicit opt-out, <code>imageStoreChoiceGraphdriverExplicit</code>
+            (<code>image_store_choice.go:115-123</code>, D35). <code>userns-remap</code> disables the containerd store,
+            and fails startup if it was explicitly enabled, because BuildKit breaks with that combination
+            (<code>moby/daemon/command/daemon_linux.go:28-40</code>, moby#47377, D26).
+          </p>
+          <h3>Same pull, two IDs</h3>
+          <p>
+            In the containerd store, the "ID" that <code>docker images</code> and <code>inspect</code> show is the
+            digest of the target descriptor, the index or manifest the tag points at
+            (<code>moby/daemon/containerd/image_list.go:439</code>: <code>ID: target.Digest.String()</code>). In the
+            legacy store it is <code>digest.FromBytes(config)</code>, written to
+            <code>image/&lt;driver&gt;/imagedb/content/sha256/&lt;id&gt;</code>
+            (<code>moby/daemon/internal/image/fs.go:112-126</code>), which is the OCI ImageID
+            <span class="src">from the code</span>. Applied to the measured digests, the same <code>docker pull
+            alpine</code> shows <code>be2656061b53</code> on a fresh 29.x host and <code>b92841763c5c</code> on an
+            upgraded one (D23) <span class="recon">reconstruction</span>. Scripts that compare image IDs across hosts
+            compare different things.
+          </p>
+
+          <figure class="figure wide" id="fig-two-stores">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">The legacy overlay2 + layerdb store against the containerd store, row by row</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Question</th><th>overlay2 + layerdb (legacy)</th><th>containerd store</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Chosen when</td><td>a prior graphdriver dir exists (upgraded hosts); <code>storage-driver</code> set; flag <code>false</code>; <code>userns-remap</code>; Windows</td><td>fresh Linux install of 29.x, or flag <code>true</code></td></tr>
+                  <tr><td>Image ID</td><td class="hl-blue" style="background: var(--blue-soft)">sha256 of the config: <code>b92841763c5c</code></td><td class="hl-purple" style="background: var(--purple-soft)">digest of the index or manifest: <code>be2656061b53</code></td></tr>
+                  <tr><td>Layer directory name</td><td>random cache-id, unrelated to any digest</td><td>bolt-allocated number: <code>snapshots/N/</code></td></tr>
+                  <tr><td>Layer indexed by</td><td><code>layerdb/sha256/&lt;ChainID&gt;/</code></td><td>snapshot name = ChainID</td></tr>
+                  <tr><td>DiffID kept in</td><td>the layerdb <code>diff</code> file</td><td>the config, snapshot labels, and blob label <code>containerd.io/uncompressed</code></td></tr>
+                  <tr><td>Compressed blob kept?</td><td class="hl-red" style="background: var(--red-soft)">no; push must recompress, which can change layer digests</td><td class="hl-green" style="background: var(--green-soft)">yes; disk ≈ compressed + unpacked</td></tr>
+                  <tr><td>Original tar headers</td><td><code>tar-split.json.gz</code> regenerates a byte-identical tar</td><td>not needed: the original blob is kept</td></tr>
+                  <tr><td>Multi-platform index, attestations</td><td class="hl-red" style="background: var(--red-soft)">cannot hold them</td><td class="hl-green" style="background: var(--green-soft)">held</td></tr>
+                  <tr><td>Mount data per lower layer</td><td><code>l/</code> + 26 random chars + <code>:</code>, 28 bytes</td><td>absolute <code>fs</code> path; on this host 23 lowers take 1,756 bytes</td></tr>
+                  <tr><td>Container rootfs</td><td><code>&lt;id&gt;-init</code> layer + rw layer in overlay2</td><td>Prepare(containerID, <code>&lt;id&gt;-init</code>), leased by container ID</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Read from moby at <code>0367cbeb</code> and containerd v2.4.2; the two IDs and the 1,756-byte lowerdir are
+              measured values (alpine's digests, this host's mount table). Neither store was run here. The trade is
+              disk against fidelity: the legacy store saves the compressed blob's space and pays for it at push time.
+            </p>
+          </figure>
+
+          <h3>Twenty-six characters and a page</h3>
+          <p>
+            The legacy driver keeps each layer under <code>overlay2/&lt;cacheID&gt;/</code> with <code>diff/</code>,
+            <code>work/</code>, <code>merged/</code>, a <code>lower</code> file listing the chain, and a
+            <code>link</code> file holding a short name. The short names exist for the mount syscall, whose options must
+            fit in one page. <code>moby/daemon/graphdriver/overlay2/overlay.go:76-85</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	maxDepth      = 128
+
+	// idLength represents the number of random characters
+	// which can be used to create the unique link identifier
+	// for every layer. If this value is too long then the
+	// page size limit for the mount command may be exceeded.
+	// The idLength should be selected such that following equation
+	// is true (512 is a buffer for label metadata).
+	// ((idLength + len(linkDir) + 1) * maxDepth) &lt;= (pageSize - 512)
+	idLength = 26</code></pre>
+          <p>
+            The equation is tight: (26 + 1 + 1) × 128 = 3,584 = 4,096 − 512 exactly, and this host's
+            <code>getconf PAGESIZE</code> is 4,096 <span class="recon">measured here</span>. The links are used only on a
+            fallback. When the absolute-path options exceed <code>pageSize-1</code>, which happens far below 128 layers,
+            overlay2 rewrites them relative to its home and mounts through <code>mountFrom</code>, a re-exec that
+            chroots first. The 512-byte reserve must then also hold <code>index=off,</code>, <code>userxattr,</code>,
+            the relative upper and work paths and any SELinux label. Past that, <code>Get</code> fails with "cannot mount
+            layer, mount label too large"; there is no further fallback (<code>overlay.go:580-602</code>, D31)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="p2-server"><span class="secnum">08</span>Push, and inside a registry</h2>
+          <p>
+            Push runs the pull backwards: blobs first, manifest last. containerd's pusher HEADs each blob and treats a
+            200 as <code>ErrAlreadyExists</code>, which is client-side layer deduplication. It then tries a cross-repo
+            mount from a repository named in the blob's <code>containerd.io/distribution.source.&lt;host&gt;</code>
+            label, written at pull time, and falls back to a normal upload if the mount gets a 401. The upload is one
+            POST for a session and one streamed <code>PUT &lt;location&gt;?digest=</code>, with the comment
+            <code>// TODO: Support chunked upload</code> at <code>containerd/core/remotes/docker/pusher.go:316</code>.
+            If the <code>Location</code> moves to another host, the pusher drops the authorizer for that hop
+            <span class="src">from the code</span>.
+          </p>
+          <h3>The reference server, measured</h3>
+          <p>
+            I ran distribution v3.1.2's release binary on <code>127.0.0.1:5055</code> and pushed alpine's amd64 image
+            by hand, including the chunked path containerd never uses
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>HEAD  /v2/lab/alpine/blobs/sha256:7b2295…        404   not there yet
+POST  /v2/lab/alpine/blobs/uploads/               202   Range: 0-0   Docker-Upload-Uuid: 01a1693a-8dbb-…
+PATCH &lt;location&gt;  bytes 0-1926553                 202   Range: 0-1926553
+PATCH &lt;location&gt;  Content-Range: 10-20            416   {"code":"RANGE_INVALID","message":"invalid content range"}
+GET   &lt;location&gt;                                  204   Range: 0-1926553
+PUT   &lt;location&gt;&amp;digest=sha256:7b2295…  (rest)   201   Docker-Content-Digest: sha256:7b2295…
+POST  …/uploads/?digest=sha256:b92841…  (body)    202   Range: 0-0   body ignored; PUT again
+PUT   /v2/lab/alpine/manifests/3.24               201   Docker-Content-Digest: sha256:c26612752c78…
+POST  /v2/lab/other/blobs/uploads/?mount=…&amp;from=lab/alpine   201   mounted</code></pre>
+          <p>
+            An empty session answers <code>Range: 0-0</code>, which under the spec's inclusive ranges
+            claims byte 0 arrived (D40). The 416 carries <code>RANGE_INVALID</code>, a code absent from the spec's
+            table (D41). The single-POST upload is ignored, which the spec permits (D39). And the manifest PUT returned
+            Hub's digest: stored byte-exact, the same bytes have the same name on any registry.
+          </p>
+          <p>
+            The server keeps no session table. The <code>Location</code> carries <code>_state</code>, signed in
+            <code>distribution/registry/handlers/hmac.go:64-73</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>func (secret hmacKey) packUploadState(lus blobUploadState) (string, error) {
+	mac := hmac.New(sha256.New, []byte(secret))
+	p, err := json.Marshal(lus)
+	if err != nil {
+		return "", err
+	}
+
+	mac.Write(p)
+
+	return base64.URLEncoding.EncodeToString(append(mac.Sum(nil), p...)), nil</code></pre>
+          <p>
+            Decoded, the first <code>_state</code> is 155 bytes: a 32-byte HMAC, then the JSON
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>{"Name":"lab/alpine","UUID":"01a1693a-8dbb-7340-9a86-b8806bf53f4d","Offset":0,
+ "StartedAt":"2026-10-23T14:46:47.483213373Z"}</code></pre>
+          <p>
+            Without <code>http.secret</code> each process invents its own key,
+            so behind a load balancer the next PATCH fails on another replica (D49).
+            On disk, the bytes accumulate in <code>_uploads/&lt;uuid&gt;/data</code> beside 108-byte resumable-hash
+            snapshots. Committed, the registry is one global <code>blobs/sha256/&lt;2 hex&gt;/&lt;hex&gt;/data</code> store
+            plus per-repository trees of <code>link</code> files. Every link is 71 bytes: <code>sha256:</code> and 64 hex
+            characters.
+          </p>
+          <h3>Accept is enforced here</h3>
+          <p>
+            distribution parses <code>Accept</code> into four booleans, ignoring q-values, and refuses OCI content the
+            client did not name. <code>distribution/registry/handlers/manifests.go:171-178</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>if manifestType == ociSchema &amp;&amp; !supports[ociSchema] {
+	imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithMessage("OCI manifest found, but accept header does not support OCI manifests"))
+	return
+}</code></pre>
+          <p>
+            So <code>*/*</code>, or no Accept, gets a 404 for an OCI manifest. Hub and ghcr ignore Accept entirely.
+            The spec's own <code>content-negotiation.md</code> is still a schema1-era TODO (D46). Figure
+            7 sets them side by side, including one path the guard misses.
+          </p>
+
+          <figure class="figure wide" id="fig-accept-matrix">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">What each registry returned for each Accept header (status and type served)</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead>
+                  <tr><th>Accept sent</th><th>Hub alpine:latest (OCI index)</th><th>ghcr busybox:1.36 (Docker list)</th><th>local, OCI manifest tag</th><th>local, Docker list tag</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td>Docker schema2 manifest</td><td>200 OCI index</td><td>200 Docker list</td><td class="hl-red" style="background: var(--red-soft)">404 MANIFEST_UNKNOWN</td><td class="hl-orange" style="background: var(--orange-soft)">200 <strong>OCI manifest</strong> (list downgrade)</td></tr>
+                  <tr><td>OCI manifest</td><td>200 OCI index</td><td>200 Docker list</td><td class="hl-green" style="background: var(--green-soft)">200 OCI manifest</td><td>200 OCI manifest (child substituted)</td></tr>
+                  <tr><td>Docker manifest list</td><td>200 OCI index</td><td>200 Docker list (sent with index + schema2)</td><td>not tried</td><td class="hl-green" style="background: var(--green-soft)">200 Docker list</td></tr>
+                  <tr><td><code>*/*</code></td><td>200 OCI index</td><td>not tried</td><td class="hl-red" style="background: var(--red-soft)">404 MANIFEST_UNKNOWN</td><td>not tried</td></tr>
+                  <tr><td>none</td><td>200 OCI index</td><td>not tried</td><td class="hl-red" style="background: var(--red-soft)">404 MANIFEST_UNKNOWN</td><td>not tried</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Measured here on 23 October 2026; "local" is distribution v3.1.2. Hub also returned its index for OCI
+              index and <code>application/json</code>. The orange cell is the downgrade path: a list fetched by a
+              schema2-only client is replaced by its linux/amd64 child, and the guard rejects only schema2 children,
+              so an OCI manifest reaches a client that said it cannot read one. The log line calls it "schema1" (D36).
+            </p>
+          </figure>
+
+          <p>
+            v3.1.2 registers seven routes and none is referrers; upstream <code>main</code> still has seven, with
+            referrers in open PR #4828 (D38). Tag listing sends a <code>Link</code> whenever a page is full, including
+            the last page, which costs a client one empty round trip (D50) <span class="recon">measured here</span>.
+          </p>
+          <h3>Garbage collection can delete a mounted blob</h3>
+          <p>
+            Deletion is two steps. <code>DELETE /manifests/&lt;digest&gt;</code> removes the revision link and untags
+            every tag pointing at it, without checking whether a list in the same repository still references it. The
+            blob data stays until an offline <code>registry garbage-collect</code>. That marks each manifest in each
+            repository's <code>_manifests/revisions</code> and recurses into a child only if the child still exists as
+            a revision. <code>distribution/registry/storage/garbagecollect.go:228-234</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>		if ingester(descriptor.Digest) {
+			continue
+		}
+
+		if ok, _ := manifestService.Exists(ctx, descriptor.Digest); ok {
+			err := markManifestReferences(descriptor.Digest, manifestService, ctx, ingester)</code></pre>
+          <p>
+            Then it deletes every unmarked blob and every unmarked <code>_layers</code> link. Figure
+            8 shows what that did in the lab.
+          </p>
+
+          <figure class="figure wide" id="fig-registry-gc">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">distribution v3.1.2 offline GC: what was marked, what was deleted, what was left dangling</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 420" role="img" aria-label="Two repositories and the global blob store. lab/alpine has tag multi pointing at a Docker manifest list d13decfd, whose child c26612752c78 lost its revision link to an earlier DELETE. lab/other has only a mounted layer link to 7b229517. GC marked the list and the child blob but did not follow the child, so it deleted the config b92841763c5c and the layer 7b229517, leaving lab/other's link dangling and the list pointing at a 404 child.">
+                <defs>
+                  <marker id="gc-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="gc-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#ad4b43"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">REPOSITORIES (LINK FILES)</text>
+                <text x="640" y="26" class="svg-lane">GLOBAL BLOB STORE</text>
+
+                <rect x="30" y="40" width="440" height="200" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="62" class="svg-step">lab/alpine</text>
+                <text x="54" y="86" class="svg-sub">_manifests/tags/multi/current/link</text>
+                <text x="54" y="106" class="svg-sub">_manifests/revisions/sha256/d13decfd01f5…/link</text>
+                <text x="54" y="130" class="svg-sub" style="fill:#ad4b43">revisions/…/c26612752c78…  (removed by DELETE)</text>
+                <line x1="54" y1="126" x2="392" y2="126" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="54" y="156" class="svg-sub" style="fill:#ad4b43">_layers/…/7b229517ed22…/link   deleted by GC</text>
+                <line x1="54" y1="152" x2="378" y2="152" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="54" y="176" class="svg-sub" style="fill:#ad4b43">_layers/…/b92841763c5c…/link   deleted by GC</text>
+                <line x1="54" y1="172" x2="378" y2="172" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="42" y="216" class="svg-note">tag edge deleted first; 3.23, 3.24, latest went with the manifest</text>
+
+                <rect x="30" y="260" width="440" height="80" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="42" y="282" class="svg-step">lab/other</text>
+                <text x="54" y="304" class="svg-sub">_layers/sha256/7b229517ed22…/link   survives</text>
+                <text x="54" y="326" class="svg-note">no manifests, so nothing here marks anything</text>
+
+                <rect x="640" y="44" width="410" height="48" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="652" y="64" class="svg-step">d13decfd01f5… · Docker manifest list</text>
+                <text x="652" y="82" class="svg-sub">marked (revision exists)</text>
+                <rect x="640" y="122" width="410" height="48" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="652" y="142" class="svg-step">c26612752c78… · OCI manifest</text>
+                <text x="652" y="160" class="svg-sub">marked as a blob, but not followed</text>
+                <rect x="640" y="212" width="410" height="48" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="652" y="232" class="svg-step">b92841763c5c… · config</text>
+                <text x="652" y="250" class="svg-sub">unmarked → deleted</text>
+                <line x1="652" y1="228" x2="840" y2="228" stroke="#ad4b43" stroke-width="1.2"/>
+                <rect x="640" y="290" width="410" height="48" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="652" y="310" class="svg-step">7b229517ed22… · layer</text>
+                <text x="652" y="328" class="svg-sub">unmarked → deleted</text>
+                <line x1="652" y1="306" x2="820" y2="306" stroke="#ad4b43" stroke-width="1.2"/>
+
+                <line x1="472" y1="98" x2="636" y2="68" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#gc-data)"/>
+                <line x1="1000" y1="94" x2="1000" y2="118" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#gc-data)"/>
+                <text x="1008" y="110" class="svg-sub">child</text>
+                <path d="M1052,150 L1066,150 L1066,236 L1054,236" fill="none" stroke="#ad4b43" stroke-width="1.4" stroke-dasharray="4 3"/>
+                <path d="M1066,236 L1066,314 L1054,314" fill="none" stroke="#ad4b43" stroke-width="1.4" stroke-dasharray="4 3"/>
+                <text x="880" y="196" class="svg-note">no revision → recursion skipped</text>
+                <line x1="472" y1="304" x2="636" y2="314" stroke="#ad4b43" stroke-width="1.6" marker-end="url(#gc-bad)"/>
+                <text x="486" y="290" class="svg-sub">HEAD → 404 BLOB_UNKNOWN</text>
+
+                <text x="30" y="378" class="svg-sub">GC output: "2 blobs marked, 2 blobs and 0 manifests eligible for deletion"</text>
+                <text x="30" y="400" class="svg-note">Afterwards: GET multi → 200 list; GET its child by digest → 404 MANIFEST_UNKNOWN; HEAD lab/other's layer → 404.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured here with distribution v3.1.2. Green blobs were marked, red ones deleted; struck-through links
+              were removed. The dashed red edges are references GC never visited because the child manifest had no
+              revision link left. The GC commands were typed by hand and not saved as a script.
+            </p>
+          </figure>
+
+          <p>
+            Two holes result (D37). <code>lab/other</code> links to a blob that no longer exists: a repository whose
+            only claim is a mount is invisible to the mark phase. And the still-tagged list points at a child that 404s
+            <span class="recon">measured here</span>. Both follow from the mark rule above.
+          </p>
+
+          <h2 id="p2-sources"><span class="secnum">09</span>Sources</h2>
+          <ul>
+            <li>moby <code>docker-v29.9.2</code> (<code>0367cbeb49b9</code>), docker/cli v29.9.2, containerd v2.4.2 (the copy moby vendors; the registry client files are byte-identical), distribution v3.1.2, OCI image-spec v1.1.1 and distribution-spec v1.1.1, Docker's token-auth spec under <code>distribution/docs/content/spec/auth/</code>, and the kernel's <code>Documentation/filesystems/overlayfs.rst</code> fetched on 23 October 2026.</li>
+            <li>Lab evidence in <code>~/docker-ref/lab/results/images/</code> (index, manifests, configs, layer listing, recompression, distroless ChainIDs, the hand-built image, this host's mount table) and <code>registry/</code> (<code>01-ping.txt</code> to <code>14-errors.txt</code> for the Hub pull, <code>20</code>–<code>23</code> for other registries, <code>31</code> for the credential helper, <code>41</code>–<code>44</code> for the push and GC lab).</li>
+          </ul>
+          <p class="footnote">
+            <strong>Provenance.</strong> Paths and line numbers were re-read in the pinned checkouts; digests, sizes,
+            headers and timings come from the saved files, and the §04 times are each request's own
+            <code>--timing--</code> total. The pull trace is curl, not <code>dockerd</code>; the credential trace used
+            docker CLI 29.8.2. No container, <code>dockerd</code> or overlay mount ran here, so the two image IDs, the
+            on-disk layouts and the unpack path are code applied to measured digests, and the content and metadata paths
+            are inferred from plugin naming. Unresolved: whether Hub's window is 3,600 or 21,600 seconds. Not verified:
+            sequential unpack in practice and page-cache sharing across containers. <code>dockerd</code>'s referrers
+            calls are read from code (one per pulled platform of an attested image), and zstd:chunked and eStargz
+            framing were measured on ghcr.io's <code>stargz-containers/alpine</code> layers. With a real Docker host: <code>docker images --no-trunc alpine</code> on a fresh
+            and an upgraded host; <code>sudo ls /var/lib/containerd/</code>; <code>dockerd</code> behind an intercepting
+            proxy, then <code>docker pull alpine</code>; anonymous HEAD/GET pairs on <code>ratelimitpreview/test</code>
+            from an unshared IP for over an hour; and the GC lab re-run as a script: push, mount into a second repo,
+            delete the manifest, <code>registry garbage-collect config.yml</code>, HEAD the mounted blob. Findings are
+            numbered as in <a href="../network-and-lifecycle/#p4-findings">Part 4's register</a>; none was reported
+            upstream.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Docker, taken apart</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../run-path/">Part 1: From docker run to a process</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../builds/">Part 3: How BuildKit builds</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../network-and-lifecycle/">Part 4: Networks, I/O and the long run</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

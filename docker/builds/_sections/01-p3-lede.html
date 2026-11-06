@@ -1,0 +1,180 @@
+          <h2 id="p3-lede"><span class="secnum">{{S}}</span>BuildKit never runs your Dockerfile</h2>
+          <p class="lede">
+            A container is an ordinary Linux process, and Docker is a relay of programs that agree on names made of
+            sha256 hashes. A build adds two more names to that relay and one more compiler. BuildKit never executes a
+            Dockerfile. It compiles the text into LLB, a graph of protobuf records, each named by the sha256 of its own
+            bytes. It keys its cache on that graph and on file content, never on timestamps. And it asks the client for
+            the build context; the client does not push it.
+          </p>
+          <p>
+            The first hop is a rename. The docker CLI treats <code>build</code>, <code>builder</code>,
+            <code>image build</code> and <code>bake</code> as calls to a plugin whose default name is
+            <code>buildx</code>, and <code>forwardBuilder</code> rewrites the argument vector before the CLI runs the plugin as a child process
+            <span class="src">from the code</span>. The table that does it is
+            <code>cli/cmd/docker/builder.go:149-164</code>:
+          </p>
+<pre><code>func forwardBuilder(alias string, args, osargs []string) ([]string, []string, []string, bool) {
+	aliases := [][3][]string{
+		{
+			{"bake"},
+			{alias, "bake"},
+			{},
+		},
+		{
+			{"builder"},
+			{alias},
+			{"builder"},
+		},
+		{
+			{"build"},
+			{alias, "build"},
+			{},</code></pre>
+          <p>
+            On the forwarded path the CLI also prepends <code>BUILDX_BUILDER=&lt;current context&gt;</code> to the
+            plugin's environment, so <code>docker build</code> targets the daemon's own builder and loads a local image
+            even after <code>docker buildx use</code> picked a container builder (<code>builder.go:132-141</code>).
+            <code>DOCKER_BUILDKIT=0</code> still selects the legacy builder on Linux, now with a deprecation warning. A
+            missing plugin falls back to the legacy builder with a "DEPRECATED" warning, unless
+            <code>DOCKER_BUILDKIT=1</code> forced BuildKit, in which case it fails <span class="src">from the code</span>.
+            Engine 23.0.0 (released 2023-02-01) made this the default on Linux. On this machine the rewrite is visible
+            without a daemon: <code>docker build --help</code> prints buildx's usage line, and <code>docker buildx ls</code>
+            shows the <code>default</code> builder in an error state because nothing listens on the socket
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>github.com/docker/buildx v0.37.1 0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a
+Usage:  docker buildx build [OPTIONS] PATH | URL | -
+Aliases:
+  docker build, docker builder build, docker image build, docker buildx b</code></pre>
+          <p>
+            The second hop shares a socket with everything else. dockerd's <code>httpHandler.ServeHTTP</code> sends any
+            HTTP/2 request whose <code>Content-Type</code> starts with <code>application/grpc</code> to a gRPC server
+            (or to an optional <code>grpcProxy</code> that claims the service), and every other request to the REST API
+            (<code>moby/daemon/command/httphandler.go:38-48</code>). The listener speaks HTTP/1, HTTP/2 and cleartext
+            HTTP/2 (h2c) at once. buildx does not use that route. Its docker driver opens <code>POST /grpc</code>
+            with <code>Upgrade: h2c</code>, an HTTP/1.1 upgrade that dockerd answers with a 101 and serves with a
+            deprecated <code>http2.Server.ServeConn</code>, and calls BuildKit's <code>Control</code> service inside
+            it: <code>Solve</code> to start a build, <code>Status</code> to stream progress
+            (<code>buildkit/api/services/control/control.proto:15-24</code>). The session goes over a second
+            hijacked connection, <code>POST /session</code>, not <code>Control.Session</code>
+            (<code>buildx/driver/docker/driver.go:62-75</code>; <code>moby/daemon/server/router/grpc/grpc_routes.go:11-52</code>).
+            Both routes are marked deprecated, and buildx v0.37.1 still uses them, as do v0.37.2 and buildx
+            <code>master</code> <span class="src">from the code</span>.
+          </p>
+          <p>
+            Inside dockerd sit two builders. The daemon still constructs the legacy
+            <code>dockerfile.NewBuildManager</code> and an embedded BuildKit rooted at
+            <code>&lt;data-root&gt;/buildkit</code> (<code>moby/daemon/command/daemon.go:471-480</code>). The embedded
+            controller registers exactly two frontends: <code>dockerfile.v0</code>, compiled into dockerd, and
+            <code>gateway.v0</code>, which runs a frontend shipped as an image. It keeps its cache index in a bbolt file,
+            <code>cache.db</code>, and runs every <code>RUN</code> step by exec'ing <code>runc</code> itself, with no
+            containerd task <span class="src">from the code</span>. Figure {{fig-build-process-map}} draws the whole
+            relay. The direction of the thin arrows is the surprise this part keeps returning to.
+          </p>
+
+          <figure class="figure wide" id="fig-build-process-map">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Who talks to whom in one <code>docker build</code></p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 470" role="img" aria-label="The docker CLI rewrites docker build into buildx build and execs the buildx plugin. buildx opens POST /grpc on dockerd's API socket, upgrades it to h2c and sends gRPC Control.Solve and Control.Status inside it; the session runs on a second hijacked connection, POST /session. A handler that routes native application/grpc requests away from REST also exists, but buildx does not use it. Inside dockerd the BuildKit controller holds the dockerfile.v0 and gateway.v0 frontends, the solver with cache.db, and the runc executor. dockerd calls back into buildx for session services: FileSync.DiffCopy, Secrets, SSH and Auth. The executor execs runc, which starts the RUN step container; a gateway frontend runs as its own container and talks the LLBBridge gRPC service over its stdin and stdout.">
+                <defs>
+                  <marker id="fig-build-process-map-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-build-process-map-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">CLIENT</text>
+                <text x="350" y="26" class="svg-lane">DOCKERD (ONE API SOCKET)</text>
+                <text x="830" y="26" class="svg-lane">PROCESSES DOCKERD STARTS</text>
+
+                <rect x="30" y="48" width="240" height="70" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="72" class="svg-step">docker CLI</text>
+                <text x="42" y="92" class="svg-sub">docker build .</text>
+                <text x="42" y="108" class="svg-sub">forwardBuilder: argv rewrite</text>
+                <line x1="150" y1="120" x2="150" y2="170" stroke="#252525" stroke-width="2" marker-end="url(#fig-build-process-map-ctl)"/>
+                <text x="160" y="142" class="svg-sub">exec buildx build .</text>
+                <text x="160" y="158" class="svg-sub">+ BUILDX_BUILDER=ctx</text>
+
+                <rect x="30" y="176" width="240" height="190" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="42" y="200" class="svg-step">buildx v0.37.1 (plugin)</text>
+                <text x="42" y="220" class="svg-sub">gRPC client of Control</text>
+                <text x="42" y="248" class="svg-lane">SESSION SERVER</text>
+                <text x="42" y="268" class="svg-sub">FileSync  the context</text>
+                <text x="42" y="286" class="svg-sub">Secrets   --secret values</text>
+                <text x="42" y="304" class="svg-sub">SSH       agent forwarding</text>
+                <text x="42" y="322" class="svg-sub">Auth      registry creds</text>
+                <text x="42" y="350" class="svg-note">the client serves; dockerd asks</text>
+
+                <rect x="350" y="48" width="430" height="318" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <rect x="366" y="64" width="398" height="56" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-width="1"/>
+                <text x="378" y="86" class="svg-step">httpHandler.ServeHTTP</text>
+                <text x="378" y="106" class="svg-sub">buildx: POST /grpc → h2c gRPC · POST /session</text>
+
+                <rect x="366" y="134" width="398" height="218" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="378" y="156" class="svg-step">embedded BuildKit controller</text>
+                <text x="378" y="176" class="svg-sub">root: &lt;data-root&gt;/buildkit</text>
+                <rect x="378" y="188" width="180" height="70" rx="4" fill="#ffffff" stroke="#367f59" stroke-width="1"/>
+                <text x="390" y="208" class="svg-step">frontends</text>
+                <text x="390" y="228" class="svg-sub">dockerfile.v0</text>
+                <text x="390" y="246" class="svg-sub">gateway.v0</text>
+                <rect x="572" y="188" width="180" height="70" rx="4" fill="#ffffff" stroke="#367f59" stroke-width="1"/>
+                <text x="584" y="208" class="svg-step">solver</text>
+                <text x="584" y="228" class="svg-sub">edges, cache keys</text>
+                <text x="584" y="246" class="svg-sub">cache.db (bbolt)</text>
+                <rect x="378" y="270" width="374" height="70" rx="4" fill="#ffffff" stroke="#367f59" stroke-width="1"/>
+                <text x="390" y="290" class="svg-step">runc executor (BuildKit's runcexecutor)</text>
+                <text x="390" y="310" class="svg-sub">execs the runc binary directly</text>
+                <text x="390" y="328" class="svg-sub">no containerd task · not in docker ps</text>
+                <line x1="560" y1="223" x2="568" y2="223" stroke="#252525" stroke-width="2" marker-end="url(#fig-build-process-map-ctl)"/>
+
+                <line x1="272" y1="200" x2="346" y2="200" stroke="#252525" stroke-width="2.4" marker-end="url(#fig-build-process-map-ctl)"/>
+                <text x="278" y="190" class="svg-sub">Solve</text>
+                <text x="278" y="216" class="svg-sub">Status</text>
+                <line x1="348" y1="300" x2="274" y2="300" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-build-process-map-data)"/>
+                <text x="280" y="290" class="svg-sub" style="fill:#3c6f97">calls</text>
+                <text x="280" y="316" class="svg-sub" style="fill:#3c6f97">back</text>
+
+                <rect x="830" y="48" width="220" height="112" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="842" y="70" class="svg-step">frontend container</text>
+                <text x="842" y="90" class="svg-sub">from # syntax= image</text>
+                <text x="842" y="108" class="svg-sub">entrypoint /run</text>
+                <text x="842" y="126" class="svg-sub">LLBBridge gRPC on</text>
+                <text x="842" y="144" class="svg-sub">its stdin/stdout</text>
+                <path d="M565,186 L565,127 L800,127 L800,104 L826,104" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-start="url(#fig-build-process-map-data)" marker-end="url(#fig-build-process-map-data)"/>
+
+                <rect x="830" y="214" width="220" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="842" y="236" class="svg-step">runc (short-lived)</text>
+                <text x="842" y="256" class="svg-sub">DOCKER_BUILDKIT_RUNC_COMMAND</text>
+                <line x1="754" y1="290" x2="800" y2="290" stroke="#252525" stroke-width="2"/>
+                <path d="M800,290 L800,242 L826,242" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-build-process-map-ctl)"/>
+
+                <rect x="830" y="296" width="220" height="70" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="842" y="318" class="svg-step">RUN step container</text>
+                <text x="842" y="338" class="svg-sub">network: bridge sandbox</text>
+                <text x="842" y="354" class="svg-sub">via a prestart hook</text>
+                <line x1="940" y1="272" x2="940" y2="292" stroke="#252525" stroke-width="2" marker-end="url(#fig-build-process-map-ctl)"/>
+
+                <line x1="30" y1="400" x2="60" y2="400" stroke="#252525" stroke-width="2.4"/>
+                <text x="68" y="404" class="svg-sub">control: a call that starts work</text>
+                <line x1="330" y1="400" x2="360" y2="400" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="368" y="404" class="svg-sub">data: bytes asked for or returned</text>
+                <text x="30" y="440" class="svg-note">Every thin arrow out of dockerd points back at a client: the context, the secrets, the SSH agent and the frontend's</text>
+                <text x="30" y="458" class="svg-note">graph are all requested by the daemon over a channel the client opened.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Read from the code at cli v29.9.2, moby 29.9.2, BuildKit v0.34.1 and buildx v0.37.2; nothing here was traced, because
+              dockerd could not start on this box. The legacy builder and the classic <code>POST /build</code> route
+              (which always solves with <code>dockerfile.v0</code>) also exist inside dockerd and are not drawn.
+            </p>
+          </figure>
+
+          <p>
+            The rest of this part follows one build through that relay. <a href="#p3-frontend">§02</a> compiles the
+            Dockerfile. <a href="#p3-llb">§03</a> takes the resulting graph apart byte by byte, using the one real build
+            record this machine could fetch: the provenance Docker Hub publishes for alpine:latest.
+            <a href="#p3-solver">§04</a> follows the solver and its two cache keys, <a href="#p3-context">§05</a> the
+            context transfer, <a href="#p3-run">§06</a> the <code>RUN</code> containers, and
+            <a href="#p3-export">§07</a> what a build writes out. The image format those outputs land in is
+            <a href="../images/#p2-lede">Part 2</a>'s subject; the runc that runs each step is
+            <a href="../run-path/#p1-runc">Part 1</a>'s.
+          </p>

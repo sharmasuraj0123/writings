@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Docker, taken apart: a four-part teardown of Docker read from the Engine 29.9.2 source and its stack — the run path down to runc and the kernel, images and registries, BuildKit, networking, I/O and lifecycle, with measurements and a findings register."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/docker/" />
+    <meta property="og:title" content="Docker, taken apart — XO Research" />
+    <meta property="og:description" content="Docker in four parts, read from Engine 29.9.2, containerd 2.4.2, runc 1.5.2 and BuildKit 0.34.1: how docker run becomes a process, what an image is on disk and on the wire, how BuildKit builds, and how networks, logs, signals and restarts work." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://quirq.ai/docker/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <title>Docker, taken apart — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --blue: #3c6f97;
+        --purple: #765b98;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .page {
+        max-width: var(--text);
+        margin: 0 auto;
+        padding: 72px 22px 96px;
+      }
+
+      .kicker {
+        margin: 0 0 14px;
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--orange);
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-family: var(--serif);
+        font-size: clamp(34px, 6vw, 46px);
+        font-weight: 500;
+        line-height: 1.12;
+        letter-spacing: -0.012em;
+      }
+
+      .lede {
+        margin: 0 0 8px;
+        max-width: 56ch;
+        color: var(--ink-soft);
+        font-size: 18px;
+      }
+
+      .section {
+        margin-top: 58px;
+      }
+
+      .section > h2 {
+        margin: 0 0 6px;
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        font-weight: 600;
+        color: var(--ink-faint);
+      }
+
+      .section > .rule {
+        height: 1px;
+        margin-bottom: 4px;
+        background: var(--line);
+      }
+
+      .log {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+
+      .log li {
+        padding: 26px 0 28px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .meta {
+        display: flex;
+        gap: 14px;
+        margin: 0 0 6px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+        color: var(--ink-faint);
+      }
+
+      .meta .dot {
+        color: var(--line-dark);
+      }
+
+      .log h3 {
+        margin: 0 0 8px;
+        font-family: var(--serif);
+        font-size: 25px;
+        font-weight: 500;
+        line-height: 1.22;
+        letter-spacing: -0.008em;
+      }
+
+      .log h3 a {
+        text-decoration: none;
+      }
+
+      .log h3 a:hover {
+        text-decoration: underline;
+        text-decoration-color: var(--orange);
+      }
+
+      .log p {
+        margin: 0;
+        max-width: 60ch;
+        color: var(--ink-soft);
+      }
+
+      .state {
+        padding: 34px 0;
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--ink-faint);
+      }
+
+      .state.error {
+        color: var(--orange);
+      }
+
+      footer {
+        margin-top: 70px;
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+        font-family: var(--mono);
+        font-size: 12.5px;
+        color: var(--ink-faint);
+      }
+
+      footer code {
+        padding: 0.08em 0.34em;
+        border-radius: 3px;
+        background: #eeeeeb;
+        font-size: 0.95em;
+      }
+
+      .collection-note {
+        margin: 14px 0 0;
+        max-width: 60ch;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+      .pill {
+        display: inline-block;
+        margin-left: 8px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        color: var(--ink-faint);
+        background: var(--paper-soft);
+        vertical-align: 3px;
+      }
+      .pill.soon { background: var(--paper-warm); color: #a8641a; border-color: #f7e3c8; }
+      .back {
+        margin: 0 0 26px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+      .back a { color: var(--ink-faint); text-decoration: none; }
+      .back a:hover { color: var(--ink); text-decoration: underline; }
+      .map { margin: 34px 0 0; }
+      .map svg { width: 100%; height: auto; display: block; }
+      .map .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .map .svg-step { font: 500 13px var(--sans); fill: var(--ink); }
+      .map .svg-sub { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .map .svg-num { font: 700 11px var(--mono); fill: var(--orange); }
+      .map figcaption { margin-top: 8px; font-size: 14px; color: var(--ink-faint); }
+      .lede code, .collection-note code { font-family: var(--mono); font-size: 0.86em; padding: 0.06em 0.3em; border-radius: 3px; background: #eeeeeb; }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <p class="back"><a href="../">← Writings</a></p>
+      <p class="kicker">XO Labs · Research collection</p>
+      <h1>Docker, taken apart</h1>
+      <p class="lede">
+        A container is an ordinary Linux process. Docker is a relay of five
+        separate programs (the <code>docker</code> CLI, <code>dockerd</code>,
+        <code>containerd</code>, a per-container shim and a short-lived
+        <code>runc</code>) that agree on names made of sha256 hashes and on a JSON
+        spec, ask the kernel to narrow one process's view of the machine, and then
+        mostly get out of the way. Most surprises live at a seam between two of
+        them. This collection reads every seam from the source, measures what can
+        be measured, and keeps a register of where the code, the docs and users'
+        expectations disagree.
+      </p>
+      <p class="collection-note">
+        Four parts, read in order or alone. Every claim cites a file and line at
+        Docker Engine 29.9.2 (<code>moby@0367cbeb</code>), docker/cli 29.9.2,
+        containerd v2.4.2, runc v1.5.2, BuildKit v0.34.1 or the OCI specs, or a
+        measurement. No container could run on the research machine, so
+        "measured" means registry traffic, image bytes, digests and this host's
+        own cgroup files; container behaviour is read from the code and labelled
+        so. Each part is one self-contained HTML file.
+      </p>
+
+      <figure class="map" aria-labelledby="map-cap">
+        <svg viewBox="0 0 704 270" role="img" aria-label="One docker run at the centre, with four parts around it: Part 1 covers the run path from the CLI to runc and the kernel; Part 2 covers images, layers and the registry; Part 3 covers BuildKit; Part 4 covers networking, I/O, lifecycle, history and the findings register.">
+          <rect x="252" y="107" width="200" height="56" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+          <text x="352" y="131" text-anchor="middle" class="svg-step">docker run alpine sh</text>
+          <text x="352" y="149" text-anchor="middle" class="svg-sub">5 programs · 1 process</text>
+          <a href="run-path/">
+            <rect x="12" y="14" width="214" height="96" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+            <text x="26" y="36" class="svg-num">PART 1</text>
+            <text x="26" y="56" class="svg-step">From docker run to a process</text>
+            <text x="26" y="76" class="svg-sub">API · dockerd · containerd</text>
+            <text x="26" y="94" class="svg-sub">shim · runc · namespaces</text>
+          </a>
+          <a href="images/">
+            <rect x="478" y="14" width="214" height="96" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+            <text x="492" y="36" class="svg-num">PART 2</text>
+            <text x="492" y="56" class="svg-step">Images, layers, registry</text>
+            <text x="492" y="76" class="svg-sub">digests · DiffID · ChainID</text>
+            <text x="492" y="94" class="svg-sub">overlayfs · pull · push</text>
+          </a>
+          <a href="builds/">
+            <rect x="12" y="160" width="214" height="96" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+            <text x="26" y="182" class="svg-num">PART 3</text>
+            <text x="26" y="202" class="svg-step">How BuildKit builds</text>
+            <text x="26" y="222" class="svg-sub">LLB · solver · cache keys</text>
+            <text x="26" y="240" class="svg-sub">context · mounts · exporters</text>
+          </a>
+          <a href="network-and-lifecycle/">
+            <rect x="478" y="160" width="214" height="96" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+            <text x="492" y="182" class="svg-num">PART 4</text>
+            <text x="492" y="202" class="svg-step">Networks, I/O, the long run</text>
+            <text x="492" y="222" class="svg-sub">bridge · DNS · logs · stop</text>
+            <text x="492" y="240" class="svg-sub">history · findings register</text>
+          </a>
+          <line x1="226" y1="86" x2="250" y2="112" stroke="#252525" stroke-width="2"/>
+          <line x1="478" y1="86" x2="454" y2="112" stroke="#252525" stroke-width="2"/>
+          <line x1="226" y1="184" x2="250" y2="158" stroke="#252525" stroke-width="2"/>
+          <line x1="478" y1="184" x2="454" y2="158" stroke="#252525" stroke-width="2"/>
+        </svg>
+        <figcaption id="map-cap">Each part starts from the same command and follows a different set of programs, files and packets outward.</figcaption>
+      </figure>
+
+      <div id="log-root">
+        <section class="section">
+          <h2>The collection</h2>
+          <div class="rule"></div>
+          <ul class="log">
+            <li>
+              <p class="meta"><span>Part 1</span><span class="dot">·</span><span>23 October 2026</span><span class="dot">·</span><span>34 min read</span></p>
+              <h3><a href="run-path/">From docker run to a process</a></h3>
+              <p>A container is an ordinary Linux process, and docker run is five programs passing it along. This first part of a four-part teardown follows one docker run -it alpine sh through Docker Engine 29.9.2: five API calls on three connections, a create that only writes JSON, a start that rebuilds the whole OCI spec, a shim that daemonises itself and adopts the container, runc building namespaces in C before Go boots, a FIFO that holds the process while dockerd plugs in the network, and the exit status climbing back through three protocols.</p>
+            </li>
+            <li>
+              <p class="meta"><span>Part 2</span><span class="dot">·</span><span>23 October 2026</span><span class="dot">·</span><span>32 min read</span></p>
+              <h3><a href="images/">Images, layers and the registry</a></h3>
+              <p>An image is a Merkle tree of JSON documents and tarballs, each named by the sha256 of its exact bytes. This second part of a four-part Docker teardown pulls alpine:latest from Docker Hub request by request, takes its 9,218-byte index, its config and its one layer apart byte by byte, derives the three hashes of the same layer (digest, DiffID, ChainID), follows the layer into containerd's content store and overlay snapshots, compares Docker 29's two image stores, and pushes into a local registry to watch its storage, its Accept rules and its garbage collector.</p>
+            </li>
+            <li>
+              <p class="meta"><span>Part 3</span><span class="dot">·</span><span>23 October 2026</span><span class="dot">·</span><span>29 min read</span></p>
+              <h3><a href="builds/">How BuildKit builds</a></h3>
+              <p>BuildKit never executes a Dockerfile. This third part of a four-part Docker teardown follows docker build from the CLI's argv rewrite into buildx and over gRPC into the BuildKit inside dockerd, compiles a Dockerfile into LLB, re-derives three vertex digests of alpine:latest's real build byte for byte from its published provenance, takes the solver's two cache keys apart to show why a comment or a touch keeps the cache and a chmod busts it, watches the daemon pull the build context from the client, and ends at the exporters, the cache formats and the attestations a build writes.</p>
+            </li>
+            <li>
+              <p class="meta"><span>Part 4</span><span class="dot">·</span><span>23 October 2026</span><span class="dot">·</span><span>43 min read</span></p>
+              <h3><a href="network-and-lifecycle/">Networks, I/O and the long run</a></h3>
+              <p>After runc start, Docker is byte pipelines and small state machines, and both lose or block more than users assume. This last part of a four-part teardown follows -p 8080:80 through netfilter and docker-proxy, finds the DNS server at 127.0.0.11 running inside dockerd, takes apart the 8-byte frame behind attach and logs, times docker stop to its SIGKILL, shows how docker kill -s HUP can switch off a restart policy, reads health, OOM, stats and events as thin readers over cgroup files and in-memory rings, tells thirteen years of moving work out of one binary, and ends with the register of all 100 findings.</p>
+            </li>
+          </ul>
+        </section>
+
+        <section class="section">
+          <h2>Related</h2>
+          <div class="rule"></div>
+          <ul class="log">
+            <li>
+              <p class="meta"><span>Collection</span><span class="dot">·</span><span>23 October 2026</span></p>
+              <h3><a href="../git/">Git, taken apart</a></h3>
+              <p>The same method applied to git v2.55.0: objects, packs, the index, refs, the wire, merging and maintenance, in three parts with a findings register.</p>
+            </li>
+          </ul>
+        </section>
+      </div>
+
+      <footer>
+        Parts live under <code>docker/&lt;slug&gt;/index.html</code> and are indexed in
+        the root <code>posts.json</code> with the <code>docker/</code> prefix in their slug.
+        The research behind them (eight dossiers, four verification passes, the lab
+        scripts and evidence) is kept outside this repository.
+      </footer>
+    </main>
+  </body>
+</html>

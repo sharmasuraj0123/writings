@@ -1,0 +1,96 @@
+          <h2 id="p4-observe"><span class="secnum">{{S}}</span>Health, OOM, stats, events, cp and pause</h2>
+          <p>
+            Docker's observability commands are thin readers. Each reads a cgroup file, an in-memory ring or a container
+            lock, and each answers a slightly different question from the one its name suggests.
+          </p>
+          <h3>Health checks</h3>
+          <p>
+            A probe is an ordinary <code>exec</code> in the container: same user, working directory and environment, no
+            TTY, no stdin, with output captured into a 4,096-byte buffer. It shows up in <code>docker events</code> as
+            <code>exec_create</code>. The defaults are interval 30 s, timeout 30 s, retries 3, start period 0 and start
+            interval 5 s, and the first probe runs one interval <em>after</em> start. A container therefore stays
+            <code>starting</code> for at least 30 seconds. A timeout kills the probe and records exit code −1. Only the
+            last five results are kept, and an event fires only on a transition
+            (<code>moby/daemon/health.go:23-44, 111-152, 238-251</code>). Then nothing happens. The restart manager
+            never looks at health, so <code>unhealthy</code> acts on nothing outside swarm and other orchestrators
+            (D88) <span class="src">from the code</span>. The same finding adds that <code>--tmpfs</code> mounts default
+            to <code>noexec,nosuid,nodev</code>, so a script copied into a <code>--tmpfs /tmp</code> will not run.
+          </p>
+          <h3>OOM</h3>
+          <p>
+            On cgroup v2 the shim watches the container cgroup's <code>memory.events</code> with inotify, re-reads it
+            on every wakeup and publishes <code>TaskOOM</code> whenever <code>oom_kill</code> grows
+            (<code>containerd/internal/oom/watcher.go:102-141</code>). The watcher is armed right after
+            <code>runc create</code>, while init still waits on the FIFO, so an early OOM is not missed. On any
+            <code>TaskOOM</code>, <code>dockerd</code> sets <code>State.OOMKilled</code>. The victim may be a child while
+            PID 1 keeps running. Docker sets no <code>memory.oom.group</code>, and runc's systemd scopes default to
+            <code>OOMPolicy=continue</code>, so the kernel normally kills one process it chooses. <code>OOMKilled:
+            true</code> means "something in this cgroup was OOM-killed during this run" (D82)
+            <span class="src">from the code</span>. This sandbox's own cgroup shows why the counters need care (comments mine)
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>$ cat /sys/fs/cgroup/memory.events      # this sandbox, not a Docker container
+low 0
+high 0
+max 7452          # times usage hit memory.max
+oom 0             # times the cgroup went OOM
+oom_kill 0        # the counter the shim watches
+oom_group_kill 0</code></pre>
+          <p>
+            <code>docker stats</code> reports cgroup v2 <code>failcnt</code> as <code>oom</code>, not <code>max</code>.
+            Here the two read 0 and 7,452 (D83). This sandbox's cgroup also has <code>memory.oom.group</code> set to 1, which a
+            Docker container's would not.
+          </p>
+          <h3>Stats</h3>
+          <p>
+            One daemon-wide goroutine samples every watched container in turn, then sleeps one second, so the real period
+            is a second plus the sampling time. Each sample is a containerd <code>Task.Metrics</code> round trip to the
+            shim, which reads <code>cpu.stat</code>, <code>memory.stat</code>, <code>memory.current</code> and the rest.
+            The "system" side is not from cgroups at all: <code>dockerd</code> sums the first seven fields of
+            <code>/proc/stat</code>'s <code>cpu</code> line and counts <code>cpuN</code> lines as online CPUs
+            (<code>moby/daemon/stats_unix.go:296-357</code>). The CLI then computes, in
+            <code>cli/cli/command/container/stats_helpers.go:196-198</code>:
+          </p>
+<pre><code>	if systemDelta &gt; 0.0 &amp;&amp; cpuDelta &gt; 0.0 {
+		cpuPercent = (cpuDelta / systemDelta) * onlineCPUs * 100.0
+	}</code></pre>
+          <p>
+            That is a percentage of one CPU, scaled by the host's CPU count, never by the container's
+            <code>cpu.max</code> quota. A Python re-implementation over this sandbox's files gives a cpuDelta of
+            2,005,555,000 ns against a systemDelta of 7,930,000,000 ns on 8 CPUs: 202.33 %, for a cgroup whose
+            <code>cpu.max</code> reads <code>200000 100000</code>, a two-CPU quota <span class="recon">measured
+            here</span>. It is arithmetic over real files, not <code>dockerd</code> output. MEM USAGE is
+            <code>memory.current − inactive_file</code>: 8,190,771,200 − 370,188,288 bytes, or 7.28 GiB. Two more
+            quirks. The first streamed sample has empty <code>precpu_stats</code>, so it is a lifetime average. And
+            <code>--no-stream</code> sends <code>stream=false</code> without <code>one-shot</code>, as the mock
+            trace shows, so the daemon waits for two samples first <span class="src">from the code</span>.
+          </p>
+          <h3>Events</h3>
+          <p>
+            The event history is an in-memory slice of the last 256 events. <code>--since</code> can replay only that,
+            and nothing from before a daemon restart. Live delivery goes through a publisher that waits at most 100 ms
+            per subscriber per event, then skips that subscriber, silently. The 256 is documented; the drop is not
+            (D85, <code>moby/daemon/events/events.go:13-31</code>). Container labels are copied <em>over</em> the
+            event's attributes, so a label named <code>exitCode</code> falsifies every <code>die</code> event (D84,
+            an inference from <code>maps.Copy</code>). The wire format is JSON lines, served as
+            <code>application/jsonl</code> from API 1.52, although the API changelog lists the change under 1.53 (D90)
+            <span class="src">from the code</span>. Fed four mock events, the CLI rendered
+            <code>kill … signal=15</code>, then <code>die … exitCode=143</code>,
+            <code>health_status: unhealthy</code> and <code>oom</code> <span class="recon">measured here</span>.
+          </p>
+          <h3><code>docker cp</code>, pause and checkpoints</h3>
+          <p>
+            <code>docker cp</code> is three verbs on <code>/containers/{id}/archive</code>: <code>HEAD</code> to stat,
+            <code>GET</code> for a tar and <code>PUT</code> to extract one. Copying out, the CLI sent a single
+            <code>GET</code> with no <code>HEAD</code> <span class="recon">measured here</span>. Since 24.0 the daemon
+            does the copy in a private mount namespace, so symlinks resolve inside the container. That code was still
+            being patched for CVEs in 2026. The <code>GET</code> holds the container lock until the client has read the
+            whole tar, so a slow copy blocks <code>docker stop</code>, <code>kill</code> and <code>pause</code> on that
+            container (D81, inferred from code, not observed). Pause writes <code>1</code> to
+            <code>cgroup.freeze</code>, and runc polls <code>cgroup.events</code> every 10 ms, up to 1,000 times, for
+            <code>frozen 1</code>. The processes receive no signal. Pausing a paused container is a 409; unpausing a
+            running one is an untyped error, so HTTP 500. <code>docker commit</code> pauses by default and ignores both
+            errors (D89). The experimental checkpoint path has the part's one latent bug. When containerd's index lacks
+            the checkpoint manifest, <code>CreateCheckpoint</code> wraps a nil error, which yields nil, and reports
+            success. Stock containerd never reaches that branch (D80) <span class="src">from the code</span>.
+          </p>

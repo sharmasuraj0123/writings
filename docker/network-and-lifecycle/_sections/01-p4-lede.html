@@ -1,0 +1,49 @@
+          <h2 id="p4-lede"><span class="secnum">{{S}}</span>After start: pipes and small state machines</h2>
+          <p class="lede">
+            A container is an ordinary Linux process, and Docker is a relay of five programs that mostly get out of its
+            way. Mostly. After <code>runc start</code> the relay is gone, but <code>dockerd</code> keeps three jobs: it
+            carries the container's bytes, it answers the container's questions, and it decides what happens when the
+            process stops. This part claims that each of those jobs is either a byte pipeline or a small state machine,
+            and that both lose or block data more often than users assume.
+          </p>
+          <p>
+            <a href="../run-path/">Part 1</a> ended with a process parked on a FIFO while <code>dockerd</code> wired its
+            network (<a href="../run-path/#p1-fifo">§06 there</a>). This part starts at that wire. A bridge network is a
+            Linux bridge, a veth pair and a set of netfilter rules. Publishing a port binds a real socket on the host,
+            attaches a filter so it hears nothing, and lets the kernel's DNAT carry almost every packet. A user-space
+            relay, <code>docker-proxy</code>, is left with three narrow cases: loopback, hairpin and IPv6 to an
+            IPv4-only container. Name resolution is stranger. The DNS server at <code>127.0.0.11</code> is a goroutine
+            inside <code>dockerd</code>, and NAT rules in the container's own namespace steer the queries to it. It
+            forwards some of them from the host's namespace, past the firewall you may have written for the container
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The bytes come next. Attach, exec and <code>docker logs</code> share one frame format: eight header bytes,
+            then a payload. The reader on the client drops a frame cut short without saying so. Logging is synchronous
+            and unbounded by default. A slow log driver can back-pressure the container's own <code>write(2)</code>, and
+            a json-file log with no <code>max-size</code> grows until the disk fills. The two buffers that do not block
+            are the ones that drop data, and one of them is on by default <span class="src">from the code</span>.
+          </p>
+          <p>
+            Then the long run. <code>docker stop</code> signals PID 1 only. The kernel's rule for a namespace's init
+            process means a plain <code>sh</code> never sees that SIGTERM, so stop becomes a ten-second wait and a
+            SIGKILL. The restart manager is a few booleans and a backoff timer, and one of those booleans is set by
+            every <code>docker kill -s</code>. So sending SIGHUP to reload nginx can quietly switch off an
+            <code>unless-stopped</code> policy. That is finding D77, the headline of the collection's register. It is
+            still on moby's <code>master</code>, and a fix has been open since August 2026. Health checks, OOM flags,
+            <code>docker stats</code> and <code>docker events</code> turn out to be thin readers over cgroup files and
+            in-memory rings. Each one answers a slightly different question from the one its name suggests.
+          </p>
+          <p>
+            The last two content sections step back. §07 tells the history as thirteen years of moving work out of one
+            binary: LXC, then libcontainer, runc and the OCI, containerd and its shim, the Moby split, and Kubernetes
+            moving off <code>dockerd</code>. In 2026 the movement reversed for the first time, with containerd running
+            inside <code>dockerd</code> when no system copy is installed. §08 is the register of all 100 findings from
+            the four parts, grouped by class, each with its upstream status and a way to check it.
+          </p>
+          <p>
+            None of this ran live. No container could start on the research box, so the CLI traces here are the real
+            docker CLI 29.8.2 against a mock daemon. The firewall rules are moby's own golden test files, and the
+            stats arithmetic uses this sandbox's own cgroup files. Each figure says which of those it is
+            <span class="recon">reconstruction</span>.
+          </p>

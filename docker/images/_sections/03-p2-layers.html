@@ -1,0 +1,169 @@
+          <h2 id="p2-layers"><span class="secnum">{{S}}</span>Layers are tar changesets</h2>
+          <p>
+            A layer is a tar of changes against the layers below it. Additions and modifications look the same: the
+            file is simply in the tar. Duplicate paths are forbidden (<code>image-spec/layer.md:22-34</code>). When an
+            entry lands on an existing path, two directories merge their attributes; in every other case the old path
+            is unlinked and recreated, so a file can replace a directory (<code>layer.md:235-242</code>)
+            <span class="src">from the code</span>. Removals need a marker, because a tar cannot hold an absence.
+          </p>
+          <p>
+            The marker is a <em>whiteout</em>: an empty regular file named <code>.wh.&lt;name&gt;</code>. It hides only
+            lower layers, so a whiteout and a same-named file in the same layer do not cancel, and no image may contain
+            a real file whose name starts with <code>.wh.</code> (<code>layer.md:245-252</code>). An <em>opaque</em>
+            marker, <code>.wh..wh..opq</code>, hides every lower child of its directory. It takes effect before any
+            sibling entry in the same layer, wherever it sits in the stream (<code>layer.md:336</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <h3>A hand-built image with both kinds</h3>
+          <p>
+            To see real bytes I built a two-layer OCI image with Python's <code>tarfile</code>, <code>gzip</code> and
+            <code>hashlib</code> alone: <code>oci-layout</code>, <code>index.json</code> and four blobs under
+            <code>blobs/sha256/</code>. The second layer deletes <code>etc/motd</code> and replaces the contents of
+            <code>app/</code> <span class="recon">measured here</span>:
+          </p>
+<pre><code>layer 1  sha256:77c9762db241…  177 B gzip  DiffID fc4a8d294103…
+drwxr-xr-x 0/0     0 1970-01-01 00:00 etc/
+-rw-r--r-- 0/0    19 1970-01-01 00:00 etc/motd
+drwxr-xr-x 0/0     0 1970-01-01 00:00 app/
+-rw-r--r-- 0/0     2 1970-01-01 00:00 app/a.txt
+-rw-r--r-- 0/0     2 1970-01-01 00:00 app/b.txt
+
+layer 2  sha256:0c0d1c0ad60e…  168 B gzip  DiffID c9d16d2ea637…
+drwxr-xr-x 0/0     0 1970-01-01 00:00 etc/
+-rw-r--r-- 0/0     0 1970-01-01 00:00 etc/.wh.motd          whiteout: hide etc/motd
+drwxr-xr-x 0/0     0 1970-01-01 00:00 app/
+-rw-r--r-- 0/0     0 1970-01-01 00:00 app/.wh..wh..opq      opaque: hide all of lower app/
+-rw-r--r-- 0/0     2 1970-01-01 00:00 app/c.txt
+
+ChainID(layer1|layer2) = sha256:08744fd6f937…f407</code></pre>
+          <p>
+            Applied in order, the two layers give <code>{etc/, app/, app/c.txt}</code>. Each tar is 10,240 bytes,
+            Python's record size, for five entries.
+          </p>
+          <h3>What the kernel sees instead</h3>
+          <p>
+            The kernel's overlayfs has its own whiteout forms: a character device with device number 0/0 (or a
+            zero-size file with <code>trusted.overlay.whiteout</code>), and an opaque directory carrying
+            <code>trusted.overlay.opaque=y</code> (kernel <code>Documentation/filesystems/overlayfs.rst:147-156</code>).
+            containerd translates while it untars. <code>containerd/pkg/archive/tar_opts_linux.go:29-52</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	// if a directory is marked as opaque, we need to translate that to overlay
+	if base == whiteoutOpaqueDir {
+		// don't write the file itself
+		return false, unix.Setxattr(dir, "trusted.overlay.opaque", []byte{'y'}, 0)
+	}
+
+	// if a file was deleted and we are using overlay, we need to create a character device
+	if strings.HasPrefix(base, whiteoutPrefix) {
+		originalBase := base[len(whiteoutPrefix):]
+		originalPath := filepath.Join(dir, originalBase)
+
+		if err := unix.Mknod(originalPath, unix.S_IFCHR, 0); err != nil {
+			return false, err
+		}
+		// don't write the file itself
+		return false, os.Chown(originalPath, hdr.Uid, hdr.Gid)
+	}</code></pre>
+          <p>
+            The marker files are never written. Figure {{fig-overlay-whiteouts}} shows the same deletion three ways. The
+            conversion step is read from the code; I could not mount overlayfs on this box.
+          </p>
+
+          <figure class="figure wide" id="fig-overlay-whiteouts">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One deletion three ways: tar entries, overlay upperdir objects, the merged view</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 450" role="img" aria-label="Panel a lists the hand-built image's tar entries, including etc/.wh.motd and app/.wh..wh..opq. Panel b shows the snapshot directories after conversion: in the upper snapshot etc/motd is a 0/0 character device and app/ carries trusted.overlay.opaque=y. Panel c shows the merged view etc/, app/ and app/c.txt. A mount line and a copy-up arrow run along the bottom.">
+                <defs>
+                  <marker id="ow-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="ow-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="26" class="svg-lane">(A) IN THE LAYER TARS</text>
+                <text x="390" y="26" class="svg-lane">(B) ON DISK AFTER UNPACK</text>
+                <text x="770" y="26" class="svg-lane">(C) WHAT THE CONTAINER SEES</text>
+
+                <rect x="30" y="40" width="310" height="110" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="42" y="62" class="svg-step">layer 1 · fc4a8d29…</text>
+                <text x="42" y="82" class="svg-sub" style="white-space:pre">etc/motd          19 B</text>
+                <text x="42" y="100" class="svg-sub" style="white-space:pre">app/a.txt          2 B</text>
+                <text x="42" y="118" class="svg-sub" style="white-space:pre">app/b.txt          2 B</text>
+                <text x="42" y="138" class="svg-sub">(+ dirs etc/, app/)</text>
+
+                <rect x="30" y="166" width="310" height="122" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="42" y="188" class="svg-step">layer 2 · c9d16d2e…</text>
+                <text x="42" y="208" class="svg-sub" style="white-space:pre">etc/.wh.motd       0 B  regular</text>
+                <text x="42" y="226" class="svg-sub" style="white-space:pre">app/.wh..wh..opq   0 B  regular</text>
+                <text x="42" y="244" class="svg-sub" style="white-space:pre">app/c.txt          2 B</text>
+                <text x="42" y="266" class="svg-note">markers are ordinary empty files</text>
+
+                <line x1="342" y1="227" x2="384" y2="227" stroke="#252525" stroke-width="2" marker-end="url(#ow-ctl)"/>
+                <text x="344" y="216" class="svg-sub">untar</text>
+
+                <rect x="390" y="40" width="330" height="110" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="402" y="62" class="svg-step">lower snapshot · snapshots/A/fs</text>
+                <text x="402" y="82" class="svg-sub" style="white-space:pre">etc/motd       regular, 19 B</text>
+                <text x="402" y="100" class="svg-sub" style="white-space:pre">app/a.txt      regular</text>
+                <text x="402" y="118" class="svg-sub" style="white-space:pre">app/b.txt      regular</text>
+
+                <rect x="390" y="166" width="330" height="122" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="402" y="188" class="svg-step">upper snapshot · snapshots/B/fs</text>
+                <text x="402" y="208" class="svg-sub" style="white-space:pre">etc/motd       char dev, c 0 0</text>
+                <text x="402" y="226" class="svg-sub" style="white-space:pre">app/           xattr</text>
+                <text x="402" y="242" class="svg-sub" style="white-space:pre">  trusted.overlay.opaque = "y"</text>
+                <text x="402" y="260" class="svg-sub" style="white-space:pre">app/c.txt      regular, 2 B</text>
+                <text x="402" y="280" class="svg-note">mknod + setxattr; no .wh. files</text>
+
+                <line x1="722" y1="160" x2="764" y2="160" stroke="#252525" stroke-width="2" marker-end="url(#ow-ctl)"/>
+                <text x="726" y="150" class="svg-sub">mount</text>
+
+                <rect x="770" y="40" width="280" height="248" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="782" y="62" class="svg-step">merged view</text>
+                <text x="782" y="86" class="svg-sub" style="white-space:pre">etc/           (motd hidden)</text>
+                <text x="782" y="106" class="svg-sub" style="white-space:pre">app/           (a.txt, b.txt hidden)</text>
+                <text x="782" y="126" class="svg-sub">app/c.txt</text>
+                <text x="782" y="158" class="svg-note">a 0/0 char device in an upper</text>
+                <text x="782" y="174" class="svg-note">layer reads as "no such file";</text>
+                <text x="782" y="190" class="svg-note">an opaque dir stops the lookup</text>
+                <text x="782" y="206" class="svg-note">from descending into lowers</text>
+
+                <rect x="30" y="314" width="1020" height="52" rx="4" fill="#ffffff" stroke="#252525" stroke-width="1.2"/>
+                <text x="42" y="336" class="svg-lane">MOUNT (containerd overlay snapshotter, Active snapshot)</text>
+                <text x="42" y="356" class="svg-sub" style="white-space:pre">overlay  lowerdir=&lt;parent fs dirs joined by ":", immediate parent first = top&gt;,upperdir=&lt;id&gt;/fs,workdir=&lt;id&gt;/work</text>
+
+                <path d="M520,400 C600,386 700,386 780,400" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ow-state)"/>
+                <text x="30" y="404" class="svg-step">copy-up</text>
+                <text x="100" y="404" class="svg-sub">first write-open of a lower file:</text>
+                <text x="30" y="424" class="svg-sub">the whole file is copied into the upperdir</text>
+                <text x="800" y="404" class="svg-sub">container's own upperdir</text>
+                <text x="800" y="424" class="svg-note">(rw snapshot, leased by container ID)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Panel (a) is measured here from the hand-built image. Panels (b) and (c) are read from containerd's
+              <code>OverlayConvertWhiteout</code> and the kernel's overlayfs documentation, not run: no overlay mount
+              was possible on this box. Snapshot numbers A and B stand for the numeric IDs containerd allocates.
+            </p>
+          </figure>
+
+          <h3>Producers disagree on the details</h3>
+          <p>
+            The spec says producers SHOULD emit explicit whiteouts rather than opaque markers
+            (<code>layer.md:315</code>). Overlay-native differs still emit <code>.wh..wh..opq</code> whenever they find
+            <code>trusted.overlay.opaque=y</code> in an upperdir: moby's go-archive
+            (<code>archive_linux.go:69-93</code>) and continuity (<code>fs/diff_linux.go:60-75</code>). An applier that
+            handles only <code>.wh.&lt;name&gt;</code> leaks lower files (register D27). The header bytes differ too.
+            moby turns a 0/0 device back into a whiteout with mode <code>0o600</code>
+            (<code>go-archive/archive_linux.go:54-63</code>), while containerd's differ writes mode 0 and epoch-zero
+            times "since containerd v2.0" (<code>containerd/pkg/archive/tar.go:557-580</code>). The same deletion
+            yields different tar bytes, so different DiffIDs (D28) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Overlay's semantics leak into containers. Copy-up copies the whole file on the first write-access open,
+            even if nothing is written (<code>overlayfs.rst:265-288</code>). Renaming a lower directory fails with
+            <code>EXDEV</code> unless <code>redirect_dir</code> is on; this host's module has it off, and
+            <code>metacopy</code> too <span class="recon">measured here</span>. In a user namespace moby's converter switches to
+            <code>user.overlay.*</code> xattrs, while containerd skips its fast path and mounts and deletes instead (D32).
+          </p>

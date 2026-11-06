@@ -1,0 +1,59 @@
+          <h2 id="p1-specimen"><span class="secnum">{{S}}</span>Reading a real container from the inside</h2>
+          <p>
+            No Docker container ran for this teardown, but one container was always available: the research
+            sandbox itself. It is a Kubernetes pod on containerd, not a Docker container, so its choices are
+            Kubernetes' choices. The mechanics are the same ones §03 and §05 read in the code, and they can be
+            read back from <code>/proc</code> and <code>/sys/fs/cgroup</code> without any privilege. Everything
+            below was read on 23 October 2026 <span class="recon">measured here</span>; the annotations on the
+            right are mine.
+          </p>
+<pre><code>$ grep -E "^(…|Cap|NoNewPrivs|Seccomp|…)" /proc/self/status     # abridged
+CapEff:	0000000000000000                         uid 1000: nothing effective
+CapBnd:	00000000a80425fb                         bits 0,1,3-8,10,13,18,27,29,31
+NoNewPrivs:	0
+Seccomp:	0                                       no filter at all
+$ ls -l /proc/self/ns                            # abridged
+cgroup -&gt; cgroup:[4026533018]                    private
+pid -&gt; pid:[4026533017]                          private (so are ipc, mnt, net, uts)
+time -&gt; time:[4026531834]                        0xeffffffa: the initial time ns
+user -&gt; user:[4026531837]                        0xeffffffd: the initial user ns
+$ cat /proc/self/cgroup
+0::/                                             private cgroupns: own cgroup is "/"
+$ cat /sys/fs/cgroup/cpu.max
+200000 100000                                    2 CPUs of quota per period
+$ cat /sys/fs/cgroup/memory.max
+8589934592                                       8 GiB</code></pre>
+          <p>
+            The bounding set <code>0xa80425fb</code> decodes to exactly Docker's fourteen default capabilities,
+            the same list <code>moby/daemon/pkg/oci/caps/defaults.go</code>:4-21 gives. The permitted and effective
+            sets are empty because the shell runs as uid 1000, but not because of the <code>setuid</code>: runc keeps
+            the capabilities across it (<code>PR_SET_KEEPCAPS</code>) and re-applies them. The spec has no ambient set
+            (CRI strips it) and <code>/bin/sh</code> has no file capabilities, so the <code>execve</code> transformation
+            leaves permitted and effective empty (capabilities(7)) <span class="src">from the code</span>. Six namespaces are private. Time and
+            user are not: their inodes are the kernel's initial ones, and the <code>uid_map</code> is the identity
+            <code>0 0 4294967295</code>. The identity map alone would not prove that, since a non-initial user
+            namespace can carry the full identity map; the initial inode is the decisive part. So this sandbox has
+            no private time namespace, which Docker would have given it since 29.5 (§03). There is no seccomp
+            filter, Kubernetes' default "Unconfined", unlike Docker's default profile, but the process is
+            AppArmor-confined as <code>cri-containerd.apparmor.d (enforce)</code> <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The mount table shows runc's mask and read-only mechanics directly. These lines from
+            <code>/proc/self/mountinfo</code> are abridged with <code>…</code> <span class="recon">measured here</span>:
+          </p>
+<pre><code>2513 3701 0:444 /bus /proc/bus ro,…  - proc proc rw     read-only sub-bind of the one proc mount
+2519 3701 0:452 /null /proc/interrupts … - tmpfs …     /dev's tmpfs file "null" bound over it
+2518 3701 0:455 / /proc/acpi ro,relatime - tmpfs tmpfs ro     a masked dir: its own ro tmpfs
+3706 3705 0:28 / /sys/fs/cgroup ro,… - cgroup2 cgroup rw     read-only at the mount, rw superblock</code></pre>
+          <p>
+            <code>/proc/{interrupts,kcore,keys,timer_list}</code> are all binds of <code>/null</code> from the
+            container's own <code>/dev</code> tmpfs (device 0:452). <code>/proc/acpi</code>,
+            <code>/proc/scsi</code> and <code>/sys/firmware</code> are three separate tmpfs instances, so this
+            node's runtime does not share one mask tmpfs: it is runc older than 1.5.0-rc.3, or not runc at all
+            <span class="recon">reconstruction</span>. The root is an <code>overlay</code> mount with 23
+            <code>lowerdir</code>s under <code>/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/</code>
+            and upper directory 619, the layer shape <a href="../images/#p2-store">Part 2</a> builds. The cgroup
+            files show live counters too: <code>memory.oom.group</code> is 1, and <code>memory.events</code> read
+            <code>max 1499</code> with <code>oom_kill 0</code> at that moment, so the limit was hit often but
+            nothing was killed <span class="recon">measured here</span>.
+          </p>

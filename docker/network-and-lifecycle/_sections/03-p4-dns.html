@@ -1,0 +1,143 @@
+          <h2 id="p4-dns"><span class="secnum">{{S}}</span>127.0.0.11 is dockerd</h2>
+          <p>
+            On a user-defined network, a container's <code>/etc/resolv.conf</code> lists one nameserver,
+            <code>127.0.0.11</code>. No process inside the container listens there. The resolver is a Go DNS server,
+            miekg/dns v1.1.73, running as goroutines inside <code>dockerd</code>. Its UDP and TCP sockets are opened
+            <em>inside the container's network namespace</em>, on 127.0.0.11 with port 0, by a function run on a thread
+            that <code>dockerd</code> has switched into that namespace
+            (<code>moby/daemon/libnetwork/resolver.go:146-203</code>, <code>sandbox_dns_unix.go:87-94</code>)
+            <span class="src">from the code</span>. One resolver starts per sandbox, the first time an endpoint joins
+            with resolution enabled.
+          </p>
+          <p>
+            Port 0 means the kernel picks a random port, so something has to turn <code>:53</code> into that port.
+            <code>dockerd</code> writes NAT rules into the container's own nat table, in
+            <code>moby/daemon/libnetwork/resolver_unix.go:37-42</code>:
+          </p>
+<pre><code>rules := [][]string{
+	{"-t", "nat", "-I", outputChain, "-d", resolverIP, "-p", "udp", "--dport", dnsPort, "-j", "DNAT", "--to-destination", laddr},
+	{"-t", "nat", "-I", postroutingChain, "-s", resolverIP, "-p", "udp", "--sport", ipPort, "-j", "SNAT", "--to-source", ":" + dnsPort},
+	{"-t", "nat", "-I", outputChain, "-d", resolverIP, "-p", "tcp", "--dport", dnsPort, "-j", "DNAT", "--to-destination", ltcpaddr},
+	{"-t", "nat", "-I", postroutingChain, "-s", resolverIP, "-p", "tcp", "--sport", tcpPort, "-j", "SNAT", "--to-source", ":" + dnsPort},
+}</code></pre>
+          <p>
+            The chains are <code>DOCKER_OUTPUT</code> and <code>DOCKER_POSTROUTING</code>, jumped to from nat OUTPUT and
+            POSTROUTING for <code>-d 127.0.0.11</code>. A query to <code>127.0.0.11:53</code> is DNATed to the real
+            port, and the answer's source port is SNATed back to 53, so the application sees an ordinary server. In
+            nftables mode the same trick lives in a per-namespace table <code>ip docker-dns</code>. Every one of these
+            rules is IPv4. The file carries <code>// TODO IPv6 support</code>, and an IPv6-only network still gets
+            <code>nameserver 127.0.0.11</code> (D69) <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-dns-resolver">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One DNS query from a container: NAT in its namespace, an answer from dockerd, two ways out</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 470" role="img" aria-label="Inside the container network namespace an application sends a UDP query to 127.0.0.11 port 53. nat OUTPUT jumps to DOCKER_OUTPUT, which DNATs it to 127.0.0.11 at a random port, where a socket owned by a dockerd goroutine receives it. The resolver answers names from libnetwork's service records, or forwards. A host resolv.conf upstream is dialed from the host network namespace and leaves with the host's address, bypassing the bridge firewall. A --dns upstream is dialed from inside the container namespace and goes out through the veth and the bridge. The reply's source port is SNATed back to 53 in DOCKER_POSTROUTING.">
+                <defs>
+                  <marker id="dn-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="dn-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <rect x="16" y="16" width="500" height="438" rx="6" fill="#ffffff" stroke="#367f59" stroke-width="1.4" stroke-dasharray="6 4"/>
+                <text x="30" y="38" class="svg-lane">CONTAINER NETWORK NAMESPACE</text>
+                <rect x="564" y="16" width="500" height="438" rx="6" fill="#ffffff" stroke="#252525" stroke-width="1.4" stroke-dasharray="6 4"/>
+                <text x="578" y="38" class="svg-lane">HOST NETWORK NAMESPACE (DOCKERD)</text>
+
+                <rect x="34" y="54" width="220" height="62" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="46" y="76" class="svg-step">application</text>
+                <text x="46" y="96" class="svg-sub">UDP → 127.0.0.11:53</text>
+                <rect x="34" y="140" width="464" height="62" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="46" y="162" class="svg-step">nat OUTPUT → DOCKER_OUTPUT</text>
+                <text x="46" y="182" class="svg-sub">-d 127.0.0.11 --dport 53 DNAT → 127.0.0.11:&lt;random&gt;</text>
+                <rect x="34" y="226" width="464" height="80" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="46" y="248" class="svg-step">socket 127.0.0.11:&lt;random&gt;</text>
+                <text x="46" y="268" class="svg-sub">opened in this netns by a dockerd thread</text>
+                <text x="46" y="286" class="svg-sub">switched into it (InvokeFunc); owned by dockerd</text>
+                <rect x="34" y="330" width="464" height="62" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="46" y="352" class="svg-step">reply: nat POSTROUTING → DOCKER_POSTROUTING</text>
+                <text x="46" y="372" class="svg-sub">-s 127.0.0.11 --sport &lt;random&gt; SNAT → :53</text>
+                <text x="46" y="424" class="svg-note">IPv4 only ("TODO IPv6 support", D69)</text>
+
+                <line x1="144" y1="116" x2="144" y2="137" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dn-data)"/>
+                <line x1="144" y1="202" x2="144" y2="223" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dn-data)"/>
+                <line x1="380" y1="306" x2="380" y2="327" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#dn-data)"/>
+
+                <rect x="582" y="54" width="464" height="98" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="594" y="76" class="svg-step">resolver goroutines (miekg/dns)</text>
+                <text x="594" y="96" class="svg-sub">A, AAAA, PTR, SRV, MX from service records</text>
+                <text x="594" y="114" class="svg-sub">TTL 600, answers shuffled; a.b.c tries "a.b.c",</text>
+                <text x="594" y="132" class="svg-sub">then "a.b" in network c, then "a" in "b.c"</text>
+                <line x1="499" y1="262" x2="578" y2="110" stroke="#252525" stroke-width="2" marker-end="url(#dn-ctl)"/>
+                <text x="520" y="200" class="svg-sub">read</text>
+
+                <rect x="582" y="176" width="464" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="594" y="203" class="svg-sub">else forward: ≤3 upstreams, 4 s each, ≤1024 in flight</text>
+                <line x1="814" y1="152" x2="814" y2="173" stroke="#252525" stroke-width="2" marker-end="url(#dn-ctl)"/>
+
+                <rect x="582" y="246" width="224" height="146" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="594" y="268" class="svg-step">host resolv.conf upstream</text>
+                <text x="594" y="288" class="svg-sub">HostLoopback = true</text>
+                <text x="594" y="306" class="svg-sub">dialed in the host netns</text>
+                <text x="594" y="324" class="svg-sub">source: the host's address</text>
+                <text x="594" y="342" class="svg-sub">never crosses FORWARD or</text>
+                <text x="594" y="360" class="svg-sub">DOCKER-USER (D63)</text>
+                <rect x="822" y="246" width="224" height="146" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="834" y="268" class="svg-step">--dns upstream</text>
+                <text x="834" y="288" class="svg-sub">ExecFunc: dialed inside</text>
+                <text x="834" y="306" class="svg-sub">the container netns</text>
+                <text x="834" y="324" class="svg-sub">veth → bridge → FORWARD</text>
+                <text x="834" y="342" class="svg-sub">→ MASQUERADE, like any</text>
+                <text x="834" y="360" class="svg-sub">container traffic</text>
+                <line x1="694" y1="220" x2="694" y2="243" stroke="#252525" stroke-width="2" marker-end="url(#dn-ctl)"/>
+                <line x1="934" y1="220" x2="934" y2="243" stroke="#252525" stroke-width="2" marker-end="url(#dn-ctl)"/>
+                <text x="582" y="424" class="svg-note">Internal-only sandboxes: no forwarding at all, so no leak.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Read from the code (<code>resolver.go</code>, <code>resolver_unix.go</code>, <code>resolvconf.go</code>);
+              nothing here ran. The red box is the surprise: a query a container sends to a nameserver taken from the
+              host's resolv.conf leaves from the host namespace, so a DOCKER-USER rule that blocks the container's
+              egress does not block its DNS.
+            </p>
+          </figure>
+
+          <p>
+            Names come first from libnetwork's service records: container names, aliases, the 12-character short ID
+            and the hostname. A name with only an IPv4 record gets an empty authoritative AAAA answer rather than
+            being forwarded <span class="src">from the code</span>. Everything else goes upstream, and where the dial
+            happens depends on where the upstream came from, in
+            <code>moby/daemon/libnetwork/resolver.go:490-505</code>:
+          </p>
+<pre><code>if server.HostLoopback {
+	return net.DialTimeout(proto, addr, extIOTimeout)
+}
+
+var (
+	extConn net.Conn
+	dialErr error
+)
+err := r.backend.ExecFunc(func() {
+	extConn, dialErr = net.DialTimeout(proto, addr, extIOTimeout)
+})</code></pre>
+          <p>
+            Servers copied from the host's resolv.conf are marked <code>HostLoopback</code> and dialed from the host
+            namespace. That is what lets a host-local resolver such as <code>127.0.0.53</code> work. It also means the
+            query leaves with the host's address and never crosses the bridge's FORWARD chain (D63). Servers given with
+            <code>--dns</code> are dialed from inside the container. When <code>/etc/resolv.conf</code> names only
+            <code>127.0.0.53</code>, libnetwork reads <code>/run/systemd/resolve/resolv.conf</code> instead
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The container's file is generated and bind-mounted. It lists <code>nameserver 127.0.0.11</code>, keeps the
+            host's search and options, adds <code>ndots:0</code> if no ndots is present, and records the stashed
+            upstreams in a trailing <code># ExtServers: [...]</code> comment. A hash file lets <code>dockerd</code>
+            notice user edits, and after one it stops rewriting the file. The default <code>bridge</code> gets none of
+            this. Resolution is disabled there, so containers cannot find each other by name; loopback nameservers are
+            stripped, and 8.8.8.8 and 8.8.4.4 are substituted if nothing remains (D68). One comment has drifted too:
+            <code>TransformForIntNS</code> promises to "use the defaults" when there are no external nameservers, but
+            the code only appends a warning (D65) <span class="src">from the code</span>. None of this could be
+            observed here. The commands in §09 show what a live host would print
+            <span class="recon">reconstruction</span>.
+          </p>

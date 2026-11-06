@@ -1,0 +1,221 @@
+          <h2 id="p1-shim"><span class="secnum">{{S}}</span>containerd, the shim and a protobuf on stdin</h2>
+          <p>
+            dockerd does not run containers. It asks containerd to, through <code>libcontainerd/remote</code>, a
+            thin wrapper over the containerd Go client (v2.4.2 is vendored), always in the containerd namespace
+            <code>moby</code> (<code>moby/daemon/daemon.go</code>:1052-1066) <span class="src">from the code</span>.
+            Which containerd it talks to is decided once, at daemon start,
+            <code>moby/daemon/command/daemon_unix.go</code>:132-149 <span class="src">from the code</span>:
+          </p>
+<pre><code>func (cli *daemonCLI) initContainerd(ctx context.Context) (func(time.Duration) error, error) {
+	// Check embedded-containerd first so daemon.json can opt in even when
+	// packaged service units pass a default --containerd socket.
+	if cli.Config.Features["embedded-containerd"] {
+		return cli.initEmbeddedContainerd(ctx)
+	}
+	if cli.Config.ContainerdAddr != "" {
+		// use system containerd at the given address.
+		return nopWaitFunc, nil
+	}
+
+	waitTimeout, err := cli.initializeContainerd(ctx)
+	if errors.Is(err, exec.ErrNotFound) {
+		log.G(ctx).WithError(err).Info("containerd binary not found, starting embedded containerd")
+		return cli.initEmbeddedContainerd(ctx)
+	}
+	return waitTimeout, err
+}</code></pre>
+
+          <figure class="figure" id="fig-containerd-source">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Where dockerd's containerd comes from, in the order the code asks</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 680 440" role="img" aria-label="Decision tree. If the embedded-containerd feature is on, containerd runs inside dockerd. Otherwise, if a containerd address is configured, dockerd uses it. Otherwise, if the system containerd socket exists, dockerd uses it. Otherwise dockerd starts and supervises its own containerd, and if the binary is missing it falls back to the embedded mode.">
+                <defs>
+                  <marker id="fig-containerd-source-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">THE QUESTION</text>
+                <text x="404" y="22" class="svg-lane">THE CONTAINERD</text>
+
+                <rect x="20" y="36" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="56" class="svg-step">embedded-containerd feature on?</text>
+                <text x="32" y="74" class="svg-sub">daemon.json "features"</text>
+                <rect x="404" y="36" width="256" height="50" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="416" y="56" class="svg-step">embedded in dockerd</text>
+                <text x="416" y="74" class="svg-sub">experimental, since 29.7.0</text>
+                <line x1="340" y1="61" x2="400" y2="61" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="356" y="54" class="svg-sub">yes</text>
+                <line x1="180" y1="86" x2="180" y2="114" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="190" y="104" class="svg-sub">no</text>
+
+                <rect x="20" y="116" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="136" class="svg-step">--containerd address set?</text>
+                <text x="32" y="154" class="svg-sub">the stock docker.service sets it</text>
+                <rect x="404" y="116" width="256" height="50" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="416" y="136" class="svg-step">that containerd</text>
+                <text x="416" y="154" class="svg-sub">packaged installs end here</text>
+                <line x1="340" y1="141" x2="400" y2="141" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="356" y="134" class="svg-sub">yes</text>
+                <line x1="180" y1="166" x2="180" y2="194" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="190" y="184" class="svg-sub">no</text>
+
+                <rect x="20" y="196" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="216" class="svg-step">system socket present?</text>
+                <text x="32" y="234" class="svg-sub">Lstat /run/containerd/containerd.sock</text>
+                <rect x="404" y="196" width="256" height="50" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="416" y="216" class="svg-step">system containerd</text>
+                <text x="416" y="234" class="svg-sub">a separate service</text>
+                <line x1="340" y1="221" x2="400" y2="221" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="356" y="214" class="svg-sub">yes</text>
+                <line x1="180" y1="246" x2="180" y2="274" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="190" y="264" class="svg-sub">no</text>
+
+                <rect x="20" y="276" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="296" class="svg-step">exec the containerd binary</text>
+                <text x="32" y="314" class="svg-sub">initializeContainerd → supervisor</text>
+                <rect x="404" y="276" width="256" height="50" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="416" y="296" class="svg-step">supervised child</text>
+                <text x="416" y="314" class="svg-sub">Pdeathsig SIGKILL: dies with dockerd</text>
+                <line x1="340" y1="301" x2="400" y2="301" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="350" y="294" class="svg-sub">found</text>
+                <line x1="180" y1="326" x2="180" y2="364" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="190" y="348" class="svg-sub">exec.ErrNotFound</text>
+
+                <rect x="20" y="366" width="320" height="50" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="32" y="386" class="svg-step">embedded fallback</text>
+                <text x="32" y="404" class="svg-sub">automatic since 29.8.0</text>
+                <text x="404" y="386" class="svg-note">shims still run as separate</text>
+                <text x="404" y="404" class="svg-note">processes in every branch</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Three of five branches end at a separate containerd process; two end inside dockerd. The fallback at
+              the bottom is invisible in <code>docker info</code>. From <code>daemon_unix.go</code>:132-149 and
+              <code>daemon.go</code>:1088-1102, 1167-1195 <span class="src">from the code</span>.
+            </p>
+          </figure>
+
+          <p>
+            The two embedded branches are new. The experimental feature arrived in 29.7.0 (<code>a8a1cfd111</code>);
+            the automatic fallback when the binary is missing, no system containerd runs and no address is set
+            arrived in 29.8.0 (<code>b25f366ced</code>). Packaged installs never hit it, because
+            <code>contrib/init/systemd/docker.service</code>:15 starts <code>dockerd -H fd://
+            --containerd=/run/containerd/containerd.sock</code>. A hand-started dockerd can. It then registers a
+            smaller plugin set (no CRI, sandbox, streaming, transfer, NRI or restart monitor), and
+            <code>docker info</code> shows nothing: the warning is gated on the feature flag the fallback never
+            sets, and even <code>Containerd.Address</code> is the same path a supervised daemon would use
+            (<code>moby/daemon/info.go</code>:255-268; finding D7, class D) <span class="src">from the code</span>.
+            Embedded mode still runs separate shims and still serves a real ttrpc socket for their events
+            (<code>moby/daemon/internal/containerd/server/embedded/server.go</code>:87-90) <span class="src">from the code</span>.
+          </p>
+
+          <h3>A container with no rootfs</h3>
+          <p>
+            At start, <code>ReplaceContainer</code> creates the containerd container object, deleting any stale one
+            with the same ID first (<code>moby/daemon/internal/libcontainerd/replace.go</code>:17-60). It carries the OCI spec,
+            the runtime name and options, and a label <code>com.docker/engine.bundle.path</code>, but no snapshot
+            key, so containerd never mounts the root filesystem for Docker. dockerd mounted it already and put
+            the absolute path in the spec (<code>libcontainerd/remote/client.go</code>:119-146)
+            <span class="src">from the code</span>. I/O is named FIFOs in
+            <code>/var/run/docker/containerd/&lt;id&gt;/</code>, named after the process: for the container's own
+            process <code>&lt;id&gt;-stdin</code>, <code>&lt;id&gt;-stdout</code>, and <code>&lt;id&gt;-stderr</code> only without a TTY
+            (<code>libcontainerd/remote/client.go</code>:218; <code>client_linux.go</code>:92-120).
+          </p>
+          <p>
+            containerd's task manager writes the bundle first,
+            <code>/run/containerd/io.containerd.runtime.v2.task/moby/&lt;id&gt;/</code> with
+            <code>config.json</code>, then starts the shim, then calls its Create
+            (<code>containerd/core/runtime/v2/task_manager.go</code>:158-200). The runtime name <code>io.containerd.runc.v2</code>
+            becomes the binary <code>containerd-shim-runc-v2</code> (<code>containerd/pkg/shim/util.go</code>:41-49)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>The shim starts twice</h3>
+          <p>
+            containerd launches the shim in its own process group with <code>GOMAXPROCS=2</code>,
+            <code>TTRPC_ADDRESS</code>, <code>GRPC_ADDRESS</code> and <code>NAMESPACE</code> in its environment:</p>
+<pre><code>containerd-shim-runc-v2 -namespace moby -address &lt;containerd.sock&gt; \
+    -publish-binary &lt;containerd&gt; -id &lt;id&gt; [-bundle &lt;bundle&gt;] start</code></pre>
+          <p>
+            Since containerd v2.3.0 it also writes a protobuf <code>BootstrapParams</code> message to the shim's
+            stdin (<code>containerd/core/runtime/v2/command.go</code>:67-158) <span class="src">from the code</span>.
+            That <code>start</code> process is only a launcher. It re-execs itself without the action as the
+            long-lived server, with <code>GOMAXPROCS=4</code> and its own process group, hands it a listening
+            socket, writes the answer to stdout and exits,
+            <code>containerd/cmd/containerd-shim-runc-v2/manager/manager_linux.go</code>:188-190, 253, 296-297
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	var params bootapi.BootstrapResult
+	params.Version = 3
+	params.Protocol = "ttrpc"
+…
+	if err := cmd.Start(); err != nil {
+…
+	params.Address = sockets[0].addr
+	return &amp;params, nil</code></pre>
+          <p>
+            The address is a hash. <code>containerd/pkg/shim/util_unix.go</code>:82-87 joins containerd's socket
+            path, the namespace and the container ID and takes the sha256:
+            <code>d := sha256.Sum256([]byte(path))</code>, then
+            <code>fmt.Sprintf("unix://%s/%x", socketRoot, d)</code> with the root <code>/run/containerd/s</code>.
+            For the ID in the trace, <code>4f1c0ffee000…</code>, that gives the following, computed from the
+            code and not observed <span class="recon">reconstruction</span>:
+          </p>
+<pre><code>path-hashed: /run/containerd/containerd.sock/moby/4f1c0ffee0000000000000000000000000000000000000000000000000000000
+unix:///run/containerd/s/3cbd891cf0891a016d6a3084ea8be730eb173321caf9b4c613b53c828d5e8bb0</code></pre>
+          <p>
+            containerd saves that address in the bundle as <code>bootstrap.json</code>, so a restarted containerd
+            can find running shims again (<code>containerd/core/runtime/v2/binary.go</code>:124-142). Calls go down
+            on the ttrpc service <code>containerd.task.v3.Task</code>, whose proto calls the shim "the parent of
+            each container" (<code>containerd/api/runtime/task/v3/shim.proto</code>:29-32)
+            <span class="src">from the code</span>. The shim then makes that true with
+            <code>PR_SET_CHILD_SUBREAPER</code>. Its <code>Create</code> runs runc through go-runc, with runc's state under Docker's
+            exec root, and waits for it to exit (<code>process/init.go</code>:82-94, 110-151):</p>
+<pre><code>runc --root /var/run/docker/runtime-runc/moby --log &lt;bundle&gt;/log.json --log-format json \
+    create --bundle &lt;bundle&gt; --pid-file &lt;bundle&gt;/init.pid --console-socket &lt;tmp.sock&gt; &lt;id&gt;</code></pre>
+          <p> With <code>-t</code> no pipes are made: runc's init allocates the pty inside the container and
+            sends the master fd back over the console socket with <code>SCM_RIGHTS</code>, and the shim pumps
+            master and FIFOs with an epoll copier (<code>process/init.go</code>:110-168)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>Exit codes, and who computes them</h3>
+          <p>
+            Failures on this path come back as exit codes, and Figure {{fig-exit-codes}} shows that three
+            different places compute them. Two of them compare error <em>text</em>. The CLI's
+            <code>toStatusError</code> maps "executable file not found" or "no such file or directory" to 127
+            and EACCES or EISDIR text to 126 (<code>cli/cli/command/container/run.go</code>:326-356). The daemon
+            appends EACCES text to an EISDIR error "because docker/cli checks whether the error message contains
+            syscall.EACCESS.Error()" and maps ENOTDIR, a file bind-mounted onto a directory, to 127 "command not
+            found" (<code>moby/daemon/errors.go</code>:136-157; findings D1 and D2, class D)
+            <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure" id="fig-exit-codes">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The exit codes of <code>docker run</code>, and which program decides each one</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Code</th><th>Means</th><th>Decided by</th><th>How</th></tr></thead>
+                <tbody>
+                  <tr><td>0, 1…</td><td>the process's own status</td><td class="hl-green" style="background: var(--green-soft)">shim reaper</td><td><code>wait4</code> status, carried up to the wait body</td></tr>
+                  <tr><td>125</td><td>Docker failed</td><td class="hl-blue" style="background: var(--blue-soft)">CLI</td><td>any error that matches neither text below; any wait error</td></tr>
+                  <tr><td>126</td><td>cannot invoke</td><td class="hl-orange" style="background: var(--orange-soft)">CLI and daemon</td><td>substring "permission denied"; EISDIR rewritten to contain it</td></tr>
+                  <tr><td>127</td><td>not found</td><td class="hl-orange" style="background: var(--orange-soft)">CLI and daemon</td><td>"executable file not found", "no such file…"; ENOTDIR</td></tr>
+                  <tr><td>137</td><td>SIGKILL</td><td class="hl-green" style="background: var(--green-soft)">shim reaper</td><td>128 + 9; also an OOM kill, and a lost process with no recorded status</td></tr>
+                  <tr><td>143</td><td>SIGTERM</td><td class="hl-green" style="background: var(--green-soft)">shim reaper</td><td>128 + 15, e.g. a clean <code>docker stop</code></td></tr>
+                  <tr><td>255</td><td>status unknown</td><td class="hl-blue" style="background: var(--blue-soft)">daemon restore</td><td>the task vanished while dockerd was down</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Only the signal codes come from the kernel's view of the process; 125 to 127 are string matches on
+              both sides of the socket. From <code>run.go</code>:326-356, <code>errors.go</code>:136-166,
+              <code>containerd/pkg/sys/reaper/reaper_unix.go</code>:280-289 (<code>exitSignalOffset = 128</code>),
+              <code>manager_linux.go</code>:360-364 and <code>moby/daemon/daemon.go</code>:528
+              <span class="src">from the code</span>. None was reproduced on a live host.
+            </p>
+          </figure>

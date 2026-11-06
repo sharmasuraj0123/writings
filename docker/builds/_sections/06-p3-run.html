@@ -1,0 +1,104 @@
+          <h2 id="p3-run"><span class="secnum">{{S}}</span>RUN, mounts and the runc executor</h2>
+          <p>
+            A <code>RUN</code> step is a container, but not one that Docker's own run path ever sees.
+            <a href="../run-path/#p1-shim">Part 1</a> follows <code>docker run</code> from dockerd through containerd and
+            a shim to <code>runc</code>. dockerd's embedded BuildKit skips the middle: it builds BuildKit's own
+            <code>runcexecutor</code> and hands it the name of the <code>runc</code> binary
+            (<code>moby/daemon/internal/builder-next/executor_linux.go:56-59, 80-86</code>):
+          </p>
+<pre><code>	// TODO: FIXME: testing env var, replace with something better or remove in a major version or two
+	runcCmds := []string{"runc"}
+	if runcOverride := os.Getenv("DOCKER_BUILDKIT_RUNC_COMMAND"); runcOverride != "" {
+		runcCmds = []string{runcOverride}
+…
+	exec, err := runcexecutor.New(runcexecutor.Opt{
+		Root:                filepath.Join(opts.root, "executor"),
+		CommandCandidates:   runcCmds,
+		DefaultCgroupParent: opts.cgroupParent,
+		Rootless:            opts.rootless,
+		NoPivot:             os.Getenv("DOCKER_RAMDISK") != "",
+		IdentityMapping:     idmap,</code></pre>
+          <p>
+            No containerd task is created, so build containers appear in neither <code>docker ps</code> nor
+            <code>ctr</code>, and containerd events and runtime classes never apply to them. That is register D57,
+            class D, unchanged on moby <code>master</code> <span class="src">from the code</span>. The claim is code
+            inference here; on a real host, <code>sudo ctr -n moby c ls</code> and <code>ps -ef | grep runc</code>
+            during a long <code>RUN sleep 60</code> would show it.
+          </p>
+          <h3>The network: the last prestart hook</h3>
+          <p>
+            The default build network is a libnetwork sandbox on Docker's <code>bridge</code> network; <code>host</code>
+            and <code>none</code> are BuildKit's built-in providers (<code>executor_linux.go:23-31</code>). Attaching a
+            build container to <code>bridge</code> uses an older mechanism than <code>docker run</code> does. The
+            sandbox is created with <code>OptionUseExternalKey</code>, and runc runs a <code>libnetwork-setkey</code>
+            re-exec of dockerd as an OCI <em>prestart hook</em>. The hook reads the runtime's <code>specs.State</code>
+            JSON on stdin and sends <code>{ContainerID, Key}</code> over the unix socket
+            <code>/run/docker/libnetwork/&lt;short-controller-id&gt;.sock</code>
+            (<code>moby/daemon/libnetwork/sandbox_externalkey_unix.go:26-190</code>). The network namespace does not
+            exist yet when the endpoint joins, so <code>sbJoin</code> defers addresses and routes until
+            <code>SetKey</code> arrives (<code>libnetwork/endpoint.go:544-567</code>). The endpoint is created with
+            <code>CreateOptionDisableResolution</code>, so a build step does not get the embedded DNS server that
+            <a href="../network-and-lifecycle/#p4-dns">Part 4</a> describes <span class="src">from the code</span>. Since
+            v0.31.0 BuildKit also has an optional proxy network mode, and dockerd wires it when
+            <code>proxyprovider.Supported()</code> holds, with a loopback-filtered host provider
+            (<code>executor_linux.go:62-78</code>).
+          </p>
+          <h3>Five mount types</h3>
+          <p>
+            <code>RUN --mount</code> accepts <code>bind</code> (the default), <code>cache</code>, <code>tmpfs</code>,
+            <code>secret</code> and <code>ssh</code>, with sharing modes <code>shared</code>, <code>private</code> and
+            <code>locked</code>; <code>mode</code>, <code>uid</code> and <code>gid</code> are rejected on bind and tmpfs
+            (<code>frontend/dockerfile/instructions/commands_runmount.go:13-42, 268-280</code>)
+            <span class="src">from the code</span>. Each lowers to an exec mount in LLB, and each has its own runtime
+            shape:
+          </p>
+          <ul>
+            <li><strong>bind</strong> is read-only unless <code>rw</code> is given. With <code>rw</code> it is marked
+              <code>ForceNoOutput</code>, so writes are discarded and never become a layer
+              (<code>dockerfile2llb/convert_runmount.go:103-107</code>).</li>
+            <li><strong>cache</strong> without <code>id</code> uses the cleaned target path as its ID, namespaced by the
+              frontend's <code>cacheIDNamespace</code>, and becomes <code>llb.AsPersistentCacheDir</code>
+              (<code>convert_runmount.go:69-120</code>). At run time it is a retained mutable snapshot found through the
+              metadata index <code>cache-dir:&lt;id&gt;[:&lt;base ref&gt;]</code>. <code>shared</code> hands one ref to
+              every concurrent user, <code>private</code> makes a new ref when the existing one is locked, and
+              <code>locked</code> polls every 100 ms until the holder lets go
+              (<code>solver/llbsolver/mounts/mount.go:68-154, 459-460</code>).</li>
+            <li><strong>secret</strong> is a fresh tmpfs (<code>nodev,nosuid</code>, plus <code>noexec</code> unless the
+              mode has an exec bit) in a 0711 temporary directory. The bytes are written to a random file name with mode
+              0600 and chowned to the requested uid and gid; the default target is <code>/run/secrets/&lt;id&gt;</code>
+              (<code>mounts/secretmount_unix.go:16-75</code>).</li>
+            <li><strong>ssh</strong> defaults to <code>/run/buildkit/ssh_agent.&lt;n&gt;</code> and sets
+              <code>SSH_AUTH_SOCK</code> to the first one if the user has not (<code>client/llb/exec.go:155-164</code>).</li>
+          </ul>
+          <p>
+            Read together with <a href="#p3-solver">§04</a>, the rules line up. Secret, SSH and tmpfs mounts never feed
+            the cache key, and a writable mount with output stays definition-keyed. A cache mount is state outside the
+            graph: its contents can differ between two runs of a step with the same key
+            <span class="recon">reconstruction</span>.
+          </p>
+          <h3>Garbage collection takes cache mounts first</h3>
+          <p>
+            dockerd's builder GC is on unless explicitly disabled. With nothing configured, the limits are 10 % of the
+            disk reserved, 80 % max used and 20 % min free, each computed as (whole GiB in that share of the disk + 1) × 10^9 bytes,
+            or 2 GB reserved if the disk cannot be stat'ed (<code>moby/daemon/config/builder.go:94-96</code>;
+            <code>worker/gc.go:74-79</code>). The first rule is the odd one
+            (<code>moby/daemon/internal/builder-next/worker/gc.go:18, 44-50</code>):
+          </p>
+<pre><code>// tempCachePercent represents the percentage ratio of the cache size in bytes to temporarily keep for a short period of time (couple of days)
+…
+	return []client.PruneInfo{
+		// if build cache uses more than 512MB delete the most easily reproducible data after it has not been used for 2 days
+		{
+			Filter:       []string{"type==source.local", "type==exec.cachemount", "type==source.git.checkout"},
+			KeepDuration: 48 * time.Hour,
+			MaxUsedSpace: tempCacheReservedSpace,
+		},</code></pre>
+          <p>
+            <code>tempCachePercent</code> is <code>math.E * math.Pi * math.Phi</code>, which the comment calls
+            "a mathematically pleasing" choice of about 13.8, with a 512 MB floor. So cache mounts, synced contexts and git
+            checkouts unused for 48 hours go first once they pass about 13.8 % of the reserved space (register D58,
+            class D) <span class="src">from the code</span>. A worked case: on a disk of 100 × 10^9 bytes, 10 % is
+            10^10 bytes, which <code>diskPercentage</code> counts as 9 whole GiB, so the reserve is
+            <code>(9 + 1) × 10^9</code> = 10 GB and the cache-mount threshold is about 1.38 GB
+            <span class="recon">reconstruction</span>, arithmetic on <code>worker/gc.go:74-77</code>.
+          </p>

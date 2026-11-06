@@ -1,0 +1,314 @@
+          <h2 id="p4-network"><span class="secnum">{{S}}</span>A bridge, a veth and a published port</h2>
+          <p>
+            runc makes the network namespace; <code>dockerd</code> adopts it. For a bridge container the OCI spec
+            carries a <code>network</code> namespace entry with an empty path, so runc creates a fresh one
+            (<code>moby/daemon/oci_linux.go:242-270</code>). After the task is created, and before its process runs,
+            <code>initializeCreatedTask</code> calls <code>sb.SetKey("/proc/&lt;pid&gt;/ns/net")</code> and then
+            <code>allocateNetwork</code> (<code>moby/daemon/start_linux.go:17-43</code>). No OCI hook is involved for
+            <code>docker run</code> any more. The old <code>libnetwork-setkey</code> prestart hook was removed in 26.0,
+            restored in 26.1 and removed again in 28.0. It survives only for BuildKit's <code>RUN</code> steps on the
+            default bridge <span class="src">from the code</span>. <code>SetKey</code> pins the namespace with a bind
+            mount, so it outlives any one process, in
+            <code>moby/daemon/libnetwork/osl/namespace_linux.go:152-158</code>:
+          </p>
+<pre><code>func mountNetworkNamespace(basePath string, lnPath string) error {
+	err := syscall.Mount(basePath, lnPath, "bind", syscall.MS_BIND, "")
+	if err != nil {
+		return fmt.Errorf("bind-mount %s -&gt; %s: %w", basePath, lnPath, err)
+	}
+	return nil
+}</code></pre>
+          <p>
+            The target is a file under <code>/var/run/docker/netns/</code> named by a 12-character key. The bridge
+            driver then creates a veth pair. The host end is <code>veth</code> plus seven random hex characters,
+            enslaved to <code>docker0</code> or <code>br-&lt;12 chars of network ID&gt;</code>. When the namespace path
+            is already known, the peer is created directly inside it and renamed to the lowest free <code>ethN</code>.
+            Since 28.0.0 the container's MAC is random and locally administered. Before that it was
+            <code>02:42:</code> plus the IPv4 address, and overlay endpoints still are
+            (<code>bridge_linux.go:1249-1299</code>, <code>netutils/utils.go:40-46</code>)
+            <span class="src">from the code</span>. One detail of the setup steps is a doc drift. The driver sets the
+            filter-FORWARD policy to DROP only when <em>it</em> flipped <code>ip_forward</code> from 0 to 1, while the
+            docs state the DROP unconditionally (D64, <code>setup_ip_forwarding.go:38-59</code>).
+          </p>
+          <h3>What <code>-p 8080:80</code> builds</h3>
+          <p>
+            Publishing starts by normalising the request. With no host IP and the default <code>--ip=0.0.0.0</code>,
+            one <code>-p</code> becomes two bindings: one on <code>0.0.0.0</code> and one on <code>[::]</code>. If the
+            container has no IPv6 address, the IPv6 binding targets its IPv4 address, which only a user-space relay can
+            do (D67, <code>port_mapping_linux.go:195-289</code>). The <code>nat</code> portmapper then reserves the host
+            port for real: <code>dockerd</code> calls <code>socket</code>, <code>bind</code> and, for TCP,
+            <code>listen</code> on each host address. A listening socket could accept connections before any DNAT rule
+            exists, so a one-instruction cBPF program is attached first. It returns 0, which tells the kernel to drop
+            every packet, and TCP clients simply retransmit their SYN
+            (<code>portallocator/osallocator_linux.go:192-200, 300-305</code>) <span class="src">from the code</span>.
+            Ephemeral ports for <code>-p 80</code> or <code>-P</code> come from the kernel's
+            <code>ip_local_port_range</code>, which on this sandbox reads 32768–60999 with no reserved ports
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The order inside <code>mapPorts</code> is: bind the sockets, add the firewall rules, detach the filter,
+            start <code>docker-proxy</code> with the bound socket as fd 4 and a status pipe as fd 3, and close
+            <code>dockerd</code>'s copy (<code>port_mapping_linux.go:105-193</code>). Each proxy is started from a
+            goroutine locked to its OS thread, because <code>Pdeathsig</code> fires when the creating <em>thread</em>
+            dies (go.dev/issue/27505). That is one <code>dockerd</code> thread per published binding, two per
+            <code>-p</code> with IPv6 (D76) <span class="src">from the code</span>. The installed
+            <code>docker-proxy -help</code> lists exactly <code>-container-ip</code>, <code>-container-port</code>, <code>-host-ip</code>,
+            <code>-host-port</code>, <code>-proto</code>, <code>-use-listen-fd</code>, <code>-v</code> and
+            <code>-version</code> <span class="recon">measured here</span>. The DNAT rule itself is built
+            in <code>moby/daemon/libnetwork/drivers/bridge/internal/iptabler/port.go:94-114</code>:
+          </p>
+<pre><code>hostIP := "0/0"
+if !b.HostIP.IsUnspecified() {
+	hostIP = b.HostIP.String()
+}
+args := []string{
+	"-p", b.Proto.String(),
+	"-d", hostIP,
+	"--dport", strconv.Itoa(int(b.HostPort)),
+	"-j", "DNAT",
+	"--to-destination", net.JoinHostPort(b.IP.String(), strconv.Itoa(int(b.Port))),
+}
+if !n.ipt.config.Hairpin {
+	args = append(args, "!", "-i", n.config.IfName)
+}</code></pre>
+          <p>
+            <code>Hairpin</code> is true only when the userland proxy is off. With the default proxy on, the rule skips
+            packets that arrive on the bridge, and the nat-OUTPUT jump skips <code>127.0.0.0/8</code>. So the kernel
+            DNATs every remote connection, and <code>docker-proxy</code> carries three cases: connections to a loopback
+            host address, a container reaching a published port through a host address, and host IPv6 to a
+            container's IPv4 (Figure {{fig-port-publish-path}}). The proxy holds the port in every case, but carries
+            almost none of the traffic <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-port-publish-path">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Three ways a packet reaches 192.168.0.2:80 after <code>-p 8080:80</code></p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 556" role="img" aria-label="Row A: a remote client's packet to a host address on port 8080 passes nat PREROUTING, is DNATed in the DOCKER chain to 192.168.0.2:80, and is accepted by the filter chains into the container. Row B: a host process connecting to 127.0.0.1:8080 skips the nat OUTPUT jump and is accepted by docker-proxy, which opens a new connection to the container. Row C: a container on the same bridge connecting to a host address arrives on br-dummy, is excluded from DNAT, and is relayed by docker-proxy. A bottom band lists what changes with --userland-proxy=false.">
+                <defs>
+                  <marker id="pp-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="21" y="24" class="svg-lane">(A) A REMOTE CLIENT: DNAT IN THE KERNEL</text>
+                <rect x="21" y="36" width="240" height="88" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="33" y="58" class="svg-step">remote client</text>
+                <text x="33" y="78" class="svg-sub">dst &lt;host address&gt;:8080</text>
+                <text x="33" y="96" class="svg-sub">arrives on the host's NIC</text>
+                <rect x="287" y="36" width="240" height="88" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="299" y="58" class="svg-step">nat PREROUTING</text>
+                <text x="299" y="78" class="svg-sub">-m addrtype --dst-type LOCAL</text>
+                <text x="299" y="96" class="svg-sub">-j DOCKER</text>
+                <rect x="553" y="36" width="240" height="88" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="565" y="58" class="svg-step">nat DOCKER</text>
+                <text x="565" y="78" class="svg-sub">! -i br-dummy --dport 8080</text>
+                <text x="565" y="96" class="svg-sub">DNAT → 192.168.0.2:80</text>
+                <rect x="819" y="36" width="240" height="88" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="831" y="58" class="svg-step">filter FORWARD → container</text>
+                <text x="831" y="78" class="svg-sub">DOCKER-FORWARD → -BRIDGE</text>
+                <text x="831" y="96" class="svg-sub">→ DOCKER: ACCEPT :80</text>
+                <text x="831" y="114" class="svg-sub">→ veth → eth0</text>
+                <line x1="262" y1="80" x2="284" y2="80" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="528" y1="80" x2="550" y2="80" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="794" y1="80" x2="816" y2="80" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+
+                <text x="21" y="160" class="svg-lane">(B) THE HOST ITSELF: CURL 127.0.0.1:8080</text>
+                <rect x="21" y="172" width="240" height="88" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="33" y="194" class="svg-step">process on the host</text>
+                <text x="33" y="214" class="svg-sub">connect 127.0.0.1:8080</text>
+                <text x="33" y="232" class="svg-sub">leaves via nat OUTPUT</text>
+                <rect x="287" y="172" width="240" height="88" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="299" y="194" class="svg-step">nat OUTPUT</text>
+                <text x="299" y="214" class="svg-sub">! -d 127.0.0.0/8 … -j DOCKER</text>
+                <text x="299" y="232" class="svg-sub">loopback skipped: no DNAT</text>
+                <rect x="553" y="172" width="240" height="88" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="565" y="194" class="svg-step">docker-proxy (user space)</text>
+                <text x="565" y="214" class="svg-sub">accept() on fd 4, the socket</text>
+                <text x="565" y="232" class="svg-sub">dockerd bound and filtered</text>
+                <rect x="819" y="172" width="240" height="88" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="831" y="194" class="svg-step">a second connection</text>
+                <text x="831" y="214" class="svg-sub">proxy → 192.168.0.2:80</text>
+                <text x="831" y="232" class="svg-sub">bytes copied both ways</text>
+                <line x1="262" y1="216" x2="284" y2="216" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="528" y1="216" x2="550" y2="216" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="794" y1="216" x2="816" y2="216" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+
+                <text x="21" y="296" class="svg-lane">(C) HAIRPIN: A CONTAINER TO A PUBLISHED PORT</text>
+                <rect x="21" y="308" width="240" height="88" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="33" y="330" class="svg-step">container on br-dummy</text>
+                <text x="33" y="350" class="svg-sub">connect &lt;host address&gt;:8080</text>
+                <text x="33" y="368" class="svg-sub">enters the host from the bridge</text>
+                <rect x="287" y="308" width="240" height="88" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="299" y="330" class="svg-step">nat PREROUTING → DOCKER</text>
+                <text x="299" y="350" class="svg-sub">-i br-dummy: the DNAT rule's</text>
+                <text x="299" y="368" class="svg-sub">! -i br-dummy excludes it</text>
+                <rect x="553" y="308" width="240" height="88" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="565" y="330" class="svg-step">docker-proxy on 0.0.0.0:8080</text>
+                <text x="565" y="350" class="svg-sub">a local socket accepts it</text>
+                <text x="565" y="368" class="svg-sub">(also: host v6 → v4-only ctr)</text>
+                <rect x="819" y="308" width="240" height="88" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="831" y="330" class="svg-step">→ 192.168.0.2:80</text>
+                <text x="831" y="350" class="svg-sub">reply returns through the</text>
+                <text x="831" y="368" class="svg-sub">proxy, so the path is symmetric</text>
+                <line x1="262" y1="352" x2="284" y2="352" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="528" y1="352" x2="550" y2="352" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+                <line x1="794" y1="352" x2="816" y2="352" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#pp-data)"/>
+
+                <rect x="21" y="424" width="1038" height="116" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2"/>
+                <text x="33" y="446" class="svg-lane">INSET: --USERLAND-PROXY=FALSE (MOBY'S GOLDEN DIFF)</text>
+                <text x="33" y="470" class="svg-sub">nat OUTPUT     loses ! -d 127.0.0.0/8, so loopback is DNATed too</text>
+                <text x="33" y="490" class="svg-sub">nat DOCKER     DNAT loses ! -i br-dummy, so hairpin is DNATed too</text>
+                <text x="33" y="510" class="svg-sub">POSTROUTING    + MASQUERADE -o br-dummy --src-type LOCAL</text>
+                <text x="33" y="530" class="svg-sub">POSTROUTING    + MASQUERADE -s 192.168.0.2 -d 192.168.0.2 --dport 80</text>
+                <text x="620" y="470" class="svg-sub">bridge ports: hairpin mode on</text>
+                <text x="620" y="490" class="svg-sub">route_localnet = 1 on br-dummy</text>
+                <text x="620" y="510" class="svg-sub">br_netfilter required</text>
+                <text x="620" y="530" class="svg-sub">no [::] binding for a v4-only ctr</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Rules from moby's golden test files for one container 192.168.0.2 on <code>br-dummy</code> (the real
+              firewaller code run by moby's tests, not a live host); the paths through them are read from the code.
+              Blue boxes are netfilter, orange is user space, green is the container. With the proxy on, the proxy holds
+              the port but only rows B and C pass through it. The inset's last line is D67: turning the proxy off
+              silently drops the only IPv6 path to an IPv4-only container.
+            </p>
+          </figure>
+
+          <h3>The chains</h3>
+          <p>
+            Docker puts one rule into the built-in filter FORWARD chain, <code>-j DOCKER-FORWARD</code>. The controller
+            later inserts <code>-j DOCKER-USER</code> above it, so user rules run first, and <code>dockerd</code> never
+            deletes rules there. <code>DOCKER-FORWARD</code> fans out to <code>DOCKER-CT</code>,
+            <code>DOCKER-INTERNAL</code> and <code>DOCKER-BRIDGE</code>, which jumps to <code>DOCKER</code>. There, one
+            ACCEPT per published port sits above a final DROP for traffic entering the bridge
+            (<code>iptabler/iptabler.go:205-226</code>, <code>firewall_linux.go:30-77</code>). The old
+            <code>DOCKER-ISOLATION-STAGE-1/2</code> chains are now only deleted <span class="src">from the code</span>.
+            Each endpoint also gets a raw-table DROP for packets addressed to the container that did not arrive on its
+            bridge, the "direct routing" block of 28.x. Publishing on <code>127.0.0.1</code> adds
+            <code>raw PREROUTING -d 127.0.0.1 --dport 8080 ! -i lo -j DROP</code>. Before 28.0.0 such a port was
+            reachable from the same L2 segment, and <code>DOCKER_INSECURE_NO_IPTABLES_RAW=1</code> still removes both
+            kinds of drop silently (D75). In <code>routed</code> gateway mode there is no NAT, so the host port is
+            ignored and <code>-p 8080:80</code> opens container port 80 (D74). Figure {{fig-iptables-chains}} draws the
+            default rule set and its nftables twin.
+          </p>
+
+          <figure class="figure wide" id="fig-iptables-chains">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Built-in chains, Docker's chains and the nftables <code>docker-bridges</code> table for the same container</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 600" role="img" aria-label="Left: built-in chains raw PREROUTING, filter FORWARD, nat PREROUTING, nat OUTPUT and nat POSTROUTING with Docker's rules. Middle: DOCKER-USER, DOCKER-FORWARD and the chains it jumps to, ending in DOCKER with an ACCEPT for port 80 and a DROP, plus the nat DOCKER chain with the DNAT rule. Right: the nftables table docker-bridges with verdict maps keyed by interface name, per-bridge chains and comments.">
+                <defs>
+                  <marker id="ic-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">BUILT-IN CHAINS</text>
+                <text x="330" y="22" class="svg-lane">DOCKER'S CHAINS (IPTABLES)</text>
+                <text x="724" y="22" class="svg-lane">NFTABLES: TABLE IP DOCKER-BRIDGES</text>
+
+                <rect x="20" y="34" width="270" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="54" class="svg-step">raw PREROUTING</text>
+                <text x="32" y="74" class="svg-sub">-d 192.168.0.2 ! -i br-dummy DROP</text>
+
+                <rect x="20" y="104" width="270" height="74" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="124" class="svg-step">filter FORWARD</text>
+                <text x="32" y="144" class="svg-sub">-j DOCKER-USER   (controller)</text>
+                <text x="32" y="162" class="svg-sub">-j DOCKER-FORWARD</text>
+
+                <rect x="20" y="300" width="270" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="320" class="svg-step">nat PREROUTING</text>
+                <text x="32" y="340" class="svg-sub">--dst-type LOCAL -j DOCKER</text>
+                <rect x="20" y="370" width="270" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="390" class="svg-step">nat OUTPUT</text>
+                <text x="32" y="410" class="svg-sub">! -d 127.0.0.0/8 LOCAL -j DOCKER</text>
+                <rect x="20" y="440" width="270" height="56" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="460" class="svg-step">nat POSTROUTING</text>
+                <text x="32" y="480" class="svg-sub">-s 192.168.0.0/24 ! -o br MASQ</text>
+
+                <rect x="330" y="34" width="340" height="42" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="342" y="60" class="svg-step">DOCKER-USER: user rules, never edited</text>
+                <rect x="330" y="90" width="340" height="92" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="110" class="svg-step">DOCKER-FORWARD</text>
+                <text x="342" y="130" class="svg-sub">-j DOCKER-CT</text>
+                <text x="342" y="146" class="svg-sub">-j DOCKER-INTERNAL   (empty here)</text>
+                <text x="342" y="162" class="svg-sub">-j DOCKER-BRIDGE</text>
+                <text x="342" y="178" class="svg-sub">-i br-dummy -j ACCEPT   (ICC on)</text>
+                <rect x="330" y="196" width="340" height="42" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="222" class="svg-sub">DOCKER-CT: -o br RELATED,ESTABLISHED ACCEPT</text>
+                <rect x="330" y="250" width="340" height="38" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="274" class="svg-sub">DOCKER-BRIDGE: -o br-dummy -j DOCKER</text>
+                <rect x="330" y="300" width="340" height="74" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="320" class="svg-step">DOCKER (filter)</text>
+                <text x="342" y="340" class="svg-sub">-d 192.168.0.2 ! -i br -o br tcp 80 ACCEPT</text>
+                <text x="342" y="358" class="svg-sub">! -i br-dummy -o br-dummy -j DROP</text>
+                <rect x="330" y="388" width="340" height="56" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="342" y="408" class="svg-step">DOCKER (nat)</text>
+                <text x="342" y="428" class="svg-sub">! -i br-dummy tcp 8080 DNAT .0.2:80</text>
+
+                <line x1="290" y1="144" x2="326" y2="58" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <line x1="290" y1="160" x2="326" y2="132" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <path d="M670,130 C690,140 690,200 674,212" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <path d="M670,162 C700,190 700,250 674,266" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <path d="M670,274 C700,290 700,310 674,322" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <line x1="290" y1="334" x2="326" y2="406" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <line x1="290" y1="404" x2="326" y2="416" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+
+                <text x="330" y="476" class="svg-note">Removed: DOCKER-ISOLATION-STAGE-1/2. Isolation</text>
+                <text x="330" y="492" class="svg-note">between networks is the per-network DROP in DOCKER.</text>
+                <text x="20" y="528" class="svg-note">Not in the golden file: DOCKER-USER (added by the controller,</text>
+                <text x="20" y="544" class="svg-note">not this test) and a FORWARD DROP policy (set only when</text>
+                <text x="20" y="560" class="svg-note">dockerd itself flips ip_forward 0 → 1, D64).</text>
+
+                <rect x="724" y="34" width="336" height="104" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="736" y="54" class="svg-step">verdict maps, keyed by ifname</text>
+                <text x="736" y="74" class="svg-sub">filter-forward-in-jumps</text>
+                <text x="736" y="90" class="svg-sub">filter-forward-out-jumps</text>
+                <text x="736" y="106" class="svg-sub">nat-postrouting-in/out-jumps</text>
+                <text x="736" y="126" class="svg-sub">"br-dummy" : jump …__br-dummy</text>
+                <rect x="724" y="150" width="336" height="58" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="736" y="170" class="svg-step">chain filter-FORWARD (base)</text>
+                <text x="736" y="190" class="svg-sub">oifname vmap @filter-forward-in-jumps</text>
+                <rect x="724" y="220" width="336" height="110" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="240" class="svg-step">filter-forward-in__br-dummy</text>
+                <text x="736" y="260" class="svg-sub">ct state established,related accept</text>
+                <text x="736" y="276" class="svg-sub">iifname "br-dummy" accept "ICC"</text>
+                <text x="736" y="292" class="svg-sub">ip daddr .0.2 tcp dport 80 accept</text>
+                <text x="736" y="308" class="svg-sub">drop "UNPUBLISHED PORT DROP"</text>
+                <rect x="724" y="342" width="336" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="362" class="svg-step">nat-prerouting-and-output</text>
+                <text x="736" y="382" class="svg-sub">tcp dport 8080 dnat to .0.2:80 "DNAT"</text>
+                <rect x="724" y="412" width="336" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="432" class="svg-step">raw-PREROUTING (base)</text>
+                <text x="736" y="452" class="svg-sub">daddr .0.2 drop "DROP DIRECT ACCESS"</text>
+                <rect x="724" y="482" width="336" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="736" y="502" class="svg-step">nat-postrouting-out__br-dummy</text>
+                <text x="736" y="522" class="svg-sub">saddr 192.168.0.0/24 "MASQUERADE"</text>
+                <path d="M892,208 L892,216" stroke="#252525" stroke-width="2" marker-end="url(#ic-ctl)"/>
+                <text x="724" y="566" class="svg-note">No DOCKER-USER chain in this mode (D70); users add</text>
+                <text x="724" y="582" class="svg-note">their own table with base chains at other priorities.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Golden test files, not a live host: moby's <code>TestIptabler</code> and <code>TestNftabler</code> output
+              for one container 192.168.0.2 with <code>8080:80/tcp</code>, proxy on, ICC on, masquerade, nat mode.
+              Thick arrows are jumps. "<code>.0.2</code>" abbreviates 192.168.0.2. The nftables table dispatches per
+              bridge through verdict maps rather than linear jump lists, and every rule carries a comment.
+            </p>
+          </figure>
+          <p>
+            Four smaller findings sit in the same tree. <code>Endpoint.Less</code>'s comment names <code>ep.name</code>
+            as the last tie-break, but the code compares network names (D66). Both branches of
+            <code>selectFirewallBackend</code> return nil (D71). <code>docs/networkdb.md</code> links an
+            <code>overlay.md</code> that does not exist (D73). And joining several containers' namespaces under
+            <code>userns-remap</code> silently overwrites the user namespace, a known FIXME, moby#46210 (D72)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The nftables backend is experimental and opt-in in 29.x (<code>--firewall-backend=nftables</code>). It has
+            no DOCKER-USER chain, does not enable IP forwarding, and refuses swarm mode unless the
+            <code>swarm-nftables</code> feature is set (D70) <span class="src">from the code</span>. One more
+            measurement for scale: this sandbox's own <code>eth0</code> is also a veth (<code>eth0@if26</code>, a random
+            locally administered MAC, a /32 address, gateway 169.254.1.1). That is a CNI-style network built by
+            another runtime, not a Docker bridge <span class="recon">measured here</span>.
+          </p>

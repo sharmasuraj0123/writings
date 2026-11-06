@@ -1,0 +1,209 @@
+          <h2 id="p1-exit"><span class="secnum">{{S}}</span>Exit, and what survives dockerd</h2>
+          <p>
+            When <code>sh</code> exits, the kernel tells its parent, and its parent is the shim. On SIGCHLD the
+            shim's reaper calls <code>wait4(-1, …, WNOHANG)</code> (<code>containerd/pkg/sys/reaper/reaper_unix.go</code>:258-266)
+            and turns a signal death into <code>128 + signal</code> via <code>exitSignalOffset = 128</code>
+            (<code>reaper_unix.go</code>:280-289), so SIGKILL is 137 and SIGTERM 143. Docker did not invent those numbers; the
+            shim computes them <span class="src">from the code</span>. From there the status climbs three
+            protocols to reach the CLI. Figure {{fig-exit-cascade}} is the whole climb.
+          </p>
+
+          <figure class="figure wide" id="fig-exit-cascade">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">An exit status climbs back up: shim, containerd, dockerd, CLI</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 600" role="img" aria-label="Five lanes: kernel, shim, containerd, dockerd and CLI. sh exits and the kernel sends SIGCHLD to the shim. The shim reaps it, waits for running execs, records the exit status in the bundle and publishes TaskExit over ttrpc. containerd forwards it to dockerd's gRPC subscription. dockerd queues it per container, handles the exit, deletes the task through containerd, drains stdio for up to two seconds, consults the restart manager, marks the container stopped and releases the pending wait, whose body becomes the CLI's exit code.">
+                <defs>
+                  <marker id="fig-exit-cascade-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-exit-cascade-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-exit-cascade-fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="28" class="svg-lane">KERNEL</text>
+                <text x="232" y="28" class="svg-lane">SHIM</text>
+                <text x="444" y="28" class="svg-lane">CONTAINERD</text>
+                <text x="656" y="28" class="svg-lane">DOCKERD</text>
+                <text x="868" y="28" class="svg-lane">CLI</text>
+                <line x1="118" y1="40" x2="118" y2="104" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="330" y1="40" x2="330" y2="284" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="542" y1="40" x2="542" y2="530" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="754" y1="40" x2="754" y2="530" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="966" y1="40" x2="966" y2="530" stroke="#deded9" stroke-width="1.5"/>
+
+                <!-- 1-2 -->
+                <rect x="20" y="50" width="196" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="68" class="svg-num">1</text>
+                <text x="46" y="68" class="svg-step">sh exits</text>
+                <text x="32" y="85" class="svg-sub">SIGCHLD to its parent</text>
+                <rect x="232" y="50" width="196" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="244" y="68" class="svg-num">2</text>
+                <text x="258" y="68" class="svg-step">reaper: wait4</text>
+                <text x="244" y="85" class="svg-sub">signal → 128 + N</text>
+                <line x1="216" y1="72" x2="230" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#fig-exit-cascade-ctl)"/>
+
+                <rect x="232" y="110" width="196" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="244" y="128" class="svg-num">3</text>
+                <text x="258" y="128" class="svg-step">running execs first</text>
+                <text x="244" y="145" class="svg-sub">init's exit is the last</text>
+                <rect x="232" y="170" width="196" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="244" y="188" class="svg-num">4</text>
+                <text x="258" y="188" class="svg-step">WriteExitStatus</text>
+                <text x="244" y="205" class="svg-sub">into the bundle (2.4+)</text>
+                <rect x="232" y="230" width="196" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="244" y="248" class="svg-num">5</text>
+                <text x="258" y="248" class="svg-step">publish TaskExit</text>
+                <text x="244" y="265" class="svg-sub">2048-slot queue</text>
+
+                <!-- 6 -->
+                <text x="440" y="244" class="svg-sub" style="fill:#765b98">ttrpc</text>
+                <line x1="428" y1="252" x2="538" y2="252" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-exit-cascade-fx)"/>
+                <rect x="444" y="290" width="196" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="456" y="308" class="svg-num">6</text>
+                <text x="470" y="308" class="svg-step">Events.Forward</text>
+                <text x="456" y="325" class="svg-sub">on containerd.sock.ttrpc</text>
+                <text x="654" y="296" class="svg-sub" style="fill:#765b98">gRPC</text>
+                <line x1="640" y1="304" x2="750" y2="304" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-exit-cascade-fx)"/>
+
+                <!-- 7-10 dockerd -->
+                <rect x="656" y="320" width="196" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="668" y="338" class="svg-num">7</text>
+                <text x="682" y="338" class="svg-step">Subscribe stream</text>
+                <text x="668" y="355" class="svg-sub">per-container queue</text>
+                <rect x="656" y="380" width="196" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="668" y="398" class="svg-num">8</text>
+                <text x="682" y="398" class="svg-step">handleContainerExit</text>
+                <text x="668" y="415" class="svg-sub">drop duplicate exits</text>
+                <rect x="656" y="440" width="196" height="44" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="668" y="458" class="svg-num">9</text>
+                <text x="682" y="458" class="svg-step">Delete task, drain</text>
+                <text x="668" y="475" class="svg-sub">stdio wait ≤ 2 s</text>
+                <text x="444" y="452" class="svg-sub" style="fill:#252525">Delete: shim cleans up</text>
+                <line x1="656" y1="462" x2="546" y2="462" stroke="#252525" stroke-width="2" marker-end="url(#fig-exit-cascade-ctl)"/>
+                <rect x="656" y="500" width="196" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.6"/>
+                <text x="668" y="518" class="svg-num">10</text>
+                <text x="688" y="518" class="svg-step">restart? else stopped</text>
+                <text x="668" y="535" class="svg-sub">checkpoint, die event</text>
+
+                <!-- 11 CLI -->
+                <rect x="868" y="500" width="196" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.6"/>
+                <text x="880" y="518" class="svg-num">11</text>
+                <text x="900" y="518" class="svg-step">wait body arrives</text>
+                <text x="880" y="535" class="svg-sub">exit code = StatusCode</text>
+                <line x1="852" y1="522" x2="866" y2="522" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-exit-cascade-data)"/>
+
+                <!-- legend -->
+                <line x1="20" y1="578" x2="50" y2="578" stroke="#252525" stroke-width="2"/>
+                <text x="58" y="582" class="svg-sub">signal or call</text>
+                <line x1="190" y1="578" x2="220" y2="578" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <text x="228" y="582" class="svg-sub">event</text>
+                <line x1="300" y1="578" x2="330" y2="578" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="338" y="582" class="svg-sub">HTTP bytes (the long-polled wait from §02)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Three protocols, one status: a ttrpc event, a gRPC stream and the body of an HTTP response the CLI
+              opened before start. The wait unblocks from dockerd's in-memory state, not from containerd. Read
+              from containerd v2.4.2 and moby 29.9.2 <span class="src">from the code</span>; no hop was timed
+              here.
+            </p>
+          </figure>
+
+          <h3>The shim publishes last</h3>
+          <p>
+            For an init exit the shim first kills any remaining processes if the PID namespace is shared, waits
+            until every running exec has reported, then records the status and only then publishes,
+            <code>containerd/cmd/containerd-shim-runc-v2/task/service.go</code>:769-791
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>if isInit {
+	e.Timestamp = p.ExitedAt()
+	if err := runc.WriteExitStatus(c.Bundle, e); err != nil {
+		log.G(s.context).
+			WithField("container_id", c.ID).
+			WithError(err).
+			Error("failed to store exit status in bundle")
+	}
+
+	if err := s.cg2oom.Stop(c.ID); err != nil {
+		log.G(context.Background()).
+			WithField("container_id", c.ID).
+			WithError(err).
+			Error("failed to stop oom event watcher")
+	}
+}
+s.send(&amp;eventstypes.TaskExit{
+	ContainerID: c.ID,
+	ID:          p.ID(),
+	Pid:         uint32(e.Pid),
+	ExitStatus:  uint32(e.Status),
+	ExitedAt:    protobuf.ToTimestamp(p.ExitedAt()),
+})</code></pre>
+          <p>
+            Recording the status in the bundle is new in containerd 2.4.0 (<code>3264a09df</code>). It makes the second,
+            <code>shim delete</code>-generated exit carry the recorded status instead of 137, but containerd still publishes
+            that second exit when a shim disconnects before task delete (<code>cleanupAfterDeadShim</code>,
+            <code>core/runtime/v2/shim.go</code>:146-196); the 128+SIGKILL fallback now applies only to a lost process with
+            no recorded status (<code>manager_linux.go</code>:360-364). moby still carries its own duplicate-exit
+            filter, <code>shouldIgnoreExitEventWithLock</code>, citing moby#46212 (<code>moby/daemon/monitor.go</code>:54-55;
+            finding D11, class E) <span class="src">from the code</span>. It is still needed on 2.4: duplicates still
+            arrive, and its state checks also stop a late exit from a previous run hitting a restarted container
+            (<code>monitor.go</code>:359-440). The event goes up as a ttrpc <code>Events.Forward</code> call to
+            <code>&lt;grpc address&gt;.ttrpc</code>, from a queue of <code>queueSize = 2048</code> with
+            <code>maxRequeue = 5</code> (<code>containerd/pkg/shim/publisher.go</code>:36-37)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>dockerd's side</h3>
+          <p>
+            dockerd holds one containerd event subscription per namespace, filtered to task topics, and
+            re-subscribes if the stream breaks (<code>libcontainerd/remote/client.go</code>:595-628). Events go
+            through a per-container serial queue, so one container's exits are handled in order
+            (<code>client.go</code>:640-698). <code>handleContainerExit</code> drops duplicates, stops health checks, calls
+            containerd <code>Delete</code> on the task, waits for stdio to drain with
+            <code>context.WithTimeout(context.Background(), 2*time.Second)</code>, asks the restart manager, then
+            sets <code>restarting</code> or <code>exited</code>, checkpoints and emits <code>die</code>
+            (<code>moby/daemon/monitor.go</code>:35-147) <span class="src">from the code</span>. Output still in
+            the FIFOs after two seconds may never reach an attached client (D5, class D, not measured). A
+            <code>TaskOOM</code> event only sets <code>OOMKilled</code>; the exit still comes as a normal
+            <code>TaskExit</code>. A start that died during network setup keeps the container
+            <code>created</code>, detected by <code>strings.Contains(c.State.ErrorMsg, errSetupNetworking)</code>
+            (<code>monitor.go</code>:48; D9, class D). <code>--rm</code> is the daemon's <code>AutoRemove</code>;
+            the CLI only waits with <code>condition=removed</code> <span class="src">from the code</span>.
+          </p>
+
+          <h3>Exec exits take another road</h3>
+          <p>
+            <code>docker exec -it</code> has no wait endpoint. The CLI creates the exec with
+            <code>POST /containers/{id}/exec</code>, hijacks <code>POST /exec/{execid}/start</code> exactly like
+            attach, and after the stream ends reads <code>ExitCode</code> from <code>GET /exec/{execid}/json</code>
+            (<code>cli/cli/command/container/exec.go</code>:88-130, 204-218) <span class="src">from the code</span>.
+            Against the mock, which answered <code>"ExitCode": 3</code>, the real CLI exited 3
+            <span class="recon">measured here</span>. In the daemon the exec becomes <code>task.Exec</code>, and the
+            shim runs <code>runc exec --process &lt;json&gt; --detach</code>, which takes the same nsexec path with
+            clone flags 0 and only joins the container's namespaces (<code>containerd/cmd/containerd-shim-runc-v2/process/exec.go</code>:181-215).
+            Exec exits are never the container's last word: the shim holds back init's <code>TaskExit</code>
+            until running execs have reported, and dockerd handles both in the same per-container queue
+            (<code>task/service.go</code>:745-764) <span class="src">from the code</span>.
+          </p>
+
+          <h3>Killing dockerd</h3>
+          <p>
+            Because <code>sh</code> is the shim's child, <code>kill -9</code> on dockerd leaves it running. On the
+            next start, <code>restore</code> reloads each container from disk, loads it in containerd and
+            re-attaches to its existing FIFOs (<code>moby/daemon/daemon.go</code>:453). Then, without
+            <code>live-restore</code>, it does the surprising thing: it logs "shutting down container considered
+            alive by containerd" and stops it (<code>daemon.go</code>:475). A container whose task vanished is
+            marked stopped with exit code 255 (<code>daemon.go</code>:528; finding D6, class D)
+            <span class="src">from the code</span>. So containers outlive a dockerd crash, but by default not the
+            next dockerd start <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            With <code>"live-restore": true</code> the shutdown path skips stopping running containers and leaves
+            mounts and networking in place for the next daemon to adopt; it is rejected in swarm mode
+            (<code>daemon.go</code>:1553-1564; <code>config/config_linux.go</code>:130-133)
+            <span class="src">from the code</span>. While no dockerd reads the FIFOs, a chatty container can write
+            only until the pipe buffer fills, then blocks until dockerd re-attaches <span class="recon">reconstruction</span>. Docker's live-restore page still says upgrades are
+            supported only between "patch releases (YY.MM.x)", a version scheme Engine left at 23.0 (finding
+            D12, class C).
+          </p>

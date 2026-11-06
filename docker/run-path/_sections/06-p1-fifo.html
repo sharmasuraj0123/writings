@@ -1,0 +1,184 @@
+          <h2 id="p1-fifo"><span class="secnum">{{S}}</span>The FIFO between create and start</h2>
+          <p>
+            The OCI runtime spec splits a container's birth in two. At <code>create</code>, "the user-specified
+            program … MUST NOT be run at this time"; <code>start</code> runs it, and starting a container that is
+            not <code>created</code> "MUST generate an error" (<code>runtime-spec/runtime.md</code>:60, 127)
+            <span class="src">from the code</span>. runc implements the gap with one named pipe. Its state
+            directory holds <code>state.json</code> and <code>exec.fifo</code>; under Docker that directory is
+            <code>/var/run/docker/runtime-runc/moby/&lt;id&gt;/</code>, because the shim passes
+            <code>--root</code> with the namespace appended (<code>runc/libcontainer/factory_linux.go</code>:21-22;
+            <code>containerd/cmd/containerd-shim-runc-v2/process/init.go</code>:82-94).
+          </p>
+          <p>
+            runc creates the FIFO mode 0622 and chowns it to the container's host-side root, so an init inside a
+            user namespace can still write it (<code>container_linux.go</code>:447-471). It hands the FIFO to init
+            only as an <code>O_PATH</code> file descriptor named by <code>_LIBCONTAINER_FIFOFD</code>, so the
+            container never holds a usable handle on the state directory (<code>container_linux.go</code>:478-494)
+            <span class="src">from the code</span>. At the very end of setup, init re-opens it for writing,
+            <code>runc/libcontainer/standard_init_linux.go</code>:260-271, 300-303
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	// Wait for the FIFO to be opened on the other side before exec-ing the
+	// user process. We open it through /proc/self/fd/$fd, because the fd that
+	// was given to us was an O_PATH fd to the fifo itself. Linux allows us to
+	// re-open an O_PATH fd through /proc.
+	fifoFile, err := pathrs.Reopen(l.fifoFile, unix.O_WRONLY|unix.O_CLOEXEC)
+	if err != nil {
+		return fmt.Errorf("reopen exec fifo: %w", err)
+	}
+	defer fifoFile.Close()
+	if _, err := fifoFile.Write([]byte("0")); err != nil {
+		return &amp;os.PathError{Op: "write exec fifo", Path: fifoFile.Name(), Err: err}
+	}
+…
+	if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
+		return err
+	}
+	return linux.Exec(name, l.config.Args, l.config.Env)</code></pre>
+          <p>
+            Opening a FIFO for writing blocks until something opens it for reading. That open is the whole
+            barrier. Everything before it, namespaces, mounts, the pivot, seccomp and capabilities, belongs to
+            create. Just before it, init calls <code>exec.LookPath(l.config.Args[0])</code>, "to make sure it
+            exists and it is returned as a create time error" (<code>standard_init_linux.go</code>:227-232). It
+            also checks that its parent is still the runc process that started it, and kills itself with
+            SIGKILL if that parent died mid-setup (<code>standard_init_linux.go</code>:220-226) <span class="src">from the code</span>.
+            Figure {{fig-create-start-fifo}} lays the barrier out in time.
+          </p>
+
+          <figure class="figure wide" id="fig-create-start-fifo">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The create/start barrier: init waits on <code>exec.fifo</code> while dockerd wires the network</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 600" role="img" aria-label="Five lanes: dockerd, the shim, runc create, runc start and runc init. runc create starts init, which looks up sh and then blocks opening exec.fifo for writing. runc create writes state.json and exits, and init is reparented to the shim. dockerd then sets the network namespace key and allocates endpoints. dockerd starts the task; the shim runs runc start, which opens the FIFO for reading. Init writes 0, closes its extra file descriptors and executes sh.">
+                <defs>
+                  <marker id="fig-create-start-fifo-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-create-start-fifo-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-create-start-fifo-fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="28" class="svg-lane">DOCKERD</text>
+                <text x="230" y="28" class="svg-lane">SHIM</text>
+                <text x="440" y="28" class="svg-lane">RUNC CREATE</text>
+                <text x="650" y="28" class="svg-lane">RUNC START</text>
+                <text x="860" y="28" class="svg-lane">RUNC INIT → SH</text>
+                <line x1="110" y1="40" x2="110" y2="540" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="320" y1="40" x2="320" y2="540" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="530" y1="40" x2="530" y2="284" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="740" y1="400" x2="740" y2="500" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="950" y1="120" x2="950" y2="540" stroke="#deded9" stroke-width="1.5"/>
+
+                <!-- R1 -->
+                <rect x="20" y="50" width="180" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="32" y="68" class="svg-step">ctr.NewTask</text>
+                <text x="32" y="85" class="svg-sub">via containerd</text>
+                <rect x="230" y="50" width="180" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="242" y="68" class="svg-step">shim Create</text>
+                <text x="242" y="85" class="svg-sub">exec runc create</text>
+                <rect x="440" y="50" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="452" y="68" class="svg-step">runc create</text>
+                <text x="452" y="85" class="svg-sub">exe seal, nsexec (§05)</text>
+                <line x1="200" y1="72" x2="228" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+                <line x1="410" y1="72" x2="438" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+
+                <!-- R2 -->
+                <line x1="530" y1="132" x2="858" y2="132" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+                <rect x="860" y="110" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="872" y="128" class="svg-step">runc init</text>
+                <text x="872" y="145" class="svg-sub">rootfs, seccomp, caps</text>
+
+                <!-- R3 -->
+                <rect x="860" y="170" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="872" y="188" class="svg-step">LookPath("sh")</text>
+                <text x="872" y="205" class="svg-sub">missing: create fails</text>
+
+                <!-- R4 -->
+                <rect x="860" y="230" width="180" height="44" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.6"/>
+                <text x="872" y="248" class="svg-step">reopen fifo O_WRONLY</text>
+                <text x="872" y="265" class="svg-sub">blocks: no reader yet</text>
+                <rect x="946" y="274" width="8" height="196" rx="2" fill="#d98226"/>
+                <rect x="440" y="230" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="452" y="248" class="svg-step">state.json: created</text>
+                <text x="452" y="265" class="svg-sub">then runc create exits</text>
+
+                <!-- R5 reparent -->
+                <text x="560" y="304" class="svg-sub" style="fill:#765b98">init reparented to the shim (subreaper)</text>
+                <line x1="944" y1="314" x2="324" y2="314" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-create-start-fifo-fx)"/>
+
+                <!-- R6 network -->
+                <rect x="20" y="330" width="180" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.6"/>
+                <text x="32" y="348" class="svg-step">initializeCreatedTask</text>
+                <text x="32" y="365" class="svg-sub">SetKey(/proc/N/ns/net)</text>
+                <text x="350" y="370" class="svg-sub" style="fill:#765b98">netns key set, endpoints allocated in it</text>
+                <line x1="200" y1="380" x2="944" y2="380" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-create-start-fifo-fx)"/>
+
+                <!-- R7 start -->
+                <rect x="20" y="400" width="180" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="32" y="418" class="svg-step">tsk.Start</text>
+                <text x="32" y="435" class="svg-sub">via containerd</text>
+                <rect x="230" y="400" width="180" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="242" y="418" class="svg-step">shim Start</text>
+                <text x="242" y="435" class="svg-sub">exec runc start &lt;id&gt;</text>
+                <rect x="650" y="400" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="662" y="418" class="svg-step">open fifo O_RDONLY</text>
+                <text x="662" y="435" class="svg-sub">read "0", remove fifo</text>
+                <line x1="200" y1="422" x2="228" y2="422" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+                <line x1="410" y1="422" x2="648" y2="422" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+
+                <!-- R8 -->
+                <text x="790" y="462" class="svg-sub" style="fill:#3c6f97">"0"</text>
+                <line x1="944" y1="472" x2="744" y2="472" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-create-start-fifo-data)"/>
+
+                <!-- R9 -->
+                <rect x="860" y="486" width="180" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="872" y="504" class="svg-step">UnsafeCloseFrom</text>
+                <text x="872" y="521" class="svg-sub">execve("sh"), same pid</text>
+                <text x="662" y="520" class="svg-sub">runc start exits</text>
+
+                <text x="20" y="568" class="svg-note">Bar: init blocked in open(2). After v1.5.2, runc main replaces the 100 ms open-poll on the reader side</text>
+                <text x="20" y="586" class="svg-note">with poll(2) and a pidfd (937d887d1c, first in v1.6.0-rc.1).</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Between the two runc invocations the process already exists, fully confined, inside its new
+              network namespace, but has not run a single instruction of <code>sh</code>. That gap is where
+              dockerd plugs in the network, with no hook. Read from runc v1.5.2 and
+              <code>moby/daemon/start_linux.go</code>:17-43 <span class="src">from the code</span>; the timing
+              was not observed.
+            </p>
+          </figure>
+
+          <h3>What dockerd does in the gap</h3>
+          <p>
+            After <code>NewTask</code> returns the init pid, dockerd points the libnetwork sandbox at that
+            process's network namespace, <code>moby/daemon/start_linux.go</code>:27-36
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>nspath, ok := oci.NamespacePath(spec, specs.NetworkNamespace)
+if ok &amp;&amp; nspath == "" { // the runtime has been instructed to create a new network namespace for tsk.
+	sb, err := daemon.netController.GetSandbox(ctr.ID)
+	if err != nil {
+		return errdefs.System(err)
+	}
+	if err := sb.SetKey(ctx, fmt.Sprintf("/proc/%d/ns/net", tsk.Pid())); err != nil {
+		return errdefs.System(err)
+	}
+}</code></pre>
+          <p>
+            Endpoints are then allocated inside it. No OCI prestart hook is involved. That was not always true:
+            the <code>SetKey</code> hook was removed in v26.0.0 (<code>0046b16d87</code>), restored in v26.1.0
+            (<code>fde80fe2e7</code>) and removed again (<code>933fcc9814</code>, May 2024)
+            <span class="src">from the code</span>. The veth, bridge and NAT rules that land in that namespace are
+            <a href="../network-and-lifecycle/#p4-network">Part 4</a>'s subject.
+          </p>
+          <p>
+            <code>runc start</code> is then almost nothing. It refuses any state but <code>Created</code> and calls
+            <code>container.Exec()</code> (<code>runc/start.go</code>:33-52). In v1.5.2 that is a goroutine doing a
+            blocking <code>open(exec.fifo, O_RDONLY)</code>, checking every 100 ms whether init has died; on success
+            it reads the byte and deletes the FIFO (<code>container_linux.go</code>:233-265, 288-302). Init's write
+            returns, it closes every fd from <code>3 + PassedFilesCount</code> up, and <code>execve</code> replaces
+            <code>runc init</code> with <code>sh</code> in the same pid <span class="src">from the code</span>. After
+            the pin, runc main swapped the open-poll for <code>handleFifo</code> with <code>poll(2)</code> and a
+            pidfd, and moved poststart hooks from create to start; neither is in v1.5.2 (finding D22, class E)
+            <span class="src">from the code</span>.
+          </p>

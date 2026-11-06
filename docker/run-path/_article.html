@@ -1,0 +1,1618 @@
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from the pinned sources, cited as
+              <code>repo/path:line</code>: moby <code>docker-v29.9.2</code> (<code>0367cbeb</code>), docker/cli
+              v29.9.2, containerd v2.4.2, runc v1.5.2 and the OCI runtime-spec v1.3.0.
+              <span class="recon">measured here</span> marks bytes or numbers observed on the research box.
+              No container ran there: the sandbox has no <code>CAP_SYS_ADMIN</code> or <code>CAP_NET_ADMIN</code>,
+              and dockerd could not start. So "measured here" covers the real <code>docker</code> CLI 29.8.2 talking
+              to a hand-written <em>mock daemon</em> (client bytes real, server bytes invented, and said so each
+              time), the installed binaries' own output, and this sandbox's own <code>/proc</code> and
+              <code>/sys/fs/cgroup</code>. Bytes computed from the code and never observed are labelled
+              <em>synthesised</em>. <span class="recon">reconstruction</span> marks a judgement I drew from those
+              sources rather than read in one place.
+            </p>
+            <p>
+              This is Part 1 of 4 of <a href="../">Docker, taken apart</a>. <a href="../images/">Part 2</a> covers
+              images, layers and the registry; <a href="../builds/">Part 3</a> covers how BuildKit builds;
+              <a href="../network-and-lifecycle/">Part 4</a> covers networks, I/O and the long run, and ends with
+              the findings register.
+            </p>
+          </div>
+
+          <h2 id="p1-lede"><span class="secnum">01</span>A process and five programs</h2>
+          <p class="lede">
+            A container is an ordinary Linux process. Docker is a relay of five separate programs: the
+            <code>docker</code> CLI, <code>dockerd</code>, <code>containerd</code>, one
+            <code>containerd-shim-runc-v2</code> per container, and a short-lived <code>runc</code>. They agree on
+            names made of sha256 hashes and on one JSON spec. They ask the kernel to narrow one process's view of
+            the machine, and then most of them get out of the way. This part follows a single
+            <code>docker run -it alpine sh</code> from the keystroke to the running shell and back to its exit
+            code. Its claim is that the run path is choreography with a hold point in the middle: the CLI makes
+            five calls, create only writes JSON, start rebuilds the spec, runc builds namespaces before Go even
+            boots, and the new process waits on a FIFO while dockerd plugs in its network.
+          </p>
+          <p>
+            Start with the end state. On a systemd host with a system containerd, one running
+            <code>docker run -it alpine sh</code> leaves this process tree: <code>systemd</code> is the parent of
+            <code>dockerd</code>, of <code>containerd</code>, and of a
+            <code>containerd-shim-runc-v2</code> started as <code>-namespace moby -id &lt;id&gt;</code> <code>-address /run/containerd/containerd.sock</code>,
+            and the shim is the parent of <code>sh</code>, which is PID 1 inside the container. No
+            <code>runc</code> process remains. No process links dockerd to the container; only named FIFOs do <span class="src">from the code</span>. That tree is an inference from the code, not an
+            observation: no container could run on the research box, so nobody ran <code>pstree</code> on one
+            <span class="recon">reconstruction</span>. §08 reads the one real container that was available, the
+            sandbox itself.
+          </p>
+
+          <figure class="figure wide" id="fig-pid-tree">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">One running <code>docker run -it alpine sh</code>: who is whose parent, and what crosses each boundary</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 610" role="img" aria-label="Process tree of one running container. systemd is the parent of dockerd, containerd and the containerd-shim-runc-v2 process. The shim is the parent of sh, the container's PID 1, and briefly of runc. Edges are labelled with the transport used across each boundary: HTTP on the Docker socket, gRPC to containerd, ttrpc between containerd and the shim, fork and exec to runc, FIFOs between dockerd and the shim, and a pty between the shim and sh. A right-hand column says whether each process can die while sh keeps running.">
+                <defs>
+                  <marker id="fig-pid-tree-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-pid-tree-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-pid-tree-fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="30" y="24" class="svg-lane">PROCESS TREE</text>
+                <text x="500" y="24" class="svg-lane">WHAT CROSSES THE BOUNDARY</text>
+                <text x="884" y="24" class="svg-lane">IF IT DIES</text>
+
+                <!-- tree lines -->
+                <line x1="50" y1="84" x2="50" y2="322" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="50" y1="142" x2="70" y2="142" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="50" y1="222" x2="70" y2="222" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="50" y1="322" x2="70" y2="322" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="90" y1="344" x2="90" y2="542" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="90" y1="402" x2="110" y2="402" stroke="#b8b8b1" stroke-width="1.5" stroke-dasharray="4 3"/>
+                <line x1="90" y1="472" x2="110" y2="472" stroke="#b8b8b1" stroke-width="1.5" stroke-dasharray="4 3"/>
+                <line x1="90" y1="542" x2="150" y2="542" stroke="#b8b8b1" stroke-width="1.5"/>
+
+                <!-- boxes -->
+                <rect x="30" y="40" width="200" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="42" y="58" class="svg-step">systemd (pid 1)</text>
+                <text x="42" y="75" class="svg-sub">adopts orphans</text>
+
+                <rect x="260" y="40" width="210" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="272" y="58" class="svg-step">docker (the CLI)</text>
+                <text x="272" y="75" class="svg-sub">in your terminal</text>
+
+                <rect x="70" y="120" width="400" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="82" y="138" class="svg-step">dockerd</text>
+                <text x="82" y="155" class="svg-sub">not an ancestor of sh</text>
+
+                <rect x="70" y="200" width="400" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="82" y="218" class="svg-step">containerd</text>
+                <text x="82" y="235" class="svg-sub">system service (or run by dockerd)</text>
+
+                <rect x="70" y="300" width="400" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="82" y="318" class="svg-step">containerd-shim-runc-v2</text>
+                <text x="82" y="335" class="svg-sub">-namespace moby -id &lt;id&gt; · subreaper</text>
+
+                <rect x="110" y="380" width="300" height="44" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 3"/>
+                <text x="122" y="398" class="svg-step">runc create, runc start</text>
+                <text x="122" y="415" class="svg-sub">short-lived; exits</text>
+
+                <rect x="110" y="450" width="230" height="44" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 3"/>
+                <text x="122" y="468" class="svg-step">docker-init (tini)</text>
+                <text x="122" y="485" class="svg-sub">only with --init</text>
+
+                <rect x="150" y="520" width="320" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="162" y="538" class="svg-step">sh (container PID 1)</text>
+                <text x="162" y="555" class="svg-sub">pty slave on fd 0, 1, 2</text>
+
+                <text x="96" y="292" class="svg-note">parent: nearest subreaper</text>
+
+                <!-- edges -->
+                <line x1="365" y1="84" x2="365" y2="118" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-pid-tree-data)"/>
+                <line x1="365" y1="164" x2="365" y2="198" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-pid-tree-ctl)"/>
+                <line x1="345" y1="244" x2="345" y2="298" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-pid-tree-ctl)"/>
+                <line x1="395" y1="298" x2="395" y2="246" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-pid-tree-fx)"/>
+                <path d="M470,150 L482,150 L482,330 L472,330" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-pid-tree-data)" marker-start="url(#fig-pid-tree-data)"/>
+                <line x1="300" y1="344" x2="300" y2="378" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-pid-tree-ctl)"/>
+                <line x1="440" y1="344" x2="440" y2="518" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-pid-tree-data)" marker-start="url(#fig-pid-tree-data)"/>
+                <line x1="380" y1="424" x2="380" y2="518" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-pid-tree-fx)"/>
+
+                <!-- boundary labels -->
+                <text x="500" y="98" class="svg-step">HTTP/1.1 on /var/run/docker.sock</text>
+                <text x="500" y="113" class="svg-sub">attach hijacks it: Upgrade: tcp</text>
+                <text x="500" y="178" class="svg-step">gRPC (HTTP/2) on containerd.sock</text>
+                <text x="500" y="193" class="svg-sub">namespace "moby" in metadata</text>
+                <text x="500" y="258" class="svg-step">ttrpc down: /run/containerd/s/&lt;sha256&gt;</text>
+                <text x="500" y="276" class="svg-sub" style="fill:#765b98">ttrpc up: Events.Forward, containerd.sock.ttrpc</text>
+                <text x="500" y="318" class="svg-step">FIFOs to dockerd</text>
+                <text x="500" y="333" class="svg-sub">&lt;id&gt;-stdin, &lt;id&gt;-stdout</text>
+                <text x="500" y="392" class="svg-step">fork/exec, config.json on disk</text>
+                <text x="500" y="407" class="svg-sub">console socket (SCM_RIGHTS), exec.fifo</text>
+                <text x="500" y="472" class="svg-sub" style="fill:#765b98">runc init execve()s into sh: same pid</text>
+                <text x="500" y="538" class="svg-step">pty</text>
+                <text x="500" y="553" class="svg-sub">the shim holds the master</text>
+
+                <!-- right stripe -->
+                <rect x="878" y="40" width="184" height="44" rx="3" fill="#dfede5"/>
+                <text x="888" y="66" class="svg-sub" style="fill:#367f59">sh keeps running</text>
+                <rect x="878" y="120" width="184" height="44" rx="3" fill="#dfede5"/>
+                <text x="888" y="146" class="svg-sub" style="fill:#367f59">sh keeps running</text>
+                <rect x="878" y="200" width="184" height="44" rx="3" fill="#dfede5"/>
+                <text x="888" y="226" class="svg-sub" style="fill:#367f59">sh keeps running</text>
+                <rect x="878" y="300" width="184" height="44" rx="3" fill="#f7e3c8"/>
+                <text x="888" y="318" class="svg-sub" style="fill:#252525">sh's parent: reaps it,</text>
+                <text x="888" y="333" class="svg-sub" style="fill:#252525">records its exit</text>
+                <rect x="878" y="380" width="184" height="44" rx="3" fill="#f7f7f5"/>
+                <text x="888" y="406" class="svg-sub">gone before sh runs</text>
+                <rect x="878" y="520" width="184" height="44" rx="3" fill="#f7f7f5"/>
+                <text x="888" y="546" class="svg-sub" style="fill:#252525">the container itself</text>
+
+                <!-- legend -->
+                <line x1="30" y1="592" x2="60" y2="592" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="68" y="596" class="svg-sub">bytes</text>
+                <line x1="130" y1="592" x2="160" y2="592" stroke="#252525" stroke-width="2.2"/>
+                <text x="168" y="596" class="svg-sub">calls</text>
+                <line x1="230" y1="592" x2="260" y2="592" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <text x="268" y="596" class="svg-sub">events, effects</text>
+                <line x1="410" y1="592" x2="440" y2="592" stroke="#b8b8b1" stroke-width="1.5"/>
+                <text x="448" y="596" class="svg-sub">parent → child (dashed: transient or optional)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Only the shim stays the container's parent. dockerd and containerd are siblings of the shim, not
+              ancestors of <code>sh</code>, so either can die and the shell keeps running; the only thing tying
+              dockerd to the container is a pair of FIFOs. Drawn from the code <span class="src">from the code</span>; the tree was not observed on a live host
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            Figure 1 labels each edge with its transport. The CLI speaks HTTP/1.1 to dockerd on a
+            Unix socket, and turns that socket into a raw byte pipe for attach. dockerd speaks gRPC to containerd
+            in the namespace <code>moby</code>. containerd calls the shim over ttrpc on a socket whose name is a
+            sha256, and the shim calls back up on a second ttrpc socket to publish events. The shim runs runc with
+            plain fork and exec, a <code>config.json</code> on disk and a Unix socket that carries the pty's
+            master file descriptor <span class="src">from the code</span>.
+          </p>
+          <p>
+            The shape explains the most useful property of the design. The shim's <code>start</code> step
+            re-executes itself as a long-lived server in its own process group and exits, so the server is
+            orphaned and adopted by the nearest subreaper
+            (<code>containerd/cmd/containerd-shim-runc-v2/manager/manager_linux.go</code>:84-114). The shim then marks itself a child
+            subreaper with <code>prctl(PR_SET_CHILD_SUBREAPER, 1)</code>, so when <code>runc create</code> exits
+            the container's init is reparented to the shim, which later reaps it with <code>wait4</code>
+            (<code>containerd/pkg/shim/shim_linux.go</code>:29-30; <code>containerd/pkg/sys/reaper/reaper_unix.go</code>:258-266). Container processes are therefore children of the shim, not of dockerd or
+            containerd. Killing dockerd does not kill them. A containerd that dockerd itself supervises dies with
+            dockerd, because it is started with <code>Pdeathsig: SIGKILL</code>
+            (<code>moby/daemon/internal/containerd/server/supervisor/utils_linux.go</code>:10), but the shims run in
+            their own process groups and survive that too (<code>manager_linux.go</code>:110-111)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            It was not always this way. Docker 1.11.0 (13 April 2016) was the first release to run containers
+            through containerd and runc, and it shipped four Linux binaries: <code>docker</code>,
+            <code>docker-containerd</code>, <code>docker-containerd-shim</code> and <code>docker-runc</code>.
+            Containers kept running across a daemon shutdown only from 1.12.0 (28 July 2016), which added
+            <code>--live-restore</code>, per the changelog in moby's <code>v1.13.0</code> tag
+            <span class="src">from the code</span>.
+            <a href="../network-and-lifecycle/#p4-history">Part 4</a> tells that history.
+          </p>
+          <p>
+            The rest of this part walks the tree top to bottom and back up. §02 is the CLI's five calls. §03 is
+            what dockerd does at create and at start. §04 is containerd and the shim. §05 is runc's
+            <code>init</code>, where the namespaces are actually made. §06 is the FIFO that separates create from
+            start. §07 is the exit climbing back up, and what survives a dockerd restart. §08 reads a real
+            container from the inside. The image that <code>alpine</code> names is
+            <a href="../images/#p2-lede">Part 2</a>'s subject; the network that §06 plugs in is
+            <a href="../network-and-lifecycle/#p4-network">Part 4</a>'s.
+          </p>
+
+          <h2 id="p1-client"><span class="secnum">02</span>Five calls on three connections</h2>
+          <p>
+            <code>docker run</code> is not one request. The daemon has no "run" endpoint. The CLI composes run
+            out of five API calls: a ping, a create, a hijacked attach, a wait and a start, in that order. Attach
+            and wait are issued <em>before</em> start, so no early output and no fast exit can be missed.
+            <code>cli/cli/command/container/run.go</code>:151, 186, 203-206 is the core of it
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	containerID, err := createContainer(ctx, dockerCli, containerCfg, &amp;runOpts.createOptions)
+…
+		closeFn, err := attachContainer(ctx, dockerCli, containerID, &amp;errCh, config, client.ContainerAttachOptions{
+…
+	statusChan := waitExitOrRemoved(statusCtx, apiClient, containerID, copts.autoRemove)
+
+	// start the container
+	if _, err := apiClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{}); err != nil {</code></pre>
+          <p>
+            To watch the bytes, the real <code>docker</code> CLI 29.8.2 was pointed at a mock daemon: a Python
+            server shaped after moby's router code. Everything the CLI sent is real. Everything the "daemon" sent
+            back was invented by the mock, and its <code>Server</code> header says <code>[MOCK]</code>
+            <span class="recon">measured here</span>. Figure 2 is that trace.
+          </p>
+
+          <figure class="figure wide" id="fig-run-sequence">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title"><code>docker run -it alpine sh</code> on the wire: five calls on three connections</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 600" role="img" aria-label="Sequence diagram of docker run -it alpine sh between the real docker CLI 29.8.2 and a mock daemon. Connection 1 carries two pings, the create request and the wait request. Connection 2 carries the attach request, upgraded to a raw stream. Connection 3 carries the start request. The typed exit and the wait body arrive at the end.">
+                <defs>
+                  <marker id="fig-run-sequence-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-run-sequence-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="16" y="40" class="svg-lane">TIME</text>
+                <text x="94" y="40" class="svg-lane">TERMINAL</text>
+                <text x="200" y="40" class="svg-lane">CLI 29.8.2 (REAL)</text>
+                <text x="1064" y="40" class="svg-lane" text-anchor="end">DAEMON (MOCK)</text>
+                <line x1="124" y1="52" x2="124" y2="520" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="250" y1="52" x2="250" y2="520" stroke="#b8b8b1" stroke-width="1.5"/>
+                <line x1="980" y1="52" x2="980" y2="520" stroke="#b8b8b1" stroke-width="1.5"/>
+
+                <!-- open-stream bars -->
+                <rect x="988" y="264" width="8" height="196" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <line x1="1012" y1="334" x2="1012" y2="486" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <text x="1000" y="512" class="svg-sub" text-anchor="middle">#2 raw · #1 pending</text>
+
+                <!-- rows -->
+                <text x="16" y="100" class="svg-sub">+0.228 s</text>
+                <rect x="258" y="86" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="264" y="98" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="296" y="98" class="svg-sub" style="fill:#252525">HEAD /_ping ×2 (unversioned path)</text>
+                <line x1="252" y1="106" x2="976" y2="106" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="128" class="svg-sub">200 OK · Api-Version: 1.56 · Ostype: linux</text>
+                <line x1="978" y1="134" x2="254" y2="134" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="168" class="svg-sub">+0.236 s</text>
+                <rect x="258" y="154" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="264" y="166" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="296" y="166" class="svg-sub" style="fill:#252525">POST /v1.56/containers/create · 1,713-byte JSON, "Tty":true, "StdinOnce":true</text>
+                <line x1="252" y1="174" x2="976" y2="174" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="196" class="svg-sub">201 Created · {"Id": "4f1c0ffee000…", "Warnings": []}</text>
+                <line x1="978" y1="202" x2="254" y2="202" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="236" class="svg-sub">+0.244 s</text>
+                <rect x="258" y="222" width="26" height="16" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="264" y="234" class="svg-sub" style="fill:#252525">#2</text>
+                <text x="296" y="234" class="svg-sub" style="fill:#252525">POST …/attach?stderr=1&amp;stdin=1&amp;stdout=1&amp;stream=1 · Upgrade: tcp</text>
+                <line x1="252" y1="242" x2="976" y2="242" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="264" class="svg-sub">HTTP/1.1 101 UPGRADED · application/vnd.docker.raw-stream</text>
+                <line x1="978" y1="270" x2="254" y2="270" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="304" class="svg-sub">+0.244 s</text>
+                <rect x="258" y="290" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="264" y="302" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="296" y="302" class="svg-sub" style="fill:#252525">POST …/wait?condition=next-exit</text>
+                <line x1="252" y1="310" x2="976" y2="310" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="332" class="svg-sub">200 OK · Transfer-Encoding: chunked · headers only, body held back</text>
+                <line x1="978" y1="338" x2="254" y2="338" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="372" class="svg-sub">+0.245 s</text>
+                <rect x="258" y="358" width="26" height="16" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="264" y="370" class="svg-sub" style="fill:#252525">#3</text>
+                <text x="296" y="370" class="svg-sub" style="fill:#252525">POST …/start · no body (#1 is busy with the wait)</text>
+                <line x1="252" y1="378" x2="976" y2="378" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="296" y="400" class="svg-sub">204 No Content</text>
+                <line x1="978" y1="406" x2="254" y2="406" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="444" class="svg-sub">+1.709 s</text>
+                <text x="132" y="438" class="svg-sub" style="fill:#252525">exit⏎</text>
+                <line x1="126" y1="450" x2="246" y2="450" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+                <rect x="258" y="430" width="26" height="16" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="264" y="442" class="svg-sub" style="fill:#252525">#2</text>
+                <text x="296" y="442" class="svg-sub" style="fill:#252525">raw stdin, 5 bytes: e x i t \r (no HTTP framing)</text>
+                <line x1="252" y1="450" x2="976" y2="450" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+
+                <text x="16" y="484" class="svg-sub">+1.810 s</text>
+                <rect x="258" y="470" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="264" y="482" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="296" y="482" class="svg-sub">wait body arrives as one chunk: exit status 0</text>
+                <line x1="978" y1="490" x2="254" y2="490" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-run-sequence-data)"/>
+                <line x1="248" y1="502" x2="128" y2="502" stroke="#252525" stroke-width="2" marker-end="url(#fig-run-sequence-ctl)"/>
+                <text x="132" y="518" class="svg-sub" style="fill:#252525">$? = 0</text>
+
+                <!-- legend -->
+                <line x1="16" y1="560" x2="46" y2="560" stroke="#252525" stroke-width="2"/>
+                <text x="54" y="564" class="svg-sub">request</text>
+                <line x1="126" y1="560" x2="156" y2="560" stroke="#3c6f97" stroke-width="1.3"/>
+                <text x="164" y="564" class="svg-sub">response or raw bytes</text>
+                <rect x="330" y="552" width="26" height="16" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="336" y="564" class="svg-sub" style="fill:#252525">#1</text>
+                <text x="364" y="564" class="svg-sub">connection number</text>
+                <text x="16" y="588" class="svg-note">All server bytes are the mock's; the "/ # " prompt it sent at +0.244 s is a mock invention and is omitted here.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Attach and wait are open before start is sent, so the client cannot miss output or the exit. The
+              real CLI 29.8.2 against a mock daemon: client bytes are real, server bytes invented
+              <span class="recon">measured here</span>. A real daemon sends nothing on the attach stream until the
+              process runs, and its wait body is <code>{"StatusCode":0}</code>, not the mock's
+              <code>{"Error": null, "StatusCode": 0}</code>, because <code>Error</code> is omitempty
+              (<code>moby/api/types/container/wait_response.go</code>:13) <span class="src">from the code</span>.
+            </p>
+          </figure>
+
+          <h3>Ping, create, and the pull you didn't ask for</h3>
+          <p>
+            The ping comes first because flag parsing depends on the daemon's OS: <code>runRun</code> calls
+            <code>Ping</code> and passes <code>serverInfo.OSType</code> into <code>parse</code>
+            (<code>run.go</code>:104-109). The client hits the unversioned <code>/_ping</code> with HEAD, reads
+            <code>API-Version</code>, and lowers its own maximum, <code>MaxAPIVersion = "1.56"</code>, to the
+            server's if that is lower; below <code>MinAPIVersion = "1.40"</code> it refuses
+            (<code>moby/client/client.go</code>:111, 115). Every later path carries the prefix
+            <code>/v1.56/</code> <span class="src">from the code</span>. Over a Unix socket the
+            <code>Host</code> header is the placeholder <code>api.moby.localhost</code>, and the user agent is
+            <code>Docker-Client/29.8.2 (linux)</code> <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The create body is the whole container config. With <code>-it</code> it says
+            <code>"Tty":true,"OpenStdin":true,"StdinOnce":true</code>; the CLI sets <code>StdinOnce</code>
+            whenever stdin is both open and attached (<code>opts.go</code>:729-732). The terminal size rides
+            along as <code>HostConfig.ConsoleSize</code> (<code>create.go</code>:327), so the pty can be sized
+            before any resize call <span class="src">from the code</span>. It was <code>[0,0]</code> in the
+            first trace, which ran without a real terminal size; after <code>stty rows 40 cols 120</code> it
+            was <code>[40,120]</code>, followed by <code>POST …/resize?h=40&amp;w=120</code> right after start
+            <span class="recon">measured here</span>. The pull is not part of create either. If create returns
+            NotFound and <code>--pull=missing</code> is in force, the CLI prints "Unable to find image", calls
+            <code>ImagePull</code> and retries create (<code>create.go</code>:338-358)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>Attach is a hijack; wait is a long-poll</h3>
+          <p>
+            Attach asks for <code>Connection: Upgrade</code> and <code>Upgrade: tcp</code>. The daemon takes
+            the socket away from Go's HTTP server and writes the status line itself,
+            <code>moby/daemon/server/router/container/container_routes.go</code>:1142, 1150-1159
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>		conn, _, err := hijacker.Hijack()
+…
+		if upgrade {
+			if multiplexed &amp;&amp; versions.GreaterThanOrEqualTo(httputils.VersionFromContext(ctx), "1.42") {
+				contentType = types.MediaTypeMultiplexedStream
+			}
+			// FIXME(thaJeztah): we should not ignore errors here; see https://github.com/moby/moby/pull/48359#discussion_r1725562802
+			fmt.Fprintf(conn, "HTTP/1.1 101 UPGRADED\r\nContent-Type: %v\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n", contentType)
+		} else {
+			// FIXME(thaJeztah): we should not ignore errors here; see https://github.com/moby/moby/pull/48359#discussion_r1725562802
+			fmt.Fprint(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n")
+		}</code></pre>
+          <p>
+            After that line the socket is raw bytes both ways. With a TTY there is no framing at all; without
+            one, output is multiplexed into 8-byte-header frames, which <a href="../network-and-lifecycle/#p4-bytes">Part 4</a>
+            takes apart. Errors after the hijack are hand-written HTTP too, and the FIXME above is still on
+            moby master (finding D10, class A, low) <span class="src">from the code</span>. Wait is the opposite
+            trick. <code>container_routes.go</code>:444-453 writes <code>200 OK</code> and flushes at once, then
+            blocks on <code>status := &lt;-waitC</code>, so the body is written only when the container exits.
+            The CLI waits with <code>condition=next-exit</code> (<code>removed</code> under <code>--rm</code>) and
+            maps any wait error to status 125 (<code>utils.go</code>:18-38). Start follows on a third
+            connection, because connection #1 is held by the pending wait. It takes no body and answers
+            <code>204</code> only after containerd has started the process (<code>container_routes.go</code>:283-309)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>The terminal side</h3>
+          <p>
+            With <code>-t</code> the CLI puts its own stdin and stdout into raw mode and wraps stdin in an escape
+            proxy whose default detach sequence is Ctrl-P Ctrl-Q, <code>defaultEscapeKeys = []byte{16, 17}</code>
+            (<code>hijack.go</code>:19) <span class="src">from the code</span>. Typing <code>a</code>,
+            <code>b</code>, Ctrl-P, Ctrl-Q sent only <code>ab</code> to the daemon, and the CLI exited 0
+            <span class="recon">measured here</span>. The daemon enforces the same keys again for TTY attaches
+            (<code>moby/daemon/internal/stream/attach.go</code>:14). There is a gap in the CLI's check:
+            <code>runContainer</code> falls back to <code>detachKeys</code> from <code>~/.docker/config.json</code>
+            but validates only the flag (<code>run.go</code>:143-149), so a bad config value fails after create
+            and attach and leaves a created container behind (finding D3, class A, still on cli master)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            When local stdin ends, the CLI half-closes the socket with <code>CloseWrite</code> rather than
+            closing it (<code>hijack.go</code>:194-196), so output keeps flowing. What the daemon does with that
+            end depends on the TTY. <code>StdinOnce</code> closes the container's stdin only when there is no
+            TTY; with <code>-it</code>, the end of client stdin closes this attach's stdout and stderr instead
+            and leaves the container's stdin open (<code>stream/attach.go</code>:69-80; finding D4, class D)
+            <span class="src">from the code</span>. Signals take a fifth path: with <code>--sig-proxy</code>
+            (default true) the CLI turns each caught signal into <code>POST /containers/{id}/kill?signal=NAME</code>,
+            and SIGWINCH into <code>POST …/resize</code> (<code>signals.go</code>:16-56, <code>tty.go</code>:80-106)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="p1-spec"><span class="secnum">03</span>Create is bookkeeping; start builds the world</h2>
+          <p>
+            <code>POST /containers/create</code> touches no runtime at all. It resolves the image locally, merges
+            the config, allocates an ID and a name, creates the read-write layer, writes JSON to disk and emits a
+            <code>create</code> event (<code>moby/daemon/create.go</code>:171-290). containerd is not called
+            until start. A missing image gives the 404 that the CLI's pull-and-retry waits for
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The ID is 32 random bytes in hex, 64 characters, drawn again if its 12-character short form is all
+            digits, because the short ID becomes the default hostname
+            (<code>moby/daemon/internal/stringid/stringid.go</code>:36-60). The program is fixed now from
+            Entrypoint and Cmd; for <code>alpine sh</code> that is <code>Path:"sh"</code> with no args
+            (<code>moby/daemon/container.go</code>:134-157). The record lands in
+            <code>/var/lib/docker/containers/&lt;id&gt;/</code>, created mode 0710, as two files written
+            atomically with mode 0600: <code>config.v2.json</code> and <code>hostconfig.json</code>. They are
+            split on purpose. <code>HostConfig</code> carries <code>json:"-"</code> with the comment "do not
+            serialize the host config in the json, otherwise we'll make the container unportable"
+            (<code>moby/daemon/container/container.go</code>:105) <span class="src">from the code</span>. Every
+            later state change is checkpointed twice, to disk and into an in-memory go-memdb replica that answers
+            <code>docker ps</code> without taking container locks (<code>container/container.go</code>:225-238).
+          </p>
+          <p>
+            One CLI flag writes more than JSON. After create, <code>--use-api-socket</code> copies a
+            <code>config.json</code> holding the user's resolved registry credentials to
+            <code>/run/secrets/docker/config.json</code> in the writable layer
+            (<code>cli/cli/command/container/create.go</code>:244-310). The comment there admits it: "This can
+            leave around the config if the container doesn't get deleted" (<code>create.go</code>:268-269;
+            finding D8, class D) <span class="src">from the code</span>.
+          </p>
+
+          <h3>Start, under one lock</h3>
+          <p>
+            <code>containerStart</code> runs under the container lock: mount the read-write layer, set up the
+            network sandbox and mounts, <code>createSpec</code>, <code>ReplaceContainer</code> in containerd,
+            <code>NewTask</code> (shim plus <code>runc create</code>), <code>initializeCreatedTask</code> (network
+            into the new netns), <code>tsk.Start</code> (<code>runc start</code>), <code>SetRunning</code>, health
+            monitor, checkpoint, <code>start</code> event (<code>moby/daemon/start.go</code>:82-271)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The OCI spec is not stored at create. It is regenerated on every start:
+            <code>oci.DefaultSpec()</code> plus about seventeen <code>SpecOpts</code> in a fixed order, from
+            cgroups through namespaces, capabilities, seccomp and mounts to the masked paths (<code>moby/daemon/oci_linux.go</code>:1024-1079)
+            <span class="src">from the code</span>. So a daemon upgrade changes the sandbox of an existing
+            container the next time it starts <span class="recon">reconstruction</span>. Figure 3
+            lists what that spec takes away, who applies each part, and what the same files read on this
+            sandbox, which is itself a container.
+          </p>
+
+          <figure class="figure wide" id="fig-spec-layers">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">What Docker's default spec removes, who applies it, and what this sandbox shows</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Layer</th><th>Docker 29.9.2 default</th><th>Applied by</th><th>Mechanism</th><th>Read live on this sandbox</th></tr></thead>
+                <tbody>
+                  <tr><td>Namespaces</td><td>mount, network, <strong>time</strong>, uts, pid, ipc; cgroup (private on v2); user only with userns-remap</td><td>dockerd spec; runc init</td><td>one <code>unshare</code> in C, before Go starts (§05)</td><td class="hl-orange" style="background: var(--orange-soft)">cgroup, ipc, mnt, net, pid, uts private; time and user are the host's</td></tr>
+                  <tr><td>Capabilities</td><td>14 (listed below)</td><td>runc init</td><td>bounding set, then permitted and effective, in <code>finalizeNamespace</code></td><td class="hl-green" style="background: var(--green-soft)"><code>CapBnd</code> <code>00000000a80425fb</code>: the same 14</td></tr>
+                  <tr><td>Seccomp</td><td>default action <code>SCMP_ACT_ERRNO</code>, errno 1 (EPERM); 426 syscall names, 361 allowed unconditionally</td><td>dockerd resolves and inlines; runc init loads</td><td><code>prctl(PR_SET_SECCOMP)</code>, before caps are dropped</td><td class="hl-orange" style="background: var(--orange-soft)"><code>Seccomp: 0</code>, no filter</td></tr>
+                  <tr><td>AppArmor</td><td><code>docker-default</code>: no <code>mount</code>, no AF_ALG or vsock, few <code>/proc</code> writes; silently skipped without <code>/sbin/apparmor_parser</code>, with <code>$container</code> set, or under rootless detach-netns</td><td>runc init</td><td>LSM exec label, set before sysctls and masks</td><td class="hl-orange" style="background: var(--orange-soft)"><code>cri-containerd.apparmor.d</code> (enforce)</td></tr>
+                  <tr><td>Masked paths</td><td>12 fixed, e.g. <code>/proc/kcore</code>, <code>/sys/firmware</code>, plus thermal paths</td><td>runc init</td><td>files: bind <code>/dev/null</code> over; dirs: read-only tmpfs</td><td class="hl-green" style="background: var(--green-soft)">4 files are binds of <code>/null</code>; <code>/proc/acpi</code>, <code>/proc/scsi</code>, <code>/sys/firmware</code> are ro tmpfs</td></tr>
+                  <tr><td>Read-only paths</td><td><code>/proc/{bus,fs,irq,sys,sysrq-trigger}</code></td><td>runc init</td><td>self-bind, then <code>MS_REMOUNT|MS_RDONLY</code></td><td class="hl-green" style="background: var(--green-soft)">the same five, ro sub-binds of one proc mount</td></tr>
+                  <tr><td><code>/dev</code></td><td>64 MiB tmpfs (<code>size=65536k</code>); fresh devpts (<code>newinstance,ptmxmode=0666</code>)</td><td>runc init</td><td>mount, mknod, <code>/dev/ptmx</code> symlink</td><td class="hl-green" style="background: var(--green-soft)">tmpfs <code>size=65536k</code>; devpts <code>ptmxmode=666</code></td></tr>
+                  <tr><td>Device rules</td><td>deny all; allow c 1:5, 1:3, 1:9, 1:8, 5:0, 5:1; deny c 10:229; runc appends "mknod any char/block device"</td><td>runc parent</td><td><code>bpf</code> program of type <code>CGROUP_DEVICE</code></td><td>not readable from inside</td></tr>
+                  <tr><td>cgroup</td><td><code>system.slice:docker:&lt;id&gt;</code> (systemd driver) or <code>/docker/&lt;id&gt;</code>; limits only if asked</td><td>runc parent</td><td>pid into <code>cgroup.procs</code> before init forks; limits written after</td><td class="hl-green" style="background: var(--green-soft)"><code>cpu.max</code> <code>200000 100000</code>; <code>memory.max</code> 8 GiB</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              The spec dockerd builds removes a lot, and runc applies almost all of it from inside the new
+              namespaces. Defaults are read from <code>moby/daemon/pkg/oci/defaults.go</code>, the vendored
+              <code>moby/profiles/seccomp/default.json</code> and runc <span class="src">from the code</span>. The
+              last column is this Kubernetes sandbox's own <code>/proc</code> and <code>/sys/fs/cgroup</code>:
+              green where it matches Docker's default, orange where Kubernetes chose differently
+              <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>Defaults worth knowing</h3>
+          <p>
+            Since docker-v29.5.0 the default namespace list includes a private time namespace
+            (<code>moby/daemon/pkg/oci/defaults.go</code>:117-124; commit <code>d5370d34d3</code>, 7 April 2026),
+            dropped on kernels older than 5.6 or with the daemon feature <code>"time-namespaces": false</code>.
+            Tools that compare <code>/proc/&lt;pid&gt;/ns/time</code>, or run <code>nsenter</code> without
+            <code>-T</code>, now see a new namespace (finding D17, class E) <span class="src">from the code</span>.
+            The 14 capabilities are CHOWN, DAC_OVERRIDE, FSETID, FOWNER, MKNOD, NET_RAW, SETGID, SETUID, SETFCAP,
+            SETPCAP, NET_BIND_SERVICE, SYS_CHROOT, KILL and AUDIT_WRITE, in the bounding, permitted and effective
+            sets only (<code>moby/daemon/pkg/oci/caps/defaults.go</code>:4-21). For a private network namespace
+            dockerd also sets <code>net.ipv4.ip_unprivileged_port_start</code> to 0, so ports below 1024 bind
+            without <code>CAP_NET_BIND_SERVICE</code> (<code>oci_linux.go</code>:753-775). Seccomp is inlined
+            into the spec, and not applied at all for <code>--privileged</code> unless a profile is given
+            (<code>moby/daemon/seccomp_linux.go</code>:19-58) <span class="src">from the code</span>.
+          </p>
+          <p>
+            <code>--init</code> is a spec rewrite, and only for a private PID namespace,
+            <code>moby/daemon/oci_linux.go</code>:731-745 <span class="src">from the code</span>:
+          </p>
+<pre><code>if c.HostConfig.PidMode.IsPrivate() {
+	if (c.HostConfig.Init != nil &amp;&amp; *c.HostConfig.Init) ||
+		(c.HostConfig.Init == nil &amp;&amp; daemonCfg.Init) {
+		s.Process.Args = append([]string{inContainerInitPath, "--", c.Path}, c.Args...)
+		path, err := daemonCfg.LookupInitPath() // this will fall back to DefaultInitBinary and return an absolute path
+		if err != nil {
+			return err
+		}
+		s.Mounts = append(s.Mounts, specs.Mount{
+			Destination: inContainerInitPath,
+			Type:        "bind",
+			Source:      path,
+			Options:     []string{"bind", "ro"},
+		})
+	}</code></pre>
+          <p>
+            The binary bind-mounted read-only at <code>/sbin/docker-init</code> is tini: the installed
+            <code>/usr/libexec/docker/docker-init --version</code> prints <code>tini version 0.19.0 - git.de40ad0</code>
+            <span class="recon">measured here</span>. Without it, <code>sh</code> is PID 1, which per
+            <code>pid_namespaces(7)</code> gets only the signals it has handlers for
+            <span class="recon">reconstruction</span>. The CLI
+            sends <code>"Init":true</code> only when the flag is given, and <code>null</code> otherwise so the
+            daemon's own default applies (<code>cli/cli/command/container/opts.go</code>:724-727)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="p1-shim"><span class="secnum">04</span>containerd, the shim and a protobuf on stdin</h2>
+          <p>
+            dockerd does not run containers. It asks containerd to, through <code>libcontainerd/remote</code>, a
+            thin wrapper over the containerd Go client (v2.4.2 is vendored), always in the containerd namespace
+            <code>moby</code> (<code>moby/daemon/daemon.go</code>:1052-1066) <span class="src">from the code</span>.
+            Which containerd it talks to is decided once, at daemon start,
+            <code>moby/daemon/command/daemon_unix.go</code>:132-149 <span class="src">from the code</span>:
+          </p>
+<pre><code>func (cli *daemonCLI) initContainerd(ctx context.Context) (func(time.Duration) error, error) {
+	// Check embedded-containerd first so daemon.json can opt in even when
+	// packaged service units pass a default --containerd socket.
+	if cli.Config.Features["embedded-containerd"] {
+		return cli.initEmbeddedContainerd(ctx)
+	}
+	if cli.Config.ContainerdAddr != "" {
+		// use system containerd at the given address.
+		return nopWaitFunc, nil
+	}
+
+	waitTimeout, err := cli.initializeContainerd(ctx)
+	if errors.Is(err, exec.ErrNotFound) {
+		log.G(ctx).WithError(err).Info("containerd binary not found, starting embedded containerd")
+		return cli.initEmbeddedContainerd(ctx)
+	}
+	return waitTimeout, err
+}</code></pre>
+
+          <figure class="figure" id="fig-containerd-source">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">Where dockerd's containerd comes from, in the order the code asks</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 680 440" role="img" aria-label="Decision tree. If the embedded-containerd feature is on, containerd runs inside dockerd. Otherwise, if a containerd address is configured, dockerd uses it. Otherwise, if the system containerd socket exists, dockerd uses it. Otherwise dockerd starts and supervises its own containerd, and if the binary is missing it falls back to the embedded mode.">
+                <defs>
+                  <marker id="fig-containerd-source-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">THE QUESTION</text>
+                <text x="404" y="22" class="svg-lane">THE CONTAINERD</text>
+
+                <rect x="20" y="36" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="56" class="svg-step">embedded-containerd feature on?</text>
+                <text x="32" y="74" class="svg-sub">daemon.json "features"</text>
+                <rect x="404" y="36" width="256" height="50" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="416" y="56" class="svg-step">embedded in dockerd</text>
+                <text x="416" y="74" class="svg-sub">experimental, since 29.7.0</text>
+                <line x1="340" y1="61" x2="400" y2="61" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="356" y="54" class="svg-sub">yes</text>
+                <line x1="180" y1="86" x2="180" y2="114" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="190" y="104" class="svg-sub">no</text>
+
+                <rect x="20" y="116" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="136" class="svg-step">--containerd address set?</text>
+                <text x="32" y="154" class="svg-sub">the stock docker.service sets it</text>
+                <rect x="404" y="116" width="256" height="50" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="416" y="136" class="svg-step">that containerd</text>
+                <text x="416" y="154" class="svg-sub">packaged installs end here</text>
+                <line x1="340" y1="141" x2="400" y2="141" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="356" y="134" class="svg-sub">yes</text>
+                <line x1="180" y1="166" x2="180" y2="194" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="190" y="184" class="svg-sub">no</text>
+
+                <rect x="20" y="196" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="216" class="svg-step">system socket present?</text>
+                <text x="32" y="234" class="svg-sub">Lstat /run/containerd/containerd.sock</text>
+                <rect x="404" y="196" width="256" height="50" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="416" y="216" class="svg-step">system containerd</text>
+                <text x="416" y="234" class="svg-sub">a separate service</text>
+                <line x1="340" y1="221" x2="400" y2="221" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="356" y="214" class="svg-sub">yes</text>
+                <line x1="180" y1="246" x2="180" y2="274" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="190" y="264" class="svg-sub">no</text>
+
+                <rect x="20" y="276" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="296" class="svg-step">exec the containerd binary</text>
+                <text x="32" y="314" class="svg-sub">initializeContainerd → supervisor</text>
+                <rect x="404" y="276" width="256" height="50" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="416" y="296" class="svg-step">supervised child</text>
+                <text x="416" y="314" class="svg-sub">Pdeathsig SIGKILL: dies with dockerd</text>
+                <line x1="340" y1="301" x2="400" y2="301" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="350" y="294" class="svg-sub">found</text>
+                <line x1="180" y1="326" x2="180" y2="364" stroke="#252525" stroke-width="2" marker-end="url(#fig-containerd-source-ctl)"/>
+                <text x="190" y="348" class="svg-sub">exec.ErrNotFound</text>
+
+                <rect x="20" y="366" width="320" height="50" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="32" y="386" class="svg-step">embedded fallback</text>
+                <text x="32" y="404" class="svg-sub">automatic since 29.8.0</text>
+                <text x="404" y="386" class="svg-note">shims still run as separate</text>
+                <text x="404" y="404" class="svg-note">processes in every branch</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Three of five branches end at a separate containerd process; two end inside dockerd. The fallback at
+              the bottom is invisible in <code>docker info</code>. From <code>daemon_unix.go</code>:132-149 and
+              <code>daemon.go</code>:1088-1102, 1167-1195 <span class="src">from the code</span>.
+            </p>
+          </figure>
+
+          <p>
+            The two embedded branches are new. The experimental feature arrived in 29.7.0 (<code>a8a1cfd111</code>);
+            the automatic fallback when the binary is missing, no system containerd runs and no address is set
+            arrived in 29.8.0 (<code>b25f366ced</code>). Packaged installs never hit it, because
+            <code>contrib/init/systemd/docker.service</code>:15 starts <code>dockerd -H fd://
+            --containerd=/run/containerd/containerd.sock</code>. A hand-started dockerd can. It then registers a
+            smaller plugin set (no CRI, sandbox, streaming, transfer, NRI or restart monitor), and
+            <code>docker info</code> shows nothing: the warning is gated on the feature flag the fallback never
+            sets, and even <code>Containerd.Address</code> is the same path a supervised daemon would use
+            (<code>moby/daemon/info.go</code>:255-268; finding D7, class D) <span class="src">from the code</span>.
+            Embedded mode still runs separate shims and still serves a real ttrpc socket for their events
+            (<code>moby/daemon/internal/containerd/server/embedded/server.go</code>:87-90) <span class="src">from the code</span>.
+          </p>
+
+          <h3>A container with no rootfs</h3>
+          <p>
+            At start, <code>ReplaceContainer</code> creates the containerd container object, deleting any stale one
+            with the same ID first (<code>moby/daemon/internal/libcontainerd/replace.go</code>:17-60). It carries the OCI spec,
+            the runtime name and options, and a label <code>com.docker/engine.bundle.path</code>, but no snapshot
+            key, so containerd never mounts the root filesystem for Docker. dockerd mounted it already and put
+            the absolute path in the spec (<code>libcontainerd/remote/client.go</code>:119-146)
+            <span class="src">from the code</span>. I/O is named FIFOs in
+            <code>/var/run/docker/containerd/&lt;id&gt;/</code>, named after the process: for the container's own
+            process <code>&lt;id&gt;-stdin</code>, <code>&lt;id&gt;-stdout</code>, and <code>&lt;id&gt;-stderr</code> only without a TTY
+            (<code>libcontainerd/remote/client.go</code>:218; <code>client_linux.go</code>:92-120).
+          </p>
+          <p>
+            containerd's task manager writes the bundle first,
+            <code>/run/containerd/io.containerd.runtime.v2.task/moby/&lt;id&gt;/</code> with
+            <code>config.json</code>, then starts the shim, then calls its Create
+            (<code>containerd/core/runtime/v2/task_manager.go</code>:158-200). The runtime name <code>io.containerd.runc.v2</code>
+            becomes the binary <code>containerd-shim-runc-v2</code> (<code>containerd/pkg/shim/util.go</code>:41-49)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>The shim starts twice</h3>
+          <p>
+            containerd launches the shim in its own process group with <code>GOMAXPROCS=2</code>,
+            <code>TTRPC_ADDRESS</code>, <code>GRPC_ADDRESS</code> and <code>NAMESPACE</code> in its environment:</p>
+<pre><code>containerd-shim-runc-v2 -namespace moby -address &lt;containerd.sock&gt; \
+    -publish-binary &lt;containerd&gt; -id &lt;id&gt; [-bundle &lt;bundle&gt;] start</code></pre>
+          <p>
+            Since containerd v2.3.0 it also writes a protobuf <code>BootstrapParams</code> message to the shim's
+            stdin (<code>containerd/core/runtime/v2/command.go</code>:67-158) <span class="src">from the code</span>.
+            That <code>start</code> process is only a launcher. It re-execs itself without the action as the
+            long-lived server, with <code>GOMAXPROCS=4</code> and its own process group, hands it a listening
+            socket, writes the answer to stdout and exits,
+            <code>containerd/cmd/containerd-shim-runc-v2/manager/manager_linux.go</code>:188-190, 253, 296-297
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	var params bootapi.BootstrapResult
+	params.Version = 3
+	params.Protocol = "ttrpc"
+…
+	if err := cmd.Start(); err != nil {
+…
+	params.Address = sockets[0].addr
+	return &amp;params, nil</code></pre>
+          <p>
+            The address is a hash. <code>containerd/pkg/shim/util_unix.go</code>:82-87 joins containerd's socket
+            path, the namespace and the container ID and takes the sha256:
+            <code>d := sha256.Sum256([]byte(path))</code>, then
+            <code>fmt.Sprintf("unix://%s/%x", socketRoot, d)</code> with the root <code>/run/containerd/s</code>.
+            For the ID in the trace, <code>4f1c0ffee000…</code>, that gives the following, computed from the
+            code and not observed <span class="recon">reconstruction</span>:
+          </p>
+<pre><code>path-hashed: /run/containerd/containerd.sock/moby/4f1c0ffee0000000000000000000000000000000000000000000000000000000
+unix:///run/containerd/s/3cbd891cf0891a016d6a3084ea8be730eb173321caf9b4c613b53c828d5e8bb0</code></pre>
+          <p>
+            containerd saves that address in the bundle as <code>bootstrap.json</code>, so a restarted containerd
+            can find running shims again (<code>containerd/core/runtime/v2/binary.go</code>:124-142). Calls go down
+            on the ttrpc service <code>containerd.task.v3.Task</code>, whose proto calls the shim "the parent of
+            each container" (<code>containerd/api/runtime/task/v3/shim.proto</code>:29-32)
+            <span class="src">from the code</span>. The shim then makes that true with
+            <code>PR_SET_CHILD_SUBREAPER</code>. Its <code>Create</code> runs runc through go-runc, with runc's state under Docker's
+            exec root, and waits for it to exit (<code>process/init.go</code>:82-94, 110-151):</p>
+<pre><code>runc --root /var/run/docker/runtime-runc/moby --log &lt;bundle&gt;/log.json --log-format json \
+    create --bundle &lt;bundle&gt; --pid-file &lt;bundle&gt;/init.pid --console-socket &lt;tmp.sock&gt; &lt;id&gt;</code></pre>
+          <p> With <code>-t</code> no pipes are made: runc's init allocates the pty inside the container and
+            sends the master fd back over the console socket with <code>SCM_RIGHTS</code>, and the shim pumps
+            master and FIFOs with an epoll copier (<code>process/init.go</code>:110-168)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>Exit codes, and who computes them</h3>
+          <p>
+            Failures on this path come back as exit codes, and Figure 5 shows that three
+            different places compute them. Two of them compare error <em>text</em>. The CLI's
+            <code>toStatusError</code> maps "executable file not found" or "no such file or directory" to 127
+            and EACCES or EISDIR text to 126 (<code>cli/cli/command/container/run.go</code>:326-356). The daemon
+            appends EACCES text to an EISDIR error "because docker/cli checks whether the error message contains
+            syscall.EACCESS.Error()" and maps ENOTDIR, a file bind-mounted onto a directory, to 127 "command not
+            found" (<code>moby/daemon/errors.go</code>:136-157; findings D1 and D2, class D)
+            <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure" id="fig-exit-codes">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">The exit codes of <code>docker run</code>, and which program decides each one</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Code</th><th>Means</th><th>Decided by</th><th>How</th></tr></thead>
+                <tbody>
+                  <tr><td>0, 1…</td><td>the process's own status</td><td class="hl-green" style="background: var(--green-soft)">shim reaper</td><td><code>wait4</code> status, carried up to the wait body</td></tr>
+                  <tr><td>125</td><td>Docker failed</td><td class="hl-blue" style="background: var(--blue-soft)">CLI</td><td>any error that matches neither text below; any wait error</td></tr>
+                  <tr><td>126</td><td>cannot invoke</td><td class="hl-orange" style="background: var(--orange-soft)">CLI and daemon</td><td>substring "permission denied"; EISDIR rewritten to contain it</td></tr>
+                  <tr><td>127</td><td>not found</td><td class="hl-orange" style="background: var(--orange-soft)">CLI and daemon</td><td>"executable file not found", "no such file…"; ENOTDIR</td></tr>
+                  <tr><td>137</td><td>SIGKILL</td><td class="hl-green" style="background: var(--green-soft)">shim reaper</td><td>128 + 9; also an OOM kill, and a lost process with no recorded status</td></tr>
+                  <tr><td>143</td><td>SIGTERM</td><td class="hl-green" style="background: var(--green-soft)">shim reaper</td><td>128 + 15, e.g. a clean <code>docker stop</code></td></tr>
+                  <tr><td>255</td><td>status unknown</td><td class="hl-blue" style="background: var(--blue-soft)">daemon restore</td><td>the task vanished while dockerd was down</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Only the signal codes come from the kernel's view of the process; 125 to 127 are string matches on
+              both sides of the socket. From <code>run.go</code>:326-356, <code>errors.go</code>:136-166,
+              <code>containerd/pkg/sys/reaper/reaper_unix.go</code>:280-289 (<code>exitSignalOffset = 128</code>),
+              <code>manager_linux.go</code>:360-364 and <code>moby/daemon/daemon.go</code>:528
+              <span class="src">from the code</span>. None was reproduced on a live host.
+            </p>
+          </figure>
+
+          <h2 id="p1-runc"><span class="secnum">05</span>runc init: namespaces from a C constructor</h2>
+          <p>
+            <code>runc create</code> runs the full container setup and then detaches; it enters the same
+            <code>startContainer</code> path as <code>runc run</code> with the action <code>CT_ACT_CREATE</code>
+            (<code>runc/create.go</code>:59-70) <span class="src">from the code</span>. The interesting work
+            happens in a child that runc spawns by re-executing itself as <code>runc init</code>. Three things
+            are prepared before that child exists.
+          </p>
+          <p>
+            First, the binary. runc never lets the container see its own executable. If
+            <code>/proc/self/exe</code> is not already a sealed copy, <code>exeseal.CloneSelfExe</code> makes one,
+            and init is executed through <code>/proc/self/fd/N</code>
+            (<code>runc/libcontainer/container_linux.go</code>:507-530). The preferred seal is a detached,
+            read-only overlayfs view; a sealed memfd copy is the fallback, priced in the code at "around ~60%
+            overhead during container startup" (<code>exeseal/cloned_binary_linux.go</code>:229)
+            <span class="src">from the code</span>. The defence dates from CVE-2019-5736, where a container could
+            overwrite the host's runc through <code>/proc/self/exe</code>. Second, file descriptors: before <code>cmd.Start()</code> runc marks
+            every fd from 3 up close-on-exec "as some additional protection against attacks like
+            CVE-2024-21626" (<code>container_linux.go</code>:341-349). Only the deliberate ExtraFiles reach the
+            child, each named by an environment variable: <code>_LIBCONTAINER_INITPIPE</code>,
+            <code>_LIBCONTAINER_SYNCPIPE</code>, <code>_LIBCONTAINER_LOGPIPE</code> and, for <code>-t</code>,
+            <code>_LIBCONTAINER_CONSOLE</code> (<code>container_linux.go</code>:547-575)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Third, the cgroup. The parent puts the child into the container's cgroup <em>before</em> it sends a
+            single byte of configuration, so every descendant is born inside it,
+            <code>runc/libcontainer/process_linux.go</code>:824-827, 849 <span class="src">from the code</span>:
+          </p>
+<pre><code>	// Do this before syncing with child so that no children can escape the
+	// cgroup. We don't need to worry about not doing this and not being root
+	// because we'd be using the rootless cgroup manager in that case.
+	if err := p.manager.Apply(p.pid()); err != nil {
+…
+	if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {</code></pre>
+
+          <h3>40 bytes of netlink</h3>
+          <p>
+            <code>bootstrapData</code> is a hand-rolled netlink message, not JSON. Its type is
+            <code>InitMsg uint16 = 62000</code> and its attributes are numbered 27281 to 27290 (clone flags,
+            namespace paths, uid and gid maps, setgroups, <code>oom_score_adj</code>, rootless, the
+            <code>newuidmap</code> paths, time offsets), numbers "randomly chosen to not conflict"
+            (<code>runc/libcontainer/message_linux.go</code>:11-25). An unknown attribute is fatal on the C side
+            (<code>nsenter/nsexec.c</code>:374-451) <span class="src">from the code</span>. For a default Docker container only three attributes are
+            present, and the whole message is 40 bytes. Figure 6 shows them. They were
+            computed from the code, not captured from a live runc <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure" id="fig-bootstrap-bytes">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">The bootstrap message for a default Docker container, byte by byte (synthesised)</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 680 392" role="img" aria-label="Forty bytes in three rows. Row one is the 16-byte netlink header: length 40, type 62000, flag NLM_F_REQUEST, sequence 1, pid 0. Row two holds attribute 27281, the clone flags 0x6e020080, and attribute 27286, the string zero plus padding. Row three holds attribute 27287, rootless, equal to 0. A side box breaks the clone flags into seven CLONE_NEW bits.">
+                <text x="64" y="24" class="svg-lane">BYTES (LITTLE-ENDIAN), OFFSET AT LEFT</text>
+
+                <!-- row 0 -->
+                <text x="16" y="62" class="svg-sub">0000</text>
+                <rect x="60" y="44" width="144" height="28" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="204" y="44" width="72" height="28" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="276" y="44" width="72" height="28" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="348" y="44" width="144" height="28" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="492" y="44" width="144" height="28" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="70" y="63" class="svg-sub" style="fill:#252525">28  00  00  00</text>
+                <text x="214" y="63" class="svg-sub" style="fill:#252525">30  f2</text>
+                <text x="286" y="63" class="svg-sub" style="fill:#252525">01  00</text>
+                <text x="358" y="63" class="svg-sub" style="fill:#252525">01  00  00  00</text>
+                <text x="502" y="63" class="svg-sub" style="fill:#252525">00  00  00  00</text>
+                <text x="70" y="90" class="svg-sub">nlmsg_len</text>
+                <text x="70" y="104" class="svg-sub">= 40</text>
+                <text x="214" y="90" class="svg-sub">type</text>
+                <text x="214" y="104" class="svg-sub">62000</text>
+                <text x="286" y="90" class="svg-sub">flags</text>
+                <text x="286" y="104" class="svg-sub">REQUEST</text>
+                <text x="358" y="90" class="svg-sub">seq = 1</text>
+                <text x="358" y="104" class="svg-sub">(placeholder)</text>
+                <text x="502" y="90" class="svg-sub">pid = 0</text>
+                <text x="64" y="124" class="svg-note">struct nlmsghdr, 16 bytes</text>
+
+                <!-- row 1 -->
+                <text x="16" y="162" class="svg-sub">0010</text>
+                <rect x="60" y="144" width="144" height="28" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="204" y="144" width="144" height="28" fill="#dfede5" stroke="#367f59"/>
+                <rect x="348" y="144" width="144" height="28" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="492" y="144" width="72" height="28" fill="#dfede5" stroke="#367f59"/>
+                <rect x="564" y="144" width="72" height="28" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="70" y="163" class="svg-sub" style="fill:#252525">08  00  91  6a</text>
+                <text x="214" y="163" class="svg-sub" style="fill:#252525">80  00  02  6e</text>
+                <text x="358" y="163" class="svg-sub" style="fill:#252525">06  00  96  6a</text>
+                <text x="502" y="163" class="svg-sub" style="fill:#252525">30  00</text>
+                <text x="574" y="163" class="svg-sub" style="fill:#252525">00  00</text>
+                <text x="70" y="190" class="svg-sub">len 8</text>
+                <text x="70" y="204" class="svg-sub">attr 27281</text>
+                <text x="214" y="190" class="svg-sub">clone flags</text>
+                <text x="214" y="204" class="svg-sub">0x6e020080</text>
+                <text x="358" y="190" class="svg-sub">len 6</text>
+                <text x="358" y="204" class="svg-sub">attr 27286</text>
+                <text x="502" y="190" class="svg-sub">"0" NUL</text>
+                <text x="502" y="204" class="svg-sub">oom adj</text>
+                <text x="574" y="190" class="svg-sub">pad</text>
+
+                <!-- row 2 -->
+                <text x="16" y="242" class="svg-sub">0020</text>
+                <rect x="60" y="224" width="144" height="28" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="204" y="224" width="144" height="28" fill="#dfede5" stroke="#367f59"/>
+                <text x="70" y="243" class="svg-sub" style="fill:#252525">08  00  97  6a</text>
+                <text x="214" y="243" class="svg-sub" style="fill:#252525">00  00  00  00</text>
+                <text x="70" y="270" class="svg-sub">len 8</text>
+                <text x="70" y="284" class="svg-sub">attr 27287</text>
+                <text x="214" y="270" class="svg-sub">rootless</text>
+                <text x="214" y="284" class="svg-sub">= 0</text>
+
+                <!-- clone flag breakdown -->
+                <rect x="380" y="224" width="256" height="156" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="392" y="244" class="svg-step">0x6e020080 =</text>
+                <text x="392" y="262" class="svg-sub" style="fill:#252525">CLONE_NEWNS</text><text x="540" y="262" class="svg-sub" style="fill:#252525">0x00020000</text>
+                <text x="392" y="277" class="svg-sub" style="fill:#252525">CLONE_NEWCGROUP</text><text x="540" y="277" class="svg-sub" style="fill:#252525">0x02000000</text>
+                <text x="392" y="292" class="svg-sub" style="fill:#252525">CLONE_NEWUTS</text><text x="540" y="292" class="svg-sub" style="fill:#252525">0x04000000</text>
+                <text x="392" y="307" class="svg-sub" style="fill:#252525">CLONE_NEWIPC</text><text x="540" y="307" class="svg-sub" style="fill:#252525">0x08000000</text>
+                <text x="392" y="322" class="svg-sub" style="fill:#252525">CLONE_NEWPID</text><text x="540" y="322" class="svg-sub" style="fill:#252525">0x20000000</text>
+                <text x="392" y="337" class="svg-sub" style="fill:#252525">CLONE_NEWNET</text><text x="540" y="337" class="svg-sub" style="fill:#252525">0x40000000</text>
+                <text x="392" y="352" class="svg-sub" style="fill:#d98226">CLONE_NEWTIME</text><text x="540" y="352" class="svg-sub" style="fill:#d98226">0x00000080</text>
+                <text x="392" y="366" class="svg-note">no CLONE_NEWUSER</text>
+
+                <!-- legend -->
+                <rect x="16" y="314" width="14" height="10" fill="#ece6f3" stroke="#765b98"/>
+                <text x="36" y="323" class="svg-sub">nlattr header</text>
+                <rect x="16" y="334" width="14" height="10" fill="#dfede5" stroke="#367f59"/>
+                <text x="36" y="343" class="svg-sub">value</text>
+                <rect x="16" y="354" width="14" height="10" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="36" y="363" class="svg-sub">padding, zero fields</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Seven namespace bits, one string and one boolean: the whole of what runc's C code needs before Go
+              starts. <strong>Synthesised from code, not captured</strong>: built from
+              <code>message_linux.go</code>:27-97 and <code>container_linux.go</code>:1043-1157, with
+              <code>seq</code> a placeholder. The <code>oom_score_adj</code> attribute is present because moby always
+              passes <code>WithOOMScore</code> (<code>moby/daemon/oci_linux.go</code>:1046)
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <h3>Three stages, all before main</h3>
+          <p>
+            The receiver is C because these namespace operations "require single-threaded program execution"
+            (<code>runc/libcontainer/nsenter/nsenter.go</code>:3-7), which a running Go runtime cannot promise.
+            So the package is a cgo constructor that runs before Go boots,
+            <code>nsenter.go</code>:10-17 <span class="src">from the code</span>:
+          </p>
+<pre><code>/*
+#cgo CFLAGS: -Wall
+extern void nsexec();
+void __attribute__((constructor)) init(void) {
+	nsexec();
+}
+*/
+import "C"</code></pre>
+          <p>
+            Every runc invocation runs it, and it returns at once unless <code>_LIBCONTAINER_INITPIPE</code> is
+            set (<code>nsexec.c</code>:743-747). In <code>runc init</code> it becomes a state machine built on
+            <code>setjmp</code> and <code>longjmp</code>: <code>clone_parent()</code> calls
+            <code>clone(child_func, ca.stack_ptr, CLONE_PARENT | SIGCHLD, &amp;ca)</code> and the child jumps back
+            into the same <code>switch</code> with the next stage number (<code>nsexec.c</code>:314-323).
+            <code>CLONE_PARENT</code> makes each new stage a sibling, a child of <code>runc create</code>, not of
+            the stage that cloned it <span class="src">from the code</span>. Figure 7 follows
+            the stages for Docker's default spec.
+          </p>
+
+          <figure class="figure wide" id="fig-nsexec-stages">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">runc's nsexec stages for a default Docker container</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 716" role="img" aria-label="Four lanes: the runc parent in Go, stage-0, stage-1 and stage-2. The parent starts runc init, joins it to the cgroup and sends the bootstrap bytes. Stage-0 clones stage-1. Stage-1 skips setns and the user namespace, unshares the remaining namespaces in one call and clones stage-2, which is PID 1 of the new PID namespace. Stage-1 asks stage-0 to forward the stage-2 pid to the parent and exits. Stage-0 releases stage-2, which calls setsid and setuid and returns into Go.">
+                <defs>
+                  <marker id="fig-nsexec-stages-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-nsexec-stages-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-nsexec-stages-fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">RUNC PARENT (GO)</text>
+                <text x="280" y="24" class="svg-lane">STAGE-0</text>
+                <text x="280" y="40" class="svg-sub">runc:[0:PARENT]</text>
+                <text x="540" y="24" class="svg-lane">STAGE-1</text>
+                <text x="540" y="40" class="svg-sub">runc:[1:CHILD]</text>
+                <text x="800" y="24" class="svg-lane">STAGE-2</text>
+                <text x="800" y="40" class="svg-sub">runc:[2:INIT], later sh</text>
+                <line x1="130" y1="52" x2="130" y2="680" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="390" y1="52" x2="390" y2="620" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="650" y1="214" x2="650" y2="510" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="910" y1="394" x2="910" y2="680" stroke="#deded9" stroke-width="1.5"/>
+
+                <!-- A -->
+                <rect x="20" y="60" width="220" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="78" class="svg-num">1</text>
+                <text x="46" y="78" class="svg-step">start runc init</text>
+                <text x="32" y="95" class="svg-sub">via /proc/self/fd/N</text>
+                <rect x="280" y="60" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="292" y="78" class="svg-step">nsexec(), constructor</text>
+                <text x="292" y="95" class="svg-sub">Go has not started</text>
+                <line x1="240" y1="82" x2="278" y2="82" stroke="#252525" stroke-width="2" marker-end="url(#fig-nsexec-stages-ctl)"/>
+
+                <!-- B -->
+                <rect x="20" y="120" width="220" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="138" class="svg-num">2</text>
+                <text x="46" y="138" class="svg-step">manager.Apply(pid)</text>
+                <text x="32" y="155" class="svg-sub">into cgroup.procs first</text>
+
+                <!-- bootstrap message -->
+                <text x="146" y="182" class="svg-num">3</text>
+                <text x="160" y="182" class="svg-sub" style="fill:#3c6f97">40-byte bootstrap, init pipe</text>
+                <line x1="132" y1="192" x2="386" y2="192" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-nsexec-stages-data)"/>
+
+                <!-- C -->
+                <rect x="280" y="210" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="292" y="228" class="svg-num">4</text>
+                <text x="306" y="228" class="svg-step">write oom_score_adj</text>
+                <text x="292" y="245" class="svg-sub">clone(CLONE_PARENT)</text>
+                <rect x="540" y="210" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="552" y="228" class="svg-step">stage-1 starts</text>
+                <text x="552" y="245" class="svg-sub">a sibling of stage-0</text>
+                <line x1="500" y1="232" x2="538" y2="232" stroke="#252525" stroke-width="2" marker-end="url(#fig-nsexec-stages-ctl)"/>
+
+                <!-- D -->
+                <rect x="540" y="270" width="220" height="44" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 3"/>
+                <text x="552" y="288" class="svg-num">5</text>
+                <text x="566" y="288" class="svg-step">setns, NEWUSER, id maps</text>
+                <text x="552" y="305" class="svg-sub">skipped for this spec</text>
+
+                <!-- E -->
+                <rect x="540" y="330" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.8"/>
+                <text x="552" y="348" class="svg-num">6</text>
+                <text x="566" y="348" class="svg-step">unshare(cloneflags)</text>
+                <text x="552" y="365" class="svg-sub">0x6e020080, one call</text>
+
+                <!-- F -->
+                <rect x="540" y="390" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="552" y="408" class="svg-num">7</text>
+                <text x="566" y="408" class="svg-step">clone(CLONE_PARENT)</text>
+                <text x="552" y="425" class="svg-sub">pidns takes children only</text>
+                <rect x="800" y="390" width="220" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="812" y="408" class="svg-step">stage-2 starts</text>
+                <text x="812" y="425" class="svg-sub">PID 1 of the new pidns</text>
+                <line x1="760" y1="412" x2="798" y2="412" stroke="#252525" stroke-width="2" marker-end="url(#fig-nsexec-stages-ctl)"/>
+
+                <!-- pid forwarding -->
+                <text x="420" y="456" class="svg-num">8</text>
+                <text x="434" y="456" class="svg-sub" style="fill:#765b98">SYNC_RECVPID_PLS</text>
+                <line x1="648" y1="466" x2="394" y2="466" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-nsexec-stages-fx)"/>
+                <text x="160" y="494" class="svg-sub" style="fill:#3c6f97">both pids, JSON</text>
+                <line x1="388" y1="504" x2="134" y2="504" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-nsexec-stages-data)"/>
+                <text x="660" y="500" class="svg-sub">CHILD_FINISH, exit(0)</text>
+
+                <!-- grandchild release -->
+                <text x="420" y="534" class="svg-num">9</text>
+                <text x="434" y="534" class="svg-sub" style="fill:#252525">SYNC_GRANDCHILD</text>
+                <line x1="392" y1="544" x2="906" y2="544" stroke="#252525" stroke-width="2" marker-end="url(#fig-nsexec-stages-ctl)"/>
+
+                <!-- G -->
+                <rect x="800" y="560" width="220" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="812" y="578" class="svg-num">10</text>
+                <text x="832" y="578" class="svg-step">setsid, setuid(0)</text>
+                <text x="812" y="595" class="svg-sub">setgid(0), setgroups(0)</text>
+
+                <!-- H -->
+                <rect x="800" y="620" width="220" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="812" y="638" class="svg-num">11</text>
+                <text x="832" y="638" class="svg-step">return into Go</text>
+                <text x="812" y="655" class="svg-sub">GOMAXPROCS(1), standard init</text>
+                <text x="290" y="640" class="svg-sub">exit(0) once stage-2 is done</text>
+                <text x="20" y="640" class="svg-sub">reaps stage-1</text>
+
+                <!-- legend -->
+                <line x1="20" y1="700" x2="50" y2="700" stroke="#252525" stroke-width="2"/>
+                <text x="58" y="704" class="svg-sub">clone or release</text>
+                <line x1="200" y1="700" x2="230" y2="700" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="238" y="704" class="svg-sub">bytes on the init pipe</text>
+                <line x1="420" y1="700" x2="450" y2="700" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <text x="458" y="704" class="svg-sub">sync socketpair message</text>
+                <rect x="650" y="693" width="30" height="14" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 3"/>
+                <text x="688" y="704" class="svg-sub">step skipped: no paths, no userns, no offsets</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Three processes, each a sibling of the last, so that the one which becomes PID 1 is created
+              <em>after</em> the new PID namespace exists. With Docker's defaults the user-namespace mapping and
+              time-offset round trips never happen. Read from <code>runc/libcontainer/nsenter/nsexec.c</code>:855-1224
+              <span class="src">from the code</span>; the <code>runc:[N:…]</code> names would show in
+              <code>ps</code> during a slow start, which was not observed here.
+            </p>
+          </figure>
+
+          <p>
+            The second clone exists because <code>unshare(CLONE_NEWPID)</code> does not move the caller; only its
+            children enter the new PID namespace (<code>nsexec.c</code>:1122-1134). The other namespaces come
+            from one <code>unshare(config.cloneflags)</code>, not clone flags, partly because
+            <code>clone(CLONE_PARENT|CLONE_NEWPID)</code> was broken on kernels up to 3.12. A user namespace, when
+            present, is unshared alone and first so stage-0 can write its maps <span class="src">from the code</span>. Stage-2 then calls
+            <code>setsid()</code>, <code>setuid(0)</code> and <code>setgid(0)</code> and <em>returns</em> from the
+            constructor, so the Go runtime boots inside every new namespace, locked to one thread with
+            <code>GOMAXPROCS(1)</code> (<code>init_linux.go</code>:106-123) <span class="src">from the code</span>.
+          </p>
+
+          <h3>After Go starts: an order shaped by CVEs</h3>
+          <p>
+            Go-side init runs a fixed sequence (<code>standard_init_linux.go</code>:51-304): keyring, network,
+            rootfs, console, hostname, AppArmor, sysctls, read-only and masked paths, seccomp, capabilities and
+            user, <code>LookPath</code>, the FIFO wait (§06), <code>execve</code>. The rootfs step makes
+            <code>/</code> recursively slave, bind-mounts the rootfs onto itself and pivots,
+            <code>runc/libcontainer/rootfs_linux.go</code>:1159-1166, 1173, 1182-1188
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	// Change to the new root so that the pivot_root actually acts on it.
+	if err := unix.Fchdir(int(root.Fd())); err != nil {
+		return &amp;os.PathError{Op: "chdir", Path: root.Name(), Err: err}
+	}
+
+	if err := unix.PivotRoot(".", "."); err != nil {
+		return &amp;os.PathError{Op: "pivot_root", Path: ".", Err: err}
+	}
+…
+	if err := unix.Fchdir(oldroot); err != nil {
+…
+	if err := mount("", ".", "", unix.MS_SLAVE|unix.MS_REC, ""); err != nil {
+		return err
+	}
+	// Perform the unmount. MNT_DETACH allows us to unmount /proc/self/cwd.
+	if err := unmount(".", unix.MNT_DETACH); err != nil {
+		return err
+	}</code></pre>
+          <p>
+            New root and old root on the same directory, then a lazy detach: no temporary directory inside the
+            rootfs is needed. Masked files get the container's own <code>/dev/null</code>, opened
+            <code>O_PATH</code> and inode-checked as char 1:3 before it is mounted by fd. That check is the fix
+            for CVE-2025-31133, where a symlinked <code>/dev/null</code> turned a mask into a read-write bind
+            (<code>rootfs_linux.go</code>:1318-1330) <span class="src">from the code</span>. runc also appends its
+            own device rules, including "mknod any char/block device", which no user can remove; its own comment
+            calls this "questionable" (<code>specconv/spec_linux.go</code>:225; finding D13, class D).
+          </p>
+          <p>
+            Seccomp placement depends on <code>no_new_privs</code>. Without it, loading a filter needs
+            <code>CAP_SYS_ADMIN</code>, so the filter goes in <em>before</em> capabilities are dropped, and
+            Docker sets <code>noNewPrivileges</code> only when asked. A tight custom profile must therefore allow
+            the syscalls runc init itself makes afterwards (<code>standard_init_linux.go</code>:188-200, 234-248;
+            finding D14) <span class="src">from the code</span>. runc loads the program itself, after prepending
+            a stub that returns <code>-ENOSYS</code> for syscalls newer than the profile
+            (<code>seccomp/patchbpf/enosys_linux.go</code>:627-650). Docker's profile is 926
+            lines, 14,122 bytes, 426 syscall names and 361 unconditional allows; <code>clone3</code> gets errno 38
+            (ENOSYS) rather than EPERM, so glibc falls back to <code>clone</code>, whose namespace flags are
+            filtered <span class="recon">measured here</span>. Unconditional <code>socketcall(2)</code> plus x86_64's 32-bit sub-arch
+            sidesteps the AF_ALG and AF_VSOCK <code>socket()</code> block when no LSM backs it (D15, class D); the
+            docs call <code>clock_adjtime</code> blocked, yet the profile allows it (D16, class C).
+          </p>
+          <p>
+            Immediately before <code>execve</code> init closes every fd from <code>3 + PassedFilesCount</code> up,
+            the core CVE-2024-21626 defence. That CVE leaked a handle to the host's
+            <code>/sys/fs/cgroup</code> into init. 1.5.2 also re-marks fds close-on-exec in
+            <code>finalizeNamespace</code> and rejects a cwd outside the container with <code>verifyCwd</code>
+            (<code>init_linux.go</code>:271-306). <code>runc exec</code> and create arm AppArmor at different points
+            (after <code>finalizeNamespace</code> versus before the masks), but both only write an on-exec profile
+            (<code>aa_change_onexec</code>), so confinement is identical from <code>execve</code> on
+            (<code>apparmor_linux.go</code>:52-68; D18, class D; runc#5362 would unify it)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="p1-fifo"><span class="secnum">06</span>The FIFO between create and start</h2>
+          <p>
+            The OCI runtime spec splits a container's birth in two. At <code>create</code>, "the user-specified
+            program … MUST NOT be run at this time"; <code>start</code> runs it, and starting a container that is
+            not <code>created</code> "MUST generate an error" (<code>runtime-spec/runtime.md</code>:60, 127)
+            <span class="src">from the code</span>. runc implements the gap with one named pipe. Its state
+            directory holds <code>state.json</code> and <code>exec.fifo</code>; under Docker that directory is
+            <code>/var/run/docker/runtime-runc/moby/&lt;id&gt;/</code>, because the shim passes
+            <code>--root</code> with the namespace appended (<code>runc/libcontainer/factory_linux.go</code>:21-22;
+            <code>containerd/cmd/containerd-shim-runc-v2/process/init.go</code>:82-94).
+          </p>
+          <p>
+            runc creates the FIFO mode 0622 and chowns it to the container's host-side root, so an init inside a
+            user namespace can still write it (<code>container_linux.go</code>:447-471). It hands the FIFO to init
+            only as an <code>O_PATH</code> file descriptor named by <code>_LIBCONTAINER_FIFOFD</code>, so the
+            container never holds a usable handle on the state directory (<code>container_linux.go</code>:478-494)
+            <span class="src">from the code</span>. At the very end of setup, init re-opens it for writing,
+            <code>runc/libcontainer/standard_init_linux.go</code>:260-271, 300-303
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	// Wait for the FIFO to be opened on the other side before exec-ing the
+	// user process. We open it through /proc/self/fd/$fd, because the fd that
+	// was given to us was an O_PATH fd to the fifo itself. Linux allows us to
+	// re-open an O_PATH fd through /proc.
+	fifoFile, err := pathrs.Reopen(l.fifoFile, unix.O_WRONLY|unix.O_CLOEXEC)
+	if err != nil {
+		return fmt.Errorf("reopen exec fifo: %w", err)
+	}
+	defer fifoFile.Close()
+	if _, err := fifoFile.Write([]byte("0")); err != nil {
+		return &amp;os.PathError{Op: "write exec fifo", Path: fifoFile.Name(), Err: err}
+	}
+…
+	if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
+		return err
+	}
+	return linux.Exec(name, l.config.Args, l.config.Env)</code></pre>
+          <p>
+            Opening a FIFO for writing blocks until something opens it for reading. That open is the whole
+            barrier. Everything before it, namespaces, mounts, the pivot, seccomp and capabilities, belongs to
+            create. Just before it, init calls <code>exec.LookPath(l.config.Args[0])</code>, "to make sure it
+            exists and it is returned as a create time error" (<code>standard_init_linux.go</code>:227-232). It
+            also checks that its parent is still the runc process that started it, and kills itself with
+            SIGKILL if that parent died mid-setup (<code>standard_init_linux.go</code>:220-226) <span class="src">from the code</span>.
+            Figure 8 lays the barrier out in time.
+          </p>
+
+          <figure class="figure wide" id="fig-create-start-fifo">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">The create/start barrier: init waits on <code>exec.fifo</code> while dockerd wires the network</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 600" role="img" aria-label="Five lanes: dockerd, the shim, runc create, runc start and runc init. runc create starts init, which looks up sh and then blocks opening exec.fifo for writing. runc create writes state.json and exits, and init is reparented to the shim. dockerd then sets the network namespace key and allocates endpoints. dockerd starts the task; the shim runs runc start, which opens the FIFO for reading. Init writes 0, closes its extra file descriptors and executes sh.">
+                <defs>
+                  <marker id="fig-create-start-fifo-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-create-start-fifo-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-create-start-fifo-fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="28" class="svg-lane">DOCKERD</text>
+                <text x="230" y="28" class="svg-lane">SHIM</text>
+                <text x="440" y="28" class="svg-lane">RUNC CREATE</text>
+                <text x="650" y="28" class="svg-lane">RUNC START</text>
+                <text x="860" y="28" class="svg-lane">RUNC INIT → SH</text>
+                <line x1="110" y1="40" x2="110" y2="540" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="320" y1="40" x2="320" y2="540" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="530" y1="40" x2="530" y2="284" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="740" y1="400" x2="740" y2="500" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="950" y1="120" x2="950" y2="540" stroke="#deded9" stroke-width="1.5"/>
+
+                <!-- R1 -->
+                <rect x="20" y="50" width="180" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="32" y="68" class="svg-step">ctr.NewTask</text>
+                <text x="32" y="85" class="svg-sub">via containerd</text>
+                <rect x="230" y="50" width="180" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="242" y="68" class="svg-step">shim Create</text>
+                <text x="242" y="85" class="svg-sub">exec runc create</text>
+                <rect x="440" y="50" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="452" y="68" class="svg-step">runc create</text>
+                <text x="452" y="85" class="svg-sub">exe seal, nsexec (§05)</text>
+                <line x1="200" y1="72" x2="228" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+                <line x1="410" y1="72" x2="438" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+
+                <!-- R2 -->
+                <line x1="530" y1="132" x2="858" y2="132" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+                <rect x="860" y="110" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="872" y="128" class="svg-step">runc init</text>
+                <text x="872" y="145" class="svg-sub">rootfs, seccomp, caps</text>
+
+                <!-- R3 -->
+                <rect x="860" y="170" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="872" y="188" class="svg-step">LookPath("sh")</text>
+                <text x="872" y="205" class="svg-sub">missing: create fails</text>
+
+                <!-- R4 -->
+                <rect x="860" y="230" width="180" height="44" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.6"/>
+                <text x="872" y="248" class="svg-step">reopen fifo O_WRONLY</text>
+                <text x="872" y="265" class="svg-sub">blocks: no reader yet</text>
+                <rect x="946" y="274" width="8" height="196" rx="2" fill="#d98226"/>
+                <rect x="440" y="230" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="452" y="248" class="svg-step">state.json: created</text>
+                <text x="452" y="265" class="svg-sub">then runc create exits</text>
+
+                <!-- R5 reparent -->
+                <text x="560" y="304" class="svg-sub" style="fill:#765b98">init reparented to the shim (subreaper)</text>
+                <line x1="944" y1="314" x2="324" y2="314" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-create-start-fifo-fx)"/>
+
+                <!-- R6 network -->
+                <rect x="20" y="330" width="180" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.6"/>
+                <text x="32" y="348" class="svg-step">initializeCreatedTask</text>
+                <text x="32" y="365" class="svg-sub">SetKey(/proc/N/ns/net)</text>
+                <text x="350" y="370" class="svg-sub" style="fill:#765b98">netns key set, endpoints allocated in it</text>
+                <line x1="200" y1="380" x2="944" y2="380" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-create-start-fifo-fx)"/>
+
+                <!-- R7 start -->
+                <rect x="20" y="400" width="180" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="32" y="418" class="svg-step">tsk.Start</text>
+                <text x="32" y="435" class="svg-sub">via containerd</text>
+                <rect x="230" y="400" width="180" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="242" y="418" class="svg-step">shim Start</text>
+                <text x="242" y="435" class="svg-sub">exec runc start &lt;id&gt;</text>
+                <rect x="650" y="400" width="180" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="662" y="418" class="svg-step">open fifo O_RDONLY</text>
+                <text x="662" y="435" class="svg-sub">read "0", remove fifo</text>
+                <line x1="200" y1="422" x2="228" y2="422" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+                <line x1="410" y1="422" x2="648" y2="422" stroke="#252525" stroke-width="2" marker-end="url(#fig-create-start-fifo-ctl)"/>
+
+                <!-- R8 -->
+                <text x="790" y="462" class="svg-sub" style="fill:#3c6f97">"0"</text>
+                <line x1="944" y1="472" x2="744" y2="472" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-create-start-fifo-data)"/>
+
+                <!-- R9 -->
+                <rect x="860" y="486" width="180" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="872" y="504" class="svg-step">UnsafeCloseFrom</text>
+                <text x="872" y="521" class="svg-sub">execve("sh"), same pid</text>
+                <text x="662" y="520" class="svg-sub">runc start exits</text>
+
+                <text x="20" y="568" class="svg-note">Bar: init blocked in open(2). After v1.5.2, runc main replaces the 100 ms open-poll on the reader side</text>
+                <text x="20" y="586" class="svg-note">with poll(2) and a pidfd (937d887d1c, first in v1.6.0-rc.1).</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Between the two runc invocations the process already exists, fully confined, inside its new
+              network namespace, but has not run a single instruction of <code>sh</code>. That gap is where
+              dockerd plugs in the network, with no hook. Read from runc v1.5.2 and
+              <code>moby/daemon/start_linux.go</code>:17-43 <span class="src">from the code</span>; the timing
+              was not observed.
+            </p>
+          </figure>
+
+          <h3>What dockerd does in the gap</h3>
+          <p>
+            After <code>NewTask</code> returns the init pid, dockerd points the libnetwork sandbox at that
+            process's network namespace, <code>moby/daemon/start_linux.go</code>:27-36
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>nspath, ok := oci.NamespacePath(spec, specs.NetworkNamespace)
+if ok &amp;&amp; nspath == "" { // the runtime has been instructed to create a new network namespace for tsk.
+	sb, err := daemon.netController.GetSandbox(ctr.ID)
+	if err != nil {
+		return errdefs.System(err)
+	}
+	if err := sb.SetKey(ctx, fmt.Sprintf("/proc/%d/ns/net", tsk.Pid())); err != nil {
+		return errdefs.System(err)
+	}
+}</code></pre>
+          <p>
+            Endpoints are then allocated inside it. No OCI prestart hook is involved. That was not always true:
+            the <code>SetKey</code> hook was removed in v26.0.0 (<code>0046b16d87</code>), restored in v26.1.0
+            (<code>fde80fe2e7</code>) and removed again (<code>933fcc9814</code>, May 2024)
+            <span class="src">from the code</span>. The veth, bridge and NAT rules that land in that namespace are
+            <a href="../network-and-lifecycle/#p4-network">Part 4</a>'s subject.
+          </p>
+          <p>
+            <code>runc start</code> is then almost nothing. It refuses any state but <code>Created</code> and calls
+            <code>container.Exec()</code> (<code>runc/start.go</code>:33-52). In v1.5.2 that is a goroutine doing a
+            blocking <code>open(exec.fifo, O_RDONLY)</code>, checking every 100 ms whether init has died; on success
+            it reads the byte and deletes the FIFO (<code>container_linux.go</code>:233-265, 288-302). Init's write
+            returns, it closes every fd from <code>3 + PassedFilesCount</code> up, and <code>execve</code> replaces
+            <code>runc init</code> with <code>sh</code> in the same pid <span class="src">from the code</span>. After
+            the pin, runc main swapped the open-poll for <code>handleFifo</code> with <code>poll(2)</code> and a
+            pidfd, and moved poststart hooks from create to start; neither is in v1.5.2 (finding D22, class E)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h2 id="p1-exit"><span class="secnum">07</span>Exit, and what survives dockerd</h2>
+          <p>
+            When <code>sh</code> exits, the kernel tells its parent, and its parent is the shim. On SIGCHLD the
+            shim's reaper calls <code>wait4(-1, …, WNOHANG)</code> (<code>containerd/pkg/sys/reaper/reaper_unix.go</code>:258-266)
+            and turns a signal death into <code>128 + signal</code> via <code>exitSignalOffset = 128</code>
+            (<code>reaper_unix.go</code>:280-289), so SIGKILL is 137 and SIGTERM 143. Docker did not invent those numbers; the
+            shim computes them <span class="src">from the code</span>. From there the status climbs three
+            protocols to reach the CLI. Figure 9 is the whole climb.
+          </p>
+
+          <figure class="figure wide" id="fig-exit-cascade">
+            <div class="figure-head">
+              <span class="figure-label">Figure 9</span>
+              <p class="figure-title">An exit status climbs back up: shim, containerd, dockerd, CLI</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 600" role="img" aria-label="Five lanes: kernel, shim, containerd, dockerd and CLI. sh exits and the kernel sends SIGCHLD to the shim. The shim reaps it, waits for running execs, records the exit status in the bundle and publishes TaskExit over ttrpc. containerd forwards it to dockerd's gRPC subscription. dockerd queues it per container, handles the exit, deletes the task through containerd, drains stdio for up to two seconds, consults the restart manager, marks the container stopped and releases the pending wait, whose body becomes the CLI's exit code.">
+                <defs>
+                  <marker id="fig-exit-cascade-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-exit-cascade-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-exit-cascade-fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="28" class="svg-lane">KERNEL</text>
+                <text x="232" y="28" class="svg-lane">SHIM</text>
+                <text x="444" y="28" class="svg-lane">CONTAINERD</text>
+                <text x="656" y="28" class="svg-lane">DOCKERD</text>
+                <text x="868" y="28" class="svg-lane">CLI</text>
+                <line x1="118" y1="40" x2="118" y2="104" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="330" y1="40" x2="330" y2="284" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="542" y1="40" x2="542" y2="530" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="754" y1="40" x2="754" y2="530" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="966" y1="40" x2="966" y2="530" stroke="#deded9" stroke-width="1.5"/>
+
+                <!-- 1-2 -->
+                <rect x="20" y="50" width="196" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="68" class="svg-num">1</text>
+                <text x="46" y="68" class="svg-step">sh exits</text>
+                <text x="32" y="85" class="svg-sub">SIGCHLD to its parent</text>
+                <rect x="232" y="50" width="196" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="244" y="68" class="svg-num">2</text>
+                <text x="258" y="68" class="svg-step">reaper: wait4</text>
+                <text x="244" y="85" class="svg-sub">signal → 128 + N</text>
+                <line x1="216" y1="72" x2="230" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#fig-exit-cascade-ctl)"/>
+
+                <rect x="232" y="110" width="196" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="244" y="128" class="svg-num">3</text>
+                <text x="258" y="128" class="svg-step">running execs first</text>
+                <text x="244" y="145" class="svg-sub">init's exit is the last</text>
+                <rect x="232" y="170" width="196" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="244" y="188" class="svg-num">4</text>
+                <text x="258" y="188" class="svg-step">WriteExitStatus</text>
+                <text x="244" y="205" class="svg-sub">into the bundle (2.4+)</text>
+                <rect x="232" y="230" width="196" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="244" y="248" class="svg-num">5</text>
+                <text x="258" y="248" class="svg-step">publish TaskExit</text>
+                <text x="244" y="265" class="svg-sub">2048-slot queue</text>
+
+                <!-- 6 -->
+                <text x="440" y="244" class="svg-sub" style="fill:#765b98">ttrpc</text>
+                <line x1="428" y1="252" x2="538" y2="252" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-exit-cascade-fx)"/>
+                <rect x="444" y="290" width="196" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="456" y="308" class="svg-num">6</text>
+                <text x="470" y="308" class="svg-step">Events.Forward</text>
+                <text x="456" y="325" class="svg-sub">on containerd.sock.ttrpc</text>
+                <text x="654" y="296" class="svg-sub" style="fill:#765b98">gRPC</text>
+                <line x1="640" y1="304" x2="750" y2="304" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-exit-cascade-fx)"/>
+
+                <!-- 7-10 dockerd -->
+                <rect x="656" y="320" width="196" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="668" y="338" class="svg-num">7</text>
+                <text x="682" y="338" class="svg-step">Subscribe stream</text>
+                <text x="668" y="355" class="svg-sub">per-container queue</text>
+                <rect x="656" y="380" width="196" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="668" y="398" class="svg-num">8</text>
+                <text x="682" y="398" class="svg-step">handleContainerExit</text>
+                <text x="668" y="415" class="svg-sub">drop duplicate exits</text>
+                <rect x="656" y="440" width="196" height="44" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="668" y="458" class="svg-num">9</text>
+                <text x="682" y="458" class="svg-step">Delete task, drain</text>
+                <text x="668" y="475" class="svg-sub">stdio wait ≤ 2 s</text>
+                <text x="444" y="452" class="svg-sub" style="fill:#252525">Delete: shim cleans up</text>
+                <line x1="656" y1="462" x2="546" y2="462" stroke="#252525" stroke-width="2" marker-end="url(#fig-exit-cascade-ctl)"/>
+                <rect x="656" y="500" width="196" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.6"/>
+                <text x="668" y="518" class="svg-num">10</text>
+                <text x="688" y="518" class="svg-step">restart? else stopped</text>
+                <text x="668" y="535" class="svg-sub">checkpoint, die event</text>
+
+                <!-- 11 CLI -->
+                <rect x="868" y="500" width="196" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.6"/>
+                <text x="880" y="518" class="svg-num">11</text>
+                <text x="900" y="518" class="svg-step">wait body arrives</text>
+                <text x="880" y="535" class="svg-sub">exit code = StatusCode</text>
+                <line x1="852" y1="522" x2="866" y2="522" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-exit-cascade-data)"/>
+
+                <!-- legend -->
+                <line x1="20" y1="578" x2="50" y2="578" stroke="#252525" stroke-width="2"/>
+                <text x="58" y="582" class="svg-sub">signal or call</text>
+                <line x1="190" y1="578" x2="220" y2="578" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <text x="228" y="582" class="svg-sub">event</text>
+                <line x1="300" y1="578" x2="330" y2="578" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="338" y="582" class="svg-sub">HTTP bytes (the long-polled wait from §02)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Three protocols, one status: a ttrpc event, a gRPC stream and the body of an HTTP response the CLI
+              opened before start. The wait unblocks from dockerd's in-memory state, not from containerd. Read
+              from containerd v2.4.2 and moby 29.9.2 <span class="src">from the code</span>; no hop was timed
+              here.
+            </p>
+          </figure>
+
+          <h3>The shim publishes last</h3>
+          <p>
+            For an init exit the shim first kills any remaining processes if the PID namespace is shared, waits
+            until every running exec has reported, then records the status and only then publishes,
+            <code>containerd/cmd/containerd-shim-runc-v2/task/service.go</code>:769-791
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>if isInit {
+	e.Timestamp = p.ExitedAt()
+	if err := runc.WriteExitStatus(c.Bundle, e); err != nil {
+		log.G(s.context).
+			WithField("container_id", c.ID).
+			WithError(err).
+			Error("failed to store exit status in bundle")
+	}
+
+	if err := s.cg2oom.Stop(c.ID); err != nil {
+		log.G(context.Background()).
+			WithField("container_id", c.ID).
+			WithError(err).
+			Error("failed to stop oom event watcher")
+	}
+}
+s.send(&amp;eventstypes.TaskExit{
+	ContainerID: c.ID,
+	ID:          p.ID(),
+	Pid:         uint32(e.Pid),
+	ExitStatus:  uint32(e.Status),
+	ExitedAt:    protobuf.ToTimestamp(p.ExitedAt()),
+})</code></pre>
+          <p>
+            Recording the status in the bundle is new in containerd 2.4.0 (<code>3264a09df</code>). It makes the second,
+            <code>shim delete</code>-generated exit carry the recorded status instead of 137, but containerd still publishes
+            that second exit when a shim disconnects before task delete (<code>cleanupAfterDeadShim</code>,
+            <code>core/runtime/v2/shim.go</code>:146-196); the 128+SIGKILL fallback now applies only to a lost process with
+            no recorded status (<code>manager_linux.go</code>:360-364). moby still carries its own duplicate-exit
+            filter, <code>shouldIgnoreExitEventWithLock</code>, citing moby#46212 (<code>moby/daemon/monitor.go</code>:54-55;
+            finding D11, class E) <span class="src">from the code</span>. It is still needed on 2.4: duplicates still
+            arrive, and its state checks also stop a late exit from a previous run hitting a restarted container
+            (<code>monitor.go</code>:359-440). The event goes up as a ttrpc <code>Events.Forward</code> call to
+            <code>&lt;grpc address&gt;.ttrpc</code>, from a queue of <code>queueSize = 2048</code> with
+            <code>maxRequeue = 5</code> (<code>containerd/pkg/shim/publisher.go</code>:36-37)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>dockerd's side</h3>
+          <p>
+            dockerd holds one containerd event subscription per namespace, filtered to task topics, and
+            re-subscribes if the stream breaks (<code>libcontainerd/remote/client.go</code>:595-628). Events go
+            through a per-container serial queue, so one container's exits are handled in order
+            (<code>client.go</code>:640-698). <code>handleContainerExit</code> drops duplicates, stops health checks, calls
+            containerd <code>Delete</code> on the task, waits for stdio to drain with
+            <code>context.WithTimeout(context.Background(), 2*time.Second)</code>, asks the restart manager, then
+            sets <code>restarting</code> or <code>exited</code>, checkpoints and emits <code>die</code>
+            (<code>moby/daemon/monitor.go</code>:35-147) <span class="src">from the code</span>. Output still in
+            the FIFOs after two seconds may never reach an attached client (D5, class D, not measured). A
+            <code>TaskOOM</code> event only sets <code>OOMKilled</code>; the exit still comes as a normal
+            <code>TaskExit</code>. A start that died during network setup keeps the container
+            <code>created</code>, detected by <code>strings.Contains(c.State.ErrorMsg, errSetupNetworking)</code>
+            (<code>monitor.go</code>:48; D9, class D). <code>--rm</code> is the daemon's <code>AutoRemove</code>;
+            the CLI only waits with <code>condition=removed</code> <span class="src">from the code</span>.
+          </p>
+
+          <h3>Exec exits take another road</h3>
+          <p>
+            <code>docker exec -it</code> has no wait endpoint. The CLI creates the exec with
+            <code>POST /containers/{id}/exec</code>, hijacks <code>POST /exec/{execid}/start</code> exactly like
+            attach, and after the stream ends reads <code>ExitCode</code> from <code>GET /exec/{execid}/json</code>
+            (<code>cli/cli/command/container/exec.go</code>:88-130, 204-218) <span class="src">from the code</span>.
+            Against the mock, which answered <code>"ExitCode": 3</code>, the real CLI exited 3
+            <span class="recon">measured here</span>. In the daemon the exec becomes <code>task.Exec</code>, and the
+            shim runs <code>runc exec --process &lt;json&gt; --detach</code>, which takes the same nsexec path with
+            clone flags 0 and only joins the container's namespaces (<code>containerd/cmd/containerd-shim-runc-v2/process/exec.go</code>:181-215).
+            Exec exits are never the container's last word: the shim holds back init's <code>TaskExit</code>
+            until running execs have reported, and dockerd handles both in the same per-container queue
+            (<code>task/service.go</code>:745-764) <span class="src">from the code</span>.
+          </p>
+
+          <h3>Killing dockerd</h3>
+          <p>
+            Because <code>sh</code> is the shim's child, <code>kill -9</code> on dockerd leaves it running. On the
+            next start, <code>restore</code> reloads each container from disk, loads it in containerd and
+            re-attaches to its existing FIFOs (<code>moby/daemon/daemon.go</code>:453). Then, without
+            <code>live-restore</code>, it does the surprising thing: it logs "shutting down container considered
+            alive by containerd" and stops it (<code>daemon.go</code>:475). A container whose task vanished is
+            marked stopped with exit code 255 (<code>daemon.go</code>:528; finding D6, class D)
+            <span class="src">from the code</span>. So containers outlive a dockerd crash, but by default not the
+            next dockerd start <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            With <code>"live-restore": true</code> the shutdown path skips stopping running containers and leaves
+            mounts and networking in place for the next daemon to adopt; it is rejected in swarm mode
+            (<code>daemon.go</code>:1553-1564; <code>config/config_linux.go</code>:130-133)
+            <span class="src">from the code</span>. While no dockerd reads the FIFOs, a chatty container can write
+            only until the pipe buffer fills, then blocks until dockerd re-attaches <span class="recon">reconstruction</span>. Docker's live-restore page still says upgrades are
+            supported only between "patch releases (YY.MM.x)", a version scheme Engine left at 23.0 (finding
+            D12, class C).
+          </p>
+
+          <h2 id="p1-specimen"><span class="secnum">08</span>Reading a real container from the inside</h2>
+          <p>
+            No Docker container ran for this teardown, but one container was always available: the research
+            sandbox itself. It is a Kubernetes pod on containerd, not a Docker container, so its choices are
+            Kubernetes' choices. The mechanics are the same ones §03 and §05 read in the code, and they can be
+            read back from <code>/proc</code> and <code>/sys/fs/cgroup</code> without any privilege. Everything
+            below was read on 23 October 2026 <span class="recon">measured here</span>; the annotations on the
+            right are mine.
+          </p>
+<pre><code>$ grep -E "^(…|Cap|NoNewPrivs|Seccomp|…)" /proc/self/status     # abridged
+CapEff:	0000000000000000                         uid 1000: nothing effective
+CapBnd:	00000000a80425fb                         bits 0,1,3-8,10,13,18,27,29,31
+NoNewPrivs:	0
+Seccomp:	0                                       no filter at all
+$ ls -l /proc/self/ns                            # abridged
+cgroup -&gt; cgroup:[4026533018]                    private
+pid -&gt; pid:[4026533017]                          private (so are ipc, mnt, net, uts)
+time -&gt; time:[4026531834]                        0xeffffffa: the initial time ns
+user -&gt; user:[4026531837]                        0xeffffffd: the initial user ns
+$ cat /proc/self/cgroup
+0::/                                             private cgroupns: own cgroup is "/"
+$ cat /sys/fs/cgroup/cpu.max
+200000 100000                                    2 CPUs of quota per period
+$ cat /sys/fs/cgroup/memory.max
+8589934592                                       8 GiB</code></pre>
+          <p>
+            The bounding set <code>0xa80425fb</code> decodes to exactly Docker's fourteen default capabilities,
+            the same list <code>moby/daemon/pkg/oci/caps/defaults.go</code>:4-21 gives. The permitted and effective
+            sets are empty because the shell runs as uid 1000, but not because of the <code>setuid</code>: runc keeps
+            the capabilities across it (<code>PR_SET_KEEPCAPS</code>) and re-applies them. The spec has no ambient set
+            (CRI strips it) and <code>/bin/sh</code> has no file capabilities, so the <code>execve</code> transformation
+            leaves permitted and effective empty (capabilities(7)) <span class="src">from the code</span>. Six namespaces are private. Time and
+            user are not: their inodes are the kernel's initial ones, and the <code>uid_map</code> is the identity
+            <code>0 0 4294967295</code>. The identity map alone would not prove that, since a non-initial user
+            namespace can carry the full identity map; the initial inode is the decisive part. So this sandbox has
+            no private time namespace, which Docker would have given it since 29.5 (§03). There is no seccomp
+            filter, Kubernetes' default "Unconfined", unlike Docker's default profile, but the process is
+            AppArmor-confined as <code>cri-containerd.apparmor.d (enforce)</code> <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The mount table shows runc's mask and read-only mechanics directly. These lines from
+            <code>/proc/self/mountinfo</code> are abridged with <code>…</code> <span class="recon">measured here</span>:
+          </p>
+<pre><code>2513 3701 0:444 /bus /proc/bus ro,…  - proc proc rw     read-only sub-bind of the one proc mount
+2519 3701 0:452 /null /proc/interrupts … - tmpfs …     /dev's tmpfs file "null" bound over it
+2518 3701 0:455 / /proc/acpi ro,relatime - tmpfs tmpfs ro     a masked dir: its own ro tmpfs
+3706 3705 0:28 / /sys/fs/cgroup ro,… - cgroup2 cgroup rw     read-only at the mount, rw superblock</code></pre>
+          <p>
+            <code>/proc/{interrupts,kcore,keys,timer_list}</code> are all binds of <code>/null</code> from the
+            container's own <code>/dev</code> tmpfs (device 0:452). <code>/proc/acpi</code>,
+            <code>/proc/scsi</code> and <code>/sys/firmware</code> are three separate tmpfs instances, so this
+            node's runtime does not share one mask tmpfs: it is runc older than 1.5.0-rc.3, or not runc at all
+            <span class="recon">reconstruction</span>. The root is an <code>overlay</code> mount with 23
+            <code>lowerdir</code>s under <code>/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/</code>
+            and upper directory 619, the layer shape <a href="../images/#p2-store">Part 2</a> builds. The cgroup
+            files show live counters too: <code>memory.oom.group</code> is 1, and <code>memory.events</code> read
+            <code>max 1499</code> with <code>oom_kill 0</code> at that moment, so the limit was hit often but
+            nothing was killed <span class="recon">measured here</span>.
+          </p>
+
+          <h2 id="p1-sources"><span class="secnum">09</span>Sources</h2>
+          <ul>
+            <li><a href="https://github.com/moby/moby/tree/docker-v29.9.2">moby/moby at <code>docker-v29.9.2</code></a> (<code>0367cbeb49b9</code>): <code>daemon/</code> (create, start, OCI spec, errors, monitor, restore), the container router and the vendored seccomp profile.</li>
+            <li><a href="https://github.com/docker/cli/tree/v29.9.2">docker/cli v29.9.2</a> (<code>a82e52890126</code>): <code>cli/command/container/run.go</code>, <code>create.go</code>, <code>hijack.go</code>, <code>opts.go</code>, <code>exec.go</code>.</li>
+            <li><a href="https://github.com/containerd/containerd/tree/v2.4.2">containerd v2.4.2</a> (<code>b7a25261e029</code>): <code>core/runtime/v2/</code>, <code>pkg/shim/</code>, <code>pkg/sys/reaper/</code>, <code>cmd/containerd-shim-runc-v2/</code>.</li>
+            <li><a href="https://github.com/opencontainers/runc/tree/v1.5.2">runc v1.5.2</a> (<code>29dd3dc2b13b</code>): <code>libcontainer/nsenter/</code>, <code>exeseal/</code>, <code>standard_init_linux.go</code>, <code>rootfs_linux.go</code>, <code>process_linux.go</code>, <code>CHANGELOG.md</code>; and the OCI runtime-spec v1.3.0 <code>runtime.md</code>.</li>
+            <li>Lab evidence: <code>~/docker-ref/lab/results/run-path/</code> and <code>runc-kernel/</code>.</li>
+          </ul>
+          <p>On a real Docker 29.x host, these check what this box could not show (none was run here):</p>
+<pre><code>docker run -d alpine sleep 600; pstree -p $(pgrep -f containerd-shim-runc-v2 | head -1)
+socat -v UNIX-LISTEN:/tmp/d.sock,fork UNIX-CONNECT:/var/run/docker.sock &amp;
+DOCKER_HOST=unix:///tmp/d.sock docker run -it alpine sh        # real daemon bytes
+readlink /proc/$(docker inspect -f '&#123;&#123;.State.Pid&#125;&#125;' c)/ns/time /proc/1/ns/time
+ps -eo pid,comm | grep 'runc:\['                                # during a slow start
+kill -9 $(pidof dockerd); docker ps     # after restart, with and without live-restore</code></pre>
+          <p class="footnote">
+            <strong>Provenance.</strong> Paths, lines and excerpts were re-read from the pinned checkouts. No
+            container ran here (no <code>CAP_SYS_ADMIN</code> or <code>CAP_NET_ADMIN</code>; dockerd could not
+            start). Wire traces are the real CLI 29.8.2 against a mock daemon, so every server byte is invented;
+            the bootstrap bytes and shim socket hash are computed from code. Installed binaries are not the pins
+            (runc 1.5.1, containerd v2.3.6). The pid tree, the dockerd-to-containerd calls, the
+            <code>BootstrapParams</code> bytes, the stage names and the 2-second drain are code readings, not
+            observations. Embedded containerd's sockets and shutdown are read from code; what it recovers after a
+            dockerd crash is inferred, not traced. The capabilities(7) and pid_namespaces(7) rules are quoted from
+            man-pages 6.19. Nothing was reported upstream; the register is in
+            <a href="../network-and-lifecycle/#p4-findings">Part 4</a>.
+          </p>
+        </section>
+      </article>

@@ -1,0 +1,169 @@
+          <h2 id="p4-stop"><span class="secnum">{{S}}</span>Signals, stop and restart</h2>
+          <p>
+            <code>docker stop</code> is a signal, a wait and a SIGKILL. On the wire it is one request. Against the mock
+            daemon, <code>docker stop -t 3 -s SIGINT web</code> sent
+            <code>POST /v1.56/containers/web/stop?signal=SIGINT&amp;t=3</code>, and a plain <code>docker stop web</code>
+            sent no query at all, so the container's own <code>StopTimeout</code> applies
+            <span class="recon">measured here</span>. <code>docker kill -s HUP</code> became <code>kill?signal=HUP</code>.
+            The daemon side is in <code>moby/daemon/stop.go:85-89, 115-118</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>	// 1. Send a stop signal
+	err := daemon.killPossiblyDeadProcess(ctx, ctr, stopSignal)
+	if err != nil {
+		wait = 2 * time.Second
+	}
+…
+	// Stop either failed or container didn't exit, so fallback to kill.
+	if err := daemon.kill(ctx, ctr); err != nil {</code></pre>
+          <p>
+            The signal is the container's <code>StopSignal</code>, else SIGTERM. The wait is the request's
+            <code>t</code>, else the container's <code>StopTimeout</code>, else 10 seconds on Linux. A negative timeout
+            waits forever. The stop runs under <code>context.WithoutCancel</code>, so pressing Ctrl-C on
+            <code>docker stop</code> does not abort it, and stopping a stopped container returns 304
+            <span class="src">from the code</span>.
+          </p>
+          <h3>Only PID 1 hears it</h3>
+          <p>
+            The signal travels <code>dockerd</code> → containerd <code>Task.Kill</code> → shim → a fresh
+            <code>runc kill &lt;id&gt; &lt;sig&gt;</code> → the container's init process. Nothing else in the container
+            is signalled; only SIGKILL with a shared PID namespace is fanned out to the whole cgroup
+            (<code>runc/libcontainer/container_linux.go:396-426</code>). Then the kernel applies its rule for a
+            namespace's init process: a signal for which init has no handler is dropped, even when root sends it. Only
+            SIGKILL and SIGSTOP from an ancestor namespace are forced (pid_namespaces(7)). A <code>sh</code> or a naive
+            binary as PID 1 never sees the SIGTERM. <code>docker stop</code> therefore always waits the full timeout and
+            ends in SIGKILL. The exit code is 137 because the shim's reaper encodes a signal death as 128 plus the
+            signal number (<code>containerd/pkg/sys/reaper/reaper_unix.go:280-289</code>) <span class="src">from the
+            code</span>. Figure {{fig-stop-timeline}} draws the clock. <code>--init</code> puts tini v0.19.0 in front as
+            PID 1; it has handlers and forwards the signal to the real program, which then dies of the default action
+            (<a href="../run-path/#p1-spec">Part 1 §03</a> shows the rewrite).
+          </p>
+
+          <figure class="figure wide" id="fig-stop-timeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title"><code>docker stop</code> with the default 10-second timeout, for three kinds of PID 1</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 370" role="img" aria-label="A time axis from 0 to 22 seconds. At t equals 0 the stop signal goes from dockerd through containerd, the shim and runc kill to PID 1 only. Lane one: tini from --init forwards SIGTERM to the child, which dies; tini exits 143. Lane two: sh as PID 1 has no handler, the kernel drops the signal, and at 10 seconds dockerd sends SIGKILL through containerd; exit 137. Lane three: if no exit event arrives within 10 more seconds, at 20 seconds dockerd calls kill(2) on the host PID itself and gives up at 22 seconds.">
+                <defs>
+                  <marker id="st-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">THE SIGNAL PATH AT T = 0</text>
+                <text x="20" y="46" class="svg-sub">dockerd → containerd Task.Kill → shim → runc kill &lt;id&gt; SIGTERM → PID 1 only</text>
+
+                <line x1="220" y1="78" x2="1050" y2="78" stroke="#252525" stroke-width="2" marker-end="url(#st-ctl)"/>
+                <line x1="240" y1="70" x2="240" y2="86" stroke="#252525" stroke-width="2"/>
+                <text x="232" y="66" class="svg-num">0 s</text>
+                <line x1="560" y1="70" x2="560" y2="86" stroke="#252525" stroke-width="2"/>
+                <text x="548" y="66" class="svg-num">10 s</text>
+                <line x1="880" y1="70" x2="880" y2="86" stroke="#252525" stroke-width="2"/>
+                <text x="868" y="66" class="svg-num">20 s</text>
+                <line x1="944" y1="70" x2="944" y2="86" stroke="#252525" stroke-width="2"/>
+                <text x="934" y="66" class="svg-num">22 s</text>
+
+                <text x="20" y="128" class="svg-step">--init (tini)</text>
+                <text x="20" y="146" class="svg-sub">has handlers</text>
+                <rect x="240" y="108" width="320" height="50" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="252" y="129" class="svg-sub">tini forwards SIGTERM → child dies</text>
+                <text x="252" y="147" class="svg-sub">exit 143 = 128 + 15, well before 10 s</text>
+
+                <text x="20" y="208" class="svg-step">sh as PID 1</text>
+                <text x="20" y="226" class="svg-sub">no handler</text>
+                <rect x="240" y="188" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="252" y="209" class="svg-sub">kernel drops SIGTERM: init of a pid</text>
+                <text x="252" y="227" class="svg-sub">namespace, no handler; nothing happens</text>
+                <rect x="560" y="188" width="320" height="50" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="572" y="209" class="svg-sub">daemon.kill: SIGKILL via containerd</text>
+                <text x="572" y="227" class="svg-sub">exit 137 = 128 + 9 (shim reaper)</text>
+
+                <text x="20" y="288" class="svg-step">no exit event</text>
+                <text x="20" y="306" class="svg-sub">SIGKILL lost</text>
+                <rect x="560" y="268" width="320" height="50" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="572" y="289" class="svg-sub">wait 10 s for containerd's exit event</text>
+                <text x="572" y="307" class="svg-sub">(75 s on Windows)</text>
+                <rect x="880" y="268" width="180" height="50" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="892" y="289" class="svg-sub">kill(2) on host PID,</text>
+                <text x="892" y="307" class="svg-sub">2 s more, then error</text>
+                <text x="20" y="352" class="svg-note">Times are the code's defaults, not measurements: no container ran on the research box.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Read from <code>stop.go</code>, <code>kill.go</code>, the shim's reaper and pid_namespaces(7). The middle
+              lane is the common case for images whose entrypoint is a shell script: every <code>docker stop</code>
+              costs the full timeout. The last lane is <code>dockerd</code> bypassing the stack entirely.
+            </p>
+          </figure>
+
+          <h3>The restart manager, and D77</h3>
+          <p>
+            After an exit, the restart manager decides. Its backoff is 100 ms, doubling on each restart, capped at one
+            minute, and reset whenever the last run lasted 10 seconds or more
+            (<code>moby/daemon/internal/restartmanager/restartmanager.go:11-15, 65-78</code>). <code>always</code>
+            restarts, <code>unless-stopped</code> restarts unless <code>hasBeenManuallyStopped</code>,
+            <code>on-failure[:N]</code> restarts on a non-zero exit while the count is below N, and <code>no</code>
+            returns before taking any lock. A manual stop also cancels the manager outright, so after
+            <code>docker stop</code> no policy restarts at exit. The policies diverge only at daemon startup, where a
+            stopped <code>always</code> container comes back and an <code>unless-stopped</code> one does not
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The flag that makes a stop "manual" is set in <code>moby/daemon/kill.go:80-103</code>, and its placement is
+            finding D77 <span class="src">from the code</span>:
+          </p>
+<pre><code>var unpause bool
+if container.Config.StopSignal != "" &amp;&amp; stopSignal != syscall.SIGKILL {
+	containerStopSignal, err := signal.ParseSignal(container.Config.StopSignal)
+	if err != nil {
+		return err
+	}
+	if containerStopSignal == stopSignal {
+		container.ExitOnNext()
+		unpause = container.State.Paused
+	}
+} else {
+	container.ExitOnNext()
+	unpause = container.State.Paused
+}
+
+if !daemon.IsShuttingDown() {
+	container.HasBeenManuallyStopped = true
+	if err := container.CheckpointTo(ctx, daemon.containersReplica); err != nil {
+	…
+}</code></pre>
+          <p>
+            <code>ExitOnNext</code> cancels the manager. Without a <code>StopSignal</code> in the config, the
+            <code>else</code> branch runs for <em>any</em> signal, so <code>docker kill -s HUP</code> cancels
+            <code>always</code> and <code>on-failure</code> too. And <code>HasBeenManuallyStopped = true</code> sits
+            outside the if/else, so every <code>docker kill -s</code> marks the container as manually stopped, even with
+            a <code>STOPSIGNAL</code>. It is checkpointed to disk, so it also survives a daemon restart. Send SIGHUP to
+            reload nginx, and the next crash of an <code>unless-stopped</code> container is never restarted. PR #26464
+            (v1.13.0, 2016) fixed only the <code>ExitOnNext</code> half. Issues #41302 and #47792 are open, and fix PR
+            #53415 has been open and unmerged since 2026-08-19. <code>kill.go</code> is byte-identical on
+            <code>master</code>. The workaround is to signal the process directly, with
+            <code>docker exec c kill -HUP 1</code>. Figure {{fig-restart-policy}} lays out every case.
+          </p>
+
+          <figure class="figure wide" id="fig-restart-policy">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Is the container restarted? By policy and by what happened before its next exit</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Policy</th><th>Exits by itself</th><th>After stop, or kill with SIGKILL or StopSignal</th><th>After kill -s HUP, no StopSignal</th><th>After kill -s HUP, StopSignal set</th><th>At daemon restart, after a manual stop</th></tr></thead>
+                <tbody>
+                  <tr><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td><td>no</td></tr>
+                  <tr><td>on-failure[:N]</td><td>if exit ≠ 0 and count &lt; N</td><td>no (cancelled)</td><td class="hl-red" style="background: var(--red-soft)">no (cancelled, D77)</td><td>if exit ≠ 0 and count &lt; N</td><td>decided by the last exit code</td></tr>
+                  <tr><td>always</td><td>yes</td><td>no (cancelled)</td><td class="hl-red" style="background: var(--red-soft)">no (cancelled, D77)</td><td>yes</td><td class="hl-green" style="background: var(--green-soft)">yes</td></tr>
+                  <tr><td>unless-stopped</td><td>yes</td><td>no (cancelled)</td><td class="hl-red" style="background: var(--red-soft)">no (D77)</td><td class="hl-red" style="background: var(--red-soft)">no (flag set, D77)</td><td>no</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Cells read from <code>kill.go:80-103</code>, <code>restartmanager.go:46-91</code>,
+              <code>monitor.go:98-117</code> and <code>daemon.go:577</code>; not run. Red cells are D77: a signal
+              meant for the application switches the policy off. Backoff between restarts: 100 ms × 2 per restart, at
+              most 60 s, reset after a run of 10 s or more. A user <code>docker start</code> clears the flag and the
+              count.
+            </p>
+          </figure>

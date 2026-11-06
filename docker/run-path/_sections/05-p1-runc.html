@@ -1,0 +1,366 @@
+          <h2 id="p1-runc"><span class="secnum">{{S}}</span>runc init: namespaces from a C constructor</h2>
+          <p>
+            <code>runc create</code> runs the full container setup and then detaches; it enters the same
+            <code>startContainer</code> path as <code>runc run</code> with the action <code>CT_ACT_CREATE</code>
+            (<code>runc/create.go</code>:59-70) <span class="src">from the code</span>. The interesting work
+            happens in a child that runc spawns by re-executing itself as <code>runc init</code>. Three things
+            are prepared before that child exists.
+          </p>
+          <p>
+            First, the binary. runc never lets the container see its own executable. If
+            <code>/proc/self/exe</code> is not already a sealed copy, <code>exeseal.CloneSelfExe</code> makes one,
+            and init is executed through <code>/proc/self/fd/N</code>
+            (<code>runc/libcontainer/container_linux.go</code>:507-530). The preferred seal is a detached,
+            read-only overlayfs view; a sealed memfd copy is the fallback, priced in the code at "around ~60%
+            overhead during container startup" (<code>exeseal/cloned_binary_linux.go</code>:229)
+            <span class="src">from the code</span>. The defence dates from CVE-2019-5736, where a container could
+            overwrite the host's runc through <code>/proc/self/exe</code>. Second, file descriptors: before <code>cmd.Start()</code> runc marks
+            every fd from 3 up close-on-exec "as some additional protection against attacks like
+            CVE-2024-21626" (<code>container_linux.go</code>:341-349). Only the deliberate ExtraFiles reach the
+            child, each named by an environment variable: <code>_LIBCONTAINER_INITPIPE</code>,
+            <code>_LIBCONTAINER_SYNCPIPE</code>, <code>_LIBCONTAINER_LOGPIPE</code> and, for <code>-t</code>,
+            <code>_LIBCONTAINER_CONSOLE</code> (<code>container_linux.go</code>:547-575)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Third, the cgroup. The parent puts the child into the container's cgroup <em>before</em> it sends a
+            single byte of configuration, so every descendant is born inside it,
+            <code>runc/libcontainer/process_linux.go</code>:824-827, 849 <span class="src">from the code</span>:
+          </p>
+<pre><code>	// Do this before syncing with child so that no children can escape the
+	// cgroup. We don't need to worry about not doing this and not being root
+	// because we'd be using the rootless cgroup manager in that case.
+	if err := p.manager.Apply(p.pid()); err != nil {
+…
+	if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {</code></pre>
+
+          <h3>40 bytes of netlink</h3>
+          <p>
+            <code>bootstrapData</code> is a hand-rolled netlink message, not JSON. Its type is
+            <code>InitMsg uint16 = 62000</code> and its attributes are numbered 27281 to 27290 (clone flags,
+            namespace paths, uid and gid maps, setgroups, <code>oom_score_adj</code>, rootless, the
+            <code>newuidmap</code> paths, time offsets), numbers "randomly chosen to not conflict"
+            (<code>runc/libcontainer/message_linux.go</code>:11-25). An unknown attribute is fatal on the C side
+            (<code>nsenter/nsexec.c</code>:374-451) <span class="src">from the code</span>. For a default Docker container only three attributes are
+            present, and the whole message is 40 bytes. Figure {{fig-bootstrap-bytes}} shows them. They were
+            computed from the code, not captured from a live runc <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure" id="fig-bootstrap-bytes">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The bootstrap message for a default Docker container, byte by byte (synthesised)</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 680 392" role="img" aria-label="Forty bytes in three rows. Row one is the 16-byte netlink header: length 40, type 62000, flag NLM_F_REQUEST, sequence 1, pid 0. Row two holds attribute 27281, the clone flags 0x6e020080, and attribute 27286, the string zero plus padding. Row three holds attribute 27287, rootless, equal to 0. A side box breaks the clone flags into seven CLONE_NEW bits.">
+                <text x="64" y="24" class="svg-lane">BYTES (LITTLE-ENDIAN), OFFSET AT LEFT</text>
+
+                <!-- row 0 -->
+                <text x="16" y="62" class="svg-sub">0000</text>
+                <rect x="60" y="44" width="144" height="28" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="204" y="44" width="72" height="28" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="276" y="44" width="72" height="28" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="348" y="44" width="144" height="28" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="492" y="44" width="144" height="28" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="70" y="63" class="svg-sub" style="fill:#252525">28  00  00  00</text>
+                <text x="214" y="63" class="svg-sub" style="fill:#252525">30  f2</text>
+                <text x="286" y="63" class="svg-sub" style="fill:#252525">01  00</text>
+                <text x="358" y="63" class="svg-sub" style="fill:#252525">01  00  00  00</text>
+                <text x="502" y="63" class="svg-sub" style="fill:#252525">00  00  00  00</text>
+                <text x="70" y="90" class="svg-sub">nlmsg_len</text>
+                <text x="70" y="104" class="svg-sub">= 40</text>
+                <text x="214" y="90" class="svg-sub">type</text>
+                <text x="214" y="104" class="svg-sub">62000</text>
+                <text x="286" y="90" class="svg-sub">flags</text>
+                <text x="286" y="104" class="svg-sub">REQUEST</text>
+                <text x="358" y="90" class="svg-sub">seq = 1</text>
+                <text x="358" y="104" class="svg-sub">(placeholder)</text>
+                <text x="502" y="90" class="svg-sub">pid = 0</text>
+                <text x="64" y="124" class="svg-note">struct nlmsghdr, 16 bytes</text>
+
+                <!-- row 1 -->
+                <text x="16" y="162" class="svg-sub">0010</text>
+                <rect x="60" y="144" width="144" height="28" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="204" y="144" width="144" height="28" fill="#dfede5" stroke="#367f59"/>
+                <rect x="348" y="144" width="144" height="28" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="492" y="144" width="72" height="28" fill="#dfede5" stroke="#367f59"/>
+                <rect x="564" y="144" width="72" height="28" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="70" y="163" class="svg-sub" style="fill:#252525">08  00  91  6a</text>
+                <text x="214" y="163" class="svg-sub" style="fill:#252525">80  00  02  6e</text>
+                <text x="358" y="163" class="svg-sub" style="fill:#252525">06  00  96  6a</text>
+                <text x="502" y="163" class="svg-sub" style="fill:#252525">30  00</text>
+                <text x="574" y="163" class="svg-sub" style="fill:#252525">00  00</text>
+                <text x="70" y="190" class="svg-sub">len 8</text>
+                <text x="70" y="204" class="svg-sub">attr 27281</text>
+                <text x="214" y="190" class="svg-sub">clone flags</text>
+                <text x="214" y="204" class="svg-sub">0x6e020080</text>
+                <text x="358" y="190" class="svg-sub">len 6</text>
+                <text x="358" y="204" class="svg-sub">attr 27286</text>
+                <text x="502" y="190" class="svg-sub">"0" NUL</text>
+                <text x="502" y="204" class="svg-sub">oom adj</text>
+                <text x="574" y="190" class="svg-sub">pad</text>
+
+                <!-- row 2 -->
+                <text x="16" y="242" class="svg-sub">0020</text>
+                <rect x="60" y="224" width="144" height="28" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="204" y="224" width="144" height="28" fill="#dfede5" stroke="#367f59"/>
+                <text x="70" y="243" class="svg-sub" style="fill:#252525">08  00  97  6a</text>
+                <text x="214" y="243" class="svg-sub" style="fill:#252525">00  00  00  00</text>
+                <text x="70" y="270" class="svg-sub">len 8</text>
+                <text x="70" y="284" class="svg-sub">attr 27287</text>
+                <text x="214" y="270" class="svg-sub">rootless</text>
+                <text x="214" y="284" class="svg-sub">= 0</text>
+
+                <!-- clone flag breakdown -->
+                <rect x="380" y="224" width="256" height="156" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="392" y="244" class="svg-step">0x6e020080 =</text>
+                <text x="392" y="262" class="svg-sub" style="fill:#252525">CLONE_NEWNS</text><text x="540" y="262" class="svg-sub" style="fill:#252525">0x00020000</text>
+                <text x="392" y="277" class="svg-sub" style="fill:#252525">CLONE_NEWCGROUP</text><text x="540" y="277" class="svg-sub" style="fill:#252525">0x02000000</text>
+                <text x="392" y="292" class="svg-sub" style="fill:#252525">CLONE_NEWUTS</text><text x="540" y="292" class="svg-sub" style="fill:#252525">0x04000000</text>
+                <text x="392" y="307" class="svg-sub" style="fill:#252525">CLONE_NEWIPC</text><text x="540" y="307" class="svg-sub" style="fill:#252525">0x08000000</text>
+                <text x="392" y="322" class="svg-sub" style="fill:#252525">CLONE_NEWPID</text><text x="540" y="322" class="svg-sub" style="fill:#252525">0x20000000</text>
+                <text x="392" y="337" class="svg-sub" style="fill:#252525">CLONE_NEWNET</text><text x="540" y="337" class="svg-sub" style="fill:#252525">0x40000000</text>
+                <text x="392" y="352" class="svg-sub" style="fill:#d98226">CLONE_NEWTIME</text><text x="540" y="352" class="svg-sub" style="fill:#d98226">0x00000080</text>
+                <text x="392" y="366" class="svg-note">no CLONE_NEWUSER</text>
+
+                <!-- legend -->
+                <rect x="16" y="314" width="14" height="10" fill="#ece6f3" stroke="#765b98"/>
+                <text x="36" y="323" class="svg-sub">nlattr header</text>
+                <rect x="16" y="334" width="14" height="10" fill="#dfede5" stroke="#367f59"/>
+                <text x="36" y="343" class="svg-sub">value</text>
+                <rect x="16" y="354" width="14" height="10" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="36" y="363" class="svg-sub">padding, zero fields</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Seven namespace bits, one string and one boolean: the whole of what runc's C code needs before Go
+              starts. <strong>Synthesised from code, not captured</strong>: built from
+              <code>message_linux.go</code>:27-97 and <code>container_linux.go</code>:1043-1157, with
+              <code>seq</code> a placeholder. The <code>oom_score_adj</code> attribute is present because moby always
+              passes <code>WithOOMScore</code> (<code>moby/daemon/oci_linux.go</code>:1046)
+              <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <h3>Three stages, all before main</h3>
+          <p>
+            The receiver is C because these namespace operations "require single-threaded program execution"
+            (<code>runc/libcontainer/nsenter/nsenter.go</code>:3-7), which a running Go runtime cannot promise.
+            So the package is a cgo constructor that runs before Go boots,
+            <code>nsenter.go</code>:10-17 <span class="src">from the code</span>:
+          </p>
+<pre><code>/*
+#cgo CFLAGS: -Wall
+extern void nsexec();
+void __attribute__((constructor)) init(void) {
+	nsexec();
+}
+*/
+import "C"</code></pre>
+          <p>
+            Every runc invocation runs it, and it returns at once unless <code>_LIBCONTAINER_INITPIPE</code> is
+            set (<code>nsexec.c</code>:743-747). In <code>runc init</code> it becomes a state machine built on
+            <code>setjmp</code> and <code>longjmp</code>: <code>clone_parent()</code> calls
+            <code>clone(child_func, ca.stack_ptr, CLONE_PARENT | SIGCHLD, &amp;ca)</code> and the child jumps back
+            into the same <code>switch</code> with the next stage number (<code>nsexec.c</code>:314-323).
+            <code>CLONE_PARENT</code> makes each new stage a sibling, a child of <code>runc create</code>, not of
+            the stage that cloned it <span class="src">from the code</span>. Figure {{fig-nsexec-stages}} follows
+            the stages for Docker's default spec.
+          </p>
+
+          <figure class="figure wide" id="fig-nsexec-stages">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">runc's nsexec stages for a default Docker container</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 716" role="img" aria-label="Four lanes: the runc parent in Go, stage-0, stage-1 and stage-2. The parent starts runc init, joins it to the cgroup and sends the bootstrap bytes. Stage-0 clones stage-1. Stage-1 skips setns and the user namespace, unshares the remaining namespaces in one call and clones stage-2, which is PID 1 of the new PID namespace. Stage-1 asks stage-0 to forward the stage-2 pid to the parent and exits. Stage-0 releases stage-2, which calls setsid and setuid and returns into Go.">
+                <defs>
+                  <marker id="fig-nsexec-stages-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-nsexec-stages-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-nsexec-stages-fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">RUNC PARENT (GO)</text>
+                <text x="280" y="24" class="svg-lane">STAGE-0</text>
+                <text x="280" y="40" class="svg-sub">runc:[0:PARENT]</text>
+                <text x="540" y="24" class="svg-lane">STAGE-1</text>
+                <text x="540" y="40" class="svg-sub">runc:[1:CHILD]</text>
+                <text x="800" y="24" class="svg-lane">STAGE-2</text>
+                <text x="800" y="40" class="svg-sub">runc:[2:INIT], later sh</text>
+                <line x1="130" y1="52" x2="130" y2="680" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="390" y1="52" x2="390" y2="620" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="650" y1="214" x2="650" y2="510" stroke="#deded9" stroke-width="1.5"/>
+                <line x1="910" y1="394" x2="910" y2="680" stroke="#deded9" stroke-width="1.5"/>
+
+                <!-- A -->
+                <rect x="20" y="60" width="220" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="78" class="svg-num">1</text>
+                <text x="46" y="78" class="svg-step">start runc init</text>
+                <text x="32" y="95" class="svg-sub">via /proc/self/fd/N</text>
+                <rect x="280" y="60" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="292" y="78" class="svg-step">nsexec(), constructor</text>
+                <text x="292" y="95" class="svg-sub">Go has not started</text>
+                <line x1="240" y1="82" x2="278" y2="82" stroke="#252525" stroke-width="2" marker-end="url(#fig-nsexec-stages-ctl)"/>
+
+                <!-- B -->
+                <rect x="20" y="120" width="220" height="44" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="138" class="svg-num">2</text>
+                <text x="46" y="138" class="svg-step">manager.Apply(pid)</text>
+                <text x="32" y="155" class="svg-sub">into cgroup.procs first</text>
+
+                <!-- bootstrap message -->
+                <text x="146" y="182" class="svg-num">3</text>
+                <text x="160" y="182" class="svg-sub" style="fill:#3c6f97">40-byte bootstrap, init pipe</text>
+                <line x1="132" y1="192" x2="386" y2="192" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-nsexec-stages-data)"/>
+
+                <!-- C -->
+                <rect x="280" y="210" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="292" y="228" class="svg-num">4</text>
+                <text x="306" y="228" class="svg-step">write oom_score_adj</text>
+                <text x="292" y="245" class="svg-sub">clone(CLONE_PARENT)</text>
+                <rect x="540" y="210" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="552" y="228" class="svg-step">stage-1 starts</text>
+                <text x="552" y="245" class="svg-sub">a sibling of stage-0</text>
+                <line x1="500" y1="232" x2="538" y2="232" stroke="#252525" stroke-width="2" marker-end="url(#fig-nsexec-stages-ctl)"/>
+
+                <!-- D -->
+                <rect x="540" y="270" width="220" height="44" rx="4" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 3"/>
+                <text x="552" y="288" class="svg-num">5</text>
+                <text x="566" y="288" class="svg-step">setns, NEWUSER, id maps</text>
+                <text x="552" y="305" class="svg-sub">skipped for this spec</text>
+
+                <!-- E -->
+                <rect x="540" y="330" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98" stroke-width="1.8"/>
+                <text x="552" y="348" class="svg-num">6</text>
+                <text x="566" y="348" class="svg-step">unshare(cloneflags)</text>
+                <text x="552" y="365" class="svg-sub">0x6e020080, one call</text>
+
+                <!-- F -->
+                <rect x="540" y="390" width="220" height="44" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="552" y="408" class="svg-num">7</text>
+                <text x="566" y="408" class="svg-step">clone(CLONE_PARENT)</text>
+                <text x="552" y="425" class="svg-sub">pidns takes children only</text>
+                <rect x="800" y="390" width="220" height="44" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.6"/>
+                <text x="812" y="408" class="svg-step">stage-2 starts</text>
+                <text x="812" y="425" class="svg-sub">PID 1 of the new pidns</text>
+                <line x1="760" y1="412" x2="798" y2="412" stroke="#252525" stroke-width="2" marker-end="url(#fig-nsexec-stages-ctl)"/>
+
+                <!-- pid forwarding -->
+                <text x="420" y="456" class="svg-num">8</text>
+                <text x="434" y="456" class="svg-sub" style="fill:#765b98">SYNC_RECVPID_PLS</text>
+                <line x1="648" y1="466" x2="394" y2="466" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#fig-nsexec-stages-fx)"/>
+                <text x="160" y="494" class="svg-sub" style="fill:#3c6f97">both pids, JSON</text>
+                <line x1="388" y1="504" x2="134" y2="504" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#fig-nsexec-stages-data)"/>
+                <text x="660" y="500" class="svg-sub">CHILD_FINISH, exit(0)</text>
+
+                <!-- grandchild release -->
+                <text x="420" y="534" class="svg-num">9</text>
+                <text x="434" y="534" class="svg-sub" style="fill:#252525">SYNC_GRANDCHILD</text>
+                <line x1="392" y1="544" x2="906" y2="544" stroke="#252525" stroke-width="2" marker-end="url(#fig-nsexec-stages-ctl)"/>
+
+                <!-- G -->
+                <rect x="800" y="560" width="220" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="812" y="578" class="svg-num">10</text>
+                <text x="832" y="578" class="svg-step">setsid, setuid(0)</text>
+                <text x="812" y="595" class="svg-sub">setgid(0), setgroups(0)</text>
+
+                <!-- H -->
+                <rect x="800" y="620" width="220" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="812" y="638" class="svg-num">11</text>
+                <text x="832" y="638" class="svg-step">return into Go</text>
+                <text x="812" y="655" class="svg-sub">GOMAXPROCS(1), standard init</text>
+                <text x="290" y="640" class="svg-sub">exit(0) once stage-2 is done</text>
+                <text x="20" y="640" class="svg-sub">reaps stage-1</text>
+
+                <!-- legend -->
+                <line x1="20" y1="700" x2="50" y2="700" stroke="#252525" stroke-width="2"/>
+                <text x="58" y="704" class="svg-sub">clone or release</text>
+                <line x1="200" y1="700" x2="230" y2="700" stroke="#3c6f97" stroke-width="1.4"/>
+                <text x="238" y="704" class="svg-sub">bytes on the init pipe</text>
+                <line x1="420" y1="700" x2="450" y2="700" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <text x="458" y="704" class="svg-sub">sync socketpair message</text>
+                <rect x="650" y="693" width="30" height="14" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="5 3"/>
+                <text x="688" y="704" class="svg-sub">step skipped: no paths, no userns, no offsets</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Three processes, each a sibling of the last, so that the one which becomes PID 1 is created
+              <em>after</em> the new PID namespace exists. With Docker's defaults the user-namespace mapping and
+              time-offset round trips never happen. Read from <code>runc/libcontainer/nsenter/nsexec.c</code>:855-1224
+              <span class="src">from the code</span>; the <code>runc:[N:…]</code> names would show in
+              <code>ps</code> during a slow start, which was not observed here.
+            </p>
+          </figure>
+
+          <p>
+            The second clone exists because <code>unshare(CLONE_NEWPID)</code> does not move the caller; only its
+            children enter the new PID namespace (<code>nsexec.c</code>:1122-1134). The other namespaces come
+            from one <code>unshare(config.cloneflags)</code>, not clone flags, partly because
+            <code>clone(CLONE_PARENT|CLONE_NEWPID)</code> was broken on kernels up to 3.12. A user namespace, when
+            present, is unshared alone and first so stage-0 can write its maps <span class="src">from the code</span>. Stage-2 then calls
+            <code>setsid()</code>, <code>setuid(0)</code> and <code>setgid(0)</code> and <em>returns</em> from the
+            constructor, so the Go runtime boots inside every new namespace, locked to one thread with
+            <code>GOMAXPROCS(1)</code> (<code>init_linux.go</code>:106-123) <span class="src">from the code</span>.
+          </p>
+
+          <h3>After Go starts: an order shaped by CVEs</h3>
+          <p>
+            Go-side init runs a fixed sequence (<code>standard_init_linux.go</code>:51-304): keyring, network,
+            rootfs, console, hostname, AppArmor, sysctls, read-only and masked paths, seccomp, capabilities and
+            user, <code>LookPath</code>, the FIFO wait (§06), <code>execve</code>. The rootfs step makes
+            <code>/</code> recursively slave, bind-mounts the rootfs onto itself and pivots,
+            <code>runc/libcontainer/rootfs_linux.go</code>:1159-1166, 1173, 1182-1188
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	// Change to the new root so that the pivot_root actually acts on it.
+	if err := unix.Fchdir(int(root.Fd())); err != nil {
+		return &amp;os.PathError{Op: "chdir", Path: root.Name(), Err: err}
+	}
+
+	if err := unix.PivotRoot(".", "."); err != nil {
+		return &amp;os.PathError{Op: "pivot_root", Path: ".", Err: err}
+	}
+…
+	if err := unix.Fchdir(oldroot); err != nil {
+…
+	if err := mount("", ".", "", unix.MS_SLAVE|unix.MS_REC, ""); err != nil {
+		return err
+	}
+	// Perform the unmount. MNT_DETACH allows us to unmount /proc/self/cwd.
+	if err := unmount(".", unix.MNT_DETACH); err != nil {
+		return err
+	}</code></pre>
+          <p>
+            New root and old root on the same directory, then a lazy detach: no temporary directory inside the
+            rootfs is needed. Masked files get the container's own <code>/dev/null</code>, opened
+            <code>O_PATH</code> and inode-checked as char 1:3 before it is mounted by fd. That check is the fix
+            for CVE-2025-31133, where a symlinked <code>/dev/null</code> turned a mask into a read-write bind
+            (<code>rootfs_linux.go</code>:1318-1330) <span class="src">from the code</span>. runc also appends its
+            own device rules, including "mknod any char/block device", which no user can remove; its own comment
+            calls this "questionable" (<code>specconv/spec_linux.go</code>:225; finding D13, class D).
+          </p>
+          <p>
+            Seccomp placement depends on <code>no_new_privs</code>. Without it, loading a filter needs
+            <code>CAP_SYS_ADMIN</code>, so the filter goes in <em>before</em> capabilities are dropped, and
+            Docker sets <code>noNewPrivileges</code> only when asked. A tight custom profile must therefore allow
+            the syscalls runc init itself makes afterwards (<code>standard_init_linux.go</code>:188-200, 234-248;
+            finding D14) <span class="src">from the code</span>. runc loads the program itself, after prepending
+            a stub that returns <code>-ENOSYS</code> for syscalls newer than the profile
+            (<code>seccomp/patchbpf/enosys_linux.go</code>:627-650). Docker's profile is 926
+            lines, 14,122 bytes, 426 syscall names and 361 unconditional allows; <code>clone3</code> gets errno 38
+            (ENOSYS) rather than EPERM, so glibc falls back to <code>clone</code>, whose namespace flags are
+            filtered <span class="recon">measured here</span>. Unconditional <code>socketcall(2)</code> plus x86_64's 32-bit sub-arch
+            sidesteps the AF_ALG and AF_VSOCK <code>socket()</code> block when no LSM backs it (D15, class D); the
+            docs call <code>clock_adjtime</code> blocked, yet the profile allows it (D16, class C).
+          </p>
+          <p>
+            Immediately before <code>execve</code> init closes every fd from <code>3 + PassedFilesCount</code> up,
+            the core CVE-2024-21626 defence. That CVE leaked a handle to the host's
+            <code>/sys/fs/cgroup</code> into init. 1.5.2 also re-marks fds close-on-exec in
+            <code>finalizeNamespace</code> and rejects a cwd outside the container with <code>verifyCwd</code>
+            (<code>init_linux.go</code>:271-306). <code>runc exec</code> and create arm AppArmor at different points
+            (after <code>finalizeNamespace</code> versus before the masks), but both only write an on-exec profile
+            (<code>aa_change_onexec</code>), so confinement is identical from <code>execve</code> on
+            (<code>apparmor_linux.go</code>:52-68; D18, class D; runc#5362 would unify it)
+            <span class="src">from the code</span>.
+          </p>

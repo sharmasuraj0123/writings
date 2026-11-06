@@ -1,0 +1,239 @@
+          <h2 id="p4-bytes"><span class="secnum">{{S}}</span>Frames and logs</h2>
+          <p>
+            A container without a TTY has two output streams, but an HTTP response is one byte stream. Docker
+            multiplexes them with a frame: eight header bytes, then a payload. Byte 0 is the stream (0 stdin, 1 stdout,
+            2 stderr, 3 "systemerr"), bytes 1–3 are zero, and bytes 4–7 are the payload length as a big-endian uint32
+            (<code>moby/api/pkg/stdcopy/stdcopy.go:14-27</code>). The daemon emits one frame per <code>Write</code>
+            call, header and payload in a single write from a pooled buffer, with no coalescing or splitting
+            (<code>moby/daemon/internal/stdcopymux/writer.go:32-55</code>). Three producers use it: non-TTY attach,
+            non-TTY exec, and <code>GET /containers/{id}/logs</code>. Only the logs path ever sends type 3
+            <span class="src">from the code</span>. <a href="../run-path/#p1-client">Part 1</a> shows the hijacked
+            attach connection these frames travel on.
+          </p>
+          <p>
+            To watch the reader work, the real docker CLI 29.8.2 was pointed at a mock daemon that writes hand-made
+            frames <span class="recon">measured here</span>. The CLI asked <code>GET …/json</code> before
+            <code>GET …/logs</code>: it decides framed or raw from the container's <code>Config.Tty</code>, not from the
+            <code>Content-Type</code> the daemon labels since API 1.42. The bytes it decoded are in Figure
+            {{fig-stdcopy-frame}}.
+          </p>
+
+          <figure class="figure wide" id="fig-stdcopy-frame">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Four frames as the CLI received them, and what it did with each</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 318" role="img" aria-label="Four frames in byte order. Frame one: type 01, three zero bytes, length 00 00 00 13 (19), payload 'line one on stdout' and a newline; the CLI writes it to stdout. Frame two: type 02, length 19, 'line two on stderr'; written to stderr. Frame three: type 03, length 00 00 00 42 (66), 'Error grabbing logs: log message is too large (1000001 > 1000000)'; the CLI prints 'error from daemon in stream' and exits 1. Frame four: type 01, length 0e (14), 'never printed'; the CLI never reads it.">
+                <text x="20" y="22" class="svg-lane">TYPE</text>
+                <text x="74" y="22" class="svg-lane">ZERO</text>
+                <text x="186" y="22" class="svg-lane">LENGTH (BIG-ENDIAN)</text>
+                <text x="346" y="22" class="svg-lane">PAYLOAD</text>
+                <text x="786" y="22" class="svg-lane">THE REAL CLI</text>
+
+                <rect x="20" y="34" width="46" height="40" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="32" y="59" class="svg-sub">01</text>
+                <rect x="74" y="34" width="104" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="84" y="59" class="svg-sub">00 00 00</text>
+                <rect x="186" y="34" width="150" height="40" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="196" y="59" class="svg-sub">00 00 00 13 = 19</text>
+                <rect x="346" y="34" width="420" height="40" rx="3" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="358" y="59" class="svg-sub">"line one on stdout\n"</text>
+                <text x="786" y="59" class="svg-sub">→ stdout</text>
+
+                <rect x="20" y="86" width="46" height="40" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="32" y="111" class="svg-sub">02</text>
+                <rect x="74" y="86" width="104" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="84" y="111" class="svg-sub">00 00 00</text>
+                <rect x="186" y="86" width="150" height="40" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="196" y="111" class="svg-sub">00 00 00 13 = 19</text>
+                <rect x="346" y="86" width="420" height="40" rx="3" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="358" y="111" class="svg-sub">"line two on stderr\n"</text>
+                <text x="786" y="111" class="svg-sub">→ stderr</text>
+
+                <rect x="20" y="138" width="46" height="58" rx="3" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="32" y="172" class="svg-sub">03</text>
+                <rect x="74" y="138" width="104" height="58" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="84" y="172" class="svg-sub">00 00 00</text>
+                <rect x="186" y="138" width="150" height="58" rx="3" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="196" y="172" class="svg-sub">00 00 00 42 = 66</text>
+                <rect x="346" y="138" width="420" height="58" rx="3" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2"/>
+                <text x="358" y="161" class="svg-sub">"Error grabbing logs: log message is</text>
+                <text x="358" y="181" class="svg-sub"> too large (1000001 &gt; 1000000)\n"</text>
+                <text x="786" y="161" class="svg-sub">"error from daemon in stream: …"</text>
+                <text x="786" y="181" class="svg-sub">exit 1; reading stops here</text>
+
+                <rect x="20" y="208" width="46" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="32" y="233" class="svg-sub">01</text>
+                <rect x="74" y="208" width="104" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="84" y="233" class="svg-sub">00 00 00</text>
+                <rect x="186" y="208" width="150" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="196" y="233" class="svg-sub">00 00 00 0e = 14</text>
+                <rect x="346" y="208" width="420" height="40" rx="3" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2" stroke-dasharray="4 3"/>
+                <text x="358" y="233" class="svg-sub">"never printed\n"</text>
+                <text x="786" y="233" class="svg-sub">never read</text>
+
+                <line x1="20" y1="268" x2="1060" y2="268" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="290" class="svg-sub">other mock streams:  cut mid-frame → partial frame dropped, exit 0  ·  first byte 0x68 ('h') →</text>
+                <text x="20" y="308" class="svg-sub">"unrecognized stream: 104", exit 1  ·  TTY container → raw bytes, no headers at all</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Frames authored by a mock daemon, decoded by the real docker CLI 29.8.2; the bytes are from
+              <code>logs-syserr.od</code>. The daemon's own emission is read in code only. A real type-3 frame carries
+              exactly this text when the <code>local</code> driver meets a record over 1,000,000 bytes, and it is
+              in-band because the HTTP 200 was sent before streaming began.
+            </p>
+          </figure>
+
+          <p>
+            Two reader paths are worth seeing in code. In <code>moby/api/pkg/stdcopy/stdcopy.go:107-127</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>for nr &lt; frameSize+stdWriterPrefixLen {
+	var nr2 int
+	nr2, err = multiplexedSource.Read(buf[nr:])
+	nr += nr2
+	if errors.Is(err, io.EOF) {
+		if nr &lt; frameSize+stdWriterPrefixLen {
+			return written, nil
+		}
+		break
+	}
+	…
+}
+if stream == Systemerr {
+	return written, fmt.Errorf("error from daemon in stream: %s", string(buf[stdWriterPrefixLen:frameSize+stdWriterPrefixLen]))
+}</code></pre>
+          <p>
+            A stream that ends inside a frame returns <code>nil</code>: a clean EOF, with the partial frame silently
+            dropped. The mock's truncated stream ended with exit 0. The buffer also grows to whatever the header
+            announces, up to 4 GiB, with no cap. Both are in the public <code>api/pkg/stdcopy</code> package, which the
+            CLI vendors unchanged (D79).
+          </p>
+          <h3>Logs: one copier, blocking, unbounded</h3>
+          <p>
+            Every container gets one <code>logger.Copier</code>, with a goroutine per stream reading the broadcaster
+            into a 16 KiB buffer. It splits on <code>\n</code> and stamps each line with <code>time.Now()</code> at copy
+            time, not when the process wrote it. Longer lines become "partial" messages that share an ID; json-file
+            does not store that ID, so a missing trailing newline is the only trace
+            (<code>moby/daemon/logger/copier.go:102-165</code>) <span class="src">from the code</span>.
+            Figure {{fig-log-pipeline}} follows a line from the container to <code>docker logs</code>.
+          </p>
+
+          <figure class="figure wide" id="fig-log-pipeline">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">From the container's <code>write(2)</code> to <code>docker logs</code>: where it blocks, where it drops</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 492" role="img" aria-label="The container writes to fds 1 and 2, which the shim holds as FIFOs. dockerd's broadcaster fans out to attach clients and to the log copier. The copier splits lines at 16 KiB and calls the driver inline, which blocks back to the container's write by default; the optional non-blocking ring of 1 MB drops the newest message when full. The driver writes json-file or local files; remote drivers also feed a dual-logging cache that is a ring by default. Reading goes through the LogFile reader, a 4096-message watcher channel and stdcopy frames to the CLI. A rotation ladder shows max-file of 2 or more renaming the live file to .1, and max-file of 1 unlinking it.">
+                <defs>
+                  <marker id="lp-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="lp-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">WRITE PATH</text>
+                <rect x="20" y="34" width="170" height="74" rx="4" fill="#dfede5" stroke="#367f59" stroke-width="1.2"/>
+                <text x="32" y="56" class="svg-step">container</text>
+                <text x="32" y="76" class="svg-sub">write(2) on fd 1, 2</text>
+                <rect x="214" y="34" width="170" height="74" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="226" y="56" class="svg-step">shim</text>
+                <text x="226" y="76" class="svg-sub">holds the FIFOs</text>
+                <rect x="408" y="34" width="170" height="74" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="420" y="56" class="svg-step">broadcaster</text>
+                <text x="420" y="76" class="svg-sub">in dockerd</text>
+                <rect x="602" y="34" width="210" height="74" rx="4" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.2"/>
+                <text x="614" y="56" class="svg-step">attach clients</text>
+                <text x="614" y="76" class="svg-sub">stdcopy frames</text>
+                <text x="614" y="94" class="svg-sub">(exit drain capped 2 s)</text>
+                <rect x="408" y="140" width="250" height="92" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="1.2"/>
+                <text x="420" y="162" class="svg-step">Copier, one per container</text>
+                <text x="420" y="182" class="svg-sub">16 KiB buffer, split on \n</text>
+                <text x="420" y="200" class="svg-sub">timestamp at copy time</text>
+                <text x="420" y="218" class="svg-sub">longer lines → partials</text>
+                <rect x="682" y="140" width="190" height="92" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="694" y="162" class="svg-step">ring (optional)</text>
+                <text x="694" y="182" class="svg-sub">mode=non-blocking</text>
+                <text x="694" y="200" class="svg-sub">1 MB; full → drop</text>
+                <text x="694" y="218" class="svg-sub">the newest, silently</text>
+                <rect x="896" y="140" width="164" height="92" rx="4" fill="#f7f7f5" stroke="#252525" stroke-width="1.4"/>
+                <text x="908" y="162" class="svg-step">driver.Log()</text>
+                <text x="908" y="182" class="svg-sub">called inline</text>
+                <text x="908" y="200" class="svg-sub">by default</text>
+
+                <line x1="191" y1="71" x2="211" y2="71" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="385" y1="71" x2="405" y2="71" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="579" y1="71" x2="599" y2="71" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="493" y1="109" x2="493" y2="137" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="659" y1="186" x2="679" y2="186" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="873" y1="186" x2="893" y2="186" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <path d="M978,140 C978,118 860,124 840,124 L120,124 C104,124 104,116 104,111" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#lp-state)"/>
+                <text x="120" y="138" class="svg-note">blocking by default: a slow driver stalls write(2)</text>
+
+                <text x="20" y="268" class="svg-lane">STORAGE</text>
+                <rect x="20" y="280" width="300" height="92" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="32" y="302" class="svg-step">json-file (the default)</text>
+                <text x="32" y="322" class="svg-sub">{"log","stream","attrs","time"}</text>
+                <text x="32" y="340" class="svg-sub">max-size -1: never rotates</text>
+                <text x="32" y="358" class="svg-sub">max-file 1</text>
+                <rect x="340" y="280" width="300" height="92" rx="4" fill="#f7f7f5" stroke="#b8b8b1" stroke-width="1.2"/>
+                <text x="352" y="302" class="svg-step">local</text>
+                <text x="352" y="322" class="svg-sub">[len][protobuf LogEntry][len]</text>
+                <text x="352" y="340" class="svg-sub">20 MiB × 5 files, gzip</text>
+                <text x="352" y="358" class="svg-sub">trailing len: --tail reads back</text>
+                <rect x="660" y="280" width="400" height="92" rx="4" fill="#f3dfdc" stroke="#ad4b43" stroke-width="1.2" stroke-dasharray="5 3"/>
+                <text x="672" y="302" class="svg-step">syslog, fluentd, gelf, awslogs …</text>
+                <text x="672" y="322" class="svg-sub">+ dual-logging cache, local format,</text>
+                <text x="672" y="340" class="svg-sub">container-cached.log; wrapped in a ring</text>
+                <text x="672" y="358" class="svg-sub">when mode is unset: lossy by default (D86)</text>
+                <line x1="978" y1="233" x2="978" y2="277" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <path d="M978,252 L170,252 L170,277" fill="none" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+                <line x1="490" y1="252" x2="490" y2="277" stroke="#3c6f97" stroke-width="1.4" marker-end="url(#lp-data)"/>
+
+                <text x="20" y="404" class="svg-lane">ROTATION (BEFORE EACH WRITE, SIZE ≥ MAX-SIZE)</text>
+                <text x="20" y="428" class="svg-sub">max-file ≥ 2:  .N-1 → .N … .1 → .2,  live → .1,  open live with O_TRUNC</text>
+                <text x="20" y="448" class="svg-sub">max-file = 1:  unlink live, start empty: all history gone (D78)</text>
+                <text x="20" y="476" class="svg-lane">READ PATH</text>
+                <text x="120" y="476" class="svg-sub">LogFile reader → watcher chan (4096) → stdcopy → HTTP → CLI;  -f only while running (D87)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Read from the code (<code>copier.go</code>, <code>ring.go</code>, <code>logfile.go</code>,
+              <code>local_cache.go</code>); nothing here was run. Red dashed boxes are the two buffers that drop data,
+              and one of them, the dual-logging cache, is on by default for drivers that cannot be read back. The
+              dashed purple arrow is the back-pressure that the default blocking mode applies.
+            </p>
+          </figure>
+
+          <p>
+            Logging is blocking by default. Unless <code>mode=non-blocking</code> is set, the copier calls the driver
+            inline, so a slow driver back-pressures the FIFO, the shim and finally the container's
+            <code>write(2)</code>. json-file is also unbounded by default: with no <code>max-size</code> the capacity is
+            −1 and nothing rotates <span class="src">from the code</span>. Setting <code>max-size</code> without
+            <code>max-file</code> is worse than it looks, in
+            <code>moby/daemon/logger/loggerutils/logfile.go:227-230</code>:
+          </p>
+<pre><code>if w.maxFiles &lt; 2 {
+	if err := unlink(fname); err != nil &amp;&amp; !errors.Is(err, fs.ErrNotExist) {
+		log.G(context.TODO()).WithError(err).Error("Error unlinking current log file")
+	}</code></pre>
+          <p>
+            <code>max-file</code> defaults to 1, so every rotation throws the whole history away. The docs say no
+            rotation happens by default; they do not say this (D78). Rotation never truncates in place, because a
+            reader may still hold the old file open.
+          </p>
+          <p>
+            The non-blocking alternative trades stalls for loss. A ring buffer, 1 MB of line bytes by default
+            (<code>max-buffer-size</code>), sits in front of the driver; when it is full, the newest message is dropped
+            and <code>Enqueue</code> returns nil (<code>moby/daemon/logger/ring.go:163-183</code>). The budget counts only
+            <code>len(Line)</code>: each message costs roughly 380 bytes of heap, so short lines can use tens of times
+            the nominal 1 MB, and empty lines count zero and are never dropped <span class="src">from the code</span>. Drivers that cannot
+            be read back, such as syslog or fluentd, get a hidden <code>local</code>-format cache so that
+            <code>docker logs</code> still works. That cache is wrapped in the same ring when <code>mode</code> is
+            unset, so it is lossy by default while the primary driver blocks (D86). The formats lose things too.
+            json-file escapes like Go's <code>encoding/json</code> and replaces invalid UTF-8 with
+            <code>�</code>, so binary output does not survive. <code>local</code> refuses any record whose length
+            header exceeds 1,000,000 bytes, and that refusal is the text in Figure {{fig-stdcopy-frame}}'s type-3 frame
+            <span class="src">from the code</span>. One last surprise: <code>docker logs -f</code> on a stopped
+            container prints the history and exits, and a later <code>docker start</code> does not reattach it (D87).
+          </p>
