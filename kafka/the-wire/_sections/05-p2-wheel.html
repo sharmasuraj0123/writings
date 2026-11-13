@@ -1,0 +1,250 @@
+          <h2 id="p2-wheel"><span class="secnum">{{S}}</span>The timing wheel</h2>
+          <p>
+            Every parked request needs a timeout, and most never fire. The docs for the structure give that as its reason:
+            "The hierarchical timing wheels works especially well when operations are completed before they time out"
+            (<code>server-common/…/server/util/timer/TimingWheel.java:89</code>). So cancel has to be cheap, and insert nearly so.
+            A hierarchical timing wheel gives O(m) insert for m wheels and O(1) cancel <span class="src">from the code</span>.
+          </p>
+          <p>
+            The default timer has a 1 ms tick and 20 buckets per wheel (<code>SystemTimer.java:44-46</code>). Each overflow
+            wheel's tick is the previous wheel's whole span. Spans and ticks are derived from those two numbers:
+          </p>
+          <table>
+            <thead><tr><th>Wheel</th><th>Tick</th><th>Span of 20 buckets</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>1 ms</td><td>20 ms</td></tr>
+              <tr><td>2</td><td>20 ms</td><td>400 ms</td></tr>
+              <tr><td>3</td><td>400 ms</td><td>8 s</td></tr>
+              <tr><td>4</td><td>8 s</td><td>160 s</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Overflow wheels are created lazily, the first time an entry does not fit. The class comment explains the contrast
+            it is drawing: priority-queue timers "have O(log n) insert/delete cost", and a simple wheel cannot hold a timeout past
+            its own span, which is "an overflow". Insert is one method. <code>TimingWheel.java:147-179</code>, with the first two branches and part of a comment
+            elided:
+          </p>
+<pre><code>    public boolean add(TimerTaskEntry timerTaskEntry) {
+        long expiration = timerTaskEntry.expirationMs;
+        …
+        } else if (expiration &lt; currentTimeMs + interval) {
+            // Put in its own bucket
+            long virtualId = expiration / tickMs;
+            int bucketId = (int) (virtualId % (long) wheelSize);
+            TimerTaskList bucket = buckets[bucketId];
+            bucket.add(timerTaskEntry);
+
+            // Set the bucket expiration time
+            if (bucket.setExpiration(virtualId * tickMs)) {
+                // The bucket needs to be enqueued because it was an expired bucket
+                …
+                queue.offer(bucket);
+            }
+
+            return true;
+        } else {
+            // Out of the interval. Put it into the parent timer
+            if (overflowWheel == null) addOverflowWheel();
+            return overflowWheel.add(timerTaskEntry);
+        }
+    }</code></pre>
+          <p>
+            The elided branches refuse an entry that is cancelled or already expired. Note what goes into the
+            <code>DelayQueue</code>: <code>queue.offer(bucket)</code>. It holds buckets, not tasks, and a bucket enters only when
+            its expiry changes. A heap costs log n per item, and here n counts active buckets rather than requests. That is
+            why a broker can park a great many requests cheaply.
+          </p>
+
+          <figure class="figure wide" id="fig-wheel">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One entry due at 517 ms, cascading from the coarsest wheel to the finest</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 420" role="img" aria-label="Three wheels of 20 buckets with ticks of 400, 20 and 1 ms. An entry due at 517 ms starts in bucket 1 of the 400 ms wheel, moves at clock 400 to bucket 5 of the 20 ms wheel, moves at clock 500 to bucket 17 of the 1 ms wheel, and runs at clock 517. A side panel shows the DelayQueue holding those three buckets, not the entry.">
+                <defs>
+                  <marker id="fig-wheel-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                  <marker id="fig-wheel-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">WHEELS (20 BUCKETS EACH)</text>
+                <text x="760" y="24" class="svg-lane">DELAYQUEUE (BUCKETS ONLY)</text>
+                <g>
+                  <text x="20" y="74" class="svg-step">400 ms tick</text><text x="20" y="90" class="svg-sub">span 8 s</text>
+                  <rect x="150" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="164" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">0</text>
+                  <rect x="178" y="60" width="28" height="32" fill="#f7e3c8" stroke="#d98226" stroke-width="1.8"/>
+                  <text x="192" y="80" class="svg-sub" style="fill:#252525" text-anchor="middle">1</text>
+                  <rect x="206" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="220" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">2</text>
+                  <rect x="234" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="248" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">3</text>
+                  <rect x="262" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="276" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">4</text>
+                  <rect x="290" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="304" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">5</text>
+                  <rect x="318" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="332" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">6</text>
+                  <rect x="346" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="360" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">7</text>
+                  <rect x="374" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="388" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">8</text>
+                  <rect x="402" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="416" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">9</text>
+                  <rect x="430" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="444" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">10</text>
+                  <rect x="458" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="472" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">11</text>
+                  <rect x="486" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="500" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">12</text>
+                  <rect x="514" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="528" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">13</text>
+                  <rect x="542" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="556" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">14</text>
+                  <rect x="570" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="584" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">15</text>
+                  <rect x="598" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="612" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">16</text>
+                  <rect x="626" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="640" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">17</text>
+                  <rect x="654" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="668" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">18</text>
+                  <rect x="682" y="60" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="696" y="80" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">19</text>
+                  <text x="20" y="184" class="svg-step">20 ms tick</text><text x="20" y="200" class="svg-sub">span 400 ms</text>
+                  <rect x="150" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="164" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">0</text>
+                  <rect x="178" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="192" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">1</text>
+                  <rect x="206" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="220" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">2</text>
+                  <rect x="234" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="248" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">3</text>
+                  <rect x="262" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="276" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">4</text>
+                  <rect x="290" y="170" width="28" height="32" fill="#e0ebf2" stroke="#3c6f97" stroke-width="1.8"/>
+                  <text x="304" y="190" class="svg-sub" style="fill:#252525" text-anchor="middle">5</text>
+                  <rect x="318" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="332" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">6</text>
+                  <rect x="346" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="360" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">7</text>
+                  <rect x="374" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="388" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">8</text>
+                  <rect x="402" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="416" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">9</text>
+                  <rect x="430" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="444" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">10</text>
+                  <rect x="458" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="472" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">11</text>
+                  <rect x="486" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="500" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">12</text>
+                  <rect x="514" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="528" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">13</text>
+                  <rect x="542" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="556" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">14</text>
+                  <rect x="570" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="584" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">15</text>
+                  <rect x="598" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="612" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">16</text>
+                  <rect x="626" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="640" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">17</text>
+                  <rect x="654" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="668" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">18</text>
+                  <rect x="682" y="170" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="696" y="190" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">19</text>
+                  <text x="20" y="294" class="svg-step">1 ms tick</text><text x="20" y="310" class="svg-sub">span 20 ms</text>
+                  <rect x="150" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="164" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">0</text>
+                  <rect x="178" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="192" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">1</text>
+                  <rect x="206" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="220" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">2</text>
+                  <rect x="234" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="248" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">3</text>
+                  <rect x="262" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="276" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">4</text>
+                  <rect x="290" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="304" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">5</text>
+                  <rect x="318" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="332" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">6</text>
+                  <rect x="346" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="360" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">7</text>
+                  <rect x="374" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="388" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">8</text>
+                  <rect x="402" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="416" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">9</text>
+                  <rect x="430" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="444" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">10</text>
+                  <rect x="458" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="472" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">11</text>
+                  <rect x="486" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="500" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">12</text>
+                  <rect x="514" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="528" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">13</text>
+                  <rect x="542" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="556" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">14</text>
+                  <rect x="570" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="584" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">15</text>
+                  <rect x="598" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="612" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">16</text>
+                  <rect x="626" y="280" width="28" height="32" fill="#dfede5" stroke="#367f59" stroke-width="1.8"/>
+                  <text x="640" y="300" class="svg-sub" style="fill:#252525" text-anchor="middle">17</text>
+                  <rect x="654" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="668" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">18</text>
+                  <rect x="682" y="280" width="28" height="32" fill="#ffffff" stroke="#deded9"/>
+                  <text x="696" y="300" class="svg-sub" style="fill:#8a8a84" text-anchor="middle">19</text>
+                </g>
+                <path d="M192,92 C192,130 304,130 304,166" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-wheel-state)"/>
+                <text x="320" y="130" class="svg-sub" style="fill:#765b98">clock 400: flush, re-add to the 20 ms wheel</text>
+                <path d="M304,202 C304,240 640,240 640,276" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-wheel-state)"/>
+                <text x="280" y="262" class="svg-sub" style="fill:#765b98">clock 500: flush, re-add to the 1 ms wheel</text>
+                <line x1="640" y1="312" x2="640" y2="346" stroke="#252525" stroke-width="2" marker-end="url(#fig-wheel-ctl)"/>
+                <rect x="412" y="350" width="330" height="48" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="424" y="370" class="svg-step">Clock 517: add refuses, "already expired"</text>
+                <text x="424" y="388" class="svg-sub">so the entry's task is submitted to run</text>
+
+                <!-- delay queue -->
+                <rect x="760" y="40" width="300" height="358" rx="4" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <rect x="776" y="60" width="268" height="46" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="788" y="80" class="svg-step">expiry 400</text>
+                <text x="788" y="97" class="svg-sub">400 ms wheel, bucket 1</text>
+                <rect x="776" y="118" width="268" height="46" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="788" y="138" class="svg-step">expiry 500</text>
+                <text x="788" y="155" class="svg-sub">20 ms wheel, bucket 5</text>
+                <rect x="776" y="176" width="268" height="46" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="788" y="196" class="svg-step">expiry 517</text>
+                <text x="788" y="213" class="svg-sub">1 ms wheel, bucket 17</text>
+                <text x="776" y="252" class="svg-note">Each bucket enters when it is first armed.</text>
+                <text x="776" y="270" class="svg-note">Entries sharing a bucket add no heap work.</text>
+                <text x="776" y="306" class="svg-sub" style="fill:#252525">advanceClock(200L):</text>
+                <text x="776" y="324" class="svg-sub">poll returns when the earliest</text>
+                <text x="776" y="340" class="svg-sub">bucket expires; 200 ms bounds</text>
+                <text x="776" y="356" class="svg-sub">an idle wait only</text>
+              </svg>
+            </div>
+            <p class="figure-caption">A worked example, by hand from <code>TimingWheel.add</code> and <code>advanceClock</code>, with the clock taken as 0 at insert. It is not a trace. The entry moves only when its bucket expires, so a request that completes first never pays for a move. <span class="recon">reconstruction</span></p>
+          </figure>
+
+          <p>
+            Walk the figure in terms of the code. An entry due at 517 ms arrives with the clock at 0. It does not fit under 20 or
+            under 400, so <code>add</code> recurses twice and lands in the 400 ms wheel, in bucket 1, whose expiry is 400. Nothing
+            happens for 400 ms. Then the bucket expires, the entry is re-added, and 517 now fits in the 20 ms wheel, in bucket 5.
+            At 500 it drops into the 1 ms wheel, in bucket 17. At 517, <code>add</code> finds it already expired and returns false,
+            and only then does the task run. That is one placement and two moves over its whole life, and if the request completes
+            first, the moves never happen.
+          </p>
+          <p>
+            The clock moves only when a bucket expires. <code>SystemTimer.java:89-101</code> polls the queue, advances the clock
+            to that bucket's expiry, and flushes the bucket by re-adding each entry. That re-add either drops the entry to a
+            finer wheel or runs it. A read/write lock excludes adds during the tick <span class="src">from the code</span>.
+          </p>
+          <p>
+            One number here gets misread. The reaper calls <code>advanceClock(200L)</code>
+            (<code>DelayedOperationPurgatory.java:409-421</code>). That is not a 200 ms tick. It is the longest the poll idles,
+            because <code>DelayQueue.poll</code> returns as soon as the earliest bucket expires. The lab's 6,000 ms wait took
+            6,005 ms, in a single run on loopback <span class="recon">measured here</span>.
+          </p>
+          <p>
+            <code>ReplicaManager</code> owns six purgatories at the pin, and the live thread dump shows a reaper for each:
+            Produce, Fetch, DeleteRecords, RemoteFetch, RemoteListOffsets, ShareFetch. Two more
+            <code>ExpirationReaper-1-AlterAcls</code> threads come from outside it <span class="recon">measured here</span>.
+          </p>

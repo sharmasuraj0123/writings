@@ -1,0 +1,204 @@
+          <h2 id="p1-index"><span class="secnum">{{S}}</span>From an offset to a byte</h2>
+          <p>
+            A consumer asks for an offset. The file only knows bytes. Two sparse, unchecksummed indexes and a short scan turn one
+            into the other. An offset index entry is 8 bytes: a 4-byte offset relative to the segment base and a 4-byte file
+            position. That relative offset is why a segment cannot span more than <code>Integer.MAX_VALUE</code> offsets. A time
+            index entry is 12 bytes: an 8-byte timestamp and a 4-byte relative offset (<code>OffsetIndex.java:44-56</code>,
+            <code>TimeIndex.java:35-56</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The entries are sparse, and the rule lives in the append loop. <code>storage/…/log/LogSegment.java:263-278</code>:
+          </p>
+<pre><code>            for (RecordBatch batch : records.batches()) {
+                long batchMaxTimestamp = batch.maxTimestamp();
+                long batchLastOffset = batch.lastOffset();
+                if (batchMaxTimestamp &gt; maxTimestampSoFar()) {
+                    maxTimestampAndOffsetSoFar = new TimestampOffset(batchMaxTimestamp, batchLastOffset);
+                }
+
+                if (bytesSinceLastIndexEntry &gt; indexIntervalBytes) {
+                    offsetIndex().append(batchLastOffset, physicalPosition);
+                    timeIndex().maybeAppend(maxTimestampSoFar(), shallowOffsetOfMaxTimestampSoFar());
+                    bytesSinceLastIndexEntry = 0;
+                }
+                var sizeInBytes = batch.sizeInBytes();
+                physicalPosition += sizeInBytes;
+                bytesSinceLastIndexEntry += sizeInBytes;
+            }</code></pre>
+          <p>
+            Read the order. The check runs before the current batch's bytes are counted, so the first batch of a segment never
+            gets an entry. And the entry pairs a batch's <em>last</em> offset with the position where that batch <em>starts</em>.
+            At the default 4,096-byte interval, one entry covers about 4 KiB of log. The lab shows the rule exactly: with
+            two-record batches of about 283 bytes and a 400-byte interval, the first slot is relative offset 5 at position 566, the
+            third batch's start, whose records are offsets 4 and 5 <span class="recon">measured here</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-lookup">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Offset to byte: a floor lookup in the sparse index, a header scan, the batch</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 356" role="img" aria-label="Looking up offset 19 in a segment. Step one: a floor lookup over the sparse offset index finds slot 3, offset 17 at position 2264. Step two: a forward scan of batch headers reads position 2264, offsets 16 to 17, too low, and hops 283 bytes to position 2547. Step three: the batch at 2547 holds offsets 18 and 19.">
+                <defs><marker id="fig-lookup-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker></defs>
+                <text x="20" y="24" class="svg-lane">LOOK UP OFFSET 19 IN TOPIC idx (index.interval.bytes=400)</text>
+                <text x="20" y="56" class="svg-num">1</text><text x="36" y="56" class="svg-step">Floor lookup in the .index: greatest entry at or below 19</text>
+                <rect x="36" y="68" width="114" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="44" y="86" class="svg-sub">slot 0</text>
+                <text x="44" y="106" class="svg-sub">5 @ 566</text>
+                <rect x="158" y="68" width="114" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="166" y="86" class="svg-sub">slot 1</text>
+                <text x="166" y="106" class="svg-sub">9 @ 1132</text>
+                <rect x="280" y="68" width="114" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="288" y="86" class="svg-sub">slot 2</text>
+                <text x="288" y="106" class="svg-sub">13 @ 1698</text>
+                <rect x="402" y="68" width="114" height="50" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="410" y="86" class="svg-sub">slot 3</text>
+                <text x="410" y="106" class="svg-sub">17 @ 2264</text>
+                <rect x="524" y="68" width="114" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="532" y="86" class="svg-sub">slot 4</text>
+                <text x="532" y="106" class="svg-sub">21 @ 2830</text>
+                <rect x="646" y="68" width="114" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="654" y="86" class="svg-sub">slot 5</text>
+                <text x="654" y="106" class="svg-sub">25 @ 3400</text>
+                <text x="772" y="86" class="svg-sub">… 4 more slots</text><text x="772" y="106" class="svg-sub">8 bytes each</text>
+                <path d="M459,118 L459,136 L311,136 L311,172" stroke="#252525" stroke-width="2" fill="none" marker-end="url(#fig-lookup-ctl)"/>
+                <text x="469" y="140" class="svg-sub">go to position 2264</text>
+                <text x="20" y="150" class="svg-num">2</text><text x="36" y="150" class="svg-step">Forward scan: read headers only</text>
+                <rect x="36" y="176" width="178" height="54" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="44" y="196" class="svg-sub">position 1981</text>
+                <text x="44" y="216" class="svg-sub">batch, offsets 14-15</text>
+                <rect x="222" y="176" width="178" height="54" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="230" y="196" class="svg-sub">position 2264</text>
+                <text x="230" y="216" class="svg-sub">batch, offsets 16-17</text>
+                <rect x="408" y="176" width="178" height="54" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="416" y="196" class="svg-sub">position 2547</text>
+                <text x="416" y="216" class="svg-sub">batch, offsets 18-19</text>
+                <rect x="594" y="176" width="178" height="54" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="602" y="196" class="svg-sub">position 2830</text>
+                <text x="602" y="216" class="svg-sub">batch, offsets 20-21</text>
+                <rect x="780" y="176" width="178" height="54" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="788" y="196" class="svg-sub">position 3115</text>
+                <text x="788" y="216" class="svg-sub">batch, offsets 22-23</text>
+                <path d="M311,234 C350,266 460,266 497,236" stroke="#252525" stroke-width="2" fill="none" marker-end="url(#fig-lookup-ctl)"/>
+                <text x="250" y="284" class="svg-sub">last offset 17 &lt; 19, so hop 12 + 271 = 283 bytes</text>
+                <text x="20" y="316" class="svg-num">3</text><text x="36" y="316" class="svg-step">The batch at 2547 is the first whose last offset reaches 19. Serve from there.</text>
+                <text x="36" y="340" class="svg-note">Slot values and positions are real output. The walk through them is worked from the code.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The index gets close, and the batch headers finish the job. The scan reads headers through the file channel and does
+              not inflate records. Slots are real; the walk is <span class="recon">reconstruction</span> from the code.
+            </p>
+          </figure>
+
+          <p>
+            Below the first entry, lookup returns the pair (base offset, 0), so a segment with no entries is scanned from the top
+            (<code>OffsetIndex.java:94-102</code>, <code>LogSegment.java:399-400</code>, <code>FileRecords.java:302-332</code>).
+            The binary search has one performance scar: it first tries a "warm" tail of 8,192 bytes of entries, to keep in-sync
+            lookups on recently used pages. The comment records that plain binary search caused page faults that pushed produce
+            latency to about a second (<code>AbstractIndex.java:354-355</code>, <code>:498-502</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The time index is not a second view of the same entries. Its timestamps only go up within a file: an entry records the
+            largest timestamp seen so far and the offset of the batch that had it (<code>TimeIndex.java:42</code>, <code>:196</code>).
+            One out-of-order batch is enough to split the two.
+          </p>
+
+          <figure class="figure wide" id="fig-time-index">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Time index against offset index: one out-of-order batch makes them diverge at slot 4</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 268" role="img" aria-label="Two strips of index slots, zero to nine. The offset index holds offsets 5, 9, 13, 17, 21, 25, 29, 33, 37. The time index holds 5, 9, 13, 17, then 19 at slot four, then 25, 29, 33, 37, 39. At slot four the strips diverge because one out-of-order batch left the maximum timestamp on offset 19. Slot nine exists only in the time index, the forced final entry at the roll.">
+                <text x="20" y="24" class="svg-lane">OFFSET INDEX: LAST OFFSET OF THE BATCH / POSITION</text>
+                <text x="67.0" y="46" class="svg-num" text-anchor="middle">slot 0</text>
+                <rect x="20.0" y="54" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="28.0" y="74" class="svg-sub">off 5</text><text x="28.0" y="92" class="svg-sub">@ 566</text>
+                <text x="164.5" y="46" class="svg-num" text-anchor="middle">slot 1</text>
+                <rect x="117.5" y="54" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="125.5" y="74" class="svg-sub">off 9</text><text x="125.5" y="92" class="svg-sub">@ 1132</text>
+                <text x="262.0" y="46" class="svg-num" text-anchor="middle">slot 2</text>
+                <rect x="215.0" y="54" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="223.0" y="74" class="svg-sub">off 13</text><text x="223.0" y="92" class="svg-sub">@ 1698</text>
+                <text x="359.5" y="46" class="svg-num" text-anchor="middle">slot 3</text>
+                <rect x="312.5" y="54" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="320.5" y="74" class="svg-sub">off 17</text><text x="320.5" y="92" class="svg-sub">@ 2264</text>
+                <text x="457.0" y="46" class="svg-num" text-anchor="middle">slot 4</text>
+                <rect x="410.0" y="54" width="94" height="50" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="418.0" y="74" class="svg-sub">off 21</text><text x="418.0" y="92" class="svg-sub">@ 2830</text>
+                <text x="554.5" y="46" class="svg-num" text-anchor="middle">slot 5</text>
+                <rect x="507.5" y="54" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="515.5" y="74" class="svg-sub">off 25</text><text x="515.5" y="92" class="svg-sub">@ 3400</text>
+                <text x="652.0" y="46" class="svg-num" text-anchor="middle">slot 6</text>
+                <rect x="605.0" y="54" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="613.0" y="74" class="svg-sub">off 29</text><text x="613.0" y="92" class="svg-sub">@ 3970</text>
+                <text x="749.5" y="46" class="svg-num" text-anchor="middle">slot 7</text>
+                <rect x="702.5" y="54" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="710.5" y="74" class="svg-sub">off 33</text><text x="710.5" y="92" class="svg-sub">@ 4540</text>
+                <text x="847.0" y="46" class="svg-num" text-anchor="middle">slot 8</text>
+                <rect x="800.0" y="54" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="808.0" y="74" class="svg-sub">off 37</text><text x="808.0" y="92" class="svg-sub">@ 5110</text>
+                <text x="944.5" y="46" class="svg-num" text-anchor="middle">slot 9</text>
+                <text x="20" y="134" class="svg-lane">TIME INDEX: LARGEST TIMESTAMP SO FAR / ITS OFFSET</text>
+                <rect x="20.0" y="146" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="28.0" y="166" class="svg-sub">…602000</text><text x="28.0" y="184" class="svg-sub">off 5</text>
+                <rect x="117.5" y="146" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="125.5" y="166" class="svg-sub">…604000</text><text x="125.5" y="184" class="svg-sub">off 9</text>
+                <rect x="215.0" y="146" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="223.0" y="166" class="svg-sub">…606000</text><text x="223.0" y="184" class="svg-sub">off 13</text>
+                <rect x="312.5" y="146" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="320.5" y="166" class="svg-sub">…608000</text><text x="320.5" y="184" class="svg-sub">off 17</text>
+                <rect x="410.0" y="146" width="94" height="50" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="418.0" y="166" class="svg-sub">…609000</text><text x="418.0" y="184" class="svg-sub">off 19</text>
+                <rect x="507.5" y="146" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="515.5" y="166" class="svg-sub">…612000</text><text x="515.5" y="184" class="svg-sub">off 25</text>
+                <rect x="605.0" y="146" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="613.0" y="166" class="svg-sub">…614000</text><text x="613.0" y="184" class="svg-sub">off 29</text>
+                <rect x="702.5" y="146" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="710.5" y="166" class="svg-sub">…616000</text><text x="710.5" y="184" class="svg-sub">off 33</text>
+                <rect x="800.0" y="146" width="94" height="50" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="808.0" y="166" class="svg-sub">…618000</text><text x="808.0" y="184" class="svg-sub">off 37</text>
+                <rect x="897.5" y="146" width="94" height="50" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="905.5" y="166" class="svg-sub">…619000</text><text x="905.5" y="184" class="svg-sub">off 39</text>
+                <text x="20" y="224" class="svg-note">Slot 4: the offset index moved on to 21. The time index stayed on offset 19, the true maximum so far, after one out-of-order batch.</text>
+                <text x="20" y="246" class="svg-note">Slot 9 (purple) exists only in the time index: the forced final entry, added when the segment stopped being active.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The two indexes do not share keys. Offset-for-timestamp is therefore a double lookup: time index to offset, offset
+              index to position, then a scan of the file. Real slots, one run <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>Believed on open</h3>
+          <p>
+            Neither index has a checksum; the design is to rebuild on a crash. A pre-existing index file is believed on open: the
+            position is set to the end of the file, and startup deliberately skips sanity checks of the offset and time indexes
+            (<code>AbstractIndex.java:483-484</code>, <code>LogSegment.java:185-188</code>). By the code, corruption below the
+            recovery point is not noticed at load; that was not tested here. Upstream treats it as an open gap:
+            <a href="https://issues.apache.org/jira/browse/KAFKA-19200">KAFKA-19200</a>, "Indexes should be sanity checked on
+            startup", was In Progress with no fix version on 6 November 2026. Two 4.4.0 commits (<code>beae700199</code>,
+            <code>72b21c706e</code>) closed a related hole, an index length that a clean shutdown could leave not durable. The
+            commit text says it does not cover unclean shutdown.
+          </p>
+
+          <h3>The other two files</h3>
+          <p>
+            The <code>.txnindex</code> is created lazily, holds one fixed-size entry per aborted transaction, and is attached to the
+            segment holding the abort marker, not the segment where the transaction started. Commit, abort, commit from one
+            producer left one entry, 34 bytes <span class="recon">measured here</span>:
+          </p>
+<pre><code>00000000: 00 00 00 00 00 00 00 00 00 04 00 00 00 00 00 00
+00000010: 00 03 00 00 00 00 00 00 00 05 00 00 00 00 00 00
+00000020: 00 06
+entry: version=0 producerId=4 firstOffset=3 lastOffset=5 lastStableOffset=6</code></pre>
+          <p>
+            A <code>.snapshot</code> has a 2-byte version, a 4-byte CRC-32C checked on read, and a producer array
+            (<code>ProducerStateManager.java:74-76</code>). A one-producer snapshot was 56 bytes, named for the first offset it does
+            not cover. It exists to bound recovery: a segment can be recovered from the snapshot plus a scan of that segment
+            (<code>UnifiedLog.java:2231-2232</code>). It is written without fsync under the log lock, then flushed by the scheduler
+            with the old segment.
+          </p>

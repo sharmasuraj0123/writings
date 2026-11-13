@@ -1,0 +1,127 @@
+          <h2 id="p3-isr"><span class="secnum">{{S}}</span>Two ways out of the ISR</h2>
+          <p>
+            Every ISR member holds the HW down, so a stuck member holds every <code>acks=all</code> ack. The ladder only moves again
+            when somebody removes it. Two detectors can, and they run in different processes.
+          </p>
+          <p>
+            The first is the leader's lag check. It runs every <code>replica.lag.time.max.ms / 2</code>, so with the 30 s default
+            a stuck follower can hold acks for up to 45 s if nothing else removes it (<code>ReplicaManager.scala:284-285</code>).
+            Stuck and slow are one case: the same <code>lastCaughtUpTimeMs</code> test, with no offset-lag threshold anywhere
+            (<code>Partition.scala:1149</code>). The leader proposes and the controller decides. One ISR change is in flight per
+            partition, and most rejections leave it stuck in that pending state until new metadata arrives
+            (<code>:877</code>, <code>:1725</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The second never involves the leader. When a broker's session expires, the controller strips it from every ISR
+            (<code>metadata/…/controller/ReplicationControlManager.java:1433-1434</code>). The session default is 9 s with a 2 s
+            heartbeat, shorter than the lag limit, so a dead or frozen broker normally leaves through fencing
+            (<code>KRaftConfigs.java:40</code>, <code>:44</code>). A broker that keeps heartbeating while its fetcher is stuck is
+            the case the lag check exists for <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>One frozen follower, default settings</h3>
+          <p>
+            SIGSTOP on one in-sync follower, 20 msg/s, <code>min.insync.replicas=2</code>
+            (<code>./stall.sh default</code>, single run on loopback) <span class="recon">measured here</span>:
+          </p>
+<pre><code>t+0060.5s SIGSTOP follower n4 at epoch_ms=1793982255717
+t+0064.6s 4s into freeze: acked=41 leader_file_bytes=2160 n3_file_bytes=2160 n4_file_bytes=2088
+t+0098.2s before SIGCONT: acked=723 Topic: t Partition: 0 Leader: 2 Replicas: 2,3,4 Isr: 2,3 Elr: LastKnownElr:
+acked=1351 send_errors=0
+ack gap 9215 ms, starting -36 ms after SIGSTOP, next acked offset 41</code></pre>
+          <p>
+            Every ack stopped for 9.2 s, with no send error. Min ISR was 2, and two copies existed, and it made no difference. The
+            byte counts line up: offset 41 begins at position 2088 and offset 42 at 2160, so the frozen follower was exactly one 72-byte
+            batch behind. The record sat on two of three logs, unacknowledged and invisible. The fence record landed at
+            16:24:24.840 and the HW moved at 16:24:24.893, 53 ms apart, and the leader logged no <code>Shrinking ISR</code> line:
+            the shrink came from the controller. Resumed after 34 s, the follower was back in the ISR about 4.8 s later, its unfence
+            record ahead of the ISR change.
+          </p>
+
+          <h3>The same freeze, with the session stretched</h3>
+          <p>
+            <code>FREEZE=60 ./stall.sh session120 broker.session.timeout.ms=120000</code> takes the controller out of it, so the
+            lag check has to fire (single run) <span class="recon">measured here</span>:
+          </p>
+<pre><code>ack gap 38240 ms, starting -8 ms after SIGSTOP, next acked offset 63
+[2026-11-06 16:47:08,635] INFO [Partition t-0 broker=2] Shrinking ISR from 4,3,2 to 2,3. Leader: (highWatermark: 61, endOffset: 65). Out of sync replicas: (brokerId: 4, endOffset: 61, lastCaughtUpTimeMs: 1793983590536). (kafka.cluster.Partition)</code></pre>
+          <p>
+            38.2 s, inside the 30 to 45 s window the code predicts. The leader's own line shows HW 61 and LEO 65: four records written and not yet committed.
+          </p>
+
+          <figure class="figure wide" id="fig-two-ways">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The two detectors against one frozen follower, with the 30 s request timeout marked</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 252" role="img" aria-label="Two lanes against seconds after SIGSTOP. With default settings the ack gap was 9.2 seconds, ended by the controller fencing the broker. With the session stretched to 120 seconds the gap was 38.2 seconds, ended by the leader lag check inside its 30 to 45 second window, past the 30 second producer request timeout.">
+                <text x="170" y="22" class="svg-lane">SECONDS AFTER SIGSTOP OF ONE IN-SYNC FOLLOWER</text>
+                <line x1="170" y1="34" x2="170" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="166" y="214" class="svg-sub">0</text>
+                <line x1="330" y1="34" x2="330" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="326" y="214" class="svg-sub">10</text>
+                <line x1="490" y1="34" x2="490" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="486" y="214" class="svg-sub">20</text>
+                <line x1="650" y1="34" x2="650" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="646" y="214" class="svg-sub">30</text>
+                <line x1="810" y1="34" x2="810" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="806" y="214" class="svg-sub">40</text>
+                <line x1="970" y1="34" x2="970" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="966" y="214" class="svg-sub">50</text>
+                <text x="20" y="62" class="svg-step">Defaults</text>
+                <text x="20" y="78" class="svg-sub">session 9 s</text>
+                <rect x="170" y="50" width="147.2" height="28" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="325.2" y="62" class="svg-step">measured ack gap 9.2 s</text>
+                <text x="325.2" y="78" class="svg-sub">controller fences; no Shrinking ISR line</text>
+                <text x="20" y="132" class="svg-step">session120</text>
+                <text x="20" y="148" class="svg-sub">session 120 s</text>
+                <rect x="650" y="112" width="240" height="56" rx="2" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 3"/>
+                <text x="785.2" y="139" class="svg-sub" fill="#765b98">lag check window</text>
+                <rect x="170" y="120" width="611.2" height="28" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="178" y="139" class="svg-step">measured ack gap 38.2 s; the leader shrinks the ISR</text>
+                <line x1="650" y1="34" x2="650" y2="196" stroke="#ad4b43" stroke-width="2"/>
+                <text x="656" y="44" class="svg-sub" fill="#ad4b43">producer request timeout, 30 s</text>
+                <text x="500" y="188" class="svg-sub" fill="#ad4b43">errors begin at 30.0 s</text>
+                <text x="20" y="240" class="svg-note">Two single runs on loopback, relative only. Lag window is replica.lag.time.max.ms to 1.5 times it, from the check period.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The session sets the stall under defaults. Once the lag check is in charge, the stall outlasts the producer's
+              request timeout, and errors start. Windows are from the code, gaps are from two single runs on loopback: relative,
+              never capacity.
+            </p>
+          </figure>
+
+          <p>
+            That stall outlasted the 30 s request timeout. Requests began failing 30.0 s in, and 3 of the 602 records the client
+            was told had failed were in the log anyway (<code>stall_session120_timedout_check.txt</code>, read back with
+            <code>kafka-dump-log.sh</code>). The run used <code>retries=0</code>, which also disables idempotence; a default
+            producer would retry until <code>delivery.timeout.ms</code>. Timeouts undo nothing, and
+            <a href="../the-wire/#p2-purgatory">Part 2</a> shows why: a parked Produce starts with
+            <code>REQUEST_TIMED_OUT</code> already set. The register has this as <a href="../transactions/#D55">D55</a>,
+            confirmed by verifier.
+          </p>
+
+          <h3>Coming back</h3>
+          <p>
+            The rejoin test is shorter than people expect. <code>core/…/cluster/Partition.scala:907-911</code>:
+          </p>
+<pre><code>  private def isFollowerInSync(followerReplica: Replica): Boolean = {
+    leaderLogIfLocal.exists { leaderLog =&gt;
+      val followerEndOffset = followerReplica.stateSnapshot.logEndOffset
+      followerEndOffset &gt;= leaderLog.highWatermark &amp;&amp; leaderEpochStartOffsetOpt.exists(followerEndOffset &gt;= _)
+    }</code></pre>
+          <p>
+            HW and the start of the current epoch, not the leader's LEO. Records between HW and LEO may still be unread. The epoch
+            clause exists because committed data can sit between a new leader's HW and LEO, and a follower admitted too early could
+            be elected and lose it (<code>:865-867</code>). The replica must also be unfenced, not shutting down, and on a matching
+            broker epoch, checked by the leader and again by the controller (<code>:929-931</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The design doc says more than the code does. <code>docs/design/design.md:335</code>: "it must fully re-sync again even
+            if it lost unflushed data in its crash." Only the missing suffix is fetched, and an elected replica does not re-sync
+            at all (<a href="../transactions/#D19">D19</a>, class C, doc drift, still at trunk <code>09f2dc1320</code>).
+            <a href="../the-log/#p1-recovery">Part 1</a> shows the local half: recovery only has to produce a clean prefix.
+          </p>

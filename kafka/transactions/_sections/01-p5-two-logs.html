@@ -1,0 +1,241 @@
+          <h2 id="p5-two-logs"><span class="secnum">{{S}}</span>Two logs, one transaction</h2>
+          <p class="lede">
+            A Kafka transaction is two logs agreeing after the fact: a decision in one, markers in others, a stall in between, and
+            a known bug when the marker has nowhere to go. Exactly-once stops where Kafka stops. This collection's claim is that
+            Kafka is one log used five times, and that nearly every promise is a line in a log: which line, in which log, moved by
+            whom. This part reads the last stable offset, the line that makes a transaction visible. It ends with the findings
+            register for all five parts.
+          </p>
+          <p>
+            Every broker runs a transaction coordinator. A transactional id maps to one by hashing onto a partition of an internal
+            topic, <code>__transaction_state</code> (<code>core/…/txn/TransactionStateManager.scala:439</code>). Changing that
+            topic's partition count would break the mapping, so the coordinator refuses to load if the count moved
+            (<code>:645</code>). The topic defaults to 50 partitions, replication factor 3, min ISR 2 and 100 MiB segments
+            (<code>TransactionLogConfig.java:32-45</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            That topic is the first log. It is compacted, with the transactional id as the only key, so compaction keeps the latest
+            state of each id (<code>TransactionLogKey.json:19-23</code>). It sets <code>unclean.leader.election.enable=false</code>
+            whatever the cluster default says (<code>core/…/txn/TransactionCoordinator.scala:1017-1019</code>), and that flag does
+            not stop <a href="../replication/#p3-elections">last-known-leader election</a>; that much is code reading, not run on this
+            topic. The coordinator's memory follows its log: it updates only after the append is replicated with
+            <code>acks=-1</code>, and the replication timeout is the transaction's own timeout, not
+            <code>request.timeout.ms</code> (<code>TransactionStateManager.scala:802-803</code>).
+          </p>
+          <p>
+            Each value stores the producer id and epoch, the timeout, the status byte, the partitions and two timestamps. <code>PreviousProducerId</code>, <code>NextProducerId</code>,
+            <code>NextProducerEpoch</code> and <code>ClientTransactionVersion</code> are tagged fields of value version 1 (<code>TransactionLogValue.json:28-50</code>). Some of that schema
+            promises more than the code does: <code>PreviousProducerId</code> always holds the current id in practice, and nobody sets <code>NextProducerEpoch</code> (<a href="#D36">D36</a>,
+            <a href="#D37">D37</a>).
+          </p>
+          <p>
+            A client's requested timeout above the broker's cap fails <code>InitProducerId</code> outright. The cap defaults to 15 minutes; the Java client default is 60 seconds
+            (<code>TransactionStateManager.scala:436</code>, <code>ProducerConfig.java:579-581</code>). A null transactional id takes the short path: a fresh producer id at epoch 0 and no log
+            write. That is the plain idempotent producer from <a href="../clients/">Part 4</a> (<code>TransactionCoordinator.scala:127-130</code>).
+          </p>
+          <p>
+            The second log is every data partition the transaction touches. It keeps state of its own: the leader's
+            <code>ProducerStateManager</code> tracks each producer's epoch and open transaction, with a sorted map of open
+            transactions and a second map of decided-but-unreplicated ones (<code>ProducerStateManager.java:89-93</code>). Nothing
+            but markers joins the two.
+          </p>
+
+          <h3>Commit, in order</h3>
+          <p>
+            <code>EndTxn</code> first appends <code>PREPARE_COMMIT</code> or <code>PREPARE_ABORT</code> to the transaction log
+            (<code>TransactionCoordinator.scala:856-857</code>). That durable record is the decision. The client gets its reply
+            next, before any marker is written. <code>core/…/txn/TransactionCoordinator.scala:973-979</code>:
+          </p>
+<pre><code>                case Right((txnMetadata, newPreSendMetadata)) =&gt;
+                  // we can respond to the client immediately and continue to write the txn markers if
+                  // the log append was successful
+                  responseCallback(Errors.NONE, newPreSendMetadata.producerId, newPreSendMetadata.producerEpoch)
+
+                  txnMarkerChannelManager.addTxnMarkersToSend(coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)
+              }</code></pre>
+          <p>
+            Markers are grouped by partition leader and sent as <code>WriteTxnMarkers</code> by one dedicated sender thread per
+            broker, over its own network client (<code>TransactionMarkerChannelManager.scala:123</code>, <code>:345</code>). The
+            leader appends each with <code>acks=-1</code> as a coordinator-origin write, unless the partition is in <code>__consumer_offsets</code>, where it goes through the group coordinator
+            (<code>KafkaApis.scala:1834-1835</code>, <code>:1872-1874</code>). As each partition acks, it leaves the transaction's partition set; when the set
+            is empty the coordinator writes <code>COMPLETE_*</code> (<code>TransactionMarkerRequestCompletionHandler.scala:138-139</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Retries have no count limit: disconnects and not-leader or not-enough-replicas errors re-enqueue against possibly new
+            leaders (<code>:149-158</code>). Two endings are final. <code>INVALID_PRODUCER_EPOCH</code> or
+            <code>TRANSACTION_COORDINATOR_FENCED</code> drops the marker for good, and <code>UNSUPPORTED_*</code> removes the partition
+            as if done (<code>:160-166</code>). A third ending, an empty leader lookup, is the subject of
+            <a href="#p5-hang">Hanging, and KAFKA-20734</a>.
+          </p>
+
+          <figure class="figure wide" id="fig-two-logs">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One transaction across the coordinator's log and two data partitions</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 400" role="img" aria-label="Timeline. The client's first send writes Ongoing to the transaction log, and data batches land on partitions A and B at epoch 0. EndTxn writes PrepareCommit, the decision. The client's commit call returns. A COMMIT marker at epoch 1 lands on partition A, later one on partition B, then the coordinator writes CompleteCommit. Each partition's records stay stalled until its own marker.">
+                <defs>
+                  <marker id="fig-two-logs-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-two-logs-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker>
+                </defs>
+                <text x="16" y="54" class="svg-lane">CLIENT</text>
+                <text x="16" y="132" class="svg-lane">TXN LOG</text>
+                <text x="16" y="148" class="svg-sub">__transaction_state</text>
+                <text x="16" y="239" class="svg-lane">PARTITION A</text>
+                <text x="16" y="329" class="svg-lane">PARTITION B</text>
+                <g stroke="#deded9" stroke-width="1">
+                  <line x1="165" y1="50" x2="985" y2="50"/><line x1="165" y1="135" x2="985" y2="135"/><line x1="165" y1="235" x2="985" y2="235"/><line x1="165" y1="325" x2="985" y2="325"/>
+                </g>
+                <rect x="370" y="231" width="280" height="8" fill="#f7e3c8"/>
+                <rect x="450" y="321" width="340" height="8" fill="#f7e3c8"/>
+                <rect x="740" y="231" width="245" height="8" fill="#dfede5"/>
+                <rect x="880" y="321" width="105" height="8" fill="#dfede5"/>
+                <text x="376" y="224" class="svg-note">stalled: LSO waits at the first data batch</text>
+                <text x="456" y="314" class="svg-note">stalled: LSO waits at the first data batch</text>
+                <text x="746" y="224" class="svg-note">reads A</text>
+                <text x="884" y="314" class="svg-note">reads B</text>
+
+                <rect x="175" y="118" width="90" height="34" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="220" y="133" text-anchor="middle" class="svg-step">Ongoing</text>
+                <text x="220" y="146" text-anchor="middle" class="svg-sub">epoch 0</text>
+                <rect x="285" y="218" width="85" height="34" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="327" y="233" text-anchor="middle" class="svg-step">data</text>
+                <text x="327" y="246" text-anchor="middle" class="svg-sub">epoch 0</text>
+                <rect x="365" y="308" width="85" height="34" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="407" y="323" text-anchor="middle" class="svg-step">data</text>
+                <text x="407" y="336" text-anchor="middle" class="svg-sub">epoch 0</text>
+                <rect x="480" y="118" width="112" height="34" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="536" y="133" text-anchor="middle" class="svg-step">PrepareCommit</text>
+                <text x="536" y="146" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <text x="536" y="170" text-anchor="middle" class="svg-note">the decision</text>
+                <rect x="650" y="218" width="90" height="34" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="695" y="233" text-anchor="middle" class="svg-step">COMMIT</text>
+                <text x="695" y="246" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <rect x="790" y="308" width="90" height="34" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="835" y="323" text-anchor="middle" class="svg-step">COMMIT</text>
+                <text x="835" y="336" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <rect x="880" y="118" width="108" height="34" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="934" y="133" text-anchor="middle" class="svg-step">CompleteCommit</text>
+                <text x="934" y="146" text-anchor="middle" class="svg-sub">epoch 1</text>
+
+                <text x="220" y="38" text-anchor="middle" class="svg-step">first send</text>
+                <line x1="220" y1="50" x2="220" y2="116" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <line x1="327" y1="50" x2="327" y2="216" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-two-logs-b)"/>
+                <line x1="407" y1="50" x2="407" y2="306" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-two-logs-b)"/>
+                <text x="520" y="38" text-anchor="middle" class="svg-step">EndTxn</text>
+                <line x1="520" y1="50" x2="520" y2="116" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <text x="580" y="38" class="svg-step">commitTransaction returns</text>
+                <line x1="575" y1="116" x2="575" y2="52" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <line x1="695" y1="135" x2="695" y2="216" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <line x1="835" y1="135" x2="835" y2="306" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <text x="703" y="182" class="svg-sub">WriteTxnMarkers</text>
+                <text x="843" y="182" class="svg-sub">WriteTxnMarkers</text>
+                <path d="M740,362 H880" fill="none" stroke="#765b98" stroke-width="1.4" stroke-dasharray="5 4"/>
+                <text x="810" y="378" text-anchor="middle" class="svg-note">a reader of both can see A and not B</text>
+                <text x="16" y="392" class="svg-note">Order and spacing are illustrative; markers land in no fixed order.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Reconstruction from the code, with epochs as measured in <code>exp1.out</code>. Commit returning sits between the decision
+              and the markers. "Reads" means a <code>read_committed</code> reader. Under TV2 the epoch moves at <code>Prepare*</code>, so markers carry one above their data.
+            </p>
+          </figure>
+
+          <h3>Decided, not visible</h3>
+          <p>
+            The lab probed the coordinator straight after <code>commitTransaction</code> or <code>abortTransaction</code> returned, in
+            all 10 commits and 3 aborts across Java TV2, Java TV0 and franz-go. Every one showed <code>PrepareCommit</code> or
+            <code>PrepareAbort</code> <span class="recon">measured here</span>. That shows <code>COMPLETE_*</code> not yet applied, not
+            that no marker had landed. This is register <a href="#D86">D86</a>. One init plus three transactions wrote ten records to
+            <code>__transaction_state</code>, so under TV2 a transaction costs three coordinator writes: <code>Ongoing</code>, <code>Prepare*</code> and <code>Complete*</code>. After the last marker,
+            <code>describe-producers</code> shows the partition holding the bumped epoch, last sequence -1 and no open transaction.
+          </p>
+          <p>
+            Markers land partition by partition. There is no global commit point, so a reader of two partitions can see one side of a
+            committed transaction before the other <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>Eight states</h3>
+          <p>
+            There are eight states, and the status byte on disk is 0 to 7 (<code>TransactionState.java:39-82</code>). Two of them never
+            reach the log. <code>PREPARE_EPOCH_FENCE</code> exists only as an in-memory pending state on the way to
+            <code>PREPARE_ABORT</code> (<code>TransactionMetadata.java:414-415</code>), and <code>DEAD</code> is a tombstone plus removal
+            from memory (<code>:426</code>). Every transition has two steps: <code>prepareTransitionTo</code> sets a pending state that
+            blocks others, and <code>completeTransitionTo</code> applies it after the append (<code>:341-349</code>, <code>:444</code>). A
+            request that arrives meanwhile gets the retriable <code>CONCURRENT_TRANSACTIONS</code>, not a queue slot
+            (<code>TransactionCoordinator.scala:439-444</code>). The legal moves are a table of previous states. <code>transaction-coordinator/…/TransactionState.java:94-103</code>:
+          </p>
+<pre><code>    public static final Map&lt;TransactionState, Set&lt;TransactionState&gt;&gt; VALID_PREVIOUS_STATES = Map.of(
+        EMPTY, Set.of(EMPTY, COMPLETE_COMMIT, COMPLETE_ABORT),
+        ONGOING, Set.of(ONGOING, EMPTY, COMPLETE_COMMIT, COMPLETE_ABORT),
+        PREPARE_COMMIT, Set.of(ONGOING),
+        PREPARE_ABORT, Set.of(ONGOING, PREPARE_EPOCH_FENCE, EMPTY, COMPLETE_COMMIT, COMPLETE_ABORT),
+        COMPLETE_COMMIT, Set.of(PREPARE_COMMIT),
+        COMPLETE_ABORT, Set.of(PREPARE_ABORT),
+        DEAD, Set.of(EMPTY, COMPLETE_ABORT, COMPLETE_COMMIT),
+        PREPARE_EPOCH_FENCE, Set.of(ONGOING)
+    );</code></pre>
+
+          <figure class="figure wide" id="fig-states">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title"><code>VALID_PREVIOUS_STATES</code>, drawn: eight states, two never persisted</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 410" role="img" aria-label="State machine. Empty goes to Ongoing. Ongoing goes to PrepareCommit, PrepareAbort or the unpersisted PrepareEpochFence, which goes to PrepareAbort. PrepareCommit goes to CompleteCommit, PrepareAbort to CompleteAbort. Both complete states return to Empty or Ongoing and can go to the unpersisted Dead state. TV2 adds edges into PrepareAbort from Empty, CompleteCommit and CompleteAbort.">
+                <defs>
+                  <marker id="fig-states-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker>
+                  <marker id="fig-states-o" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#d98226"/></marker>
+                </defs>
+                <rect x="680" y="52" width="180" height="280" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="770" y="192" text-anchor="middle" class="svg-note">either complete state</text>
+
+                <g fill="#ffffff" stroke="#252525" stroke-width="1">
+                  <rect x="30" y="170" width="140" height="54" rx="4"/><rect x="240" y="170" width="140" height="54" rx="4"/>
+                  <rect x="470" y="70" width="150" height="54" rx="4"/><rect x="470" y="260" width="150" height="54" rx="4"/>
+                  <rect x="695" y="70" width="150" height="54" rx="4"/><rect x="695" y="260" width="150" height="54" rx="4"/>
+                </g>
+                <rect x="240" y="320" width="170" height="54" rx="4" fill="#ffffff" stroke="#765b98" stroke-dasharray="5 4"/>
+                <rect x="885" y="165" width="105" height="54" rx="4" fill="#ffffff" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="100" y="194" text-anchor="middle" class="svg-step">Empty</text><text x="100" y="211" text-anchor="middle" class="svg-sub">byte 0</text>
+                <text x="310" y="194" text-anchor="middle" class="svg-step">Ongoing</text><text x="310" y="211" text-anchor="middle" class="svg-sub">byte 1</text>
+                <text x="545" y="94" text-anchor="middle" class="svg-step">PrepareCommit</text><text x="545" y="111" text-anchor="middle" class="svg-sub">byte 2</text>
+                <text x="545" y="284" text-anchor="middle" class="svg-step">PrepareAbort</text><text x="545" y="301" text-anchor="middle" class="svg-sub">byte 3</text>
+                <text x="770" y="94" text-anchor="middle" class="svg-step">CompleteCommit</text><text x="770" y="111" text-anchor="middle" class="svg-sub">byte 4</text>
+                <text x="770" y="284" text-anchor="middle" class="svg-step">CompleteAbort</text><text x="770" y="301" text-anchor="middle" class="svg-sub">byte 5</text>
+                <text x="937" y="189" text-anchor="middle" class="svg-step">Dead</text><text x="937" y="206" text-anchor="middle" class="svg-sub">byte 6</text>
+                <text x="325" y="344" text-anchor="middle" class="svg-step">PrepareEpochFence</text><text x="325" y="361" text-anchor="middle" class="svg-sub">byte 7</text>
+
+                <g fill="none" stroke="#252525" stroke-width="1.6">
+                  <path d="M170,197 H238" marker-end="url(#fig-states-k)"/>
+                  <path d="M380,185 L468,110" marker-end="url(#fig-states-k)"/>
+                  <path d="M380,210 L468,275" marker-end="url(#fig-states-k)"/>
+                  <path d="M320,224 V318" marker-end="url(#fig-states-k)"/>
+                  <path d="M410,345 L480,316" marker-end="url(#fig-states-k)"/>
+                  <path d="M620,97 H693" marker-end="url(#fig-states-k)"/>
+                  <path d="M620,280 H693" marker-end="url(#fig-states-k)"/>
+                  <path d="M770,52 V24 H100 V168" marker-end="url(#fig-states-k)"/>
+                  <path d="M310,24 V168" marker-end="url(#fig-states-k)"/>
+                  <path d="M860,192 H883" marker-end="url(#fig-states-k)"/>
+                </g>
+                <g fill="none" stroke="#d98226" stroke-width="2">
+                  <path d="M100,224 V394 H545 V316" marker-end="url(#fig-states-o)"/>
+                  <path d="M693,300 H622" marker-end="url(#fig-states-o)"/>
+                  <path d="M695,120 L605,258" marker-end="url(#fig-states-o)"/>
+                </g>
+                <text x="400" y="18" class="svg-sub">back to Empty or Ongoing</text>
+                <text x="112" y="388" class="svg-sub">TV2 only: abort from an idle state</text>
+                <text x="885" y="238" class="svg-note">also from Empty</text>
+                <text x="885" y="254" class="svg-note">(not drawn)</text>
+                <text x="620" y="360" class="svg-note">Dashed box: never written to the log.</text>
+                <text x="620" y="378" class="svg-note">Orange: edges into PrepareAbort, added for TV2.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              From the table above <span class="src">from the code</span>. <code>PREPARE_COMMIT</code> has one way in.
+              <code>PREPARE_ABORT</code> has five, because under TV2 a client that does not know the server's state can send
+              <code>EndTxn</code> when uncertain.
+            </p>
+          </figure>

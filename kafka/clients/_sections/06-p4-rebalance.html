@@ -1,0 +1,245 @@
+          <h2 id="p4-rebalance"><span class="secnum">{{S}}</span>The barrier and the heartbeat</h2>
+          <p>
+            Groups decide who owns what. The classic protocol is a five-state machine around one barrier: any change moves the group to
+            PreparingRebalance, heartbeats tell members to come, and their join requests park until everyone is in or a timer fires.
+            <code>group/GroupMetadataManager.java:7847-7858</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>        if (group.hasAllMembersJoined()) {
+            // All members have joined. Proceed to sync phase.
+            return completeClassicGroupJoin(group);
+        } else {
+            timer.schedule(
+                classicGroupJoinKey,
+                group.rebalanceTimeoutMs(),
+                TimeUnit.MILLISECONDS,
+                false,
+                () -&gt; completeClassicGroupJoin(group.groupId())
+            );
+            return EMPTY_RESULT;</code></pre>
+          <p>
+            That timeout is the largest across the group, and the Java client sets it from <code>max.poll.interval.ms</code>, 5 minutes, so one busy
+            member can hold a rebalance open that long (<code>clients/GroupRebalanceConfig.java:55</code>). A heartbeat during PreparingRebalance still renews
+            the session, so heartbeats keep a stuck member alive while it holds up the group. The broker never computes a classic assignment: the leader
+            gets the member list in its join response and returns the assignment in SyncGroup.
+          </p>
+          <p>
+            Under eager, a client revokes every partition before it rejoins. Under cooperative it revokes only those it no longer owns, keeps the rest during
+            the rebalance, and needs a follow-up round whenever a partition moves (KIP-429). The Java default lists Range and CooperativeSticky, and the client
+            takes the highest protocol all listed assignors share, so the out-of-the-box classic consumer is eager
+            (<code>consumer/internals/ConsumerCoordinator.java:257-271</code>).
+          </p>
+
+          <h3>KIP-848: one member at a time</h3>
+          <p>
+            KIP-848 replaces Join, Sync and Heartbeat with one RPC, where the epoch does the signalling: 0 joins, −1 leaves, −2 is a static member stepping out. A
+            heartbeat updates the member, updates the target assignment if the group epoch is ahead, and reconciles this member. The broker computes the assignment,
+            inline on the heartbeat path, and client-side assignors from the KIP's design are not implemented. An offload setting defaults to true, but nothing at the
+            pin reads it, and the configs became internal (<a href="../transactions/#p5-register">register D32</a>, class C, doc drift; getters only at trunk). Reconciliation holds no
+            barrier. It is set arithmetic on one member. <code>group/modern/consumer/CurrentAssignmentBuilder.java:393-405</code>:
+          </p>
+<pre><code>            // New Assigned Partitions = Previous Assigned Partitions ∩ Target
+            Map&lt;Integer, Integer&gt; assignedPartitions = new HashMap&lt;&gt;(currentAssignedPartitions);
+            assignedPartitions.keySet().retainAll(target);
+
+            // Partitions Pending Revocation = Previous Assigned Partitions - New Assigned Partitions
+            Map&lt;Integer, Integer&gt; partitionsPendingRevocation = new HashMap&lt;&gt;(currentAssignedPartitions);
+            partitionsPendingRevocation.keySet().removeAll(assignedPartitions.keySet());
+
+            // Partitions Pending Assignment = Target - New Assigned Partitions - Unreleased Partitions
+            Set&lt;Integer&gt; partitionsPendingAssignment = new HashSet&lt;&gt;(target);
+            partitionsPendingAssignment.removeAll(assignedPartitions.keySet());
+            hasUnreleasedPartitions = partitionsPendingAssignment.removeIf(partitionId -&gt;
+                currentPartitionEpoch.apply(topicId, partitionId) != -1 &amp;&amp;</code></pre>
+          <p>
+            A partition another member still owns is held back from the newcomer until released, so one partition never has two owners while the rest of the group runs.
+            A member that owes a revocation gets a personal rebalance timeout, and missing it fences that member alone (read, not run). All of this persists next to the
+            offsets. A join and a leave on disk, trimmed from <code>kafka-dump-log.sh --offsets-decoder</code> <span class="recon">measured here</span>:
+          </p>
+<pre><code>| offset: 0 ... key: {"type":"5","data":{"groupId":"grp-consumer","memberId":"VQTDsv9nQgSCkHbTV_BQpQ"}} ...
+| offset: 1 ... key: {"type":"3","data":{"groupId":"grp-consumer"}} payload: {...{"epoch":2,"metadataHash":573870876925506249}}
+| offset: 2 ... key: {"type":"7",...} payload: {...{"topicPartitions":[{"topicId":"8qCmmX8cSrq4lBYXSeiviQ","partitions":[0]}]}}
+| offset: 3 ... key: {"type":"6","data":{"groupId":"grp-consumer"}} payload: {...{"assignmentEpoch":2,...}}
+| offset: 4 ... key: {"type":"8",...} payload: {...{"memberEpoch":2,"previousMemberEpoch":0,"state":0,...
+| offset: 5 ... key: {"type":"1","data":{"group":"grp-consumer","topic":"offs","partition":0}} payload: {...{"offset":42,...
+| offset: 6 ... key: {"type":"8",...} payload: &lt;DELETE&gt;
+| offset: 7 ... key: {"type":"7",...} payload: &lt;DELETE&gt;
+| offset: 8 ... key: {"type":"5",...} payload: &lt;DELETE&gt;
+| offset: 9 ... key: {"type":"3","data":{"groupId":"grp-consumer"}} payload: {...{"epoch":3}}
+| offset: 10 ... key: {"type":"6","data":{"groupId":"grp-consumer"}} payload: {...{"assignmentEpoch":3}}</code></pre>
+          <p>
+            No type 4 record appears. The schema says that record was replaced in 4.1 by KIP-1101, though a heartbeat comment at the pin still names it
+            (<a href="../transactions/#p5-register">register D9</a>, class B, fixed after 4.4.0 in <code>72955baae9</code>, no tag). Since 4.3, target assignment is also rate-limited.
+            <code>GroupMetadataManager.java:4187-4208</code>:
+          </p>
+<pre><code>    static boolean canComputeNextTargetAssignment(
+        long assignmentTimestampMs,
+        int assignmentIntervalMs,
+        long currentTimeMs
+    ) {
+        // The next target assignment can be computed immediately
+        //  * when there is no existing target assignment,
+        //  * or we do not know when the existing target assignment was computed.
+        if (assignmentTimestampMs == 0) {
+            return true;
+        }
+
+        // The next target assignment can be computed immediately when the assignment interval is
+        // zero. This provides an escape hatch if the wall clock undergoes a large backwards
+        // correction.
+        if (assignmentIntervalMs == 0) {
+            return true;
+        }
+
+        // Otherwise, we wait for the assignment interval to elapse.
+        return currentTimeMs &gt;= assignmentTimestampMs + assignmentIntervalMs;
+    }</code></pre>
+          <p>
+            A deferred assignment has no timer of its own. It waits for a later heartbeat from any member. One such wait is on disk, in a share group that uses the same path:
+            4,835 ms (<a href="../transactions/#p5-register">register D105</a>, class E, behaviour change).
+          </p>
+
+          <h3>Measured: 7 members, no state</h3>
+          <p>
+            "Stop" is the longest gap with zero records consumed on any partition. "Done" is the last listener event after the change. At 100 records/s over 12 partitions a
+            healthy partition sees a record about every 120 ms, so stop values near 100 ms are the measuring floor. Loopback, Java client only, relative only
+            <span class="recon">measured here</span>:
+          </p>
+          <table>
+            <thead><tr><th>Event</th><th>Mode</th><th>Runs</th><th>Stop ms</th><th>Idle &gt; 1 s</th><th>Idle p·s</th><th>Done ms</th><th>Re-read</th></tr></thead>
+            <tbody>
+              <tr><td>Scale-out 6→7</td><td>eager</td><td>4</td><td>85–381</td><td>0</td><td>0</td><td>2730–3049</td><td>0</td></tr>
+              <tr><td></td><td>cooperative</td><td>2</td><td>71–77</td><td>1</td><td>3.1–3.2</td><td>5977–6096</td><td>0–1</td></tr>
+              <tr><td></td><td>consumer, 5 s</td><td>4</td><td>66–84</td><td>1</td><td>2.7–2.9</td><td>5240–5326</td><td>0</td></tr>
+              <tr><td></td><td>consumer, 1 s</td><td>2</td><td>60–82</td><td>0–1</td><td>0–1.1</td><td>1423–1448</td><td>0</td></tr>
+              <tr><td>Graceful leave</td><td>eager</td><td>1</td><td>98</td><td>2</td><td>5.6</td><td>2743</td><td>0</td></tr>
+              <tr><td></td><td>consumer, 5 s</td><td>1</td><td>81</td><td>2</td><td>6.3</td><td>3075</td><td>0</td></tr>
+              <tr><td></td><td>consumer, 1 s</td><td>1</td><td>38</td><td>2</td><td>2.4</td><td>998</td><td>0</td></tr>
+              <tr style="background: var(--red-soft)"><td>Busy member</td><td>eager</td><td>1</td><td><strong>22398</strong></td><td><strong>12</strong></td><td><strong>275.2</strong></td><td>25061</td><td>0</td></tr>
+              <tr><td></td><td>cooperative</td><td>1</td><td>89</td><td>3</td><td>53.1</td><td>28064</td><td>175</td></tr>
+              <tr><td></td><td>consumer, 5 s</td><td>1</td><td>67</td><td>3</td><td>53.1</td><td>5547</td><td>0</td></tr>
+              <tr><td></td><td>consumer, 1 s</td><td>1</td><td>135</td><td>3</td><td>51.5</td><td>1725</td><td>0</td></tr>
+              <tr><td>SIGKILL</td><td>eager</td><td>1</td><td>115</td><td>10</td><td>120.1</td><td>47743</td><td>34</td></tr>
+              <tr><td></td><td>consumer, 5 s</td><td>1</td><td>52</td><td>2</td><td>86.1</td><td>42956</td><td>52</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Eager looks best in the quiet row, and that is a best case: its members had finished the same rebalance together, so their heartbeats landed within about
+            240 ms of each other. The consumer protocol moved one partition and paused no other, but finished later, 5.2 to 5.3 s against 2.7 to 3.0 s, with the moved partition idle 2.7 to
+            2.9 s, because each step waits for a 5 s heartbeat. A 1 s heartbeat cut it to about 1.4 s, so cadence sets the speed here, not the assignor. A graceful leave cost about the
+            same in all default modes (one run each).
+          </p>
+
+          <figure class="figure wide" id="fig-busy">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The busy member, two ways: one member sleeps 25 s between polls while a joiner arrives</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 340" role="img" aria-label="Two swimlane panels of 12 partitions over 45 seconds. Eager classic: ten partitions go idle from about 2.7 to 25 seconds, and the sleeper's two are idle from 0 to 25 seconds, so all twelve are dark together for 22.4 seconds. Consumer protocol: only the sleeper's two partitions are idle for 25 seconds, and one partition being handed over is idle for 2,981 milliseconds; the rest keep flowing.">
+                <text x="50" y="24" class="svg-lane">EAGER CLASSIC</text>
+                <text x="50" y="42" class="svg-sub">all 12 stopped for 22.4 s, until the sleeper polled</text>
+                <text x="590" y="24" class="svg-lane">CONSUMER PROTOCOL, 5 S HEARTBEAT</text>
+                <text x="590" y="42" class="svg-sub">global stop 67 ms; joiner served at 5.5 s, sleeper still asleep</text>
+                <text x="42" y="63" text-anchor="end" class="svg-sub">p0</text>
+                <rect x="50" y="52" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="52" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="79" text-anchor="end" class="svg-sub">p1</text>
+                <rect x="50" y="68" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="68" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="95" text-anchor="end" class="svg-sub">p2</text>
+                <rect x="50" y="84" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="84" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="111" text-anchor="end" class="svg-sub">p3</text>
+                <rect x="50" y="100" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="100" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="127" text-anchor="end" class="svg-sub">p4</text>
+                <rect x="50" y="116" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="116" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="143" text-anchor="end" class="svg-sub">p5</text>
+                <rect x="50" y="132" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="132" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="159" text-anchor="end" class="svg-sub">p6</text>
+                <rect x="50" y="148" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="148" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="175" text-anchor="end" class="svg-sub">p7</text>
+                <rect x="50" y="164" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="164" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="191" text-anchor="end" class="svg-sub">p8</text>
+                <rect x="50" y="180" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="180" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="207" text-anchor="end" class="svg-sub">p9</text>
+                <rect x="50" y="196" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="196" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="223" text-anchor="end" class="svg-sub">p10</text>
+                <rect x="50" y="212" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="50.3" y="212" width="233.5" height="12" fill="#252525"/>
+                <text x="42" y="239" text-anchor="end" class="svg-sub">p11</text>
+                <rect x="50" y="228" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="50.3" y="228" width="233.5" height="12" fill="#252525"/>
+                <line x1="50" y1="250" x2="470" y2="250" stroke="#b8b8b1"/>
+                <line x1="50" y1="250" x2="50" y2="254" stroke="#b8b8b1"/><text x="50" y="267" class="svg-sub">0 s</text>
+                <line x1="143" y1="250" x2="143" y2="254" stroke="#b8b8b1"/><text x="143" y="267" class="svg-sub">10 s</text>
+                <line x1="237" y1="250" x2="237" y2="254" stroke="#b8b8b1"/><text x="237" y="267" class="svg-sub">20 s</text>
+                <line x1="330" y1="250" x2="330" y2="254" stroke="#b8b8b1"/><text x="330" y="267" class="svg-sub">30 s</text>
+                <line x1="423" y1="250" x2="423" y2="254" stroke="#b8b8b1"/><text x="423" y="267" class="svg-sub">40 s</text>
+                <text x="582" y="63" text-anchor="end" class="svg-sub">p0</text>
+                <rect x="590" y="52" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="79" text-anchor="end" class="svg-sub">p1</text>
+                <rect x="590" y="68" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="617.9" y="68" width="27.8" height="12" fill="#d98226"/>
+                <text x="582" y="95" text-anchor="end" class="svg-sub">p2</text>
+                <rect x="590" y="84" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="111" text-anchor="end" class="svg-sub">p3</text>
+                <rect x="590" y="100" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="127" text-anchor="end" class="svg-sub">p4</text>
+                <rect x="590" y="116" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="590.4" y="116" width="233.4" height="12" fill="#252525"/>
+                <text x="582" y="143" text-anchor="end" class="svg-sub">p5</text>
+                <rect x="590" y="132" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="590.4" y="132" width="233.4" height="12" fill="#252525"/>
+                <text x="582" y="159" text-anchor="end" class="svg-sub">p6</text>
+                <rect x="590" y="148" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="175" text-anchor="end" class="svg-sub">p7</text>
+                <rect x="590" y="164" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="191" text-anchor="end" class="svg-sub">p8</text>
+                <rect x="590" y="180" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="207" text-anchor="end" class="svg-sub">p9</text>
+                <rect x="590" y="196" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="223" text-anchor="end" class="svg-sub">p10</text>
+                <rect x="590" y="212" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="239" text-anchor="end" class="svg-sub">p11</text>
+                <rect x="590" y="228" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <line x1="590" y1="250" x2="1010" y2="250" stroke="#b8b8b1"/>
+                <line x1="590" y1="250" x2="590" y2="254" stroke="#b8b8b1"/><text x="590" y="267" class="svg-sub">0 s</text>
+                <line x1="683" y1="250" x2="683" y2="254" stroke="#b8b8b1"/><text x="683" y="267" class="svg-sub">10 s</text>
+                <line x1="777" y1="250" x2="777" y2="254" stroke="#b8b8b1"/><text x="777" y="267" class="svg-sub">20 s</text>
+                <line x1="870" y1="250" x2="870" y2="254" stroke="#b8b8b1"/><text x="870" y="267" class="svg-sub">30 s</text>
+                <line x1="963" y1="250" x2="963" y2="254" stroke="#b8b8b1"/><text x="963" y="267" class="svg-sub">40 s</text>
+                <rect x="50" y="292" width="16" height="12" fill="#dfede5" stroke="#367f59"/><text x="72" y="302" class="svg-sub">consuming</text>
+                <rect x="170" y="292" width="16" height="12" fill="#252525"/><text x="192" y="302" class="svg-sub">the sleeper's own two: idle under any protocol</text>
+                <rect x="590" y="292" width="16" height="12" fill="#ad4b43"/><text x="612" y="302" class="svg-sub">idle behind the barrier</text>
+                <rect x="800" y="292" width="16" height="12" fill="#d98226"/><text x="822" y="302" class="svg-sub">handed over: idle 2,981 ms</text>
+                <text x="50" y="330" class="svg-note">x is seconds since the event: one member starts a 25 s sleep between polls and a joiner arrives. Lane edges come from listener events.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">7 stateless members, single run each, Java client, loopback. 50 of eager's 275.2 partition-seconds, and of the consumer protocol's 53.1, belong to the sleeper's own two partitions. The assignor happened to take the moved partition from a different member, so this run did not exercise a slow member that must itself revoke. KIP-848's claims concern larger groups with slow members; this is not that. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            Cooperative sits between them. Other partitions kept flowing, 89 ms global gap, but the joiner got nothing until the barrier cleared, 28 s against 5.5 s. It also redelivered 175
+            records in one run. A classic client refuses offset commits while rebalancing (<code>ConsumerCoordinator.java:1312-1322</code>), so partition 8 kept being consumed with commits failing,
+            then moved. The refusal is read in code; the link to 175 is inferred, and it holds arithmetically: 175 ÷ 8.33 records/s is 21 s, and the rebalance was open about 22 s
+            (<a href="../transactions/#p5-register">register D82</a>, class D, gotcha).
+          </p>
+          <p>
+            After a SIGKILL the group first reacted at about 44.7 s and 43 s, in one run each: the session timeout, plus the next heartbeat carrying the news. Then they differ. Under eager, 8
+            surviving partitions idled about 3.1 s, because one member's heartbeat came 3 s after the others' and the barrier waited for it, and why it was out of phase was not determined.
+            Under the consumer protocol no surviving partition idled.
+          </p>
+          <p>
+            Classic is still the default: <code>group.protocol</code> is <code>classic</code> in Java 4.4.0 (<code>ConsumerConfig.java:121-123</code>), librdkafka and franz-go, so nobody gets KIP-848
+            without opting in. Migration is online, but the knobs change. <code>session.timeout.ms</code> and <code>heartbeat.interval.ms</code> are rejected on the client, a session under 45 s needs
+            a broker change, and a quiet scale-out gets slower by default (<a href="../transactions/#p5-register">register D83</a>, class D). One small thing: a fencing log for a plain classic commit says
+            <code>txn-offset-commit</code>, because <code>validateOffsetCommit</code> passes its label inverted (<a href="../transactions/#p5-register">register D8</a>, class B, log text only, fixed after 4.4.0 in
+            <code>a3e4a7e42c</code>, no tag).
+          </p>

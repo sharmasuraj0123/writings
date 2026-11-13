@@ -1,0 +1,345 @@
+          <h2 id="p4-idempotence"><span class="secnum">{{S}}</span>Idempotence, and where it runs out</h2>
+          <p>
+            <code>enable.idempotence</code> is on by default, and it is built on a <code>TransactionManager</code> even with no
+            transactions. A producer gets a producer ID (PID) from any broker, at epoch 0, from a block of 1,000 leased from the
+            controller. Every instance burns a fresh PID, and a restart cannot resume the old one
+            (<code>core/…/coordinator/transaction/TransactionCoordinator.scala:127-130</code>). Sequence numbers are per partition, count
+            records, and are assigned at drain, not at <code>send</code>. Once assigned they never change on retry.
+            <code>RecordAccumulator.java:958-967</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>                    // If the batch already has an assigned sequence, then we should not change the producer id and
+                    // sequence number, since this may introduce duplicates. In particular, the previous attempt
+                    // may actually have been accepted, and if we change the producer id and sequence here, this
+                    // attempt will also be accepted, causing a duplicate.
+                    //
+                    // Additionally, we update the next sequence number bound for the partition, and also have
+                    // the transaction manager track the batch so as to ensure that sequence ordering is maintained
+                    // even if we receive out of order responses.
+                    batch.setProducerState(producerIdAndEpoch, transactionManager.sequenceNumber(batch.topicPartition), isTransactional);
+                    transactionManager.incrementSequenceNumber(batch.topicPartition, batch.recordCount);</code></pre>
+          <p>
+            The other half is on the broker. Per partition and per PID it keeps a <code>ProducerStateEntry</code>: the epoch and the
+            metadata of the last 5 batches. <code>NUM_BATCHES_TO_RETAIN</code> is why the client's limit is 5. A duplicate is an exact
+            match, with no partial case. <code>log/ProducerStateEntry.java:128-137</code>:
+          </p>
+<pre><code>    Optional&lt;BatchMetadata&gt; findDuplicateBatch(RecordBatch batch) {
+        return batch.producerEpoch() != producerEpoch ? Optional.empty() : batchWithSequenceRange(batch.baseSequence(), batch.lastSequence());
+    }
+
+    // Return the batch metadata of the cached batch having the exact sequence range, if any.
+    private Optional&lt;BatchMetadata&gt; batchWithSequenceRange(int firstSeq, int lastSeq) {
+        return batchMetadata.stream()
+            .filter(metadata -&gt; firstSeq == metadata.firstSeq() &amp;&amp; lastSeq == metadata.lastSeq())
+            .findFirst();
+    }</code></pre>
+          <p>
+            A match is answered with the first write's offsets and writes nothing, so the callback looks like a first-time success
+            (<code>log/UnifiedLog.java:1261-1270</code>). Anything else must start exactly one past the last sequence, unless the broker has
+            no epoch for this PID. <code>log/ProducerAppendInfo.java:186-188</code>:
+          </p>
+<pre><code>            // If there is no current producer epoch (possibly because all producer records have been deleted due to
+            // retention or the DeleteRecords API) accept writes with any sequence number
+            if (!(currentEntry.producerEpoch() == RecordBatch.NO_PRODUCER_EPOCH || inSequence(currentLastSeq, appendFirstSeq))) {</code></pre>
+          <p>
+            With no state, a late retry is just new data. Every edge below comes from that condition, or from the client's half of the
+            bargain.
+          </p>
+
+          <figure class="figure wide" id="fig-tree">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The broker's decision for one client batch, with the no-state hole</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 372" role="img" aria-label="Four checks in order. Same epoch and an exact sequence range among the last five batches: answer with the first write's offsets and write nothing. Older epoch: refuse with InvalidProducerEpochException. No stored epoch for this PID: accept any sequence, the highlighted hole. Otherwise the batch must start at last sequence plus one, or at sequence 0 for a new epoch; if not, OutOfOrderSequenceException; if so, append.">
+                <defs>
+                  <marker id="fig-tree-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">CHECK, IN CODE ORDER</text>
+                <text x="620" y="22" class="svg-lane">IF YES</text>
+
+                <rect x="20" y="36" width="500" height="58" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="34" y="58" class="svg-step">Same epoch, and exact first and last sequence among the last 5?</text>
+                <text x="34" y="78" class="svg-sub">UnifiedLog: findDuplicateBatch, client appends only</text>
+                <line x1="520" y1="65" x2="618" y2="65" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <rect x="620" y="36" width="440" height="58" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="634" y="58" class="svg-step">Answer with the first write's offsets. Write nothing.</text>
+                <text x="634" y="78" class="svg-sub">callback looks like a first-time success</text>
+
+                <rect x="20" y="112" width="500" height="58" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="34" y="134" class="svg-step">Epoch older than the stored epoch?</text>
+                <text x="34" y="154" class="svg-sub">fences a pre-bump batch still in flight</text>
+                <line x1="520" y1="141" x2="618" y2="141" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <rect x="620" y="112" width="440" height="58" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="634" y="134" class="svg-step">Refuse: InvalidProducerEpochException</text>
+                <text x="634" y="154" class="svg-sub">ProducerAppendInfo.java:151</text>
+
+                <rect x="20" y="188" width="500" height="58" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <text x="34" y="210" class="svg-step">No stored epoch for this PID?</text>
+                <text x="34" y="230" class="svg-sub">first write, expired state, retention, DeleteRecords</text>
+                <line x1="520" y1="217" x2="618" y2="217" stroke="#d98226" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <rect x="620" y="188" width="440" height="58" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <text x="634" y="210" class="svg-step">Accept any sequence.</text>
+                <text x="634" y="230" class="svg-sub">the hole: a late retry is just new data</text>
+
+                <rect x="20" y="264" width="500" height="58" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="34" y="286" class="svg-step">Starts at last sequence + 1 (or 0, for a new epoch)?</text>
+                <text x="34" y="306" class="svg-sub">wraps at Integer.MAX_VALUE</text>
+                <line x1="520" y1="293" x2="618" y2="293" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <rect x="620" y="264" width="210" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="634" y="286" class="svg-step">Append</text>
+                <text x="634" y="306" class="svg-sub">update the 5-entry deque</text>
+                <rect x="840" y="264" width="220" height="58" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="852" y="286" class="svg-step">If no: refuse</text>
+                <text x="852" y="306" class="svg-sub">OutOfOrderSequenceException</text>
+
+                <line x1="270" y1="94" x2="270" y2="112" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <line x1="270" y1="170" x2="270" y2="188" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <line x1="270" y1="246" x2="270" y2="264" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <text x="280" y="107" class="svg-sub">no</text>
+                <text x="280" y="183" class="svg-sub">no</text>
+                <text x="280" y="259" class="svg-sub">no</text>
+                <text x="20" y="352" class="svg-note">Followers rebuild this state from what they replicate, so the window survives a leader change if the batch was replicated (read in code, not run).</text>
+              </svg>
+            </div>
+            <p class="figure-caption">Drawn from <code>UnifiedLog.java</code> and <code>ProducerAppendInfo.java</code>. The orange row is the condition the rest of this section keeps returning to. <span class="recon">reconstruction</span></p>
+          </figure>
+
+          <h3>The case it was built for</h3>
+          <p>
+            A proxy swallowed one response and closed the connection, a fault injected on purpose. Broker and client were real. Without
+            idempotence the log holds two copies and the callback names the second offset. With it, the same request bytes arrive twice,
+            one copy lands, and the callback gets offset 0. franz-go behaved the same way in both cases.
+          </p>
+
+          <figure class="figure wide" id="fig-lost-ack">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">A lost ack, without and with idempotence</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 318" role="img" aria-label="Two panels with client, proxy and log lanes. Idempotence off: produce corr 4 appends at offset 0, the proxy drops the response, produce corr 7 appends at offset 1, and the callback says offset 1. Idempotence on: produce corr 6 appends at offset 0 sequence 0, the response is dropped, produce corr 9 is recognised as a duplicate, and the callback says offset 0.">
+                <defs>
+                  <marker id="fig-lost-ack-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-lost-ack-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="20" class="svg-lane">IDEMPOTENCE OFF</text>
+                <text x="570" y="20" class="svg-lane">IDEMPOTENCE ON</text>
+                <!-- panel A lanes -->
+                <text x="40" y="44" class="svg-sub">client</text><text x="196" y="44" class="svg-sub">proxy</text><text x="340" y="44" class="svg-sub">log</text>
+                <line x1="56" y1="52" x2="56" y2="240" stroke="#b8b8b1"/><line x1="212" y1="52" x2="212" y2="240" stroke="#b8b8b1"/><line x1="352" y1="52" x2="352" y2="240" stroke="#b8b8b1"/>
+                <line x1="56" y1="76" x2="350" y2="76" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-lost-ack-data)"/>
+                <text x="66" y="70" class="svg-sub" style="fill:#3c6f97">produce corr=4, 127 B</text>
+                <rect x="362" y="62" width="168" height="26" rx="3" fill="#f3dfdc" stroke="#ad4b43"/><text x="372" y="79" class="svg-sub" style="fill:#252525">offset 0, seq -1</text>
+                <line x1="352" y1="104" x2="216" y2="104" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-lost-ack-state)"/>
+                <text x="224" y="98" class="svg-sub" style="fill:#ad4b43">response dropped</text>
+                <text x="66" y="128" class="svg-sub">NETWORK_EXCEPTION, retry</text>
+                <line x1="56" y1="150" x2="350" y2="150" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-lost-ack-data)"/>
+                <text x="66" y="144" class="svg-sub" style="fill:#3c6f97">produce corr=7, 127 B</text>
+                <rect x="362" y="136" width="168" height="26" rx="3" fill="#f3dfdc" stroke="#ad4b43"/><text x="372" y="153" class="svg-sub" style="fill:#252525">offset 1, seq -1</text>
+                <line x1="352" y1="184" x2="58" y2="184" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-lost-ack-state)"/>
+                <text x="66" y="178" class="svg-sub" style="fill:#765b98">callback A ok offset=1</text>
+                <text x="40" y="266" class="svg-step">Two copies, identical bytes</text>
+                <text x="40" y="285" class="svg-sub">crc 2811889636, both; producerId -1</text>
+                <text x="40" y="303" class="svg-sub">the broker cannot tell a retry from new data</text>
+
+                <line x1="550" y1="10" x2="550" y2="306" stroke="#deded9"/>
+
+                <!-- panel B lanes -->
+                <text x="590" y="44" class="svg-sub">client</text><text x="746" y="44" class="svg-sub">proxy</text><text x="890" y="44" class="svg-sub">log</text>
+                <line x1="606" y1="52" x2="606" y2="240" stroke="#b8b8b1"/><line x1="762" y1="52" x2="762" y2="240" stroke="#b8b8b1"/><line x1="902" y1="52" x2="902" y2="240" stroke="#b8b8b1"/>
+                <line x1="606" y1="76" x2="900" y2="76" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-lost-ack-data)"/>
+                <text x="616" y="70" class="svg-sub" style="fill:#3c6f97">produce corr=6, 127 B</text>
+                <rect x="908" y="62" width="160" height="26" rx="3" fill="#dfede5" stroke="#367f59"/><text x="916" y="79" class="svg-sub" style="fill:#252525">offset 0, seq 0</text>
+                <line x1="902" y1="104" x2="766" y2="104" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-lost-ack-state)"/>
+                <text x="774" y="98" class="svg-sub" style="fill:#ad4b43">response dropped</text>
+                <text x="616" y="128" class="svg-sub">NETWORK_EXCEPTION, retry</text>
+                <line x1="606" y1="150" x2="900" y2="150" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-lost-ack-data)"/>
+                <text x="616" y="144" class="svg-sub" style="fill:#3c6f97">produce corr=9, same bytes</text>
+                <rect x="908" y="136" width="160" height="26" rx="3" fill="#ffffff" stroke="#b8b8b1"/><text x="916" y="153" class="svg-sub" style="fill:#252525">duplicate: no write</text>
+                <line x1="902" y1="184" x2="608" y2="184" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-lost-ack-state)"/>
+                <text x="616" y="178" class="svg-sub" style="fill:#765b98">callback A ok offset=0</text>
+                <text x="590" y="266" class="svg-step">One copy, and the first write's offset</text>
+                <text x="590" y="285" class="svg-sub">crc 886892178; producerId 0, epoch 0</text>
+                <text x="590" y="303" class="svg-sub">the exact-range match in the 5-entry deque</text>
+              </svg>
+            </div>
+            <p class="figure-caption">Measured with a fault-injecting proxy that withholds the ack; broker and client real, one run each, loopback. <span class="recon">measured here</span></p>
+          </figure>
+
+          <h3>Order, and the first-batch overtake</h3>
+          <p>
+            Muting a partition is only used when <code>max.in.flight=1</code> (<code>Sender.java:420-424</code>). With 5 in flight, order
+            rests on the sequence check: a failed head makes every later request fail too, and they retry in sequence order. That needs the
+            broker to have a last sequence to compare against. On a producer's first batch to a partition it has none.
+          </p>
+
+          <figure class="figure wide" id="fig-order">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">When the first of two in-flight batches fails: the log after each run</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead><tr><th>Fault</th><th>Idempotence, in flight</th><th>Partition</th><th>Log (offset)</th><th>Result</th></tr></thead>
+                <tbody>
+                  <tr><td>proxy byte flip</td><td>off, 5</td><td>new</td><td>B(0) A(1)</td><td>reordered</td></tr>
+                  <tr><td>proxy byte flip</td><td>off, 1</td><td>new</td><td>A(0) B(1)</td><td>in order</td></tr>
+                  <tr><td>proxy byte flip</td><td>on, 5</td><td>this producer wrote before</td><td>S(0) A(1) B(2)</td><td>in order; B bounced with <code>OUT_OF_ORDER</code></td></tr>
+                  <tr style="background: var(--red-soft)"><td>proxy byte flip</td><td>on, 5</td><td>never written</td><td>B(0, seq 1)</td><td><strong>A lost</strong>, reported as <code>TimeoutException</code>; B kept</td></tr>
+                  <tr style="background: var(--red-soft)"><td>proxy byte flip</td><td>on, 5</td><td>holds another producer's data</td><td>X(0, pid 3) B(1, pid 4, seq 1)</td><td><strong>A lost</strong>, reported; B kept</td></tr>
+                  <tr style="background: var(--red-soft)"><td><strong>none</strong>: <code>MESSAGE_TOO_LARGE</code> split</td><td>on, 5</td><td>2 empty, 3 prefilled</td><td>prefilled: P(0) B(1, seq 3)</td><td><strong>A1 to A3 lost</strong>, each reported; 5 of 5 runs</td></tr>
+                  <tr style="background: var(--green-soft)"><td><strong>none</strong>: same split</td><td>on, 1</td><td>prefilled</td><td>A1(1) … B(4)</td><td>in order; control, one run</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">The proxy rows are injected: a flipped byte draws a real broker rejection, and a 400 ms hold stands in for a client that has already pipelined B. The no-proxy rows inject nothing, at deliberately small sizes: topic limit 1,500 bytes, <code>batch.size</code> 2,000. All on loopback. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            Reject A while B is in flight. The broker has no state, so B lands at a non-zero sequence. A then fails
+            <code>OUT_OF_ORDER_SEQUENCE_NUMBER</code> on every retry, 9 in the proxy run, until the delivery timeout expires it. With
+            idempotence on and <code>acks=all</code>, the log holds B and not A. This is not silent: the application gets a
+            <code>TimeoutException</code> for A, and B stays. An application that logs the failure and moves on has a hole in its order.
+          </p>
+          <p>
+            It needs no proxy. A batch over the topic's <code>max.message.bytes</code> is split while the next batch lands, in 5 of 5 runs,
+            and <code>max.in.flight=1</code> kept order. Those sizes were chosen to force it. In practice the route would be a wrong
+            compression estimate or a <code>batch.size</code> above the topic limit, and neither was run. How often this happens in production
+            is unknown; nothing here measures it. Transactions v2 producers are excluded by the check at
+            <code>ProducerAppendInfo.java:158-163</code> (KAFKA-18202).
+          </p>
+          <p>
+            Upstream knows, and its position is mixed. The never-written case (<a href="../transactions/#p5-register">register D7</a>, class B)
+            is fixed after 4.4.0 in <code>81b993044e</code>, KAFKA-15591, fix version 4.5.0, absent from the <code>4.4</code> branch. Its commit
+            message says "silent", which is true only if callbacks are ignored. The case of a partition that already holds records
+            (<a href="../transactions/#p5-register">register D4</a>, class A) stands: a non-zero first sequence can be legitimate there after
+            retention or expiry. KAFKA-19880 reports it and is Open; KAFKA-14312 was closed Won't Fix in 2024 as not a bug. It stands on trunk by the
+            fix commit's own statement; trunk was not run. By reading, this path is a fatal error in librdkafka, not run. franz-go holds back
+            pipelining until the first ack, a gate built for this race and not run here (<code>franz-go/pkg/kgo/sink.go:1285-1291</code>).
+          </p>
+
+          <h3>What "failed" means</h3>
+          <p>
+            The delivery timeout also fires on batches already in flight. <code>Sender.java:195-205</code>:
+          </p>
+<pre><code>                    if (batch.hasReachedDeliveryTimeout(accumulator.getDeliveryTimeoutMs(), now)) {
+                        iter.remove();
+                        // expireBatches is called in Sender.sendProducerData, before client.poll.
+                        // The !batch.isDone() invariant should always hold. An IllegalStateException
+                        // exception will be thrown if the invariant is violated.
+                        if (!batch.isDone()) {
+                            expiredBatches.add(batch);
+                        } else {
+                            throw new IllegalStateException(batch.topicPartition + " batch created at " +
+                                batch.createdMs + " gets unexpected final state " + batch.finalState());
+                        }</code></pre>
+          <p>
+            A batch's final state cannot change once set, so a late broker success is only a debug log line
+            (<code>ProducerBatch.java:301-302</code>). "Failed" means unknown. The docs warn: "avoid application level re-sends since these
+            cannot be de-duplicated" (<code>KafkaProducer.java:177-178</code>). The message does not
+            (<a href="../transactions/#p5-register">register D74</a>, class D, gotcha, documented).
+          </p>
+
+          <figure class="figure wide" id="fig-failed">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Two failure callbacks, two copies; franz-go, one success and a long wait</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 262" role="img" aria-label="Java client: callback A FAILED at 4615 ms, the application resends, the producer bumps to epoch 1, callback A FAILED at 7618 ms. The log holds offset 0 sequence 0 epoch 0 and offset 1 sequence 0 epoch 1. franz-go under the same outage: callback A ok at 10025 ms, offset 0, one copy, no failure surfaced.">
+                <defs>
+                  <marker id="fig-failed-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-failed-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">JAVA CALLBACKS</text>
+                <line x1="20" y1="82" x2="700" y2="82" stroke="#252525" stroke-width="2" marker-end="url(#fig-failed-ctl)"/>
+                <rect x="60" y="36" width="176" height="34" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="70" y="51" class="svg-sub" style="fill:#252525">+4615 ms: A FAILED</text>
+                <text x="70" y="64" class="svg-sub">TimeoutException</text>
+                <rect x="252" y="36" width="192" height="34" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="262" y="51" class="svg-sub" style="fill:#252525">+4616 ms: app re-sends</text>
+                <text x="262" y="64" class="svg-sub">bump: PID 5, epoch 1</text>
+                <rect x="460" y="36" width="176" height="34" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="470" y="51" class="svg-sub" style="fill:#252525">+7618 ms: A FAILED</text>
+                <text x="470" y="64" class="svg-sub">TimeoutException</text>
+                <text x="20" y="116" class="svg-lane">JAVA LOG</text>
+                <rect x="60" y="128" width="284" height="44" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="72" y="146" class="svg-step">offset 0: A</text>
+                <text x="72" y="163" class="svg-sub">PID 5, epoch 0, sequence 0</text>
+                <rect x="352" y="128" width="284" height="44" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="364" y="146" class="svg-step">offset 1: A</text>
+                <text x="364" y="163" class="svg-sub">PID 5, epoch 1, sequence 0</text>
+                <path d="M148,70 L148,126" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-failed-state)"/>
+                <path d="M548,70 L500,126" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-failed-state)"/>
+                <text x="20" y="204" class="svg-note">Five attempts of each send. Same sequence, new epoch, so the broker cannot match the re-send to the original.</text>
+                <text x="20" y="224" class="svg-note">Both callbacks said failed, and both records are in the log.</text>
+
+                <line x1="720" y1="14" x2="720" y2="246" stroke="#deded9"/>
+                <text x="740" y="22" class="svg-lane">FRANZ-GO, SAME OUTAGE</text>
+                <rect x="740" y="36" width="320" height="34" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="750" y="51" class="svg-sub" style="fill:#252525">+10025 ms: A ok, offset=0, pid=1, epoch=0</text>
+                <text x="750" y="64" class="svg-sub">RecordDeliveryTimeout was 3 s</text>
+                <rect x="740" y="128" width="320" height="44" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="752" y="146" class="svg-step">offset 0: A</text>
+                <text x="752" y="163" class="svg-sub">one copy, no failure surfaced</text>
+                <text x="740" y="204" class="svg-note">No false failure, and no answer for as long</text>
+                <text x="740" y="224" class="svg-note">as the outage lasts.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">Measured through a proxy (<code>drop_until 6</code>) that drops responses, single runs, loopback. Java had <code>delivery.timeout.ms=3000</code>. The two clients made opposite choices about the same unknown. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            kgo enforces its timeout only when safe, never on a record whose request has no answer yet (<code>franz-go/pkg/kgo/config.go:1507-1512</code>),
+            and it marks a batch unsure when the broker's answer leaves the outcome open. <code>franz-go/pkg/kgo/sink.go:1081-1088</code>:
+          </p>
+<pre><code>	// If the response was from a timeout, or the record was written but
+	// not to enough replicas, we actually do not know whether the record
+	// was persisted or not. We need to poison this batch: if we encounter
+	// a retryable error the NEXT time we produce, we still are unsure of
+	// the final state, and we need to block canceling producing.
+	if rp.ErrorCode == kerr.RequestTimedOut.Code || rp.ErrorCode == kerr.NotEnoughReplicasAfterAppend.Code {
+		batch.unsureIfProduced = true
+	}</code></pre>
+
+          <h3>Two more ends, and the traps in the config</h3>
+          <p>
+            Producer state expires. With <code>producer.id.expiration.ms</code> set to 3 s, a 500 ms check, and a proxy withholding the response
+            for 6 s, the log held the same PID, epoch and sequence twice, and the callback said success. <strong>That 3 s is a lab setting, not default
+            behaviour.</strong> The default is 24 h, checked every 10 min, against a 2 min delivery timeout. With defaults the same result needs retention
+            or <code>DeleteRecords</code> to remove the write, or an old <code>CreateTime</code>, because the clock is record time; that route was read, not
+            run (<a href="../transactions/#p5-register">register D79</a>, class D, documented in part).
+          </p>
+          <p>
+            <code>delivery.timeout.ms</code> is documented as "An upper bound", and there is one case where it is not. While InitProducerId cannot complete,
+            a pass of the Sender returns early and never reaches expiry. <code>Sender.java:333-344</code>:
+          </p>
+<pre><code>                if (maybeSendAndPollTransactionalRequest()) {
+                    return;
+                }
+            } catch (AuthenticationException e) {
+                // This is already logged as error, but propagated here to perform any clean ups.
+                log.trace("Authentication exception while processing transactional request", e);
+                transactionManager.authenticationFailed(e);
+            }
+        }
+
+        long currentTimeMs = time.milliseconds();
+        long pollTimeout = sendProducerData(currentTimeMs);</code></pre>
+          <p>
+            With two controllers killed (<a href="../replication/#p3-quorum">Part 3</a>), a first idempotent Java producer's record stayed pending for 210 s
+            against an 8 s timeout, over 1,943 InitProducerId round trips, all <code>errorCode=14</code>. In a second run, with the quorum restored, it failed
+            at once when the PID arrived: "92904 ms has passed since batch creation". Each is a single run, and only the no-block case was run;
+            <code>flush()</code> and no-arg <code>close()</code> wait on it too by reading. franz-go failed at 27.9 s in one run, unexplained. librdkafka was not
+            tested (<a href="../transactions/#p5-register">register D3</a>, class A, still at trunk <code>09f2dc1320</code>; no Jira matched two text searches,
+            which is not proof none exists).
+          </p>
+          <p>
+            Config conflicts differ by case. <code>acks=1</code> or <code>retries=0</code> turn idempotence off with an INFO log as the only signal
+            (<a href="../transactions/#D75">D75</a>, class D). <code>max.in.flight=6</code> throws, though the doc says conflicts disable idempotence
+            (<a href="../transactions/#D30">D30</a>, class C, still at trunk). <code>DUPLICATE_SEQUENCE_NUMBER</code> handling is dead against a 4.4
+            broker, because in-window duplicates get success (<a href="../transactions/#D76">D76</a>, class D). franz-go <code>5d3342df</code>, dated
+            2026-10-06, changes what follows a failed sent batch, so check which side you pin
+            (<a href="../transactions/#D104">D104</a>, class E).
+          </p>

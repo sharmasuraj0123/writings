@@ -1,0 +1,91 @@
+          <h2 id="p2-schemas"><span class="secnum">{{S}}</span>Generated from 203 JSON files</h2>
+          <p>
+            None of the bytes above are written by hand. The protocol is data. <code>message/README.md:6-13</code>: "The JSON files
+            in this directory define the Apache Kafka message protocol", and "When Kafka is compiled, these specification files
+            are translated into Java code to read and write messages" <span class="src">from the code</span>.
+          </p>
+          <div class="measured">
+            <div><div class="n">203</div><div class="k">JSON files in the message directory at the pin</div></div>
+            <div><div class="n">95</div><div class="k">of them are requests</div></div>
+            <div><div class="n">77</div><div class="k">API keys a live broker advertised over ApiVersions v5</div></div>
+            <div><div class="n">2</div><div class="k">live request schemas with no flexible version</div></div>
+          </div>
+          <p>
+            The Gradle task at <code>build.gradle:2125-2130</code> runs the generator on that directory, with
+            <code>ApiMessageTypeGenerator</code>, <code>MessageDataGenerator</code> and <code>JsonConverterGenerator</code>. Three
+            rules from the README shape everything that follows. One generated class covers every version of a message: "a single
+            MessageData object represents every possible version of a Message", and the version is passed to read and write. Field
+            order in the JSON is the wire order: "Changing the order of the fields in a message is an incompatible change". And by
+            default, writing a non-default field into a version that lacks it throws, unless the field is marked
+            <code>ignorable</code>. In the README's words, "we assume that information loss is not acceptable".
+          </p>
+
+          <p>
+            The schema comments double as a changelog. <code>message/ProduceRequest.json</code> opens with "Versions 0-2 were removed
+            in Apache Kafka 4.0, version 3 is the new baseline", and then walks forward: "Version 3 adds the transactional ID".
+          </p>
+
+          <h3>What flexible versions bought</h3>
+          <p>
+            Before flexible versions, any new field meant a new version, and a new version meant both sides had to agree on it.
+            A tag section changes that. <code>message/README.md:127-129</code>:
+          </p>
+<pre><code>Unlike mandatory fields, tagged fields can be added to message versions that
+already exists.  Older servers will ignore new tagged fields which they do not
+understand.</code></pre>
+          <p>
+            This is the trade behind the three empty bytes at the end of the <a href="#fig-bytes">Produce frame</a>. Each component
+            spends one byte on a count of zero. In return, a sender can add a field that an old receiver skips safely. "Ignore" is
+            also stronger than it sounds: unknown tags are kept, not dropped. The generated reader stores them and the writer merges
+            them back, with reads bounded at 10,000 tags.
+          </p>
+          <p>
+            Tagged fields do not replace versions, though. <code>message/ApiVersionsRequest.json</code> added
+            <code>ClusterId</code> and <code>NodeId</code> at version 5 as ordinary fields, <code>"versions": "5+"</code>. The two
+            mechanisms sit side by side <span class="src">from the code</span>.
+          </p>
+          <p>
+            The generator enforces the direction of travel. It rejects any range that closes. From
+            <code>generator/…/message/MessageSpec.java:73-78</code>: "flexibleVersions must be either none, or an open-ended range
+            (that ends with a plus sign)". Tagged versions have the same rule. Once a message goes flexible it stays flexible. At the
+            pin, only two live request schemas have no flexible version: OffsetDelete and SaslHandshake.
+          </p>
+
+          <p>
+            The same flag picks the header. Each schema's <code>flexibleVersions</code> starts somewhere different (Produce
+            <code>9+</code>, Fetch <code>12+</code>, Metadata <code>9+</code>, JoinGroup <code>6+</code>, ApiVersions <code>3+</code>),
+            and the generator turns it into the header version. <code>ApiMessageTypeGenerator.java:371-377</code>:
+          </p>
+<pre><code>                ifMember(__ -&gt; {
+                    if (type.equals("request")) {
+                        buffer.printf("return (short) 2;%n");
+                    } else {
+                        buffer.printf("return (short) 1;%n");
+                    }
+                }).</code></pre>
+
+          <h3>Retiring things</h3>
+          <p>
+            Two schema markers do the removals. <code>validVersions</code> of <code>none</code> retires an API but reserves its key,
+            with no data class and no listeners. <code>ApiKeys.java:259-266</code> gives the reason: "the api key remains assigned to
+            the removed api so we do not accidentally reuse it for a different api". LeaderAndIsr, key 4, is one of these.
+          </p>
+          <p>
+            <code>latestVersionUnstable</code> does the opposite job for what is not ready. It hides a schema's top version unless an
+            internal flag is set. <code>message/InitProducerIdRequest.json:32-33</code> says <code>"latestVersionUnstable": true</code>
+            and <code>"validVersions": "0-6"</code>, and the live broker advertised 0 to 5 <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Other people's copies</h3>
+          <p>
+            The JSON is Kafka's own. franz-go generates
+            its Go types from a custom DSL: "The generator reads definition files from <code>definitions/</code>"
+            (<code>franz-go/generate/README.md</code>). So a new Kafka field reaches it only when someone writes it in; that last
+            clause is an inference. At the pin it is level with Kafka for Produce (13), Fetch (18) and ApiVersions (5)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            librdkafka at v2.16.0 caps Produce at v10 (<code>librdkafka/src/rdkafka_msgset_writer.c:49</code>), three behind the
+            broker. So it still sends topic names, and the topic-id capture above would look different from it. That is computed from
+            the code. librdkafka was read, never run.
+          </p>

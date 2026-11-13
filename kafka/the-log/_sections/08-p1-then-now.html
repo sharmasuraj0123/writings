@@ -1,0 +1,63 @@
+          <h2 id="p1-then-now"><span class="secnum">{{S}}</span><code>sendfile</code>, tiering, and the 2011 paper</h2>
+          <p>
+            Everything so far follows from a sentence about formats. <code>docs/design/design.md:92</code>: the log holds message sets "written
+            to disk in the same format used by the producer and consumer". That is what makes file-to-socket transfer possible, and it is why the
+            broker works so hard not to touch a batch. On a plaintext connection the fetch path ends in three lines.
+            <code>clients/…/common/network/PlaintextTransportLayer.java:213-215</code>:
+          </p>
+<pre><code>    public long transferFrom(FileChannel fileChannel, long position, long count) throws IOException {
+        return fileChannel.transferTo(position, count, socketChannel);
+    }</code></pre>
+          <p>
+            The shim saw it reach the kernel: 87 <code>sendfile</code> calls on the partition's <code>.log</code> moved 14,544,114 bytes, from a
+            <code>data-plane-kafk</code> thread, which is a network thread by code reading. Reading everything back from a warm page cache caused
+            zero physical reads: <code>read_bytes</code> in <code>/proc/&lt;pid&gt;/io</code> stayed 0 while <code>rchar</code> rose about
+            14.9 MB. After evicting those files with <code>fsync</code> plus <code>posix_fadvise(DONTNEED)</code>, the same read caused 14,389,248
+            bytes of physical reads <span class="recon">measured here</span>. A single run on one disk, and it says nothing about speed. It does show
+            where the data came from.
+          </p>
+          <p>
+            The price of this path is visible at the same line. The file-level write checks only that the file has not shrunk; nothing validates a
+            CRC (<code>FileRecords.java:280-291</code>), which is the clean-start row of Figure {{fig-damage}}. And TLS gives it up entirely: the broker
+            reads the file into a 32 KiB direct buffer in user space and encrypts it (<code>SslTransportLayer.java:1021-1026</code>;
+            <a href="../transactions/#D51">D51</a>, class D).
+          </p>
+
+          <h3>What survives from 2011</h3>
+          <p>
+            The 2011 NetDB paper by Kreps, Narkhede and Rao describes most of this directory.
+          </p>
+          <table style="font-size: 13px">
+            <thead><tr><th>Idea in § 3.1</th><th>At 4.4.0</th></tr></thead>
+            <tbody>
+              <tr><td>Segment files of about 1 GB, appended at the last</td><td>Still true; 1 GiB is still the default</td></tr>
+              <tr><td>"we rely on the underlying file system page cache"</td><td>Stands, warm-cache-across-restart argument included</td></tr>
+              <tr><td><code>sendfile</code> to deliver log bytes</td><td>Stands for plaintext only; the paper does not mention TLS</td></tr>
+              <tr><td>Stateless broker, "simple time-based SLA"</td><td>7 days survives as default retention, but the broker now stores consumer offsets in a topic</td></tr>
+              <tr><td>A message is exposed only after a flush</td><td>Gone. The high watermark governs visibility, and the default produce path does not fsync</td></tr>
+              <tr><td>Offsets are byte positions, "increasing but not consecutive", no index</td><td>Gone. Offsets count records, and each segment has indexes</td></tr>
+              <tr><td>"built-in replication" as future work</td><td><a href="../replication/#p3-ladder">Part 3</a></td></tr>
+            </tbody>
+          </table>
+          <p>
+            The 4 copies and 2 system calls that <code>sendfile</code> avoids appear in both the paper and the current design doc
+            (<code>design.md:103</code>). The two ideas that went are not small. Visibility moved from a disk event to a line in the log. An offset moved
+            from a place in a file to a count of records, which is why §04 needs indexes at all. The v2 producer fields of §02 came later still.
+          </p>
+
+          <h3>Tiering is the same files, further away</h3>
+          <p>
+            Tiered storage is a broker switch plus a topic switch, with two plugin interfaces, and Apache ships no production
+            <code>RemoteStorageManager</code>: the doc says "Kafka server doesn't provide out-of-the-box implementation", and the only one in the tree is for tests
+            (<code>docs/operations/tiered-storage.md:39-60</code>). Only rolled segments are uploaded, and only those below the last stable offset,
+            subject to new copy-lag settings. An
+            upload carries the files a local segment has: the log, both indexes, the optional transaction index, the producer snapshot and the
+            leader-epoch data (<code>RemoteLogManager.java:930-959</code>, <code>:1117-1119</code>). With tiering on, a local segment is deletable
+            only once uploaded or passed by the log start offset, an active segment past retention is rolled so it can be uploaded, and tiering excludes
+            compaction, in code and in the docs
+            (<code>LogConfig.java:604</code>). Tiering was read here, not run.
+          </p>
+          <p>
+            So the log is a directory, the batch is the unit, and the guarantees are lines. <a href="../the-wire/#p2-pools">Part 2</a> takes this file
+            to a socket and shows how one request travels through a broker.
+          </p>

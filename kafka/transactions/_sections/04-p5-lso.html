@@ -1,0 +1,150 @@
+          <h2 id="p5-lso"><span class="secnum">{{S}}</span>The last stable offset</h2>
+          <p>
+            A data partition does not know a transaction exists until its first transactional batch, which records the first offset
+            (<code>ProducerAppendInfo.java:239-242</code>). The transaction's end on that partition is the marker and nothing else
+            (<code>:288</code>). Between the two sits the offset every <code>read_committed</code> reader stops at. <code>UnifiedLog.java:678-686</code>:
+          </p>
+<pre><code>    public long lastStableOffset() {
+        // cache the first unstable offset metadata to avoid a concurrent update breaking the isPresent check
+        Optional&lt;LogOffsetMetadata&gt; firstUnstableOffsetMetadataCopy = firstUnstableOffsetMetadata;
+        if (firstUnstableOffsetMetadataCopy.isPresent() &amp;&amp; firstUnstableOffsetMetadataCopy.get().messageOffset &lt; highWatermark()) {
+            return firstUnstableOffsetMetadataCopy.get().messageOffset;
+        } else {
+            return highWatermark();
+        }
+    }</code></pre>
+          <p>
+            The LSO equals the first unstable offset, capped at the <a href="../replication/#p3-ladder">high watermark</a>. The consumer config doc says the LSO "is
+            the one less than the offset of the first open transaction" (<code>ConsumerConfig.java:377</code>). Code and lab show it equals that offset
+            (<a href="#D35">D35</a>).
+          </p>
+          <p>
+            "Unstable" covers two things: undecided transactions, and decided ones whose marker is still above the high watermark. So the LSO waits for marker
+            replication too. <code>storage/…/log/ProducerStateManager.java:246-258</code>:
+          </p>
+<pre><code>    public Optional&lt;LogOffsetMetadata&gt; firstUnstableOffset() {
+        Optional&lt;LogOffsetMetadata&gt; unreplicatedFirstOffset = Optional.ofNullable(unreplicatedTxns.firstEntry()).map(e -&gt; e.getValue().firstOffset);
+        Optional&lt;LogOffsetMetadata&gt; undecidedFirstOffset = Optional.ofNullable(ongoingTxns.firstEntry()).map(e -&gt; e.getValue().firstOffset);
+
+        if (unreplicatedFirstOffset.isEmpty())
+            return undecidedFirstOffset;
+        else if (undecidedFirstOffset.isEmpty())
+            return unreplicatedFirstOffset;
+        else if (undecidedFirstOffset.get().messageOffset &lt; unreplicatedFirstOffset.get().messageOffset)
+            return undecidedFirstOffset;
+        else
+            return unreplicatedFirstOffset;
+    }</code></pre>
+          <p>
+            That state survives restarts. Producer state goes to <code>.snapshot</code> files, including an open transaction's first offset, which returns to
+            <code>ongoingTxns</code> on load (<code>ProducerStateManager.java:326</code>). A producer entry with an open transaction never expires, while an idle one goes after
+            <code>producer.id.expiration.ms</code>, default one day (<code>:330</code>). Both facts matter <a href="#p5-hang">later</a>.
+          </p>
+
+          <h3>Plain records wait too</h3>
+          <p>
+            The read bound is a single offset, so non-transactional records after an open transaction wait as well (<code>UnifiedLog.java:1671</code>; register
+            <a href="#D87">D87</a>). The lab opened a transaction at offset 1 and wrote three plain records after it (<code>exp1.out</code>, one run, loopback,
+            relative only) <span class="recon">measured here</span>:
+          </p>
+<pre><code>[  2.589s] open txn: HW=5 LSO=1; state=Ongoing coordinator=3 pid=3 epoch=0 partitions=[tl-0]
+[  5.798s] read_uncommitted [0:before-0, 1:open-1, 2:plain-a, 3:plain-b, 4:plain-c]
+[ 11.901s] read_committed   [0:before-0]
+[ 11.930s] consumer.endOffsets(read_committed)={tl-0=1}
+[ 11.949s] commit returned
+[ 12.006s] HW=6 LSO=6
+[ 15.089s] read_committed   [0:before-0, 1:open-1, 2:plain-a, 3:plain-b, 4:plain-c]</code></pre>
+
+          <figure class="figure" id="fig-lso">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">HW and LSO as two cursors, before and after the commit</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 704 300" role="img" aria-label="Before commit, offsets 0 to 4 hold before-0, open-1 and three plain records. LSO is at 1 and HW at 5, so plain records sit trapped between the cursors. After commit a marker takes offset 5, and HW and LSO are both at 6.">
+                <text x="16" y="24" class="svg-lane">BEFORE COMMIT</text>
+                <g stroke-width="1">
+                  <rect x="16" y="66" width="104" height="44" fill="#dfede5" stroke="#367f59"/>
+                  <rect x="122" y="66" width="104" height="44" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="228" y="66" width="104" height="44" fill="#f3dfdc" stroke="#ad4b43"/><rect x="334" y="66" width="104" height="44" fill="#f3dfdc" stroke="#ad4b43"/><rect x="440" y="66" width="104" height="44" fill="#f3dfdc" stroke="#ad4b43"/>
+                </g>
+                <text x="68" y="86" text-anchor="middle" class="svg-sub">0 before-0</text><text x="68" y="101" text-anchor="middle" class="svg-sub">readable</text>
+                <text x="174" y="86" text-anchor="middle" class="svg-sub">1 open-1</text><text x="174" y="101" text-anchor="middle" class="svg-sub">open txn</text>
+                <text x="280" y="86" text-anchor="middle" class="svg-sub">2 plain-a</text><text x="280" y="101" text-anchor="middle" class="svg-sub">trapped</text>
+                <text x="386" y="86" text-anchor="middle" class="svg-sub">3 plain-b</text><text x="386" y="101" text-anchor="middle" class="svg-sub">trapped</text>
+                <text x="492" y="86" text-anchor="middle" class="svg-sub">4 plain-c</text><text x="492" y="101" text-anchor="middle" class="svg-sub">trapped</text>
+                <g stroke="#765b98" stroke-width="2" stroke-dasharray="4 3">
+                  <line x1="121" y1="44" x2="121" y2="122"/><line x1="545" y1="44" x2="545" y2="122"/>
+                </g>
+                <text x="127" y="54" class="svg-lane">LSO=1</text>
+                <text x="551" y="54" class="svg-lane">HW=5</text>
+                <text x="16" y="140" class="svg-note">endOffsets under read_committed says 1, so lag computed from it hides the stall.</text>
+
+                <text x="16" y="176" class="svg-lane">AFTER COMMIT</text>
+                <g stroke-width="1">
+                  <rect x="16" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/><rect x="122" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/><rect x="228" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/><rect x="334" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/><rect x="440" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/>
+                  <rect x="546" y="214" width="104" height="44" fill="#ece6f3" stroke="#765b98"/>
+                </g>
+                <text x="68" y="240" text-anchor="middle" class="svg-sub">0 before-0</text><text x="174" y="240" text-anchor="middle" class="svg-sub">1 open-1</text><text x="280" y="240" text-anchor="middle" class="svg-sub">2 plain-a</text><text x="386" y="240" text-anchor="middle" class="svg-sub">3 plain-b</text><text x="492" y="240" text-anchor="middle" class="svg-sub">4 plain-c</text><text x="598" y="240" text-anchor="middle" class="svg-sub">5 COMMIT</text>
+                <line x1="651" y1="192" x2="651" y2="270" stroke="#765b98" stroke-width="2" stroke-dasharray="4 3"/>
+                <text x="645" y="202" text-anchor="end" class="svg-lane">HW=6 LSO=6</text>
+                <text x="16" y="288" class="svg-note">All five records became readable; the marker took offset 5.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured, one run. <code>read_committed</code> returned only offset 0 over a 6 s read. The record at offset 1 is transactional, and offsets 2 to 4 are
+              non-transactional and still waited.
+            </p>
+          </figure>
+
+          <p>
+            The LSO moved within about 15 ms of the commit returning. The first probe, 13 ms after return, had already moved, so that is an upper bound on one run,
+            not a latency. The output above is trimmed by one line, <code>HW=5 LSO=6</code>. That line is a probe artefact: the driver reads HW and LSO in two separate
+            <code>ListOffsets</code> calls, so it does not show LSO above HW.
+          </p>
+          <p>
+            Lag tools see none of this as lag. <code>ListOffsets</code> for latest under <code>read_committed</code> returns the LSO
+            (<code>Partition.scala:1442</code>), so <code>endOffsets</code> said 1 while five records sat in the log, and lag computed from it reads "caught up". The signal
+            is the per-partition <code>LastStableOffsetLag</code> gauge, HW minus LSO (<code>Partition.scala:226</code>) <span class="src">from the code</span>.
+          </p>
+
+          <p>
+            How long can it last? For a dead producer, the transaction's timeout plus up to one 10 s scan interval (see <a href="#p5-hang">Hanging</a>). So about 70 s at the Java default of 60 s, and about 15 minutes 10 s at the
+            broker's default cap. Those two figures are arithmetic from the configs, not runs <span class="recon">reconstruction</span>. The stall is partition-wide for that whole time, and it also holds back
+            compaction (<code>LogCleaner.java:87-89</code>).
+          </p>
+
+          <h3>The client does the filtering</h3>
+          <p>
+            The broker's <code>read_committed</code> fetch filters nothing. It caps the read at the LSO and attaches the overlapping aborted transactions
+            (<code>UnifiedLog.java:1673</code>, <code>LocalLog.java:546</code>). <code>clients/…/consumer/internals/CompletedFetch.java:208-224</code>:
+          </p>
+<pre><code>                if (fetchConfig.isolationLevel == IsolationLevel.READ_COMMITTED &amp;&amp; currentBatch.hasProducerId()) {
+                    // remove from the aborted transaction queue all aborted transactions which have begun
+                    // before the current batch's last offset and add the associated producerIds to the
+                    // aborted producer set
+                    consumeAbortedTransactionsUpTo(currentBatch.lastOffset());
+
+                    long producerId = currentBatch.producerId();
+                    if (containsAbortMarker(currentBatch)) {
+                        abortedProducerIds.remove(producerId);
+                    } else if (isBatchAborted(currentBatch)) {
+                        log.debug("Skipping aborted record batch from partition {} with producerId {} and " +
+                                        "offsets {} to {}",
+                                partition, producerId, currentBatch.baseOffset(), currentBatch.lastOffset());
+                        nextFetchOffset = currentBatch.nextOffset();
+                        continue;
+                    }
+                }</code></pre>
+          <p>
+            Walk it over <a href="#p5-disk">the log above</a>, assuming one fetch from offset 0. Offsets 0 to 2 are not in any aborted range. At offset 4 the queue yields the entry for producer 1001 that begins there, so batches 4 and 5 are
+            skipped, and the abort marker at 6 removes the producer from the set. Offset 8 is read normally <span class="recon">reconstruction</span>. So aborted bytes cross the wire and sit in the log, and the offsets of aborted records and markers leave permanent gaps. The isolation default differs by client:
+            Java and franz-go use <code>read_uncommitted</code>, librdkafka <code>read_committed</code> (<a href="#D93">D93</a>).
+          </p>
+          <p>
+            Pending offsets stall reads differently. The Java consumer always asks for stable offsets, at either isolation level, so while a transaction holds pending offsets it gets
+            <code>UNSTABLE_OFFSET_COMMIT</code> and retries rather than reading a stale position (<code>ConsumerCoordinator.java:1502</code>). In the lab, while offsets are pending in an open transaction, <code>consumer.committed</code> on that partition retried until its timeout.
+            The admin client does not retry: with <code>requireStable=true</code> and the partition named it returned an empty map after 12 ms, because the handler logs a warning
+            and drops any partition with an error (<code>ListConsumerGroupOffsetsHandler.java:179</code>; <a href="#D89">D89</a>). The result looks like "no offset"
+            <span class="recon">measured here</span>.
+          </p>

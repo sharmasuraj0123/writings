@@ -1,0 +1,115 @@
+          <h2 id="p4-linger"><span class="secnum">{{S}}</span>What linger actually does</h2>
+          <p>
+            Linger is usually described as "wait a little to batch more". The test is simpler, and it has more exits than that.
+            <code>producer/internals/RecordAccumulator.java:656-667</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>        if (!readyNodes.contains(leader) &amp;&amp; !isMuted(part)) {
+            long timeToWaitMs = backingOff ? retryBackoff.backoff(backoffAttempts &gt; 0 ? backoffAttempts - 1 : 0) : lingerMs;
+            boolean expired = waitedTimeMs &gt;= timeToWaitMs;
+            boolean transactionCompleting = transactionManager != null &amp;&amp; transactionManager.isCompleting();
+            boolean sendable = full
+                    || expired
+                    || exhausted
+                    || closed
+                    || flushInProgress()
+                    || transactionCompleting;
+            if (sendable &amp;&amp; !backingOff) {
+                readyNodes.add(leader);</code></pre>
+          <p>
+            Three details change how this reads. <code>linger.ms</code> is measured from the batch's creation, not from the last
+            append, so new records do not extend the wait (<code>ProducerBatch.java:98</code>, <code>:484</code>). A partition with
+            more than one queued batch counts as <code>full</code>, so once a batch is closed behind another the head stops lingering
+            (<code>RecordAccumulator.java:759</code>). And <code>exhausted</code> means a thread is waiting on the pool: a full pool
+            cancels linger for every partition (<code>:713</code>).
+          </p>
+          <p>
+            Batching also happens at <code>linger.ms=0</code>. A node that cannot take another request leaves the drain set, so
+            records pile into batches while requests are in flight (<code>Sender.java:403-408</code>). Linger is not the only source
+            of batches. The limit that triggers this, <code>max.in.flight.requests.per.connection</code>, is 5 per connection, not per
+            partition (<code>InFlightRequests.java:98-99</code>). A due metadata refresh gates sending the same way
+            (<code>NetworkClient.java:586</code>). Linger's default has been 5 ms since 4.0, and that upgrade changes behaviour for anyone who relied on 0
+            (<a href="../transactions/#p5-register">register D103</a>, class E, behaviour change, documented).
+          </p>
+
+          <figure class="figure wide" id="fig-ready">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">A batch's life: fill rises, and any one of these exits ends it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 280" role="img" aria-label="A time axis from batch creation. Fill level rises toward batch.size. The exits are: full at batch.size or another batch queued behind, linger.ms elapsed since creation, memory exhausted, and flush, close or transaction completion. A low-rate batch exits at linger; a high-rate batch exits at batch.size.">
+                <defs>
+                  <marker id="fig-ready-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">FILL LEVEL</text>
+                <line x1="70" y1="230" x2="640" y2="230" stroke="#252525" stroke-width="2" marker-end="url(#fig-ready-ctl)"/>
+                <line x1="70" y1="230" x2="70" y2="40" stroke="#b8b8b1"/>
+                <text x="560" y="250" class="svg-sub">time since creation</text>
+                <line x1="70" y1="70" x2="640" y2="70" stroke="#ad4b43" stroke-dasharray="4 3"/>
+                <text x="78" y="62" class="svg-sub" style="fill:#ad4b43">batch.size (16 KiB)</text>
+                <line x1="430" y1="40" x2="430" y2="230" stroke="#d98226" stroke-dasharray="4 3"/>
+                <text x="436" y="218" class="svg-sub" style="fill:#d98226">linger.ms</text>
+                <!-- high rate -->
+                <polyline points="70,230 250,70" fill="none" stroke="#3c6f97" stroke-width="2"/>
+                <circle cx="250" cy="70" r="5" fill="#3c6f97"/>
+                <text x="258" y="92" class="svg-sub" style="fill:#3c6f97">high rate: exits full</text>
+                <!-- low rate -->
+                <polyline points="70,230 430,170" fill="none" stroke="#367f59" stroke-width="2"/>
+                <circle cx="430" cy="170" r="5" fill="#367f59"/>
+                <text x="230" y="160" class="svg-sub" style="fill:#367f59">low rate: exits on linger</text>
+
+                <text x="690" y="24" class="svg-lane">THE EXITS (sendable)</text>
+                <rect x="690" y="40" width="370" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="702" y="58" class="svg-step">full</text>
+                <text x="702" y="75" class="svg-sub">at the limit, or another batch queued behind</text>
+                <rect x="690" y="92" width="370" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="702" y="110" class="svg-step">expired</text>
+                <text x="702" y="127" class="svg-sub">linger.ms since creation, or backoff elapsed</text>
+                <rect x="690" y="144" width="370" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="702" y="162" class="svg-step">exhausted</text>
+                <text x="702" y="179" class="svg-sub">a thread is waiting on the BufferPool</text>
+                <rect x="690" y="196" width="370" height="44" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="702" y="214" class="svg-step">closed, flushInProgress, transactionCompleting</text>
+                <text x="702" y="231" class="svg-sub">the application asked for it</text>
+              </svg>
+              <table>
+                <thead><tr><th>Rate /s</th><th>linger</th><th>batch.size</th><th>Codec</th><th>Records/req</th><th>Requests</th><th>Queue ms</th><th>Ratio</th></tr></thead>
+                <tbody>
+                  <tr style="background: var(--green-soft)"><td>1,000</td><td>0</td><td>16,384</td><td>none</td><td>4.2</td><td>1,425</td><td>2.2</td><td>1.000</td></tr>
+                  <tr style="background: var(--green-soft)"><td>1,000</td><td>5</td><td>16,384</td><td>none</td><td>7.3</td><td>830</td><td>5.5</td><td>1.000</td></tr>
+                  <tr style="background: var(--green-soft)"><td>1,000</td><td>50</td><td>16,384</td><td>none</td><td>53.1</td><td>117</td><td>48.7</td><td>1.000</td></tr>
+                  <tr style="background: var(--blue-soft)"><td>20,000</td><td>0</td><td>16,384</td><td>none</td><td>43.1</td><td>2,788</td><td>3.9</td><td>1.000</td></tr>
+                  <tr style="background: var(--blue-soft)"><td>20,000</td><td>5</td><td>16,384</td><td>none</td><td>77.6</td><td>1,551</td><td>14.1</td><td>1.000</td></tr>
+                  <tr style="background: var(--blue-soft)"><td>20,000</td><td>50</td><td>16,384</td><td>none</td><td>78.0</td><td>1,543</td><td>7.1</td><td>1.000</td></tr>
+                  <tr style="background: var(--red-soft)"><td>20,000</td><td>5</td><td>1,024</td><td>none</td><td>4.0</td><td>30,004</td><td>6,277.2</td><td>1.000</td></tr>
+                  <tr><td>20,000</td><td>5</td><td>262,144</td><td>none</td><td>150.2</td><td>803</td><td>5.5</td><td>1.000</td></tr>
+                  <tr><td>20,000</td><td>5</td><td>16,384</td><td>lz4</td><td>72.6</td><td>1,658</td><td>33.5</td><td>0.994</td></tr>
+                  <tr><td>20,000</td><td>5</td><td>16,384</td><td>zstd</td><td>111.8</td><td>1,077</td><td>7.9</td><td>0.608</td></tr>
+                  <tr><td>20,000</td><td>5</td><td>16,384</td><td>gzip</td><td>108.5</td><td>1,110</td><td>5.9</td><td>0.632</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">Measured with <code>kafka-producer-perf-test.sh</code>: one run per row, 6 s of 200-byte records, one partition, RF 1, loopback on a shared 2-vCPU box. Relative only, never capacity. Ratios describe the tool's random text and nothing else. Read the batch columns. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            At a low rate, linger sets the batch: at 1,000 records/s, 0, 5 and 50 ms gave 4.2, 7.3 and 53.1 records per request. The
+            perf tool throttles in bursts, so part of the 4.2 is its burstiness. At a high rate <code>batch.size</code> takes over:
+            at 20,000 records/s, linger 5 and 50 both reached about 78 records, the 16 KiB limit. Linger 5 averaged 17.65 ms produce
+            latency and linger 50 averaged 8.33 ms, the reverse of what queueing predicts. That gap is noise, which is why only the
+            batch counts should be read.
+          </p>
+          <p>
+            Too small a <code>batch.size</code> collapses the producer: 1,024 bytes took 30,004 requests against 1,551, and queue time
+            rose to 6,277 ms from 14 ms. Raising it to 262,144 cut requests to 803 at about 31.5 KB per batch, well below the limit, because
+            the batch leaves on linger first. Compression fits more records in a batch by the ratio it achieves, because
+            <code>batch.size</code> bounds estimated compressed bytes. That estimate learns asymmetrically, 0.05 up and 0.005 down, on
+            purpose (<code>common/record/internal/CompressionRatioEstimator.java:29-31</code>). When it is wrong and the broker answers
+            <code>MESSAGE_TOO_LARGE</code>, the client splits the batch and resends without spending a retry
+            (<code>Sender.java:678-688</code>). That split matters again below.
+          </p>
+          <p>
+            One warning about the tool itself. <code>--command-property</code> keeps only its last occurrence when repeated, silently.
+            An invalid first run of this table differed from the corrected one by a factor of 19.5
+            (<a href="../transactions/#p5-register">register D78</a>, class D, gotcha; upstream status not checked).
+          </p>

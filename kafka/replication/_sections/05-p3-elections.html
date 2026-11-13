@@ -1,0 +1,239 @@
+          <h2 id="p3-elections"><span class="secnum">{{S}}</span>Elections, ELR, and the last leader</h2>
+          <p>
+            The controller elects, and a clean candidate is an acceptable replica in the ISR, or in the Eligible Leader Replicas
+            (ELR) when the ISR is empty (<code>PartitionChangeBuilder.java:319-321</code>). After keeping a still-valid leader
+            (<code>:257</code>), the order is this. <code>metadata/…/controller/PartitionChangeBuilder.java:262-284</code>:
+          </p>
+<pre><code>        Optional&lt;Integer&gt; onlineLeader = targetReplicas.stream()
+            .filter(this::isValidNewLeader)
+            .findFirst();
+        if (onlineLeader.isPresent()) {
+            return new ElectionResult(onlineLeader.get(), false);
+        }
+
+        if (canElectLastKnownLeader()) {
+            return new ElectionResult(partition.lastKnownElr[0], true);
+        }
+
+        if (election == Election.UNCLEAN) {
+            // Attempt unclean leader election
+            Optional&lt;Integer&gt; uncleanLeader = targetReplicas.stream()
+                .filter(isAcceptableLeader::test)
+                .findFirst();
+            if (uncleanLeader.isPresent()) {
+                return new ElectionResult(uncleanLeader.get(), true);
+            }
+        }
+
+        return new ElectionResult(NO_LEADER, false);
+    }</code></pre>
+
+          <figure class="figure wide" id="fig-election-ladder">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The election ladder, with the flag's position after the last-known-leader step</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 404" role="img" aria-label="Flowchart. Keep a valid current leader; else a clean ISR or ELR member; else the last known leader if ISR and ELR are empty, without consulting the unclean flag, as KIP-966&#x27;s Delivery plan specifies; else, only in UNCLEAN mode, any acceptable replica; else no leader.">
+                <defs><marker id="fig-election-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker></defs>
+                <text x="20" y="22" class="svg-lane">DECISIONS, IN CODE ORDER</text>
+                <text x="590" y="22" class="svg-lane">RESULT</text>
+                <rect x="20" y="34" width="490" height="52" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="55" class="svg-num">1</text>
+                <text x="50" y="55" class="svg-step">Current leader still valid?</text>
+                <text x="50" y="74" class="svg-sub">isValidNewLeader(partition.leader)</text>
+                <line x1="510" y1="60" x2="588" y2="60" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="530" y="53" class="svg-sub">yes</text>
+                <rect x="590" y="34" width="390" height="52" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="602" y="55" class="svg-step">Keep it</text>
+                <text x="602" y="74" class="svg-sub">clean</text>
+                <line x1="60" y1="86" x2="60" y2="114" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="70" y="104" class="svg-sub">no</text>
+                <rect x="20" y="114" width="490" height="52" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="135" class="svg-num">2</text>
+                <text x="50" y="135" class="svg-step">An acceptable ISR member, or ELR if ISR is empty?</text>
+                <text x="50" y="154" class="svg-sub">first in replica order</text>
+                <line x1="510" y1="140" x2="588" y2="140" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="530" y="133" class="svg-sub">yes</text>
+                <rect x="590" y="114" width="390" height="52" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="602" y="135" class="svg-step">Elect it</text>
+                <text x="602" y="154" class="svg-sub">clean; ELR member becomes a one-member ISR</text>
+                <line x1="60" y1="166" x2="60" y2="194" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="70" y="184" class="svg-sub">no</text>
+                <rect x="20" y="194" width="490" height="52" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="215" class="svg-num">3</text>
+                <text x="50" y="215" class="svg-step">ISR and ELR empty, one last known leader, acceptable?</text>
+                <text x="50" y="234" class="svg-sub">canElectLastKnownLeader(): ELR on</text>
+                <line x1="510" y1="220" x2="588" y2="220" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="530" y="213" class="svg-sub">yes</text>
+                <rect x="590" y="194" width="390" height="52" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="602" y="215" class="svg-step">Elect the last known leader</text>
+                <text x="602" y="234" class="svg-sub">flagged unclean, RECOVERING</text>
+                <line x1="60" y1="246" x2="60" y2="274" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="70" y="264" class="svg-sub">no</text>
+                <text x="150" y="264" class="svg-note">flag not consulted, as KIP-966's Delivery plan specifies</text>
+                <rect x="20" y="274" width="490" height="52" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="295" class="svg-num">4</text>
+                <text x="50" y="295" class="svg-step">election == UNCLEAN?</text>
+                <text x="50" y="314" class="svg-sub">the flag on, or an operator asked</text>
+                <line x1="510" y1="300" x2="588" y2="300" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="530" y="293" class="svg-sub">yes</text>
+                <rect x="590" y="274" width="390" height="52" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="602" y="295" class="svg-step">Elect any acceptable replica</text>
+                <text x="602" y="314" class="svg-sub">flagged unclean, RECOVERING</text>
+                <line x1="60" y1="326" x2="60" y2="354" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="70" y="344" class="svg-sub">no</text>
+                <text x="150" y="344" class="svg-note">unclean.leader.election.enable applies here</text>
+                <rect x="20" y="354" width="490" height="40" rx="2" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="50" y="379" class="svg-step">NO_LEADER: the partition stays offline</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              <code>unclean.leader.election.enable</code> guards only the fourth step. The third runs in ONLINE mode too. This is
+              <strong>intended</strong>, a design choice, not a coding error. <span class="src">from the code</span>
+            </p>
+          </figure>
+
+          <h3>ELR</h3>
+          <p>
+            ELR is populated exactly when the target ISR falls below min ISR: members leaving the ISR move into it, unless they had
+            an unclean shutdown (<code>:536-553</code>). It is safe only because of strict min ISR. The HW froze when the ISR fell
+            below min, so every replica in the ISR at that moment holds everything committed
+            (<code>docs/operations/eligible-leader-replicas.md:31</code>). A broker's shutdown counts as clean only if its
+            clean-shutdown file names the epoch on record (<code>ClusterControlManager.java:439-441</code>). On re-registration,
+            the difference is this. <code>metadata/…/controller/ReplicationControlManager.java:1511-1518</code>:
+          </p>
+<pre><code>    void handleBrokerShutdown(int brokerId, boolean isCleanShutdown, List&lt;ApiMessageAndVersion&gt; records) {
+        if (featureControl.isElrFeatureEnabled() &amp;&amp; !isCleanShutdown) {
+            // ELR is enabled, generate unclean shutdown partition change records
+            generateLeaderAndIsrUpdates("handleBrokerUncleanShutdown", NO_LEADER, NO_LEADER, brokerId, records,
+                brokersToIsrs.partitionsWithBrokerInIsr(brokerId));
+            generateLeaderAndIsrUpdates("handleBrokerUncleanShutdown", NO_LEADER, NO_LEADER, brokerId, records,
+                brokersToElrs.partitionsWithBrokerInElr(brokerId));
+        } else {</code></pre>
+          <p>
+            ELR is on by default for clusters bootstrapped at metadata version 4.1 or later. With <code>min.insync.replicas=2</code>
+            and two clean stops, the cluster answered as designed (<code>./e12_unclean_elr.sh</code>, single run)
+            <span class="recon">measured here</span>: <code>acks=all</code> was rejected before any append; after SIGKILL of the
+            leader, a cleanly stopped ELR member was elected on return with no recovery state set, and all 100 <code>acks=all</code>
+            records survived.
+          </p>
+          <p>
+            The same run shows the trap on that under-min-ISR leader:
+          </p>
+<pre><code>t+0240.6s Topic: s Partition: 0 Leader: 2 Replicas: 2,3,4 Isr: 2 Elr: 3 LastKnownElr:
+t+0254.5s acks=1 under min ISR: acked=20, HW now=s:0:100 (was s:0:100)
+t+0352.3s E2 acks=1:   acked=20 read_back=100 acked_but_missing=20 first_lost_offset=100 last_lost_offset=119</code></pre>
+          <p>
+            <code>acks=1</code> writes were accepted and acked, but the HW
+            did not move, so no consumer could see them. When the leader died, all 20 were gone
+            (<a href="../transactions/#D101">D101</a>, class E, a behaviour change since 3.7). The older path is
+            still there too: with <code>min.insync.replicas=1</code>, 100 records acked on a sole leader were erased by an
+            operator's unclean election, and only a WARN and the election's own lines marked it. Unclean election stamps
+            <code>RECOVERING</code>, which performs no recovery at this pin: the new leader logs it and sets <code>RECOVERED</code> at
+            once (<code>Partition.scala:614-615</code>, <code>:626</code>).
+          </p>
+
+          <h3>The last known leader</h3>
+          <p>
+            The first time a partition goes leaderless, the controller records its last leader in <code>lastKnownElr</code>
+            (<code>PartitionChangeBuilder.java:493-498</code>). <code>metadata/…/controller/PartitionChangeBuilder.java:286-295</code>,
+            then <code>:305-315</code>, with a comment between them elided:
+          </p>
+<pre><code>    private boolean canElectLastKnownLeader() {
+        if (!eligibleLeaderReplicasEnabled || !useLastKnownLeaderInBalancedRecovery) {
+            log.trace("Try to elect last known leader for {}-{} but elrEnabled={}, useLastKnownLeaderInBalancedRecovery={}",
+                    topicId, partitionId, eligibleLeaderReplicasEnabled, useLastKnownLeaderInBalancedRecovery);
+            return false;
+        }
+        if (!targetElr.isEmpty() || !targetIsr.isEmpty()) {
+            log.trace("Try to elect last known leader for {}-{} but ELR/ISR is not empty. ISR={}, ELR={}",
+                    topicId, partitionId, targetIsr, targetElr);
+            return false;</code></pre>
+<pre><code>        if (partition.lastKnownElr.length != 1) {
+            log.trace("Try to elect last known leader for {}-{} but lastKnownElr does not only have 1 member. lastKnownElr={}",
+                    topicId, partitionId, Arrays.toString(partition.lastKnownElr));
+            return false;
+        }
+        if (!isAcceptableLeader.test(partition.lastKnownElr[0])) {
+            log.trace("Try to elect last known leader for {}-{} but last known leader is not alive. last known leader={}",
+                    topicId, partitionId, partition.lastKnownElr[0]);
+            return false;
+        }
+        return true;</code></pre>
+          <p>
+            Last-known-leader election runs without consulting <code>unclean.leader.election.enable</code>, as KIP-966's Delivery
+            plan specifies: intended, a design choice, not a coding error. It is flagged unclean and sets RECOVERING. No production
+            switch exists: the field defaults to true, and its setter has callers only in tests (<code>:104</code>,
+            <code>:180</code>). It compares nothing, because KIP-966's Unclean Recovery half has no code at this pin
+            (<a href="../transactions/#D20">D20</a>, class C). The ops doc says only "This is a similar behavior prior to the 4.0 when
+            all the replicas are offline" (<code>eligible-leader-replicas.md:35</code>), and leaves out the flag and the unclean
+            label (<a href="../transactions/#D21">D21</a>, class C, still on trunk).
+          </p>
+
+          <figure class="figure wide" id="fig-isr-drains">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The ISR drains (mock): real metadata records around a tail cut by hand on one host</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>t+ (s, sampled)</th><th>Step</th><th>ISR</th><th>ELR</th><th>Last known</th><th>Leader</th><th>HW</th></tr></thead>
+                <tbody>
+                  <tr><td>134.0</td><td>2,000 acked; <code>acks=all</code>, min ISR 2, flag false</td><td>2,3,4</td><td></td><td></td><td>2</td><td>2000</td></tr>
+                  <tr><td>149.2</td><td>SIGKILL n2</td><td>3,4</td><td></td><td></td><td>3</td><td></td></tr>
+                  <tr><td>164.1</td><td>SIGKILL n3</td><td>4</td><td>3</td><td></td><td>4</td><td></td></tr>
+                  <tr><td>182.9</td><td>SIGKILL n4</td><td></td><td>3,4</td><td>4</td><td>none</td><td></td></tr>
+                  <tr style="background: var(--orange-soft)"><td>182.9</td><td><strong>The mock.</strong> <code>truncate -s</code> n4's stopped segment, 73146 to 36573 bytes. n2 still holds 73146.</td><td></td><td>3,4</td><td>4</td><td>none</td><td></td></tr>
+                  <tr><td>196.0</td><td>Restart n2: no change</td><td></td><td>3,4</td><td>4</td><td>none</td><td></td></tr>
+                  <tr><td>209.1</td><td>Restart n3: unclean exit, leaves ELR</td><td></td><td>4</td><td>4</td><td>none</td><td></td></tr>
+                  <tr style="background: var(--red-soft)"><td>224.6</td><td>Restart n4: leaves ELR, then last-known election, <code>leaderRecoveryState: 1</code>; n2, n3 rejoin</td><td>2,3,4</td><td></td><td></td><td>4</td><td>1013 (at 229.1)</td></tr>
+                </tbody>
+              </table>
+              <p style="font-size: 13px; margin: 12px 0"><strong>acked=2000, read_back=1013, acked_but_missing=987.</strong> 987 is a dial set by the cut, not a loss rate.</p>
+              <table style="font-size: 13px">
+                <thead><tr><th>Run</th><th>Layout</th><th>Failure</th><th>Mock</th><th>Elected</th><th>Lost of 2000 (dial)</th></tr></thead>
+                <tbody>
+                  <tr><td>E4</td><td>sole voter n1</td><td>SIGKILL in turn, 15 s apart</td><td>half of n4</td><td>n4, last-known, RECOVERING</td><td>987</td></tr>
+                  <tr><td>V2</td><td>same</td><td>n2, n3, n4 in one command</td><td>half of n3, the last leader</td><td>n3, last-known</td><td>827</td></tr>
+                  <tr><td>V3</td><td>same</td><td>n2 SIGKILL, n3 clean stop, n4 SIGKILL</td><td>half of n4</td><td>n3, ELR, no RECOVERING</td><td>0</td></tr>
+                  <tr><td>V1</td><td>3 combined voters</td><td>SIGKILL n1, n2 (quorum lost), n3</td><td>half of n2, leader in metadata</td><td>n3, last-known</td><td>0</td></tr>
+                  <tr><td>V1b</td><td>same</td><td>same</td><td>half of n3</td><td>n2, last-known</td><td>0</td></tr>
+                  <tr><td>V1c</td><td>same</td><td>same</td><td>n2 to 1/2, n3 to 3/4</td><td>n2, last-known</td><td>860</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              <code>measured-vs-mock</code>, one sample per row. "Lost" is set by the cut. Three runs do not establish a
+              distribution, and no run used three dedicated voters. <code>truncate -s</code> stands in for lost page cache; everything else is
+              the real system.
+            </p>
+          </figure>
+
+          <p>
+            This is simulated damage on one host (<code>./e34_tail_loss.sh</code>, E4). With
+            <code>unclean.leader.election.enable</code> at its default of false, <code>min.insync.replicas=2</code> and
+            <code>acks=all</code>, the last leader came back without its tail, was elected anyway, and 987 of 2,000 acked records
+            were deleted from all three replicas, including two that still held them. The other two replicas were SIGKILLed and
+            kept their bytes, so this models one machine lost plus two process deaths. Half the file was cut by hand, so 987 is a
+            dial set by the mock, not a loss rate. KIP-966 promises MinISR-1 tolerance; this has two unclean exits at min ISR 2. No
+            real power cut was run. <a href="../transactions/#D62">D62</a> files it as class D, intended per KIP-966's Delivery plan.
+          </p>
+          <p>
+            The controls isolate the bytes. With no cut, the same kill-and-restart sequence and the same election kept all 2,000.
+            With a clean ELR member (V3), 0 of 2,000 were lost. With ELR off and the same cut, 774 were lost, also a dial: there
+            the ISR keeps the dead last member, its return is a clean election, and the metadata records carry no trace. That run is
+            not a last-known election at all. With three combined voters, fencing order after quorum returned, not who died last, decided
+            the last known leader. V1 and V1b lost 0 only because the mocked broker was not elected.
+          </p>
+          <p>
+            How close is this to a real crash? On inference, not measurement: E4's producer finished about t+128 and n4 died at
+            t+167.4, and with <code>vm.dirty_expire_centisecs=3000</code> on ext4, stock writeback would probably have put those
+            bytes on disk. A real loss needs the last leader to die within about 35 s of the last acked write.
+          </p>
+          <p>
+            Afterwards the partition reports a full ISR and three logs of one size, so an ISR-based dashboard shows no sign. n2 and
+            n3 logged <code>Truncating z-0 to offset 1013 below high water…</code> as WARN. By the code,
+            <code>UncleanLeaderElectionsPerSec</code> counts this election and misses the ELR-off case; it was not scraped
+            (<a href="../transactions/#D65">D65</a>). Offsets at and above 1013 will be reassigned, and a consumer's reaction was not run (<a href="../transactions/#D66">D66</a>).
+          </p>

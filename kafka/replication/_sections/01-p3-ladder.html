@@ -1,0 +1,318 @@
+          <h2 id="p3-ladder"><span class="secnum">{{S}}</span>The commit ladder</h2>
+          <p class="lede">
+            An <code>acks=all</code> ack says the record reached the page cache of every in-sync replica, and that the in-sync set
+            met a floor. It says nothing about disk. The metadata log, which does fsync, decides who is in that set, so losing it
+            freezes the line while data keeps moving. This collection's claim is that Kafka is one log used five times, and that
+            nearly every promise is a line in a log: which line, in which log, moved by whom. This part reads the high watermark
+            and the metadata commit. All-replica loss here runs on a mock.
+          </p>
+          <p>
+            <a href="../the-log/#p1-append">Part 1</a> left a record in one broker's file. To reach another broker it has to be
+            asked for. Followers pull. A follower's fetcher thread does two things in a loop: truncate whatever is marked for
+            truncation, then fetch (<code>core/…/server/AbstractFetcherThread.scala:112-114</code>). A follower append runs the
+            same <code>append</code> as a leader append, and takes the leader's offsets instead of assigning its own
+            (<code>UnifiedLog.java:1094-1097</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            There is no replication ack. The offset a follower asks for in its next Fetch is its log end offset (LEO) as far as
+            the leader knows, because <code>updateFollowerFetchState</code> takes it from the read
+            (<code>core/…/cluster/Partition.scala:1313-1321</code>). A fetch offset is an ack. The leader keeps six fields per
+            follower: log start, LEO, the leader's LEO at the last fetch, last fetch time, last caught-up time and broker epoch
+            (<code>ReplicaState.java:32-39</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The broker accepts three <code>acks</code> values. <code>acks=1</code> answers straight after the leader's local
+            append. Only <code>acks=-1</code> waits, parked in the <a href="../the-wire/#p2-purgatory">purgatory Part 2 reads</a>
+            (<code>ReplicaManager.scala:1370</code>, <code>:1364-1366</code>, <code>:913-916</code>). It is also the only value
+            that meets a durability check before the append. <code>core/…/cluster/Partition.scala:1227-1243</code>:
+          </p>
+<pre><code>    val (info, leaderHWIncremented) = inReadLock(leaderIsrUpdateLock, () =&gt; {
+      leaderLogIfLocal match {
+        case Some(leaderLog) =&gt;
+          val minIsr = effectiveMinIsr(leaderLog)
+          val inSyncSize = partitionState.isr.size
+
+          // Avoid writing to leader if there are not enough insync replicas to make it safe
+          if (inSyncSize &lt; minIsr &amp;&amp; requiredAcks == -1) {
+            throw new NotEnoughReplicasException(s"The size of the current ISR : $inSyncSize " +
+              s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition, " +
+              s"live replica(s) broker.id are : $inSyncReplicaIds")
+          }
+
+          val info = leaderLog.appendAsLeader(records, this.leaderEpoch, origin, requestLocal, verificationGuard, transactionVersion)
+
+          // we may need to increment high watermark since ISR could be down to 1
+          (info, maybeIncrementLeaderHW(leaderLog))</code></pre>
+
+          <figure class="figure wide" id="fig-ladder">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">One <code>acks=all</code> write up the ladder: three logs, with LEO and HW after each step</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 490" role="img" aria-label="Five steps of one acks=all write across a leader and two followers. The leader appends, followers fetch and append, their next fetch offset acts as the ack, the leader raises the high watermark and answers, and the next fetch response carries the high watermark to the followers.">
+                <defs><marker id="fig-ladder-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker><marker id="fig-ladder-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker></defs>
+                <text x="330" y="22" class="svg-lane">LEADER n2</text>
+                <text x="550" y="22" class="svg-lane">FOLLOWER n3</text>
+                <text x="770" y="22" class="svg-lane">FOLLOWER n4</text>
+                <text x="20" y="55" class="svg-num">1</text>
+                <text x="38" y="55" class="svg-step">Leader appends</text>
+                <text x="38" y="73" class="svg-sub">Produce parks in purgatory,</text>
+                <text x="38" y="89" class="svg-sub">waiting for HW to reach 1299.</text>
+                <rect x="330" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="61" class="svg-sub">96</text>
+                <rect x="370" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="61" class="svg-sub">97</text>
+                <rect x="410" y="44" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="413" y="61" class="svg-sub">98</text>
+                <text x="456" y="54" class="svg-sub">LEO 1299</text>
+                <text x="456" y="70" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="409" y1="40" x2="409" y2="72" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="61" class="svg-sub">96</text>
+                <rect x="590" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="61" class="svg-sub">97</text>
+                <rect x="630" y="44" width="38" height="24" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="633" y="61" class="svg-sub">98</text>
+                <text x="676" y="54" class="svg-sub">LEO 1298</text>
+                <text x="676" y="70" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="629" y1="40" x2="629" y2="72" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="61" class="svg-sub">96</text>
+                <rect x="810" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="61" class="svg-sub">97</text>
+                <rect x="850" y="44" width="38" height="24" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="853" y="61" class="svg-sub">98</text>
+                <text x="896" y="54" class="svg-sub">LEO 1298</text>
+                <text x="896" y="70" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="849" y1="40" x2="849" y2="72" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="20" y1="116" x2="980" y2="116" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="139" class="svg-num">2</text>
+                <text x="38" y="139" class="svg-step">Fetch at 1298 returns it</text>
+                <text x="38" y="157" class="svg-sub">Followers append with the</text>
+                <text x="38" y="173" class="svg-sub">leader's offset. No fsync.</text>
+                <rect x="330" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="145" class="svg-sub">96</text>
+                <rect x="370" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="145" class="svg-sub">97</text>
+                <rect x="410" y="128" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="413" y="145" class="svg-sub">98</text>
+                <text x="456" y="138" class="svg-sub">LEO 1299</text>
+                <text x="456" y="154" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="409" y1="124" x2="409" y2="156" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="145" class="svg-sub">96</text>
+                <rect x="590" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="145" class="svg-sub">97</text>
+                <rect x="630" y="128" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="633" y="145" class="svg-sub">98</text>
+                <text x="676" y="138" class="svg-sub">LEO 1299</text>
+                <text x="676" y="154" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="629" y1="124" x2="629" y2="156" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="145" class="svg-sub">96</text>
+                <rect x="810" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="145" class="svg-sub">97</text>
+                <rect x="850" y="128" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="853" y="145" class="svg-sub">98</text>
+                <text x="896" y="138" class="svg-sub">LEO 1299</text>
+                <text x="896" y="154" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="849" y1="124" x2="849" y2="156" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="390" y1="172" x2="606" y2="172" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-ladder-b)"/>
+                <line x1="610" y1="172" x2="826" y2="172" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-ladder-b)"/>
+                <text x="396" y="188" class="svg-sub" fill="#3c6f97">records for 1298</text>
+                <line x1="20" y1="200" x2="980" y2="200" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="223" class="svg-num">3</text>
+                <text x="38" y="223" class="svg-step">Fetch at 1299 is the ack</text>
+                <text x="38" y="241" class="svg-sub">updateFollowerFetchState sets</text>
+                <text x="38" y="257" class="svg-sub">n3 and n4 to 1299 on the leader.</text>
+                <rect x="330" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="229" class="svg-sub">96</text>
+                <rect x="370" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="229" class="svg-sub">97</text>
+                <rect x="410" y="212" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="413" y="229" class="svg-sub">98</text>
+                <text x="456" y="222" class="svg-sub">LEO 1299</text>
+                <text x="456" y="238" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="409" y1="208" x2="409" y2="240" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="229" class="svg-sub">96</text>
+                <rect x="590" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="229" class="svg-sub">97</text>
+                <rect x="630" y="212" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="633" y="229" class="svg-sub">98</text>
+                <text x="676" y="222" class="svg-sub">LEO 1299</text>
+                <text x="676" y="238" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="629" y1="208" x2="629" y2="240" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="229" class="svg-sub">96</text>
+                <rect x="810" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="229" class="svg-sub">97</text>
+                <rect x="850" y="212" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="853" y="229" class="svg-sub">98</text>
+                <text x="896" y="222" class="svg-sub">LEO 1299</text>
+                <text x="896" y="238" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="849" y1="208" x2="849" y2="240" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="830" y1="256" x2="614" y2="256" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-ladder-k)"/>
+                <line x1="610" y1="256" x2="394" y2="256" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-ladder-k)"/>
+                <text x="396" y="272" class="svg-sub">fetch offset=1299</text>
+                <line x1="20" y1="284" x2="980" y2="284" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="307" class="svg-num">4</text>
+                <text x="38" y="307" class="svg-step">HW rises, ack goes out</text>
+                <text x="38" y="325" class="svg-sub">New HW = lowest LEO = 1299.</text>
+                <text x="38" y="341" class="svg-sub">The parked Produce completes.</text>
+                <rect x="330" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="313" class="svg-sub">96</text>
+                <rect x="370" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="313" class="svg-sub">97</text>
+                <rect x="410" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="413" y="313" class="svg-sub">98</text>
+                <text x="456" y="306" class="svg-sub">LEO 1299</text>
+                <text x="456" y="322" class="svg-sub" fill="#765b98">HW 1299</text>
+                <line x1="449" y1="292" x2="449" y2="324" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="313" class="svg-sub">96</text>
+                <rect x="590" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="313" class="svg-sub">97</text>
+                <rect x="630" y="296" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="633" y="313" class="svg-sub">98</text>
+                <text x="676" y="306" class="svg-sub">LEO 1299</text>
+                <text x="676" y="322" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="629" y1="292" x2="629" y2="324" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="313" class="svg-sub">96</text>
+                <rect x="810" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="313" class="svg-sub">97</text>
+                <rect x="850" y="296" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="853" y="313" class="svg-sub">98</text>
+                <text x="896" y="306" class="svg-sub">LEO 1299</text>
+                <text x="896" y="322" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="849" y1="292" x2="849" y2="324" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="20" y1="368" x2="980" y2="368" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="391" class="svg-num">5</text>
+                <text x="38" y="391" class="svg-step">HW reaches followers</text>
+                <text x="38" y="409" class="svg-sub">The next response carries 1299,</text>
+                <text x="38" y="425" class="svg-sub">clamped to each LEO.</text>
+                <rect x="330" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="397" class="svg-sub">96</text>
+                <rect x="370" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="397" class="svg-sub">97</text>
+                <rect x="410" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="413" y="397" class="svg-sub">98</text>
+                <text x="456" y="390" class="svg-sub">LEO 1299</text>
+                <text x="456" y="406" class="svg-sub" fill="#765b98">HW 1299</text>
+                <line x1="449" y1="376" x2="449" y2="408" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="397" class="svg-sub">96</text>
+                <rect x="590" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="397" class="svg-sub">97</text>
+                <rect x="630" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="633" y="397" class="svg-sub">98</text>
+                <text x="676" y="390" class="svg-sub">LEO 1299</text>
+                <text x="676" y="406" class="svg-sub" fill="#765b98">HW 1299</text>
+                <line x1="669" y1="376" x2="669" y2="408" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="397" class="svg-sub">96</text>
+                <rect x="810" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="397" class="svg-sub">97</text>
+                <rect x="850" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="853" y="397" class="svg-sub">98</text>
+                <text x="896" y="390" class="svg-sub">LEO 1299</text>
+                <text x="896" y="406" class="svg-sub" fill="#765b98">HW 1299</text>
+                <line x1="889" y1="376" x2="889" y2="408" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="390" y1="424" x2="606" y2="424" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-ladder-b)"/>
+                <line x1="610" y1="424" x2="826" y2="424" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-ladder-b)"/>
+                <text x="396" y="440" class="svg-sub" fill="#3c6f97">HW=1299 in the response</text>
+                <text x="330" y="462" class="svg-note">Cells show the last two digits of offsets 1296 to 1298. Green is below the HW, orange above.</text>
+                <text x="330" y="478" class="svg-note">The dashed purple tick is the HW, an exclusive bound.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The follower's LEO moves on the leader one fetch after it moves on the follower, and the follower's HW one fetch
+              after that. The order is read from the code. The offsets echo the trace below, taken from the leader's view of one
+              run. The diagram is a <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            The rule for the line sits in one method. The new high watermark (HW) is the smallest LEO among the leader, the
+            maximal ISR, and any replica outside the ISR that is caught up and eligible to join.
+            <code>core/…/cluster/Partition.scala:1010-1033</code>:
+          </p>
+<pre><code>  private def maybeIncrementLeaderHW(leaderLog: UnifiedLog, currentTimeMs: Long = time.milliseconds): Boolean = {
+    if (isUnderMinIsr) {
+      trace(s"Not increasing HWM because partition is under min ISR(ISR=${partitionState.isr})")
+      return false
+    }
+    // maybeIncrementLeaderHW is in the hot path, the following code is written to
+    // avoid unnecessary collection generation
+    val leaderLogEndOffset = leaderLog.logEndOffsetMetadata
+    var newHighWatermark = leaderLogEndOffset
+    remoteReplicasMap.forEach { (_, replica) =&gt;
+      val replicaState = replica.stateSnapshot
+
+      def shouldWaitForReplicaToJoinIsr: Boolean = {
+        replicaState.isCaughtUp(leaderLogEndOffset.messageOffset, currentTimeMs, replicaLagTimeMaxMs) &amp;&amp;
+        isReplicaIsrEligible(replica.brokerId)
+      }
+
+      // Note here we are using the "maximal", see explanation above
+      if (replicaState.logEndOffsetMetadata.messageOffset &lt; newHighWatermark.messageOffset &amp;&amp;
+          (partitionState.maximalIsr.contains(replica.brokerId) || shouldWaitForReplicaToJoinIsr)
+      ) {
+        newHighWatermark = replicaState.logEndOffsetMetadata
+      }
+    }</code></pre>
+          <p>
+            Three details in that method matter later. The first <code>return</code> is strict min ISR: below
+            <code>min.insync.replicas</code> the HW does not move at all, whichever <code>acks</code> the writes used. A caught-up
+            replica outside the ISR holds the HW back on purpose, otherwise it would chase a moving line on a sole-ISR leader and
+            never rejoin (<code>:995-997</code>). "Maximal" means a pending ISR change counts in the stricter direction: an
+            expansion counts the new member at once, and a shrink keeps waiting for the departing one until the controller
+            confirms (<code>:1614-1615</code>, <code>:1640-1641</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The leader's TRACE log shows the gap. The offset is exclusive, so "offset 1299" asks for the record at 1298
+            (<code>kafka.cluster.Partition=TRACE</code>, single run) <span class="recon">measured here</span>:
+          </p>
+<pre><code>[2026-11-06 16:25:18,579] TRACE [Partition t-0 broker=2] Progress awaiting ISR acks for offset 1299: acked: HashSet(broker 2: 1299), awaiting HashSet(broker 3: 1298, broker 4: 1298) (kafka.cluster.Partition)</code></pre>
+          <p>
+            Below the HW, readers split by line: followers read to the LEO, <code>read_uncommitted</code> consumers to the HW,
+            <code>read_committed</code> consumers to the <a href="../transactions/#p5-lso">last stable offset</a>
+            (<code>FetchIsolation.java:32-37</code>). A follower learns the HW only from a Fetch response and clamps it to its
+            own LEO, so its HW trails the leader's by at least one round trip (<code>ReplicaFetcherThread.scala:143</code>). On
+            disk the HW is a checkpoint, written every 5 s by default and on clean shutdown, so after a restart it is a stale hint
+            (<code>ReplicaManager.scala:265</code>) <span class="src">from the code</span>.
+          </p>
+
+          <h3>A floor, not a quorum</h3>
+          <p>
+            <code>min.insync.replicas</code> does not say how many acks are enough. It says how few members the ISR may have.
+            With a full ISR, every member must catch up, and the config's own doc says so.
+            <code>clients/…/common/config/TopicConfig.java:222-223</code>: "then all three replicas must acknowledge an
+            <code>acks=all</code> write for it to succeed, even if <code>min.insync.replicas</code> happens to be less than 3."
+            The register lists this as <a href="../transactions/#D63">D63</a>, class D (gotcha), documented. The defaults
+            are the weak half of the pair: the producer defaults to <code>acks=all</code>, the broker to
+            <code>min.insync.replicas=1</code> and <code>default.replication.factor=1</code>, so a default <code>acks=all</code>
+            on a default topic is one copy (<code>ServerLogConfigs.java:155</code>, <code>ReplicationConfigs.java:42</code>).
+          </p>
+          <p>
+            Who counts as caught up is a time test with an exact-LEO escape hatch (<code>ReplicaState.java:66</code>). The javadoc
+            above it has the subtraction backwards (<a href="../transactions/#D22">D22</a>, class C, doc drift, still on
+            trunk). So <code>acks=all</code> commits when the slowest ISR member's next fetch arrives.
+          </p>
+          <p>
+            One test turns that into an answer. <code>core/…/cluster/Partition.scala:968-979</code>:
+          </p>
+<pre><code>        val minIsr = effectiveMinIsr(leaderLog)
+        if (leaderLog.highWatermark &gt;= requiredOffset) {
+          /*
+           * The topic may be configured not to accept messages if there are not enough replicas in ISR
+           * in this scenario the request was already appended locally and then added to the purgatory before the ISR was shrunk
+           */
+          if (minIsr &lt;= curMaximalIsr.size)
+            (true, Errors.NONE)
+          else
+            (true, Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND)
+        } else
+          (false, Errors.NONE)</code></pre>

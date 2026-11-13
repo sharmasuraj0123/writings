@@ -1,0 +1,178 @@
+          <h2 id="p1-directory"><span class="secnum">{{S}}</span>A partition is a directory</h2>
+          <p class="lede">
+            Kafka is one data structure used five times: an append-only log whose disk format is its wire format,
+            replicated by followers pulling. Nearly every promise it makes is a statement about where a line sits in
+            such a log, not about a disk or an outcome: the high watermark, the last stable offset, the recovery
+            point, the committed offset, the metadata commit. Read a guarantee as "which line, in which log, moved by
+            whom", and both the guarantee and its edges follow. This collection reads Apache Kafka 4.4.0 that way, in
+            five parts. This first part is the log itself. A partition is a directory of segments holding batches
+            exactly as the producer sent them. The broker stamps only fields outside the CRC, syncs nothing on append
+            by default, and checks CRCs only above the recovery point, which is why hand-injected damage has such
+            uneven results.
+          </p>
+          <p>
+            Most of the design is visible in <code>ls</code>. Here is a fresh partition of a topic named
+            <code>bytes</code>, holding nine records from three lab producers, on one broker over loopback. Real output,
+            with the owner columns dropped <span class="recon">measured here</span>:
+          </p>
+<pre><code>10485760  00000000000000000000.index
+     424  00000000000000000000.log
+10485756  00000000000000000000.timeindex
+       8  leader-epoch-checkpoint
+      43  partition.metadata</code></pre>
+          <p>
+            Five files. There is no <code>.snapshot</code> or <code>.txnindex</code> yet; those wait until something
+            asks for one. The twenty-digit name is the segment's base offset, the first offset it can hold. The
+            <code>.log</code> holds the records. It is 424 bytes because nine small records were written. The two
+            indexes look enormous beside it, and they hold nothing: <code>du</code>
+            reports 0 KiB of real blocks for each, and 4 KiB each once a few entries are written. They are sparse files,
+            created at full length and memory-mapped. The 10 MiB comes from <code>segment.index.bytes</code>, rounded
+            down to a multiple of the entry size, which is why the time index, with 12-byte entries, is 10,485,756 bytes
+            and not 10,485,760 <span class="src">from the code</span>.
+          </p>
+          <p>
+            The classes follow the files. <code>UnifiedLog</code> is the public face of one partition's log, and it spans
+            a local part and an optional remote part: tiered segments first, then an optional overlap, then local
+            segments including the active one (<code>storage/…/log/UnifiedLog.java:95-100</code>). It hands local segment
+            handling to an encapsulated <code>LocalLog</code>. A <code>LogSegment</code> is a <code>FileRecords</code>, a
+            lazily opened offset index, a lazily opened time index and a transaction index, and it is not thread-safe on
+            its own (<code>LogSegment.java:63-82</code>). That class's own comment still says a segment is "stored in two
+            files", against the listing above. The register carries it as
+            <a href="../transactions/#D11">D11</a>, class C (doc drift).
+          </p>
+          <p>
+            The full vocabulary is a fixed set of suffixes in <code>LogFileUtils.java:27-58</code>:
+            <code>.log</code>, <code>.index</code>, <code>.timeindex</code>, <code>.txnindex</code> and
+            <code>.snapshot</code>, plus three transient ones used for crash-safe replacement and deletion:
+            <code>.cleaned</code>, <code>.swap</code> and <code>.deleted</code>. A file's suffix is part of the recovery
+            protocol, as §07 shows.
+          </p>
+
+          <figure class="figure wide" id="fig-directory">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">A partition directory before a roll, after a roll, and after a clean stop: 10 MiB indexes collapse to their real size</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 430" role="img" aria-label="Three listings of a partition directory with real file sizes. Before the roll the offset and time indexes are preallocated at about 10 MiB. After the roll the old indexes shrink to 72 and 120 bytes, and a new segment named 40 appears with fresh 10 MiB indexes and a 56-byte snapshot. After a clean stop of another topic the active segment index is 0 bytes, its time index 12 bytes, and a snapshot named 9 has appeared.">
+                <defs><marker id="fig-directory-fx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker></defs>
+                <text x="20" y="24" class="svg-lane">BEFORE THE ROLL</text>
+                <text x="20" y="42" class="svg-sub">topic idx, one live segment</text>
+                <rect x="20" y="56" width="330" height="26" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="28" y="73" class="svg-sub">00000000000000000000.index</text>
+                <text x="342" y="73" class="svg-sub" text-anchor="end">10,485,760</text>
+                <rect x="20" y="87" width="330" height="26" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="28" y="104" class="svg-sub">00000000000000000000.log</text>
+                <text x="342" y="104" class="svg-sub" text-anchor="end">5,680</text>
+                <rect x="20" y="118" width="330" height="26" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="28" y="135" class="svg-sub">00000000000000000000.timeindex</text>
+                <text x="342" y="135" class="svg-sub" text-anchor="end">10,485,756</text>
+                <rect x="20" y="149" width="330" height="26" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="28" y="166" class="svg-sub">leader-epoch-checkpoint</text>
+                <text x="342" y="166" class="svg-sub" text-anchor="end">8</text>
+                <rect x="20" y="180" width="330" height="26" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="28" y="197" class="svg-sub">partition.metadata</text>
+                <text x="342" y="197" class="svg-sub" text-anchor="end">43</text>
+                <text x="375" y="24" class="svg-lane">AFTER THE ROLL</text>
+                <text x="375" y="42" class="svg-sub">same topic; the next record rolled it</text>
+                <rect x="375" y="56" width="330" height="26" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="383" y="73" class="svg-sub">00000000000000000000.index</text>
+                <text x="697" y="73" class="svg-sub" text-anchor="end">72</text>
+                <rect x="375" y="87" width="330" height="26" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="383" y="104" class="svg-sub">00000000000000000000.log</text>
+                <text x="697" y="104" class="svg-sub" text-anchor="end">5,680</text>
+                <rect x="375" y="118" width="330" height="26" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="383" y="135" class="svg-sub">00000000000000000000.timeindex</text>
+                <text x="697" y="135" class="svg-sub" text-anchor="end">120</text>
+                <rect x="375" y="149" width="330" height="26" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="383" y="166" class="svg-sub">00000000000000000040.index</text>
+                <text x="697" y="166" class="svg-sub" text-anchor="end">10,485,760</text>
+                <rect x="375" y="180" width="330" height="26" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="383" y="197" class="svg-sub">00000000000000000040.log</text>
+                <text x="697" y="197" class="svg-sub" text-anchor="end">75</text>
+                <rect x="375" y="211" width="330" height="26" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="383" y="228" class="svg-sub">00000000000000000040.snapshot</text>
+                <text x="697" y="228" class="svg-sub" text-anchor="end">56</text>
+                <rect x="375" y="242" width="330" height="26" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="383" y="259" class="svg-sub">00000000000000000040.timeindex</text>
+                <text x="697" y="259" class="svg-sub" text-anchor="end">10,485,756</text>
+                <rect x="375" y="273" width="330" height="26" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="383" y="290" class="svg-sub">leader-epoch-checkpoint</text>
+                <text x="697" y="290" class="svg-sub" text-anchor="end">8</text>
+                <rect x="375" y="304" width="330" height="26" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="383" y="321" class="svg-sub">partition.metadata</text>
+                <text x="697" y="321" class="svg-sub" text-anchor="end">43</text>
+                <text x="730" y="24" class="svg-lane">AFTER A CLEAN STOP</text>
+                <text x="730" y="42" class="svg-sub">topic bytes, one active segment</text>
+                <rect x="730" y="56" width="330" height="26" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="738" y="73" class="svg-sub">00000000000000000000.index</text>
+                <text x="1052" y="73" class="svg-sub" text-anchor="end">0</text>
+                <rect x="730" y="87" width="330" height="26" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="738" y="104" class="svg-sub">00000000000000000000.log</text>
+                <text x="1052" y="104" class="svg-sub" text-anchor="end">424</text>
+                <rect x="730" y="118" width="330" height="26" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="738" y="135" class="svg-sub">00000000000000000000.timeindex</text>
+                <text x="1052" y="135" class="svg-sub" text-anchor="end">12</text>
+                <rect x="730" y="149" width="330" height="26" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="738" y="166" class="svg-sub">00000000000000000009.snapshot</text>
+                <text x="1052" y="166" class="svg-sub" text-anchor="end">102</text>
+                <rect x="730" y="180" width="330" height="26" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="738" y="197" class="svg-sub">leader-epoch-checkpoint</text>
+                <text x="1052" y="197" class="svg-sub" text-anchor="end">8</text>
+                <rect x="730" y="211" width="330" height="26" rx="3" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="738" y="228" class="svg-sub">partition.metadata</text>
+                <text x="1052" y="228" class="svg-sub" text-anchor="end">43</text>
+                <path d="M350,69 L374,69" stroke="#765b98" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#fig-directory-fx)" fill="none"/>
+                <path d="M350,131 L374,131" stroke="#765b98" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#fig-directory-fx)" fill="none"/>
+                <text x="20" y="232" class="svg-note">Both indexes sit at about 10 MiB of length;</text>
+                <text x="20" y="248" class="svg-note">du reports 4 KiB of real blocks each.</text>
+                <text x="730" y="256" class="svg-note">.index: no entries, so trimmed to nothing.</text>
+                <text x="730" y="272" class="svg-note">.timeindex: 12 bytes, one entry.</text>
+                <text x="730" y="288" class="svg-note">The snapshot is named for the next offset.</text>
+                <rect x="20" y="372" width="16" height="12" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="42" y="382" class="svg-sub">records: .log</text>
+                <rect x="210" y="372" width="16" height="12" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="232" y="382" class="svg-sub">sparse indexes</text>
+                <rect x="400" y="372" width="16" height="12" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="422" y="382" class="svg-sub">producer state</text>
+                <rect x="590" y="372" width="16" height="12" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="612" y="382" class="svg-sub">sidecar text</text>
+                <text x="20" y="412" class="svg-note">Sizes in bytes from ls. Real output; the directory columns are dropped. Dashed purple: the same file after the roll trimmed it.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The index files only look large. A segment's real size appears the moment it stops being active: nine
+              entries of 8 bytes make 72, and ten of 12 make 120. Real listings on one broker; the third column is a
+              different topic <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <p>
+            The two sidecars are small and human-readable. <code>partition.metadata</code> carries the topic ID, which
+            differs per run. <code>leader-epoch-checkpoint</code> is a version line, a count, and
+            <code>epoch startOffset</code> pairs; on this partition it reads <code>0</code>, <code>1</code>,
+            <code>0 0</code> <span class="recon">measured here</span>.
+          </p>
+          <p>
+            One level up, the log directory holds the lines. <code>recovery-point-offset-checkpoint</code> and
+            <code>log-start-offset-checkpoint</code> are named offset checkpoints for the log layer, and they are written
+            on a 60-second timer, not on each flush (<code>LogManager.java:85-86</code>,
+            <code>server-common/…/ServerLogConfigs.java:115-120</code>) <span class="src">from the code</span>. That timer
+            matters later. A file on disk can be flushed while the file that says so is a minute behind.
+          </p>
+          <p>
+            A clean shutdown adds one more file. <code>LogManager</code> writes a marker holding the broker epoch, and only
+            after recovery points and log start offsets are checkpointed (<code>LogManager.java:898-911</code>). On disk it
+            was one line of JSON named <code>.kafka_cleanshutdown</code>:
+            <code>{"version":0,"brokerEpoch":15}</code>. The same stop trimmed the active segment: <code>.index</code> to
+            0 bytes, <code>.timeindex</code> to 12 bytes, one entry, and a <code>.snapshot</code> named for the next offset
+            appeared <span class="recon">measured here</span>. That marker is a one-bit answer to a large question. Its
+            presence decides whether recovery runs at the next start.
+          </p>
+          <p>
+            So the map of this part is the listing. §02 opens the <code>.log</code>. §03 asks when its bytes reach the
+            disk. §04 reads the two indexes. §05 is what rolls a segment and what deletes one. §06 is what rewrites one.
+            §07 is what happens when the bytes are wrong. Part 2 then follows the same bytes
+            <a href="../the-wire/#p2-bytes">onto the wire</a>, and
+            <a href="../replication/#p3-ladder">Part 3</a> follows them to other brokers.
+          </p>

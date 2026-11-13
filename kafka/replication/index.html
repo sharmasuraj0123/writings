@@ -1,0 +1,2627 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Apache Kafka 4.4.0 taken apart, part 3: the commit ladder, what an acks=all ack promises, the two ways out of the ISR, leader epochs and truncation, ELR and last-known-leader election, the KRaft metadata log, controller failover, and what quorum loss stops."
+    />
+    <meta name="author" content="Suraj Sharma" />
+    <meta name="theme-color" content="#ffffff" />
+    <link rel="icon" href="../../assets/favicon.svg" />
+    <link rel="canonical" href="https://quirq.ai/kafka/replication/" />
+    <meta property="og:title" content="What an ack promises: replication and the metadata quorum" />
+    <meta property="og:description" content="Part 3 of a five-part Kafka teardown at kafka 1156b275 (4.4.0): a fetch offset is an ack, the high watermark is a minimum, one frozen follower stalls every ack, a frozen leader acks what it later deletes, and last-known-leader election runs without consulting the unclean flag, as KIP-966 intends. Tail-loss counts are simulated damage set by the mock, never a loss rate." />
+    <meta property="og:type" content="article" />
+    <meta property="og:url" content="https://quirq.ai/kafka/replication/" />
+    <meta property="og:image" content="https://quirq.ai/assets/og.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="What an ack promises: replication and the metadata quorum" />
+    <meta name="twitter:description" content="Apache Kafka 4.4.0 taken apart, part 3: what an ack promises, from the commit ladder to the metadata quorum, with mock damage labelled as mock." />
+    <title>What an ack promises: replication and the metadata quorum — XO Research</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #ffffff;
+        --paper-soft: #f7f7f5;
+        --paper-warm: #fff8ea;
+        --ink: #252525;
+        --ink-soft: #4f4f4b;
+        --ink-faint: #777772;
+        --line: #deded9;
+        --line-dark: #b8b8b1;
+        --orange: #d98226;
+        --orange-soft: #f7e3c8;
+        --green: #367f59;
+        --green-soft: #dfede5;
+        --blue: #3c6f97;
+        --blue-soft: #e0ebf2;
+        --purple: #765b98;
+        --purple-soft: #ece6f3;
+        --red: #ad4b43;
+        --red-soft: #f3dfdc;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu,
+          Cantarell, "Helvetica Neue", Arial, sans-serif;
+        --serif:
+          "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
+          Georgia, serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        --text: 704px;
+        --middle: 1000px;
+        --page: 1120px;
+        --shadow: 0 12px 38px rgba(30, 30, 25, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 17px;
+        line-height: 1.62;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a {
+        color: inherit;
+        text-decoration-color: rgba(37, 37, 37, 0.32);
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        text-decoration-color: currentColor;
+      }
+
+      ::selection {
+        color: var(--ink);
+        background: #f7dcb8;
+      }
+
+      :focus-visible {
+        outline: 3px solid rgba(217, 130, 38, 0.58);
+        outline-offset: 3px;
+      }
+
+      .threadbar {
+        display: flex;
+        min-height: 58px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        padding: 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .thread-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        color: var(--ink);
+        font-size: 14px;
+        font-weight: 600;
+        text-decoration: none;
+      }
+
+      .xo-logo {
+        display: block;
+        width: 34px;
+        height: 34px;
+        flex: 0 0 auto;
+      }
+
+      .thread-status {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .masthead {
+        padding: clamp(64px, 9vw, 110px) 24px clamp(36px, 5vw, 56px);
+        border-bottom: 1px solid var(--line);
+      }
+
+      .masthead-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+      }
+
+      .kicker {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 24px;
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .kicker::before {
+        width: 34px;
+        height: 2px;
+        background: currentColor;
+        content: "";
+      }
+
+      .masthead h1 {
+        margin: 0 0 22px;
+        font: 500 clamp(40px, 6vw, 68px) / 1.02 var(--serif);
+        letter-spacing: -0.042em;
+        max-width: 880px;
+      }
+
+      .dek {
+        max-width: 720px;
+        margin: 0;
+        color: var(--ink-soft);
+        font-family: var(--serif);
+        font-size: clamp(18px, 2vw, 21px);
+        letter-spacing: -0.01em;
+        line-height: 1.56;
+      }
+
+      .masthead-byline {
+        margin: 22px 0 0;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        display: inline-block;
+        padding: 2.5px 9px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--paper-soft);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        vertical-align: middle;
+        margin-left: 10px;
+      }
+
+      main {
+        max-width: var(--middle);
+        margin: 0 auto;
+        padding: 0 24px 80px;
+      }
+
+      .prose {
+        max-width: var(--text);
+      }
+
+      .prose p {
+        margin: 0 0 1.25em;
+      }
+
+      .prose p.lede {
+        font-family: var(--serif);
+        font-size: 19.5px;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 2.6em 0 0.7em;
+        font: 600 clamp(26px, 3.4vw, 34px) / 1.18 var(--sans);
+        letter-spacing: -0.028em;
+        scroll-margin-top: 24px;
+      }
+
+      h2 .secnum {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 0.62em;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-right: 12px;
+        vertical-align: 0.18em;
+      }
+
+      h3 {
+        margin: 2em 0 0.6em;
+        font: 650 20px/1.3 var(--sans);
+        letter-spacing: -0.015em;
+        scroll-margin-top: 24px;
+      }
+
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--paper-soft);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0.08em 0.35em;
+        white-space: nowrap;
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 1.4em 0;
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--paper-soft);
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+      }
+
+      pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        white-space: pre;
+      }
+
+      .toc {
+        margin: clamp(36px, 5vw, 54px) 0 0;
+        padding: 26px 28px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: var(--paper-soft);
+        max-width: var(--text);
+      }
+
+      .toc-title {
+        margin: 0 0 14px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .toc ol {
+        margin: 0;
+        padding: 0 0 0 1.4em;
+        columns: 2;
+        column-gap: 36px;
+        font-size: 14.5px;
+        line-height: 1.9;
+      }
+
+      .toc a {
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      @media (max-width: 640px) {
+        .toc ol {
+          columns: 1;
+        }
+      }
+
+      .figure {
+        margin: 2.2em 0;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        max-width: var(--middle);
+      }
+
+      .figure-head {
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper-soft);
+      }
+
+      .figure-label {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .figure-title {
+        margin: 0;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+
+      .figure-body {
+        padding: 22px;
+        overflow-x: auto;
+      }
+
+      .figure-caption {
+        margin: 0;
+        padding: 14px 20px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 13.5px;
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+        line-height: 1.55;
+      }
+
+      th {
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 2px solid var(--line-dark);
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      td {
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td code {
+        white-space: nowrap;
+      }
+
+      .stack {
+        display: grid;
+        gap: 8px;
+        font-family: var(--mono);
+        font-size: 12.5px;
+      }
+
+      .stack-row {
+        display: grid;
+        grid-template-columns: 190px 1fr;
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .stack-cell {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 11px 14px;
+        background: var(--paper);
+      }
+
+      .stack-cell.head {
+        background: var(--paper-soft);
+        color: var(--ink-soft);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+      }
+
+      .stack-cell.hl-blue { background: var(--blue-soft); }
+      .stack-cell.hl-green { background: var(--green-soft); }
+      .stack-cell.hl-purple { background: var(--purple-soft); }
+      .stack-cell.hl-orange { background: var(--orange-soft); }
+      .stack-cell.hl-red { background: var(--red-soft); }
+
+      @media (max-width: 640px) {
+        .stack-row {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .callout {
+        margin: 1.8em 0;
+        padding: 18px 22px;
+        border-left: 3px solid var(--orange);
+        border-radius: 0 8px 8px 0;
+        background: var(--paper-warm);
+        max-width: var(--text);
+        font-size: 15.5px;
+      }
+
+      .callout p {
+        margin: 0 0 0.8em;
+      }
+
+      .callout p:last-child {
+        margin-bottom: 0;
+      }
+
+      .callout .k {
+        color: var(--orange);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .tier-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .tier-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .tier-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+      }
+
+      .tier-card h4 {
+        margin: 0 0 4px;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+      }
+
+      .tier-card .sub {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .tier-card p {
+        margin: 10px 0 0;
+        font-size: 13.5px;
+        color: var(--ink-soft);
+        line-height: 1.6;
+      }
+
+      .tier-card.ep { background: var(--blue-soft); }
+      .tier-card.se { background: var(--purple-soft); }
+      .tier-card.pr { background: var(--green-soft); }
+
+      /* ── Wide diagrams ─────────────────────────────────────── */
+
+      .figure.wide {
+        max-width: var(--page);
+        margin-left: calc((var(--text) - var(--page)) / 2);
+      }
+
+      @media (max-width: 1180px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      .figure-body.plain {
+        padding: 0;
+      }
+
+      .figure svg {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+
+      .svg-lane { font: 600 11px var(--mono); fill: var(--ink-faint); letter-spacing: 0.06em; }
+      .svg-step { font: 500 12px var(--sans); fill: var(--ink); }
+      .svg-sub  { font: 400 10.5px var(--mono); fill: var(--ink-faint); }
+      .svg-num  { font: 700 10px var(--mono); fill: var(--orange); }
+      .svg-note { font: italic 11px var(--serif); fill: var(--ink-soft); }
+
+      /* ── Journey cards ─────────────────────────────────────── */
+
+      .journeys {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 12px;
+        margin: 1.8em 0;
+      }
+
+      @media (max-width: 700px) {
+        .journeys {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .jcard {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 15px 17px;
+        background: var(--paper-soft);
+      }
+
+      .jcard h4 {
+        margin: 0 0 3px;
+        font-size: 14.5px;
+        letter-spacing: -0.01em;
+      }
+
+      .jcard .who {
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+
+      .jcard p {
+        margin: 9px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+        line-height: 1.55;
+      }
+
+      /* ── Measured-number strip ─────────────────────────────── */
+
+      .measured {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 1px;
+        margin: 1.8em 0;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--line);
+      }
+
+      @media (max-width: 760px) {
+        .measured {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+
+      .measured div {
+        background: var(--paper);
+        padding: 14px 16px;
+      }
+
+      .measured .n {
+        font-family: var(--mono);
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+
+      .measured .k {
+        margin-top: 5px;
+        color: var(--ink-faint);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .footnote {
+        color: var(--ink-faint);
+        font-size: 13.5px;
+      }
+
+      .site-footer {
+        border-top: 1px solid var(--line);
+        padding: 26px 24px 54px;
+      }
+
+      .footer-inner {
+        max-width: var(--middle);
+        margin: 0 auto;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 11.5px;
+        letter-spacing: 0.03em;
+      }
+
+      .footer-inner a {
+        color: var(--ink-soft);
+      }
+      /* ── Reading chrome: progress bar, floating TOC, contents rail ──────
+         Standard blocks lifted from what-is-quirq/index.html (the flagship).
+         Keep selectors and values in sync with writings/AGENTS.md §5. */
+
+      .progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        z-index: 100;
+        width: 0;
+        height: 3px;
+        background: linear-gradient(
+          90deg,
+          var(--orange),
+          #e5b73f,
+          var(--green),
+          var(--blue),
+          var(--purple)
+        );
+      }
+
+      .floating-toc {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 90;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateY(-6px);
+        transition:
+          opacity 150ms ease,
+          transform 150ms ease,
+          visibility 150ms;
+      }
+
+      .floating-toc.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .toc-button {
+        display: flex;
+        max-width: min(340px, calc(100vw - 24px));
+        min-height: 30px;
+        align-items: center;
+        gap: 9px;
+        padding: 5px 10px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 3px 14px rgba(30, 30, 25, 0.08);
+        cursor: pointer;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .toc-button-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .toc-menu {
+        position: absolute;
+        top: 38px;
+        left: 0;
+        display: none;
+        width: min(340px, calc(100vw - 24px));
+        max-height: min(70vh, 560px);
+        padding: 7px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.98);
+        box-shadow: var(--shadow);
+      }
+
+      .floating-toc.open .toc-menu {
+        display: grid;
+      }
+
+      .toc-menu a {
+        padding: 8px 10px;
+        border-radius: 3px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1.3;
+        text-decoration: none;
+      }
+
+      .toc-menu a:hover,
+      .toc-menu a.active {
+        color: var(--ink);
+        background: var(--paper-soft);
+      }
+
+      .toc-parent {
+        font-weight: 700;
+      }
+
+      .toc-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 2px 0 5px 12px;
+        padding-left: 8px;
+        border-left: 1px solid var(--line);
+      }
+
+      .toc-subsections a {
+        padding-top: 7px;
+        padding-bottom: 7px;
+        font-size: 11px;
+      }
+
+      .contents-rail {
+        position: fixed;
+        top: 88px;
+        left: 20px;
+        z-index: 70;
+        width: 154px;
+        max-height: calc(100vh - 108px);
+        padding-right: 8px;
+        overflow-y: auto;
+        visibility: hidden;
+        opacity: 0;
+        transform: translateX(-8px);
+        transition:
+          opacity 180ms ease,
+          transform 180ms ease,
+          visibility 180ms;
+      }
+
+      .contents-rail.visible {
+        visibility: visible;
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .contents-rail-title {
+        margin: 0 0 12px;
+        color: var(--ink-faint);
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .contents-rail nav {
+        display: grid;
+        gap: 2px;
+        padding-left: 12px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-rail a {
+        position: relative;
+        padding: 5px 0;
+        color: var(--ink-faint);
+        font-size: 11px;
+        line-height: 1.3;
+        text-decoration: none;
+        transition: color 140ms ease;
+      }
+
+      .contents-rail a::before {
+        position: absolute;
+        top: 9px;
+        left: -15px;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: transparent;
+        content: "";
+      }
+
+      .contents-rail a:hover,
+      .contents-rail a.active {
+        color: var(--ink);
+      }
+
+      .contents-rail a.active::before {
+        background: var(--orange);
+      }
+
+      .contents-parent {
+        color: var(--ink-soft);
+        font-weight: 700;
+      }
+
+      .contents-subsections {
+        display: grid;
+        gap: 1px;
+        margin: 1px 0 4px 5px;
+        padding-left: 9px;
+        border-left: 1px solid var(--line);
+      }
+
+      .contents-subsections a {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        font-size: 10.5px;
+      }
+
+      .contents-subsections a::before {
+        top: 8px;
+        left: -12px;
+      }
+
+      /* Wide screens: hide the floating TOC, shift the article clear of the
+         fixed rail (rail column ends at 174px; 184px = rail + 10px gap). */
+      @media (min-width: 1180px) {
+        .floating-toc {
+          display: none;
+        }
+
+        main {
+          margin-right: 0;
+          margin-left: calc(184px + max(0px, (100vw - 184px - var(--middle)) / 2));
+        }
+      }
+
+      /* Between 1180 and 1319px the negative pull of .figure.wide would slide
+         under the rail; clamp it to the main column in that band. */
+      @media (min-width: 1180px) and (max-width: 1319px) {
+        .figure.wide {
+          max-width: 100%;
+          margin-left: 0;
+        }
+      }
+
+      /* Narrow screens: no rail; the floating TOC takes over. */
+      @media (max-width: 1179px) {
+        .contents-rail {
+          display: none;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        .progress,
+        .floating-toc,
+        .contents-rail,
+        .threadbar {
+          display: none !important;
+        }
+      }
+      /* epistemic badges — see j-space/ */
+      .src, .recon {
+        display: inline-block;
+        margin-left: 4px;
+        padding: 1.5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 9px;
+        font-weight: 400;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        vertical-align: 2px;
+      }
+      .src { background: var(--paper-soft); color: var(--ink-faint); }
+      .recon { background: var(--paper-warm); border-color: var(--orange-soft); color: #a8641a; }
+      .prose ul, .prose ol { max-width: var(--text); }
+      .prose li { margin: 0.35em 0; }
+    </style>
+  </head>
+  <body>
+    <div class="progress" aria-hidden="true"></div>
+    <header class="threadbar">
+      <a class="thread-brand" href="../../" aria-label="Writings, home">
+        <svg class="xo-logo" viewBox="0 0 500 500" role="img" aria-label="XO">
+          <polyline points="36.99 165.84 118.47 247.31 31.16 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+          <polyline points="328.12 165.06 246.65 246.53 333.95 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="380.51 165.06 461.99 246.53 374.68 333.84" fill="none" stroke="#83d63a" stroke-width="15.38"></polyline>
+          <polyline points="244.91 165.84 163.44 247.31 250.74 334.61" fill="none" stroke="#000" stroke-width="15.38"></polyline>
+        </svg>
+        <span>Writings</span>
+      </a>
+      <span class="thread-status">Suraj Sharma · XO Labs</span>
+    </header>
+
+    <div class="floating-toc" aria-label="Floating contents">
+      <button
+        class="toc-button"
+        type="button"
+        aria-expanded="false"
+        aria-controls="toc-menu"
+      >
+        <span aria-hidden="true">☰</span>
+        <span class="toc-button-label">01 · The commit ladder</span>
+      </button>
+      <nav class="toc-menu" id="toc-menu" aria-label="Article sections">
+        <a class="toc-parent" href="#p3-ladder">01 · The commit ladder</a>
+        <a class="toc-parent" href="#p3-promise">02 · What the ack promises</a>
+        <a class="toc-parent" href="#p3-isr">03 · Two ways out of the ISR</a>
+        <a class="toc-parent" href="#p3-epochs">04 · Forks and truncation</a>
+        <a class="toc-parent" href="#p3-elections">05 · Elections, ELR, and the last leader</a>
+        <a class="toc-parent" href="#p3-raft">06 · The metadata log</a>
+        <a class="toc-parent" href="#p3-failover">07 · Losing a controller</a>
+        <a class="toc-parent" href="#p3-quorum">08 · Losing the quorum</a>
+        <a class="toc-parent" href="#p3-sources">09 · Sources</a>
+      </nav>
+    </div>
+
+    <aside class="contents-rail" aria-label="Contents">
+      <p class="contents-rail-title">Contents</p>
+      <nav aria-label="Article contents">
+        <a href="#p3-ladder">01 · The commit ladder</a>
+        <a href="#p3-promise">02 · What the ack promises</a>
+        <a href="#p3-isr">03 · Two ways out of the ISR</a>
+        <a href="#p3-epochs">04 · Forks and truncation</a>
+        <a href="#p3-elections">05 · Elections and ELR</a>
+        <a href="#p3-raft">06 · The metadata log</a>
+        <a href="#p3-failover">07 · Losing a controller</a>
+        <a href="#p3-quorum">08 · Losing the quorum</a>
+        <a href="#p3-sources">09 · Sources</a>
+      </nav>
+    </aside>
+
+    <section class="masthead">
+      <div class="masthead-inner">
+        <p class="kicker">XO Labs · Languages & Tools</p>
+        <h1>What an ack promises: replication and the metadata quorum<span class="status-pill">Teardown</span></h1>
+        <p class="dek">
+          An acks=all ack says a record reached the page cache of every in-sync replica and that the in-sync set met a floor. It says nothing about disk. This third part of a five-part teardown reads Apache Kafka 4.4.0 line by line: followers that ack by asking for the next offset, a high watermark that is a minimum, two detectors that decide who leaves the set, a frozen leader that acks what it later deletes, the election ladder down to a last known leader that KIP-966 intends, and the fsyncing metadata log whose loss freezes every one of those lines. All-replica loss here is simulated damage on one host, and its numbers are set by the mock.
+        </p>
+        <p class="masthead-byline">Suraj Sharma · XO Labs · 6 November 2026 · Subject: <code>kafka@1156b275</code> (Apache Kafka 4.4.0) · Part 3 of 5 · Read from the source; measured where this machine allows</p>
+      </div>
+    </section>
+
+    <main>
+      <nav class="toc" aria-label="Article sections">
+        <p class="toc-title">Contents</p>
+        <ol>
+          <li><a href="#p3-ladder">The commit ladder</a></li>
+          <li><a href="#p3-promise">What the ack promises</a></li>
+          <li><a href="#p3-isr">Two ways out of the ISR</a></li>
+          <li><a href="#p3-epochs">Forks and truncation</a></li>
+          <li><a href="#p3-elections">Elections, ELR, and the last leader</a></li>
+          <li><a href="#p3-raft">The metadata log</a></li>
+          <li><a href="#p3-failover">Losing a controller</a></li>
+          <li><a href="#p3-quorum">Losing the quorum</a></li>
+          <li><a href="#p3-sources">Sources</a></li>
+        </ol>
+      </nav>
+
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from the pinned source, cited as
+              <code>repo/path:line</code>: Apache Kafka 4.4.0 (<code>1156b275</code>). Paths are relative to the
+              <code>kafka/</code> checkout; <code>core/…/</code> abbreviates <code>core/src/main/scala/kafka/</code>,
+              <code>metadata/…/</code> abbreviates <code>metadata/src/main/java/org/apache/kafka/</code>, and
+              <code>raft/…/</code> abbreviates <code>raft/src/main/java/org/apache/kafka/raft/</code>. A bare file name is under a tree named nearby.
+              <span class="recon">measured here</span> marks output from small clusters on loopback, on a shared
+              2-vCPU machine with one disk and no iptables. Timings show relative behaviour, never capacity. Each
+              scenario is a single run unless it says otherwise. Tail cuts with <code>truncate -s</code> are simulated damage on
+              one host: they stand in for lost page cache, their loss counts are set by the mock, and no real power
+              cut was run. <span class="recon">reconstruction</span> marks a judgement drawn from those sources rather
+              than read in one place. Register ids such as D62 point at the findings register in Part 5.
+            </p>
+            <p>
+              This is Part 3 of 5 of <a href="../">Kafka, taken apart</a>. <a href="../the-log/">Part 1</a> reads the
+              log on disk; <a href="../the-wire/">Part 2</a> follows one request on the wire and through the broker;
+              <a href="../clients/">Part 4</a> covers producers and consumer groups; <a href="../transactions/">Part 5</a>
+              covers exactly-once, and ends with the findings register.
+            </p>
+          </div>
+
+          <h2 id="p3-ladder"><span class="secnum">01</span>The commit ladder</h2>
+          <p class="lede">
+            An <code>acks=all</code> ack says the record reached the page cache of every in-sync replica, and that the in-sync set
+            met a floor. It says nothing about disk. The metadata log, which does fsync, decides who is in that set, so losing it
+            freezes the line while data keeps moving. This collection's claim is that Kafka is one log used five times, and that
+            nearly every promise is a line in a log: which line, in which log, moved by whom. This part reads the high watermark
+            and the metadata commit. All-replica loss here runs on a mock.
+          </p>
+          <p>
+            <a href="../the-log/#p1-append">Part 1</a> left a record in one broker's file. To reach another broker it has to be
+            asked for. Followers pull. A follower's fetcher thread does two things in a loop: truncate whatever is marked for
+            truncation, then fetch (<code>core/…/server/AbstractFetcherThread.scala:112-114</code>). A follower append runs the
+            same <code>append</code> as a leader append, and takes the leader's offsets instead of assigning its own
+            (<code>UnifiedLog.java:1094-1097</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            There is no replication ack. The offset a follower asks for in its next Fetch is its log end offset (LEO) as far as
+            the leader knows, because <code>updateFollowerFetchState</code> takes it from the read
+            (<code>core/…/cluster/Partition.scala:1313-1321</code>). A fetch offset is an ack. The leader keeps six fields per
+            follower: log start, LEO, the leader's LEO at the last fetch, last fetch time, last caught-up time and broker epoch
+            (<code>ReplicaState.java:32-39</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The broker accepts three <code>acks</code> values. <code>acks=1</code> answers straight after the leader's local
+            append. Only <code>acks=-1</code> waits, parked in the <a href="../the-wire/#p2-purgatory">purgatory Part 2 reads</a>
+            (<code>ReplicaManager.scala:1370</code>, <code>:1364-1366</code>, <code>:913-916</code>). It is also the only value
+            that meets a durability check before the append. <code>core/…/cluster/Partition.scala:1227-1243</code>:
+          </p>
+<pre><code>    val (info, leaderHWIncremented) = inReadLock(leaderIsrUpdateLock, () =&gt; {
+      leaderLogIfLocal match {
+        case Some(leaderLog) =&gt;
+          val minIsr = effectiveMinIsr(leaderLog)
+          val inSyncSize = partitionState.isr.size
+
+          // Avoid writing to leader if there are not enough insync replicas to make it safe
+          if (inSyncSize &lt; minIsr &amp;&amp; requiredAcks == -1) {
+            throw new NotEnoughReplicasException(s"The size of the current ISR : $inSyncSize " +
+              s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition, " +
+              s"live replica(s) broker.id are : $inSyncReplicaIds")
+          }
+
+          val info = leaderLog.appendAsLeader(records, this.leaderEpoch, origin, requestLocal, verificationGuard, transactionVersion)
+
+          // we may need to increment high watermark since ISR could be down to 1
+          (info, maybeIncrementLeaderHW(leaderLog))</code></pre>
+
+          <figure class="figure wide" id="fig-ladder">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">One <code>acks=all</code> write up the ladder: three logs, with LEO and HW after each step</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 490" role="img" aria-label="Five steps of one acks=all write across a leader and two followers. The leader appends, followers fetch and append, their next fetch offset acts as the ack, the leader raises the high watermark and answers, and the next fetch response carries the high watermark to the followers.">
+                <defs><marker id="fig-ladder-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker><marker id="fig-ladder-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker></defs>
+                <text x="330" y="22" class="svg-lane">LEADER n2</text>
+                <text x="550" y="22" class="svg-lane">FOLLOWER n3</text>
+                <text x="770" y="22" class="svg-lane">FOLLOWER n4</text>
+                <text x="20" y="55" class="svg-num">1</text>
+                <text x="38" y="55" class="svg-step">Leader appends</text>
+                <text x="38" y="73" class="svg-sub">Produce parks in purgatory,</text>
+                <text x="38" y="89" class="svg-sub">waiting for HW to reach 1299.</text>
+                <rect x="330" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="61" class="svg-sub">96</text>
+                <rect x="370" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="61" class="svg-sub">97</text>
+                <rect x="410" y="44" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="413" y="61" class="svg-sub">98</text>
+                <text x="456" y="54" class="svg-sub">LEO 1299</text>
+                <text x="456" y="70" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="409" y1="40" x2="409" y2="72" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="61" class="svg-sub">96</text>
+                <rect x="590" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="61" class="svg-sub">97</text>
+                <rect x="630" y="44" width="38" height="24" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="633" y="61" class="svg-sub">98</text>
+                <text x="676" y="54" class="svg-sub">LEO 1298</text>
+                <text x="676" y="70" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="629" y1="40" x2="629" y2="72" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="61" class="svg-sub">96</text>
+                <rect x="810" y="44" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="61" class="svg-sub">97</text>
+                <rect x="850" y="44" width="38" height="24" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="853" y="61" class="svg-sub">98</text>
+                <text x="896" y="54" class="svg-sub">LEO 1298</text>
+                <text x="896" y="70" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="849" y1="40" x2="849" y2="72" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="20" y1="116" x2="980" y2="116" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="139" class="svg-num">2</text>
+                <text x="38" y="139" class="svg-step">Fetch at 1298 returns it</text>
+                <text x="38" y="157" class="svg-sub">Followers append with the</text>
+                <text x="38" y="173" class="svg-sub">leader's offset. No fsync.</text>
+                <rect x="330" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="145" class="svg-sub">96</text>
+                <rect x="370" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="145" class="svg-sub">97</text>
+                <rect x="410" y="128" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="413" y="145" class="svg-sub">98</text>
+                <text x="456" y="138" class="svg-sub">LEO 1299</text>
+                <text x="456" y="154" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="409" y1="124" x2="409" y2="156" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="145" class="svg-sub">96</text>
+                <rect x="590" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="145" class="svg-sub">97</text>
+                <rect x="630" y="128" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="633" y="145" class="svg-sub">98</text>
+                <text x="676" y="138" class="svg-sub">LEO 1299</text>
+                <text x="676" y="154" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="629" y1="124" x2="629" y2="156" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="145" class="svg-sub">96</text>
+                <rect x="810" y="128" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="145" class="svg-sub">97</text>
+                <rect x="850" y="128" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="853" y="145" class="svg-sub">98</text>
+                <text x="896" y="138" class="svg-sub">LEO 1299</text>
+                <text x="896" y="154" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="849" y1="124" x2="849" y2="156" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="390" y1="172" x2="606" y2="172" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-ladder-b)"/>
+                <line x1="610" y1="172" x2="826" y2="172" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-ladder-b)"/>
+                <text x="396" y="188" class="svg-sub" fill="#3c6f97">records for 1298</text>
+                <line x1="20" y1="200" x2="980" y2="200" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="223" class="svg-num">3</text>
+                <text x="38" y="223" class="svg-step">Fetch at 1299 is the ack</text>
+                <text x="38" y="241" class="svg-sub">updateFollowerFetchState sets</text>
+                <text x="38" y="257" class="svg-sub">n3 and n4 to 1299 on the leader.</text>
+                <rect x="330" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="229" class="svg-sub">96</text>
+                <rect x="370" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="229" class="svg-sub">97</text>
+                <rect x="410" y="212" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="413" y="229" class="svg-sub">98</text>
+                <text x="456" y="222" class="svg-sub">LEO 1299</text>
+                <text x="456" y="238" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="409" y1="208" x2="409" y2="240" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="229" class="svg-sub">96</text>
+                <rect x="590" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="229" class="svg-sub">97</text>
+                <rect x="630" y="212" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="633" y="229" class="svg-sub">98</text>
+                <text x="676" y="222" class="svg-sub">LEO 1299</text>
+                <text x="676" y="238" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="629" y1="208" x2="629" y2="240" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="229" class="svg-sub">96</text>
+                <rect x="810" y="212" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="229" class="svg-sub">97</text>
+                <rect x="850" y="212" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="853" y="229" class="svg-sub">98</text>
+                <text x="896" y="222" class="svg-sub">LEO 1299</text>
+                <text x="896" y="238" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="849" y1="208" x2="849" y2="240" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="830" y1="256" x2="614" y2="256" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-ladder-k)"/>
+                <line x1="610" y1="256" x2="394" y2="256" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-ladder-k)"/>
+                <text x="396" y="272" class="svg-sub">fetch offset=1299</text>
+                <line x1="20" y1="284" x2="980" y2="284" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="307" class="svg-num">4</text>
+                <text x="38" y="307" class="svg-step">HW rises, ack goes out</text>
+                <text x="38" y="325" class="svg-sub">New HW = lowest LEO = 1299.</text>
+                <text x="38" y="341" class="svg-sub">The parked Produce completes.</text>
+                <rect x="330" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="313" class="svg-sub">96</text>
+                <rect x="370" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="313" class="svg-sub">97</text>
+                <rect x="410" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="413" y="313" class="svg-sub">98</text>
+                <text x="456" y="306" class="svg-sub">LEO 1299</text>
+                <text x="456" y="322" class="svg-sub" fill="#765b98">HW 1299</text>
+                <line x1="449" y1="292" x2="449" y2="324" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="313" class="svg-sub">96</text>
+                <rect x="590" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="313" class="svg-sub">97</text>
+                <rect x="630" y="296" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="633" y="313" class="svg-sub">98</text>
+                <text x="676" y="306" class="svg-sub">LEO 1299</text>
+                <text x="676" y="322" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="629" y1="292" x2="629" y2="324" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="313" class="svg-sub">96</text>
+                <rect x="810" y="296" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="313" class="svg-sub">97</text>
+                <rect x="850" y="296" width="38" height="24" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="853" y="313" class="svg-sub">98</text>
+                <text x="896" y="306" class="svg-sub">LEO 1299</text>
+                <text x="896" y="322" class="svg-sub" fill="#765b98">HW 1298</text>
+                <line x1="849" y1="292" x2="849" y2="324" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="20" y1="368" x2="980" y2="368" stroke="#deded9" stroke-width="1"/>
+                <text x="20" y="391" class="svg-num">5</text>
+                <text x="38" y="391" class="svg-step">HW reaches followers</text>
+                <text x="38" y="409" class="svg-sub">The next response carries 1299,</text>
+                <text x="38" y="425" class="svg-sub">clamped to each LEO.</text>
+                <rect x="330" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="333" y="397" class="svg-sub">96</text>
+                <rect x="370" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="373" y="397" class="svg-sub">97</text>
+                <rect x="410" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="413" y="397" class="svg-sub">98</text>
+                <text x="456" y="390" class="svg-sub">LEO 1299</text>
+                <text x="456" y="406" class="svg-sub" fill="#765b98">HW 1299</text>
+                <line x1="449" y1="376" x2="449" y2="408" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="550" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="553" y="397" class="svg-sub">96</text>
+                <rect x="590" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="593" y="397" class="svg-sub">97</text>
+                <rect x="630" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="633" y="397" class="svg-sub">98</text>
+                <text x="676" y="390" class="svg-sub">LEO 1299</text>
+                <text x="676" y="406" class="svg-sub" fill="#765b98">HW 1299</text>
+                <line x1="669" y1="376" x2="669" y2="408" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <rect x="770" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="773" y="397" class="svg-sub">96</text>
+                <rect x="810" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="813" y="397" class="svg-sub">97</text>
+                <rect x="850" y="380" width="38" height="24" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="853" y="397" class="svg-sub">98</text>
+                <text x="896" y="390" class="svg-sub">LEO 1299</text>
+                <text x="896" y="406" class="svg-sub" fill="#765b98">HW 1299</text>
+                <line x1="889" y1="376" x2="889" y2="408" stroke="#765b98" stroke-width="2" stroke-dasharray="4 2"/>
+                <line x1="390" y1="424" x2="606" y2="424" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-ladder-b)"/>
+                <line x1="610" y1="424" x2="826" y2="424" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-ladder-b)"/>
+                <text x="396" y="440" class="svg-sub" fill="#3c6f97">HW=1299 in the response</text>
+                <text x="330" y="462" class="svg-note">Cells show the last two digits of offsets 1296 to 1298. Green is below the HW, orange above.</text>
+                <text x="330" y="478" class="svg-note">The dashed purple tick is the HW, an exclusive bound.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The follower's LEO moves on the leader one fetch after it moves on the follower, and the follower's HW one fetch
+              after that. The order is read from the code. The offsets echo the trace below, taken from the leader's view of one
+              run. The diagram is a <span class="recon">reconstruction</span>.
+            </p>
+          </figure>
+
+          <p>
+            The rule for the line sits in one method. The new high watermark (HW) is the smallest LEO among the leader, the
+            maximal ISR, and any replica outside the ISR that is caught up and eligible to join.
+            <code>core/…/cluster/Partition.scala:1010-1033</code>:
+          </p>
+<pre><code>  private def maybeIncrementLeaderHW(leaderLog: UnifiedLog, currentTimeMs: Long = time.milliseconds): Boolean = {
+    if (isUnderMinIsr) {
+      trace(s"Not increasing HWM because partition is under min ISR(ISR=${partitionState.isr})")
+      return false
+    }
+    // maybeIncrementLeaderHW is in the hot path, the following code is written to
+    // avoid unnecessary collection generation
+    val leaderLogEndOffset = leaderLog.logEndOffsetMetadata
+    var newHighWatermark = leaderLogEndOffset
+    remoteReplicasMap.forEach { (_, replica) =&gt;
+      val replicaState = replica.stateSnapshot
+
+      def shouldWaitForReplicaToJoinIsr: Boolean = {
+        replicaState.isCaughtUp(leaderLogEndOffset.messageOffset, currentTimeMs, replicaLagTimeMaxMs) &amp;&amp;
+        isReplicaIsrEligible(replica.brokerId)
+      }
+
+      // Note here we are using the "maximal", see explanation above
+      if (replicaState.logEndOffsetMetadata.messageOffset &lt; newHighWatermark.messageOffset &amp;&amp;
+          (partitionState.maximalIsr.contains(replica.brokerId) || shouldWaitForReplicaToJoinIsr)
+      ) {
+        newHighWatermark = replicaState.logEndOffsetMetadata
+      }
+    }</code></pre>
+          <p>
+            Three details in that method matter later. The first <code>return</code> is strict min ISR: below
+            <code>min.insync.replicas</code> the HW does not move at all, whichever <code>acks</code> the writes used. A caught-up
+            replica outside the ISR holds the HW back on purpose, otherwise it would chase a moving line on a sole-ISR leader and
+            never rejoin (<code>:995-997</code>). "Maximal" means a pending ISR change counts in the stricter direction: an
+            expansion counts the new member at once, and a shrink keeps waiting for the departing one until the controller
+            confirms (<code>:1614-1615</code>, <code>:1640-1641</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The leader's TRACE log shows the gap. The offset is exclusive, so "offset 1299" asks for the record at 1298
+            (<code>kafka.cluster.Partition=TRACE</code>, single run) <span class="recon">measured here</span>:
+          </p>
+<pre><code>[2026-11-06 16:25:18,579] TRACE [Partition t-0 broker=2] Progress awaiting ISR acks for offset 1299: acked: HashSet(broker 2: 1299), awaiting HashSet(broker 3: 1298, broker 4: 1298) (kafka.cluster.Partition)</code></pre>
+          <p>
+            Below the HW, readers split by line: followers read to the LEO, <code>read_uncommitted</code> consumers to the HW,
+            <code>read_committed</code> consumers to the <a href="../transactions/#p5-lso">last stable offset</a>
+            (<code>FetchIsolation.java:32-37</code>). A follower learns the HW only from a Fetch response and clamps it to its
+            own LEO, so its HW trails the leader's by at least one round trip (<code>ReplicaFetcherThread.scala:143</code>). On
+            disk the HW is a checkpoint, written every 5 s by default and on clean shutdown, so after a restart it is a stale hint
+            (<code>ReplicaManager.scala:265</code>) <span class="src">from the code</span>.
+          </p>
+
+          <h3>A floor, not a quorum</h3>
+          <p>
+            <code>min.insync.replicas</code> does not say how many acks are enough. It says how few members the ISR may have.
+            With a full ISR, every member must catch up, and the config's own doc says so.
+            <code>clients/…/common/config/TopicConfig.java:222-223</code>: "then all three replicas must acknowledge an
+            <code>acks=all</code> write for it to succeed, even if <code>min.insync.replicas</code> happens to be less than 3."
+            The register lists this as <a href="../transactions/#D63">D63</a>, class D (gotcha), documented. The defaults
+            are the weak half of the pair: the producer defaults to <code>acks=all</code>, the broker to
+            <code>min.insync.replicas=1</code> and <code>default.replication.factor=1</code>, so a default <code>acks=all</code>
+            on a default topic is one copy (<code>ServerLogConfigs.java:155</code>, <code>ReplicationConfigs.java:42</code>).
+          </p>
+          <p>
+            Who counts as caught up is a time test with an exact-LEO escape hatch (<code>ReplicaState.java:66</code>). The javadoc
+            above it has the subtraction backwards (<a href="../transactions/#D22">D22</a>, class C, doc drift, still on
+            trunk). So <code>acks=all</code> commits when the slowest ISR member's next fetch arrives.
+          </p>
+          <p>
+            One test turns that into an answer. <code>core/…/cluster/Partition.scala:968-979</code>:
+          </p>
+<pre><code>        val minIsr = effectiveMinIsr(leaderLog)
+        if (leaderLog.highWatermark &gt;= requiredOffset) {
+          /*
+           * The topic may be configured not to accept messages if there are not enough replicas in ISR
+           * in this scenario the request was already appended locally and then added to the purgatory before the ISR was shrunk
+           */
+          if (minIsr &lt;= curMaximalIsr.size)
+            (true, Errors.NONE)
+          else
+            (true, Errors.NOT_ENOUGH_REPLICAS_AFTER_APPEND)
+        } else
+          (false, Errors.NONE)</code></pre>
+
+          <h2 id="p3-promise"><span class="secnum">02</span>What the ack promises</h2>
+          <p>
+            That test is <code>Partition.checkEnoughReplicasReachOffset</code>, and it is everything an <code>acks=all</code>
+            success means. Two conditions: the HW has passed the record, and the maximal ISR is at least the effective min ISR
+            (<code>Partition.scala:969-979</code>). Neither mentions a disk. The design doc defines "committed" by the same two
+            conditions and states the guarantee in one sentence. <code>docs/design/design.md:309</code>: "The guarantee that Kafka
+            offers is that a committed message will not be lost, as long as there is at least one in sync replica alive, at all
+            times." <span class="src">from the code</span>
+          </p>
+          <p>
+            Read that test's other branch too. When the HW has passed but the ISR has since dropped below min, the answer is
+            <code>NOT_ENOUGH_REPLICAS_AFTER_APPEND</code>: an error, for a record that is committed. The exception is retriable,
+            which is a duplicate path without idempotence (<code>Errors.java:225</code>). The record is there; the client is told
+            otherwise. <a href="../transactions/#D55">D55</a> collects the cases.
+          </p>
+          <p>
+            Now the disk. By default Kafka never fsyncs on a timer or on a message count: both knobs default to
+            <code>Long.MAX_VALUE</code> (<code>ServerLogConfigs.java:101</code>, <code>:109</code>). The only flush in the append
+            path is the message-count check <a href="../the-log/#p1-append">Part 1 quotes</a>, and leader and follower appends
+            share it, so neither side syncs before an ack (<code>UnifiedLog.java:1300</code>). The follower half of that is code
+            reading plus the recovery points below; the fsync-counting shim ran at replication factor 1.
+          </p>
+          <p>
+            Two things do get fsynced by default: a rolled segment, asynchronously, on the scheduler, up to the new segment's base
+            offset; and everything, on clean shutdown (<code>UnifiedLog.java:2242-2245</code>). A real flush covers the log and
+            its offset, time and transaction indexes, then moves the recovery point (<code>LogSegment.java:631-634</code>)
+            <span class="src">from the code</span>. In the run counted in Part 1, about 15,573 records were acked into a topic
+            whose <code>.log</code> saw one fsync, from <code>kafka-scheduler</code>, for the roll, in a window of about 25 s with
+            <code>segment.bytes=8388608</code> and replication factor 1. At the 1 GiB default that window has no roll
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Here is the same thing at replication factor 3. Two topics, about 2,000 acked records each, and the checkpoint read 70
+            s later, past its 60 s interval. Topic <code>t</code> has defaults; <code>tf</code> has <code>flush.messages=1</code>
+            (<code>./a_hw_isr.sh</code>, one run) <span class="recon">measured here</span>:
+          </p>
+<pre><code>t+0184.0s HW t=t:0:2005  HW tf=tf:0:2000
+t+0184.0s n2 recovery-point: tf 0 2000 t 0 0
+t+0184.0s n3 recovery-point: tf 0 2000 t 0 0
+t+0184.0s n4 recovery-point: tf 0 2000 t 0 0</code></pre>
+          <p>
+            2,005 acknowledged records sat above a recovery point of 0 on all three replicas. <code>flush.messages=1</code> kept
+            the recovery point at the HW. The label matters: a recovery point of 0 shows Kafka did not flush. Kernel writeback may
+            still have written the bytes. That writeback runs on the kernel's clock, and no Kafka line records it. The HW checkpoint on
+            every replica did agree with the leader's HW, once its 5 s timer had fired.
+          </p>
+          <p>
+            That gives three lines on one partition, moved by three different actors. Fetches move the HW. The scheduler moves the
+            recovery point. The kernel moves the bytes, and tells nobody. <a href="../the-log/#p1-recovery">Part 1</a> shows what depends on the second: CRCs are
+            checked only above the recovery point.
+          </p>
+
+          <figure class="figure wide" id="fig-safe">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">Where a record is safe, over time, with the HW and the recovery point tracked</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 346" role="img" aria-label="Timeline of one record: append to the leader page cache, fetched by followers, high watermark passes and the ack goes out, segment roll flushes it. Bytes survive a process kill from the append, a machine from the ack, all machines only from the flush. Kernel writeback runs independently throughout.">
+                <defs><marker id="fig-safe-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker></defs>
+                <text x="20" y="22" class="svg-lane">ONE RECORD, OVER TIME (NOT TO SCALE)</text>
+                <line x1="250" y1="62" x2="975" y2="62" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-safe-k)"/>
+                <line x1="280" y1="56" x2="280" y2="68" stroke="#252525" stroke-width="2"/>
+                <text x="278" y="38" class="svg-step">append</text>
+                <text x="278" y="52" class="svg-sub">leader page cache</text>
+                <line x1="430" y1="56" x2="430" y2="68" stroke="#252525" stroke-width="2"/>
+                <text x="428" y="38" class="svg-step">fetched</text>
+                <text x="428" y="52" class="svg-sub">follower page caches</text>
+                <line x1="590" y1="56" x2="590" y2="68" stroke="#252525" stroke-width="2"/>
+                <text x="588" y="38" class="svg-step">HW passes</text>
+                <text x="588" y="52" class="svg-sub">the ack goes out</text>
+                <line x1="810" y1="56" x2="810" y2="68" stroke="#252525" stroke-width="2"/>
+                <text x="808" y="38" class="svg-step">segment rolls</text>
+                <text x="808" y="52" class="svg-sub">async flush</text>
+                <text x="20" y="97" class="svg-step">Bytes in a file</text>
+                <text x="20" y="112" class="svg-sub">survive a process kill</text>
+                <rect x="280" y="86" width="695" height="28" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="288" y="105" class="svg-sub">a new leader may still lack them until the HW passes</text>
+                <text x="20" y="143" class="svg-step">Committed</text>
+                <text x="20" y="158" class="svg-sub">survives one machine</text>
+                <rect x="590" y="132" width="385" height="28" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="598" y="151" class="svg-sub">one replica losing half its log (mock): 0 lost</text>
+                <text x="20" y="189" class="svg-step">Flushed by Kafka</text>
+                <text x="20" y="204" class="svg-sub">survives all machines</text>
+                <rect x="810" y="178" width="165" height="28" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="818" y="197" class="svg-sub">on disk</text>
+                <text x="20" y="235" class="svg-step">Kernel writeback</text>
+                <text x="20" y="250" class="svg-sub">independent of Kafka</text>
+                <rect x="280" y="224" width="695" height="28" rx="2" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 3"/>
+                <text x="288" y="243" class="svg-sub" fill="#765b98">may write the bytes at any point here; no Kafka line records it</text>
+                <text x="20" y="281" class="svg-step">HW</text>
+                <line x1="280" y1="277" x2="590" y2="277" stroke="#b8b8b1" stroke-width="2"/>
+                <line x1="590" y1="277" x2="975" y2="277" stroke="#765b98" stroke-width="3"/>
+                <text x="288" y="294" class="svg-sub">below the record</text>
+                <text x="598" y="294" class="svg-sub" fill="#765b98">above the record</text>
+                <text x="20" y="321" class="svg-step">Recovery point</text>
+                <line x1="280" y1="317" x2="810" y2="317" stroke="#b8b8b1" stroke-width="2"/>
+                <line x1="810" y1="317" x2="975" y2="317" stroke="#765b98" stroke-width="3"/>
+                <text x="288" y="334" class="svg-sub">below the record; measured at 0 for 2,005 acked records</text>
+                <text x="818" y="334" class="svg-sub" fill="#765b98">above the record</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The ack lands at the Committed lane, and the Flushed lane may not start for a long time. Which lane a failure tests decides
+              what it costs. The timeline's order is read from the code; it is a <span class="recon">reconstruction</span>, not a
+              timing. The one-replica result is <code>measured-vs-mock</code>: half a follower's file was cut by hand, one run.
+            </p>
+          </figure>
+
+          <h3>The design, not an oversight</h3>
+          <p>
+            None of this is hidden. <code>docs/operations/hardware-and-os.md:64</code>: "Note that durability in Kafka does not
+            require syncing data to disk, as a failed node will always recover from its replicas." Two lines on, <code>:66</code>:
+            "We recommend using the default flush settings which disable application fsync entirely." The register files this as
+            <a href="../transactions/#D41">D41</a>, class D, status intended. The design doc gives the cost of the
+            alternative as "two to three orders of magnitude" (<code>design.md:335</code>). That figure was not reproduced here.
+          </p>
+          <p>
+            "Will always recover" has an edge: it is not true when the failed node is elected before the others. That is
+            <a href="../transactions/#D18">D18</a>, class C, minor, because it falls outside the design doc's stated guarantee, and
+            its example, which §05 walks through, is <code>measured-vs-mock</code>. KIP-966's Motivation names the same scenario:
+            the last ISR member loses unflushed data, is re-elected, and followers truncate to it. Its next sentence states the
+            limit: "MinISR-1 tolerance to data loss unclean shutdown events".
+          </p>
+          <p>
+            So the ack is a statement about the HW. It moves on fetches, and fetches read page cache. Replication covers one
+            machine going away, not a window in which every copy loses its unflushed tail. How often that window opens on real
+            hardware was not measured here.
+          </p>
+
+          <h2 id="p3-isr"><span class="secnum">03</span>Two ways out of the ISR</h2>
+          <p>
+            Every ISR member holds the HW down, so a stuck member holds every <code>acks=all</code> ack. The ladder only moves again
+            when somebody removes it. Two detectors can, and they run in different processes.
+          </p>
+          <p>
+            The first is the leader's lag check. It runs every <code>replica.lag.time.max.ms / 2</code>, so with the 30 s default
+            a stuck follower can hold acks for up to 45 s if nothing else removes it (<code>ReplicaManager.scala:284-285</code>).
+            Stuck and slow are one case: the same <code>lastCaughtUpTimeMs</code> test, with no offset-lag threshold anywhere
+            (<code>Partition.scala:1149</code>). The leader proposes and the controller decides. One ISR change is in flight per
+            partition, and most rejections leave it stuck in that pending state until new metadata arrives
+            (<code>:877</code>, <code>:1725</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The second never involves the leader. When a broker's session expires, the controller strips it from every ISR
+            (<code>metadata/…/controller/ReplicationControlManager.java:1433-1434</code>). The session default is 9 s with a 2 s
+            heartbeat, shorter than the lag limit, so a dead or frozen broker normally leaves through fencing
+            (<code>KRaftConfigs.java:40</code>, <code>:44</code>). A broker that keeps heartbeating while its fetcher is stuck is
+            the case the lag check exists for <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>One frozen follower, default settings</h3>
+          <p>
+            SIGSTOP on one in-sync follower, 20 msg/s, <code>min.insync.replicas=2</code>
+            (<code>./stall.sh default</code>, single run on loopback) <span class="recon">measured here</span>:
+          </p>
+<pre><code>t+0060.5s SIGSTOP follower n4 at epoch_ms=1793982255717
+t+0064.6s 4s into freeze: acked=41 leader_file_bytes=2160 n3_file_bytes=2160 n4_file_bytes=2088
+t+0098.2s before SIGCONT: acked=723 Topic: t Partition: 0 Leader: 2 Replicas: 2,3,4 Isr: 2,3 Elr: LastKnownElr:
+acked=1351 send_errors=0
+ack gap 9215 ms, starting -36 ms after SIGSTOP, next acked offset 41</code></pre>
+          <p>
+            Every ack stopped for 9.2 s, with no send error. Min ISR was 2, and two copies existed, and it made no difference. The
+            byte counts line up: offset 41 begins at position 2088 and offset 42 at 2160, so the frozen follower was exactly one 72-byte
+            batch behind. The record sat on two of three logs, unacknowledged and invisible. The fence record landed at
+            16:24:24.840 and the HW moved at 16:24:24.893, 53 ms apart, and the leader logged no <code>Shrinking ISR</code> line:
+            the shrink came from the controller. Resumed after 34 s, the follower was back in the ISR about 4.8 s later, its unfence
+            record ahead of the ISR change.
+          </p>
+
+          <h3>The same freeze, with the session stretched</h3>
+          <p>
+            <code>FREEZE=60 ./stall.sh session120 broker.session.timeout.ms=120000</code> takes the controller out of it, so the
+            lag check has to fire (single run) <span class="recon">measured here</span>:
+          </p>
+<pre><code>ack gap 38240 ms, starting -8 ms after SIGSTOP, next acked offset 63
+[2026-11-06 16:47:08,635] INFO [Partition t-0 broker=2] Shrinking ISR from 4,3,2 to 2,3. Leader: (highWatermark: 61, endOffset: 65). Out of sync replicas: (brokerId: 4, endOffset: 61, lastCaughtUpTimeMs: 1793983590536). (kafka.cluster.Partition)</code></pre>
+          <p>
+            38.2 s, inside the 30 to 45 s window the code predicts. The leader's own line shows HW 61 and LEO 65: four records written and not yet committed.
+          </p>
+
+          <figure class="figure wide" id="fig-two-ways">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">The two detectors against one frozen follower, with the 30 s request timeout marked</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 252" role="img" aria-label="Two lanes against seconds after SIGSTOP. With default settings the ack gap was 9.2 seconds, ended by the controller fencing the broker. With the session stretched to 120 seconds the gap was 38.2 seconds, ended by the leader lag check inside its 30 to 45 second window, past the 30 second producer request timeout.">
+                <text x="170" y="22" class="svg-lane">SECONDS AFTER SIGSTOP OF ONE IN-SYNC FOLLOWER</text>
+                <line x1="170" y1="34" x2="170" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="166" y="214" class="svg-sub">0</text>
+                <line x1="330" y1="34" x2="330" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="326" y="214" class="svg-sub">10</text>
+                <line x1="490" y1="34" x2="490" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="486" y="214" class="svg-sub">20</text>
+                <line x1="650" y1="34" x2="650" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="646" y="214" class="svg-sub">30</text>
+                <line x1="810" y1="34" x2="810" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="806" y="214" class="svg-sub">40</text>
+                <line x1="970" y1="34" x2="970" y2="196" stroke="#deded9" stroke-width="1"/>
+                <text x="966" y="214" class="svg-sub">50</text>
+                <text x="20" y="62" class="svg-step">Defaults</text>
+                <text x="20" y="78" class="svg-sub">session 9 s</text>
+                <rect x="170" y="50" width="147.2" height="28" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="325.2" y="62" class="svg-step">measured ack gap 9.2 s</text>
+                <text x="325.2" y="78" class="svg-sub">controller fences; no Shrinking ISR line</text>
+                <text x="20" y="132" class="svg-step">session120</text>
+                <text x="20" y="148" class="svg-sub">session 120 s</text>
+                <rect x="650" y="112" width="240" height="56" rx="2" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 3"/>
+                <text x="785.2" y="139" class="svg-sub" fill="#765b98">lag check window</text>
+                <rect x="170" y="120" width="611.2" height="28" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="178" y="139" class="svg-step">measured ack gap 38.2 s; the leader shrinks the ISR</text>
+                <line x1="650" y1="34" x2="650" y2="196" stroke="#ad4b43" stroke-width="2"/>
+                <text x="656" y="44" class="svg-sub" fill="#ad4b43">producer request timeout, 30 s</text>
+                <text x="500" y="188" class="svg-sub" fill="#ad4b43">errors begin at 30.0 s</text>
+                <text x="20" y="240" class="svg-note">Two single runs on loopback, relative only. Lag window is replica.lag.time.max.ms to 1.5 times it, from the check period.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The session sets the stall under defaults. Once the lag check is in charge, the stall outlasts the producer's
+              request timeout, and errors start. Windows are from the code, gaps are from two single runs on loopback: relative,
+              never capacity.
+            </p>
+          </figure>
+
+          <p>
+            That stall outlasted the 30 s request timeout. Requests began failing 30.0 s in, and 3 of the 602 records the client
+            was told had failed were in the log anyway (<code>stall_session120_timedout_check.txt</code>, read back with
+            <code>kafka-dump-log.sh</code>). The run used <code>retries=0</code>, which also disables idempotence; a default
+            producer would retry until <code>delivery.timeout.ms</code>. Timeouts undo nothing, and
+            <a href="../the-wire/#p2-purgatory">Part 2</a> shows why: a parked Produce starts with
+            <code>REQUEST_TIMED_OUT</code> already set. The register has this as <a href="../transactions/#D55">D55</a>,
+            confirmed by verifier.
+          </p>
+
+          <h3>Coming back</h3>
+          <p>
+            The rejoin test is shorter than people expect. <code>core/…/cluster/Partition.scala:907-911</code>:
+          </p>
+<pre><code>  private def isFollowerInSync(followerReplica: Replica): Boolean = {
+    leaderLogIfLocal.exists { leaderLog =&gt;
+      val followerEndOffset = followerReplica.stateSnapshot.logEndOffset
+      followerEndOffset &gt;= leaderLog.highWatermark &amp;&amp; leaderEpochStartOffsetOpt.exists(followerEndOffset &gt;= _)
+    }</code></pre>
+          <p>
+            HW and the start of the current epoch, not the leader's LEO. Records between HW and LEO may still be unread. The epoch
+            clause exists because committed data can sit between a new leader's HW and LEO, and a follower admitted too early could
+            be elected and lose it (<code>:865-867</code>). The replica must also be unfenced, not shutting down, and on a matching
+            broker epoch, checked by the leader and again by the controller (<code>:929-931</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The design doc says more than the code does. <code>docs/design/design.md:335</code>: "it must fully re-sync again even
+            if it lost unflushed data in its crash." Only the missing suffix is fetched, and an elected replica does not re-sync
+            at all (<a href="../transactions/#D19">D19</a>, class C, doc drift, still at trunk <code>09f2dc1320</code>).
+            <a href="../the-log/#p1-recovery">Part 1</a> shows the local half: recovery only has to produce a clean prefix.
+          </p>
+
+          <h2 id="p3-epochs"><span class="secnum">04</span>Forks and truncation</h2>
+          <p>
+            Replicas diverge when leadership moves. Kafka's answer is a number stamped in every batch: the leader epoch. Each
+            replica rebuilds its epoch-to-start-offset map from those stamps as it appends
+            (<code>UnifiedLog.java:1226-1229</code>). A new leader records its epoch's start offset as its current LEO, and
+            never truncates itself: everything up to its LEO becomes authoritative, including records never committed under the old
+            leader (<code>Partition.scala:636-638</code>, <code>:649</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            A follower of a new leader does not truncate first either. It keeps fetching from its LEO and carries its last epoch,
+            and the leader decides. If that epoch does not match the leader's cache, the leader returns an empty read plus a
+            diverging-epoch hint (<code>:1401-1408</code>). A diverging fetch does not count as progress
+            (<code>:1313</code>). An epoch's end offset is the start of the next higher epoch the leader knows
+            (<code>LeaderEpochFileCache.java:297</code>). The follower truncates to the lower of the two end offsets, or to an
+            intermediate point if it does not know that epoch, and asks again
+            (<code>AbstractFetcherThread.scala:634-641</code>). The truncating fetch applies no data, so the follower never exposes
+            a HW over bytes it is about to delete (<code>:357-359</code>). Purgatory does not delay any of it: a parked follower
+            fetch completes as soon as divergence is seen (<code>DelayedFetch.scala:109</code>).
+          </p>
+          <p>
+            Every epoch-bearing read also compares epochs: an older request is fenced, a newer one told to retry
+            (<code>Partition.scala:375-378</code>). A deposed leader finds out on its next request. That sentence is the whole
+            problem, as a frozen leader shows.
+          </p>
+
+          <h3>A frozen leader wakes up</h3>
+          <p>
+            <code>./c_leader_failure.sh</code>: leader SIGSTOPped for 29 s, with 300 msg/s offered to one topic at each
+            <code>acks</code> level, <code>min.insync.replicas=2</code>, one run <span class="recon">measured here</span>:
+          </p>
+<pre><code>acks=all: acked=13911 read_back=13911 acked_but_missing=0
+acks=1:   acked=13860 read_back=5129 acked_but_missing=8731 first_lost_offset=1645 last_lost_offset=10375
+[2026-11-06 17:05:55,985] INFO [UnifiedLog partition=c1-0, dir=/home/coder/kafka-ref/lab/scratch/replication/c/n2/data] Truncating to offset 1645 (org.apache.kafka.storage.internals.log.UnifiedLog)</code></pre>
+          <p>
+            Under <code>acks=all</code>, every acked value came back, and 49 in-flight sends failed with
+            <code>NotLeaderOrFollower</code>. Under <code>acks=1</code>, on SIGCONT the deposed leader appended and acked what the
+            producer had buffered for 29 s, then learned of the new leader and truncated all of it. 8,731 acked records
+            went. It wakes up still believing it leads, and the check that would tell it arrives after it has answered. The
+            deposed leader cut its <code>acks=all</code> topic too, at offset 1633, but those records had never been acked.
+          </p>
+          <p>
+            The two logs after truncation agree at the fork, batch by batch (<code>kafka-dump-log.sh --files</code> on n2 and n3,
+            columns trimmed):
+          </p>
+<pre><code>baseOffset: 1628 lastOffset: 1644 partitionLeaderEpoch: 0
+baseOffset: 1645 lastOffset: 1699 partitionLeaderEpoch: 1
+baseOffset: 1700 lastOffset: 1705 partitionLeaderEpoch: 1</code></pre>
+
+          <figure class="figure wide" id="fig-fork">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">The fork: a deposed leader's epoch 0 tail, the Fetch exchange, and the cut at offset 1645</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 372" role="img" aria-label="Two replica logs share epoch 0 up to offset 1644. The deposed leader n2 has an epoch 0 tail from 1645 to 10375. New leader n3 has epoch 1 from 1645. A Fetch from n2 carries last epoch 0, n3 returns an empty read with a diverging epoch hint, and n2 truncates to 1645, then matches n3.">
+                <defs><marker id="fig-fork-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker><marker id="fig-fork-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker></defs>
+                <text x="20" y="22" class="svg-lane">BEFORE THE FETCH</text>
+                <text x="20" y="54" class="svg-step">n2, deposed</text>
+                <text x="20" y="70" class="svg-sub">woke from SIGSTOP</text>
+                <rect x="170" y="40" width="250" height="34" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="178" y="55" class="svg-sub">epoch 0</text>
+                <text x="178" y="69" class="svg-sub">... 1628-1644</text>
+                <rect x="420" y="40" width="540" height="34" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="428" y="55" class="svg-sub">epoch 0, acked while deposed</text>
+                <text x="428" y="69" class="svg-sub">1645 ... 10375</text>
+                <text x="20" y="110" class="svg-step">n3, new leader</text>
+                <text x="20" y="126" class="svg-sub">epoch 1 from 1645</text>
+                <rect x="170" y="96" width="250" height="34" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="178" y="111" class="svg-sub">epoch 0</text>
+                <text x="178" y="125" class="svg-sub">... 1628-1644</text>
+                <rect x="420" y="96" width="150" height="34" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="428" y="111" class="svg-sub">epoch 1</text>
+                <text x="428" y="125" class="svg-sub">1645-1699</text>
+                <rect x="570" y="96" width="150" height="34" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="578" y="111" class="svg-sub">epoch 1</text>
+                <text x="578" y="125" class="svg-sub">1700-1705 ...</text>
+                <text x="20" y="164" class="svg-lane">THE EXCHANGE</text>
+                <text x="20" y="188" class="svg-sub">n2 to n3</text>
+                <line x1="170" y1="184" x2="720" y2="184" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-fork-k)"/>
+                <text x="176" y="178" class="svg-sub">Fetch: offset at n2's LEO, lastFetchedEpoch 0</text>
+                <text x="20" y="224" class="svg-sub">n3 to n2</text>
+                <line x1="720" y1="220" x2="170" y2="220" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-fork-b)"/>
+                <text x="176" y="214" class="svg-sub" fill="#3c6f97">empty read, diverging epoch 0, end offset 1645</text>
+                <text x="176" y="250" class="svg-sub">Does not count as progress. No data on this fetch.</text>
+                <text x="20" y="284" class="svg-lane">AFTER THE CUT</text>
+                <text x="20" y="316" class="svg-step">n2</text>
+                <text x="20" y="332" class="svg-sub">Truncating to 1645</text>
+                <rect x="170" y="302" width="250" height="34" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="178" y="317" class="svg-sub">epoch 0</text>
+                <text x="178" y="331" class="svg-sub">... 1628-1644</text>
+                <rect x="420" y="302" width="150" height="34" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="428" y="317" class="svg-sub">epoch 1</text>
+                <text x="428" y="331" class="svg-sub">1645-1699</text>
+                <rect x="570" y="302" width="150" height="34" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="578" y="317" class="svg-sub">epoch 1</text>
+                <text x="578" y="331" class="svg-sub">1700-1705 ...</text>
+                <rect x="720" y="302" width="240" height="34" rx="2" fill="#ffffff" stroke="#ad4b43" stroke-dasharray="4 3"/>
+                <text x="728" y="317" class="svg-sub" fill="#ad4b43">8,731 acked records gone</text>
+                <text x="728" y="331" class="svg-sub" fill="#ad4b43">10375 - 1645 + 1 = 8,731</text>
+                <line x1="420" y1="34" x2="420" y2="136" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3"/>
+                <line x1="420" y1="296" x2="420" y2="342" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3"/>
+                <text x="426" y="360" class="svg-sub" fill="#765b98">the fork at 1645: both checkpoints then read epoch 0 from 0, epoch 1 from 1645</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Offsets, epochs and batches are real, from the <code>acks=1</code> topic in one run. Both epoch checkpoints agree
+              afterwards: epoch 0 from offset 0, epoch 1 from 1645. The message order is read from the code, so the exchange is a
+              <span class="recon">reconstruction</span> around real numbers. Widths are not to scale.
+            </p>
+          </figure>
+
+          <figure class="figure" id="fig-acks-freeze">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title"><code>acks=1</code> and <code>acks=all</code>, same 29 s freeze</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 704 224" role="img" aria-label="Paired bars. acks=all acked 13,911, read back 13,911, lost 0. acks=1 acked 13,860, read back 5,129, lost 8,731.">
+                <text x="20" y="22" class="svg-lane">RECORDS, 29 s FREEZE, 300 msg/s OFFERED</text>
+                <text x="20" y="57" class="svg-step">acks=all</text>
+                <text x="110" y="57" class="svg-sub">acked</text>
+                <rect x="190" y="44" width="400.0" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="598.0" y="57" class="svg-step">13,911</text>
+                <text x="110" y="83" class="svg-sub">read back</text>
+                <rect x="190" y="70" width="400.0" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="598.0" y="83" class="svg-step">13,911</text>
+                <text x="110" y="109" class="svg-sub">lost</text>
+                <rect x="190" y="96" width="1.5" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="199.5" y="109" class="svg-step">0</text>
+                <text x="20" y="149" class="svg-step">acks=1</text>
+                <text x="110" y="149" class="svg-sub">acked</text>
+                <rect x="190" y="136" width="398.5" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="596.5" y="149" class="svg-step">13,860</text>
+                <text x="110" y="175" class="svg-sub">read back</text>
+                <rect x="190" y="162" width="147.5" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="345.5" y="175" class="svg-step">5,129</text>
+                <text x="110" y="201" class="svg-sub">lost</text>
+                <rect x="190" y="188" width="251.1" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="449.1" y="201" class="svg-step">8,731</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              8,731 is rate × freeze: 300 msg/s for 29 s is about 8,700 records. It is a dial, not a loss rate. The ledger tool ran
+              with <code>retries=0</code>, which also turns idempotence off. Single run.
+            </p>
+          </figure>
+
+          <p>
+            The effect has a window. It needs a pause over the 9 s session, so leadership moves, and under the 30 s request
+            timeout, so buffered sends are still live on waking. <a href="../transactions/#D64">D64</a> files it as class D:
+            a frozen leader is worse for <code>acks=1</code> than a dead one. Upstream status was not checked.
+          </p>
+          <p>
+            A dead leader, in the same harness: SIGKILL under load lost nothing in this run at either level, because the surviving
+            followers already held the acked records. The <code>acks=1</code> zero is one sample, not a guarantee. It also delayed
+            clients less. The longest ack gap was 8.9 s after SIGKILL against about 29 s frozen, even though the controller had
+            moved leadership by the first sample after 18 s. A closed socket is news, and a silent one is not.
+          </p>
+          <p>
+            The SIGKILL run shows the mirror image of loss as well: under <code>acks=all</code>, 26,249 acked and 26,252 read back. An
+            error at the client does not mean the record is absent.
+          </p>
+          <p>
+            One edge to carry into the next section. Truncating below a broker's own HW is neither refused nor raised as an error.
+            The log writes a warning and proceeds, and the HW drops with the log (<code>:2396-2397</code>).
+            <code>storage/…/log/UnifiedLog.java:2370-2371</code>:
+          </p>
+<pre><code>                    if (targetOffset &lt; hwm) {
+                        logger.warn("Truncating {}{} to offset {} below high watermark {}", isFuture() ? "future " : "", topicPartition(), targetOffset, hwm);</code></pre>
+          <p>
+            That one line, on the truncating broker, can be the only trace left (<a href="../transactions/#D65">D65</a>).
+          </p>
+
+          <h2 id="p3-elections"><span class="secnum">05</span>Elections, ELR, and the last leader</h2>
+          <p>
+            The controller elects, and a clean candidate is an acceptable replica in the ISR, or in the Eligible Leader Replicas
+            (ELR) when the ISR is empty (<code>PartitionChangeBuilder.java:319-321</code>). After keeping a still-valid leader
+            (<code>:257</code>), the order is this. <code>metadata/…/controller/PartitionChangeBuilder.java:262-284</code>:
+          </p>
+<pre><code>        Optional&lt;Integer&gt; onlineLeader = targetReplicas.stream()
+            .filter(this::isValidNewLeader)
+            .findFirst();
+        if (onlineLeader.isPresent()) {
+            return new ElectionResult(onlineLeader.get(), false);
+        }
+
+        if (canElectLastKnownLeader()) {
+            return new ElectionResult(partition.lastKnownElr[0], true);
+        }
+
+        if (election == Election.UNCLEAN) {
+            // Attempt unclean leader election
+            Optional&lt;Integer&gt; uncleanLeader = targetReplicas.stream()
+                .filter(isAcceptableLeader::test)
+                .findFirst();
+            if (uncleanLeader.isPresent()) {
+                return new ElectionResult(uncleanLeader.get(), true);
+            }
+        }
+
+        return new ElectionResult(NO_LEADER, false);
+    }</code></pre>
+
+          <figure class="figure wide" id="fig-election-ladder">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">The election ladder, with the flag's position after the last-known-leader step</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 404" role="img" aria-label="Flowchart. Keep a valid current leader; else a clean ISR or ELR member; else the last known leader if ISR and ELR are empty, without consulting the unclean flag, as KIP-966&#x27;s Delivery plan specifies; else, only in UNCLEAN mode, any acceptable replica; else no leader.">
+                <defs><marker id="fig-election-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker></defs>
+                <text x="20" y="22" class="svg-lane">DECISIONS, IN CODE ORDER</text>
+                <text x="590" y="22" class="svg-lane">RESULT</text>
+                <rect x="20" y="34" width="490" height="52" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="55" class="svg-num">1</text>
+                <text x="50" y="55" class="svg-step">Current leader still valid?</text>
+                <text x="50" y="74" class="svg-sub">isValidNewLeader(partition.leader)</text>
+                <line x1="510" y1="60" x2="588" y2="60" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="530" y="53" class="svg-sub">yes</text>
+                <rect x="590" y="34" width="390" height="52" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="602" y="55" class="svg-step">Keep it</text>
+                <text x="602" y="74" class="svg-sub">clean</text>
+                <line x1="60" y1="86" x2="60" y2="114" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="70" y="104" class="svg-sub">no</text>
+                <rect x="20" y="114" width="490" height="52" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="135" class="svg-num">2</text>
+                <text x="50" y="135" class="svg-step">An acceptable ISR member, or ELR if ISR is empty?</text>
+                <text x="50" y="154" class="svg-sub">first in replica order</text>
+                <line x1="510" y1="140" x2="588" y2="140" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="530" y="133" class="svg-sub">yes</text>
+                <rect x="590" y="114" width="390" height="52" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="602" y="135" class="svg-step">Elect it</text>
+                <text x="602" y="154" class="svg-sub">clean; ELR member becomes a one-member ISR</text>
+                <line x1="60" y1="166" x2="60" y2="194" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="70" y="184" class="svg-sub">no</text>
+                <rect x="20" y="194" width="490" height="52" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="215" class="svg-num">3</text>
+                <text x="50" y="215" class="svg-step">ISR and ELR empty, one last known leader, acceptable?</text>
+                <text x="50" y="234" class="svg-sub">canElectLastKnownLeader(): ELR on</text>
+                <line x1="510" y1="220" x2="588" y2="220" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="530" y="213" class="svg-sub">yes</text>
+                <rect x="590" y="194" width="390" height="52" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="602" y="215" class="svg-step">Elect the last known leader</text>
+                <text x="602" y="234" class="svg-sub">flagged unclean, RECOVERING</text>
+                <line x1="60" y1="246" x2="60" y2="274" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="70" y="264" class="svg-sub">no</text>
+                <text x="150" y="264" class="svg-note">flag not consulted, as KIP-966's Delivery plan specifies</text>
+                <rect x="20" y="274" width="490" height="52" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="32" y="295" class="svg-num">4</text>
+                <text x="50" y="295" class="svg-step">election == UNCLEAN?</text>
+                <text x="50" y="314" class="svg-sub">the flag on, or an operator asked</text>
+                <line x1="510" y1="300" x2="588" y2="300" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="530" y="293" class="svg-sub">yes</text>
+                <rect x="590" y="274" width="390" height="52" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="602" y="295" class="svg-step">Elect any acceptable replica</text>
+                <text x="602" y="314" class="svg-sub">flagged unclean, RECOVERING</text>
+                <line x1="60" y1="326" x2="60" y2="354" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-election-k)"/>
+                <text x="70" y="344" class="svg-sub">no</text>
+                <text x="150" y="344" class="svg-note">unclean.leader.election.enable applies here</text>
+                <rect x="20" y="354" width="490" height="40" rx="2" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="50" y="379" class="svg-step">NO_LEADER: the partition stays offline</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              <code>unclean.leader.election.enable</code> guards only the fourth step. The third runs in ONLINE mode too. This is
+              <strong>intended</strong>, a design choice, not a coding error. <span class="src">from the code</span>
+            </p>
+          </figure>
+
+          <h3>ELR</h3>
+          <p>
+            ELR is populated exactly when the target ISR falls below min ISR: members leaving the ISR move into it, unless they had
+            an unclean shutdown (<code>:536-553</code>). It is safe only because of strict min ISR. The HW froze when the ISR fell
+            below min, so every replica in the ISR at that moment holds everything committed
+            (<code>docs/operations/eligible-leader-replicas.md:31</code>). A broker's shutdown counts as clean only if its
+            clean-shutdown file names the epoch on record (<code>ClusterControlManager.java:439-441</code>). On re-registration,
+            the difference is this. <code>metadata/…/controller/ReplicationControlManager.java:1511-1518</code>:
+          </p>
+<pre><code>    void handleBrokerShutdown(int brokerId, boolean isCleanShutdown, List&lt;ApiMessageAndVersion&gt; records) {
+        if (featureControl.isElrFeatureEnabled() &amp;&amp; !isCleanShutdown) {
+            // ELR is enabled, generate unclean shutdown partition change records
+            generateLeaderAndIsrUpdates("handleBrokerUncleanShutdown", NO_LEADER, NO_LEADER, brokerId, records,
+                brokersToIsrs.partitionsWithBrokerInIsr(brokerId));
+            generateLeaderAndIsrUpdates("handleBrokerUncleanShutdown", NO_LEADER, NO_LEADER, brokerId, records,
+                brokersToElrs.partitionsWithBrokerInElr(brokerId));
+        } else {</code></pre>
+          <p>
+            ELR is on by default for clusters bootstrapped at metadata version 4.1 or later. With <code>min.insync.replicas=2</code>
+            and two clean stops, the cluster answered as designed (<code>./e12_unclean_elr.sh</code>, single run)
+            <span class="recon">measured here</span>: <code>acks=all</code> was rejected before any append; after SIGKILL of the
+            leader, a cleanly stopped ELR member was elected on return with no recovery state set, and all 100 <code>acks=all</code>
+            records survived.
+          </p>
+          <p>
+            The same run shows the trap on that under-min-ISR leader:
+          </p>
+<pre><code>t+0240.6s Topic: s Partition: 0 Leader: 2 Replicas: 2,3,4 Isr: 2 Elr: 3 LastKnownElr:
+t+0254.5s acks=1 under min ISR: acked=20, HW now=s:0:100 (was s:0:100)
+t+0352.3s E2 acks=1:   acked=20 read_back=100 acked_but_missing=20 first_lost_offset=100 last_lost_offset=119</code></pre>
+          <p>
+            <code>acks=1</code> writes were accepted and acked, but the HW
+            did not move, so no consumer could see them. When the leader died, all 20 were gone
+            (<a href="../transactions/#D101">D101</a>, class E, a behaviour change since 3.7). The older path is
+            still there too: with <code>min.insync.replicas=1</code>, 100 records acked on a sole leader were erased by an
+            operator's unclean election, and only a WARN and the election's own lines marked it. Unclean election stamps
+            <code>RECOVERING</code>, which performs no recovery at this pin: the new leader logs it and sets <code>RECOVERED</code> at
+            once (<code>Partition.scala:614-615</code>, <code>:626</code>).
+          </p>
+
+          <h3>The last known leader</h3>
+          <p>
+            The first time a partition goes leaderless, the controller records its last leader in <code>lastKnownElr</code>
+            (<code>PartitionChangeBuilder.java:493-498</code>). <code>metadata/…/controller/PartitionChangeBuilder.java:286-295</code>,
+            then <code>:305-315</code>, with a comment between them elided:
+          </p>
+<pre><code>    private boolean canElectLastKnownLeader() {
+        if (!eligibleLeaderReplicasEnabled || !useLastKnownLeaderInBalancedRecovery) {
+            log.trace("Try to elect last known leader for {}-{} but elrEnabled={}, useLastKnownLeaderInBalancedRecovery={}",
+                    topicId, partitionId, eligibleLeaderReplicasEnabled, useLastKnownLeaderInBalancedRecovery);
+            return false;
+        }
+        if (!targetElr.isEmpty() || !targetIsr.isEmpty()) {
+            log.trace("Try to elect last known leader for {}-{} but ELR/ISR is not empty. ISR={}, ELR={}",
+                    topicId, partitionId, targetIsr, targetElr);
+            return false;</code></pre>
+<pre><code>        if (partition.lastKnownElr.length != 1) {
+            log.trace("Try to elect last known leader for {}-{} but lastKnownElr does not only have 1 member. lastKnownElr={}",
+                    topicId, partitionId, Arrays.toString(partition.lastKnownElr));
+            return false;
+        }
+        if (!isAcceptableLeader.test(partition.lastKnownElr[0])) {
+            log.trace("Try to elect last known leader for {}-{} but last known leader is not alive. last known leader={}",
+                    topicId, partitionId, partition.lastKnownElr[0]);
+            return false;
+        }
+        return true;</code></pre>
+          <p>
+            Last-known-leader election runs without consulting <code>unclean.leader.election.enable</code>, as KIP-966's Delivery
+            plan specifies: intended, a design choice, not a coding error. It is flagged unclean and sets RECOVERING. No production
+            switch exists: the field defaults to true, and its setter has callers only in tests (<code>:104</code>,
+            <code>:180</code>). It compares nothing, because KIP-966's Unclean Recovery half has no code at this pin
+            (<a href="../transactions/#D20">D20</a>, class C). The ops doc says only "This is a similar behavior prior to the 4.0 when
+            all the replicas are offline" (<code>eligible-leader-replicas.md:35</code>), and leaves out the flag and the unclean
+            label (<a href="../transactions/#D21">D21</a>, class C, still on trunk).
+          </p>
+
+          <figure class="figure wide" id="fig-isr-drains">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">The ISR drains (mock): real metadata records around a tail cut by hand on one host</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>t+ (s, sampled)</th><th>Step</th><th>ISR</th><th>ELR</th><th>Last known</th><th>Leader</th><th>HW</th></tr></thead>
+                <tbody>
+                  <tr><td>134.0</td><td>2,000 acked; <code>acks=all</code>, min ISR 2, flag false</td><td>2,3,4</td><td></td><td></td><td>2</td><td>2000</td></tr>
+                  <tr><td>149.2</td><td>SIGKILL n2</td><td>3,4</td><td></td><td></td><td>3</td><td></td></tr>
+                  <tr><td>164.1</td><td>SIGKILL n3</td><td>4</td><td>3</td><td></td><td>4</td><td></td></tr>
+                  <tr><td>182.9</td><td>SIGKILL n4</td><td></td><td>3,4</td><td>4</td><td>none</td><td></td></tr>
+                  <tr style="background: var(--orange-soft)"><td>182.9</td><td><strong>The mock.</strong> <code>truncate -s</code> n4's stopped segment, 73146 to 36573 bytes. n2 still holds 73146.</td><td></td><td>3,4</td><td>4</td><td>none</td><td></td></tr>
+                  <tr><td>196.0</td><td>Restart n2: no change</td><td></td><td>3,4</td><td>4</td><td>none</td><td></td></tr>
+                  <tr><td>209.1</td><td>Restart n3: unclean exit, leaves ELR</td><td></td><td>4</td><td>4</td><td>none</td><td></td></tr>
+                  <tr style="background: var(--red-soft)"><td>224.6</td><td>Restart n4: leaves ELR, then last-known election, <code>leaderRecoveryState: 1</code>; n2, n3 rejoin</td><td>2,3,4</td><td></td><td></td><td>4</td><td>1013 (at 229.1)</td></tr>
+                </tbody>
+              </table>
+              <p style="font-size: 13px; margin: 12px 0"><strong>acked=2000, read_back=1013, acked_but_missing=987.</strong> 987 is a dial set by the cut, not a loss rate.</p>
+              <table style="font-size: 13px">
+                <thead><tr><th>Run</th><th>Layout</th><th>Failure</th><th>Mock</th><th>Elected</th><th>Lost of 2000 (dial)</th></tr></thead>
+                <tbody>
+                  <tr><td>E4</td><td>sole voter n1</td><td>SIGKILL in turn, 15 s apart</td><td>half of n4</td><td>n4, last-known, RECOVERING</td><td>987</td></tr>
+                  <tr><td>V2</td><td>same</td><td>n2, n3, n4 in one command</td><td>half of n3, the last leader</td><td>n3, last-known</td><td>827</td></tr>
+                  <tr><td>V3</td><td>same</td><td>n2 SIGKILL, n3 clean stop, n4 SIGKILL</td><td>half of n4</td><td>n3, ELR, no RECOVERING</td><td>0</td></tr>
+                  <tr><td>V1</td><td>3 combined voters</td><td>SIGKILL n1, n2 (quorum lost), n3</td><td>half of n2, leader in metadata</td><td>n3, last-known</td><td>0</td></tr>
+                  <tr><td>V1b</td><td>same</td><td>same</td><td>half of n3</td><td>n2, last-known</td><td>0</td></tr>
+                  <tr><td>V1c</td><td>same</td><td>same</td><td>n2 to 1/2, n3 to 3/4</td><td>n2, last-known</td><td>860</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              <code>measured-vs-mock</code>, one sample per row. "Lost" is set by the cut. Three runs do not establish a
+              distribution, and no run used three dedicated voters. <code>truncate -s</code> stands in for lost page cache; everything else is
+              the real system.
+            </p>
+          </figure>
+
+          <p>
+            This is simulated damage on one host (<code>./e34_tail_loss.sh</code>, E4). With
+            <code>unclean.leader.election.enable</code> at its default of false, <code>min.insync.replicas=2</code> and
+            <code>acks=all</code>, the last leader came back without its tail, was elected anyway, and 987 of 2,000 acked records
+            were deleted from all three replicas, including two that still held them. The other two replicas were SIGKILLed and
+            kept their bytes, so this models one machine lost plus two process deaths. Half the file was cut by hand, so 987 is a
+            dial set by the mock, not a loss rate. KIP-966 promises MinISR-1 tolerance; this has two unclean exits at min ISR 2. No
+            real power cut was run. <a href="../transactions/#D62">D62</a> files it as class D, intended per KIP-966's Delivery plan.
+          </p>
+          <p>
+            The controls isolate the bytes. With no cut, the same kill-and-restart sequence and the same election kept all 2,000.
+            With a clean ELR member (V3), 0 of 2,000 were lost. With ELR off and the same cut, 774 were lost, also a dial: there
+            the ISR keeps the dead last member, its return is a clean election, and the metadata records carry no trace. That run is
+            not a last-known election at all. With three combined voters, fencing order after quorum returned, not who died last, decided
+            the last known leader. V1 and V1b lost 0 only because the mocked broker was not elected.
+          </p>
+          <p>
+            How close is this to a real crash? On inference, not measurement: E4's producer finished about t+128 and n4 died at
+            t+167.4, and with <code>vm.dirty_expire_centisecs=3000</code> on ext4, stock writeback would probably have put those
+            bytes on disk. A real loss needs the last leader to die within about 35 s of the last acked write.
+          </p>
+          <p>
+            Afterwards the partition reports a full ISR and three logs of one size, so an ISR-based dashboard shows no sign. n2 and
+            n3 logged <code>Truncating z-0 to offset 1013 below high water…</code> as WARN. By the code,
+            <code>UncleanLeaderElectionsPerSec</code> counts this election and misses the ELR-off case; it was not scraped
+            (<a href="../transactions/#D65">D65</a>). Offsets at and above 1013 will be reassigned, and a consumer's reaction was not run (<a href="../transactions/#D66">D66</a>).
+          </p>
+
+          <h2 id="p3-raft"><span class="secnum">06</span>The metadata log</h2>
+          <p>
+            Who is in the ISR is itself a record in a log. The fifth use of the data structure is <code>__cluster_metadata</code>, one
+            single-partition log for the whole cluster: a request for any other partition is rejected, with a comment that
+            "multi-raft" is not supported yet (<code>raft/…/KafkaRaftClient.java:1495</code>). The class comment states the design in
+            one sentence. <code>raft/…/KafkaRaftClient.java:129-133</code>:
+          </p>
+<pre><code>/**
+ * This class implements a Kafkaesque version of the Raft protocol. Leader election
+ * is more or less pure Raft, but replication is driven by replica fetching and we use Kafka's
+ * log reconciliation protocol to truncate the log to a common point following each leader
+ * election.</code></pre>
+          <p>
+            Followers pull here too, so a new leader needs an announcement RPC standard Raft lacks: <code>BeginQuorumEpoch</code>,
+            which KIP-595 and the code both explain by the pull design (<code>:149-152</code>). All Raft work runs on one thread,
+            and any throwable from it is fatal (<code>KafkaRaftClientDriver.java:31-66</code>). Voters elect; observers, which
+            include every broker, fetch the same log and never campaign (<code>QuorumState.java:71-73</code>)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>Elections</h3>
+          <p>
+            A follower's trigger is the fetch timeout, and it goes to Prospective, not Candidate
+            (<code>KafkaRaftClient.java:3329-3331</code>). That step is pre-vote, and it has preceded every election since 4.0
+            (<a href="../transactions/#D102">D102</a>, class E). It writes nothing and keeps the epoch. <code>raft/…/QuorumState.java:621-622</code>:
+          </p>
+<pre><code>        // Durable transition is not necessary since there is no change to the persisted electionState
+        memoryTransitionTo(</code></pre>
+          <p>
+            Only a majority of pre-votes reaches Candidate, and that step does write. <code>:641-644</code>:
+          </p>
+<pre><code>        int newEpoch = epoch() + 1;
+        int electionTimeoutMs = randomElectionTimeoutMs();
+
+        durableTransitionTo(new CandidateState(</code></pre>
+          <p>
+            A durable transition writes a small JSON file holding leader, epoch and voted id to a temp file, fsyncs it and renames
+            it, which is what stops double voting after a crash (<code>FileQuorumStateStore.java:181-183</code>). A follower still
+            hearing its leader refuses to help depose it. <code>raft/…/FollowerState.java:234-237</code>:
+          </p>
+<pre><code>    public boolean canGrantVote(ReplicaKey replicaKey, boolean isLogUpToDate, boolean isPreVote) {
+        if (isPreVote &amp;&amp; !hasFetchedFromLeader &amp;&amp; isLogUpToDate) {
+            return true;
+        }</code></pre>
+
+          <h3>Commit, and the one log that syncs</h3>
+          <p>
+            A fetch offset is an ack again (<code>KafkaRaftClient.java:1632-1635</code>). The difference is one call, and it is why
+            <a href="../the-log/#p1-append">Part 1's shim</a> counted 49 fsyncs on this log and one on the data log.
+            <code>raft/…/KafkaRaftClient.java:1849-1855</code>:
+          </p>
+<pre><code>        if (quorum.isVoter() || canBecomeVoter) {
+            // the leader only requires that voters have flushed their log before sending a Fetch
+            // request. Because of reconfiguration some observers (that are getting added to the
+            // voter set) need to flush the disk because the leader may assume that they are in the
+            // set of voters.
+            log.flush(false);
+        }</code></pre>
+          <p>
+            So on this log the next fetch offset is a durability claim. The leader flushes its own batches right after appending
+            (<code>:677-679</code>). And the line is a majority, not a minimum. <code>raft/…/LeaderState.java:660-680</code>:
+          </p>
+<pre><code>    private boolean maybeUpdateHighWatermark() {
+        // Find the largest offset which is replicated to a majority of replicas (the leader counts)
+        ArrayList&lt;ReplicaState&gt; followersByDescendingFetchOffset = followersByDescendingFetchOffset()
+            .collect(Collectors.toCollection(ArrayList::new));
+
+        int indexOfHw = voterStates.size() / 2;
+        Optional&lt;LogOffsetMetadata&gt; highWatermarkUpdateOpt = followersByDescendingFetchOffset.get(indexOfHw).endOffset;
+
+        if (highWatermarkUpdateOpt.isPresent()) {
+
+            // The KRaft protocol requires an extra condition on commitment after a leader
+            // election. The leader must commit one record from its own epoch before it is
+            // allowed to expose records from any previous epoch. This guarantees that its
+            // log will contain the largest record (in terms of epoch/offset) in any log
+            // which ensures that any future leader will have replicated this record as well
+            // as all records from previous epochs that the current leader has committed.
+
+            LogOffsetMetadata highWatermarkUpdateMetadata = highWatermarkUpdateOpt.get();
+            long highWatermarkUpdateOffset = highWatermarkUpdateMetadata.offset();
+
+            if (highWatermarkUpdateOffset &gt; epochStartOffset) {</code></pre>
+          <p>
+            That rule is why every new leader writes a control record at once, the <code>LeaderChange</code> that opens each epoch
+            (<code>KafkaRaftClient.java:667-670</code>). Here are the first bytes of a dynamic quorum's log
+            (<code>exp5_dynamic.sh</code>; real bytes, loopback) <span class="recon">measured here</span>:
+          </p>
+<pre><code>00000000  00 00 00 00 00 00 00 00 00 00 00 a2 00 00 00 01   ................
+00000010  02 bf 44 83 72 00 20 00 00 00 02 00 00 01 a1 b1   ..D.r. .........
+00000020  b6 5d 85 00 00 01 a1 b1 b6 5d 85 ff ff ff ff ff   .].......]......
+00000030  ff ff ff ff ff ff ff ff ff 00 00 00 03 3a 00 00   .............:..</code></pre>
+          <p>
+            It is the <a href="../the-log/#p1-batch">batch from Part 1</a>. Base offset 0, length <code>0xa2</code> = 162, partition
+            leader epoch 1, which here is the Raft epoch, magic 2. Attributes <code>0x0020</code> at <code>0x15</code> is the
+            control bit. Producer id, epoch and sequence are all -1. Record count 3 at <code>0x39</code>: control types 2, 5 and 6,
+            which are <code>LEADER_CHANGE</code>, <code>KRAFT_VERSION</code> and <code>KRAFT_VOTERS</code>.
+          </p>
+
+          <h3>The controller on top</h3>
+          <p>
+            The controller is a state machine on one event thread. It replays its own records into memory before Raft has them, and
+            any failure there is fatal. <code>metadata/…/controller/QuorumController.java:828-852</code>:
+          </p>
+<pre><code>                        // Start by trying to apply the record to our in-memory state. This should always
+                        // succeed; if it does not, that's a fatal error. It is important to do this before
+                        // scheduling the record for Raft replication.
+                        int recordIndex = 0;
+                        long lastOffset = raftClient.prepareAppend(controllerEpoch, records);
+                        long baseOffset = lastOffset - records.size() + 1;
+                        for (ApiMessageAndVersion message : records) {
+                            long recordOffset = baseOffset + recordIndex;
+                            try {
+                                replay(message.message(), Optional.empty(), recordOffset);
+                            } catch (Throwable e) {
+                                String failureMessage = String.format("Unable to apply %s " +
+                                    "record at offset %d on active controller, from the " +
+                                    "batch with baseOffset %d",
+                                    message.message().getClass().getSimpleName(),
+                                    recordOffset, baseOffset);
+                                throw fatalFaultHandler.handleFault(failureMessage, e);
+                            }
+                            recordIndex++;
+                        }
+                        raftClient.schedulePreparedAppend();
+                        offsetControl.handleScheduleAppend(lastOffset);
+                        return lastOffset;
+                    }
+                );</code></pre>
+          <p>
+            The write's future then waits in a deferred queue keyed by offset, so an admin success means committed
+            (<code>:860-862</code>, <code>:170-171</code>). Losing leadership rolls a snapshot registry back to the last stable offset,
+            with no log read (<code>:1123</code>). Standbys replay each committed batch as it arrives, which is why they are
+            hot (<code>:993-1012</code>).
+          </p>
+
+          <h3>Every broker is a reader</h3>
+          <p>
+            No controller-to-broker <code>LeaderAndIsr</code> RPC exists. A broker's <code>MetadataLoader</code> packages committed
+            records into an image; the publisher swaps one volatile reference, then tells <code>ReplicaManager</code> the delta
+            (<code>BrokerMetadataPublisher.scala:130-148</code>). A decoded log is plain to read
+            (<code>kafka-dump-log.sh --cluster-metadata-decoder</code>) <span class="recon">measured here</span>:
+          </p>
+<pre><code>| offset: 22 ... payload: {"type":"BROKER_REGISTRATION_CHANGE_RECORD","version":0,"data":{"brokerId":2,"brokerEpoch":10,"fenced":-1}}
+| offset: 55 ... payload: {"type":"TOPIC_RECORD","version":0,"data":{"name":"registry","topicId":"ybHiwpZ4T4uom9SjvS1ejQ"}}
+| offset: 57 ... payload: {"type":"CLEAR_ELR_RECORD","version":0,"data":{"topicName":"registry"}}</code></pre>
+          <p>
+            A broker's epoch is its registration record's offset; here epoch 10 sits at offset 10. <code>"fenced":-1</code> means
+            unfenced. On an idle cluster 65 of 93 records were <code>NO_OP_RECORD</code>, at a median 500 ms gap. Each node writes
+            its own snapshots, by default at 20 MiB or 1 hour, and a new replica is sent to a snapshot even if the log still reaches
+            offset 0 (<code>KafkaRaftClient.java:1622-1625</code>); a real new broker did exactly that.
+          </p>
+          <p>
+            Inspecting this has edges. The metadata shell shows <code>image</code> and <code>local</code> at the root, not the layout in
+            the docs (<a href="../transactions/#D23">D23</a>). It reports a snapshot's internal offset as provenance, refuses live directories, and logs ERROR for
+            normal control records (<a href="../transactions/#D73">D73</a>). Config docs drift too:
+            <code>election.timeout.ms</code> is documented with the fetch timeout's meaning (<a href="../transactions/#D25">D25</a>) and <code>election.backoff.max.ms</code>
+            as a binary exponential backoff against gridlock, when in code it is only read on graceful resignation (<a href="../transactions/#D26">D26</a>). Also in the register are the class comment (<a href="../transactions/#D27">D27</a>),
+            the format-time sentence (<a href="../transactions/#D28">D28</a>), KIP status pages (<a href="../transactions/#D29">D29</a>) and <code>addAt</code> (<a href="../transactions/#D72">D72</a>).
+          </p>
+
+          <h2 id="p3-failover"><span class="secnum">07</span>Losing a controller</h2>
+          <p>
+            Timers default low on purpose: election 1000 ms, fetch 2000 ms, and the comment says standbys are hot, so leader
+            change is cheap (<code>raft/…/QuorumConfig.java:48-49</code>, <code>:77-104</code>). The election timeout is randomised
+            in [T, 2T) (<code>QuorumState.java:748</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Three dedicated controllers, two brokers, default timers, milliseconds after the signal, from the first matching log
+            line on a surviving controller (<code>exp2_failover.sh</code>, <code>exp2b_probe_fence.sh</code>)
+            <span class="recon">measured here</span>:
+          </p>
+
+          <figure class="figure" id="fig-failover">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">Failover by signal: the fetch timer against everything after it</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 704 320" role="img" aria-label="Stacked bars for 11 failover rounds. SIGKILL rounds reach an active controller in 1885 to 2619 milliseconds, most of it the fetch timeout. SIGSTOP takes 2103. SIGTERM rounds take 527 to 610, with almost no fetch-timer wait.">
+                <rect x="20" y="10" width="12" height="12" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="38" y="21" class="svg-sub">fetch timeout fires</text>
+                <rect x="193" y="10" width="12" height="12" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="211" y="21" class="svg-sub">to candidate</text>
+                <rect x="317" y="10" width="12" height="12" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="335" y="21" class="svg-sub">to leader</text>
+                <rect x="420" y="10" width="12" height="12" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="438" y="21" class="svg-sub">to active</text>
+                <text x="20" y="49" class="svg-sub">SIGKILL kill2</text>
+                <rect x="140.0" y="36" width="337.5" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="477.5" y="36" width="5.2" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="482.8" y="36" width="28.7" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="511.5" y="36" width="35.3" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="554.8" y="50" class="svg-step">2337 ms</text>
+                <text x="20" y="73" class="svg-sub">SIGKILL kill3</text>
+                <rect x="140.0" y="60" width="314.2" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="454.2" y="60" width="5.9" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="460.1" y="60" width="17.2" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="477.4" y="60" width="34.5" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="519.8" y="74" class="svg-step">2136 ms</text>
+                <text x="20" y="97" class="svg-sub">SIGKILL kill4</text>
+                <rect x="140.0" y="84" width="295.2" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="435.2" y="84" width="10.4" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="445.7" y="84" width="19.7" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="465.3" y="84" width="35.5" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="508.9" y="98" class="svg-step">2073 ms</text>
+                <text x="20" y="121" class="svg-sub">SIGKILL kill5</text>
+                <rect x="140.0" y="108" width="276.4" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="416.4" y="108" width="10.6" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="427.0" y="108" width="9.6" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="436.6" y="108" width="31.5" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="476.1" y="122" class="svg-step">1885 ms</text>
+                <text x="20" y="145" class="svg-sub">SIGKILL 2b-1</text>
+                <rect x="140.0" y="132" width="353.0" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="493.0" y="132" width="16.9" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="509.9" y="132" width="34.1" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="544.0" y="132" width="51.9" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="603.9" y="146" class="svg-step">2619 ms</text>
+                <text x="20" y="169" class="svg-sub">SIGKILL 2b-2</text>
+                <rect x="140.0" y="156" width="330.4" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="470.4" y="156" width="27.9" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="498.2" y="156" width="47.9" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="546.1" y="156" width="37.9" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="592.1" y="170" class="svg-step">2551 ms</text>
+                <text x="20" y="193" class="svg-sub">SIGKILL 2b-3</text>
+                <rect x="140.0" y="180" width="322.7" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="462.7" y="180" width="14.3" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="477.0" y="180" width="29.4" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="506.4" y="180" width="22.8" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="537.2" y="194" class="svg-step">2236 ms</text>
+                <text x="20" y="225" class="svg-sub">SIGSTOP</text>
+                <rect x="140.0" y="212" width="298.5" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="438.5" y="212" width="11.8" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="450.4" y="212" width="34.6" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="485.0" y="212" width="21.1" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="514.1" y="226" class="svg-step">2103 ms</text>
+                <text x="20" y="257" class="svg-sub">SIGTERM term1</text>
+                <rect x="140.0" y="244" width="46.5" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="186.5" y="244" width="8.2" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="194.7" y="244" width="17.1" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="211.7" y="244" width="34.5" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="254.2" y="258" class="svg-step">610 ms</text>
+                <text x="20" y="281" class="svg-sub">SIGTERM term2</text>
+                <rect x="140.0" y="268" width="25.4" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="165.4" y="268" width="4.4" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="169.8" y="268" width="27.3" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="197.1" y="268" width="40.4" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="245.5" y="282" class="svg-step">560 ms</text>
+                <text x="20" y="305" class="svg-sub">SIGTERM term3</text>
+                <rect x="140.0" y="292" width="40.2" height="18" rx="2" fill="#f7e3c8" stroke="#d98226"/>
+                <rect x="180.2" y="292" width="14.8" height="18" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <rect x="195.0" y="292" width="12.4" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="207.4" y="292" width="24.4" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="239.7" y="306" class="svg-step">527 ms</text>
+                <line x1="140" y1="32" x2="140" y2="316" stroke="#b8b8b1" stroke-width="1"/>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Loopback on a loaded shared box: relative only, and any single row is good to about half a second. Each row is one
+              round. Two more were excluded: one lost its log to the hourly roll, and one has a recorded T0 later than the
+              JVM's own SIGTERM line, which is not explained.
+            </p>
+          </figure>
+
+          <p>
+            After SIGKILL, a follower's fetch timer fired 1.6 to 2.0 s later and a new controller was active 1.9 to 2.6 s after the
+            kill, over 7 usable rounds. Fetch timeout to leader took 116 to 435 ms. The wait for the timer is most of it. SIGSTOP
+            looks the same to followers, at 2.1 s: a pause longer than the fetch timeout costs leadership.
+          </p>
+          <p>
+            SIGTERM took 527 to 610 ms, about a quarter of a kill. A graceful resignation sends <code>EndQuorumEpoch</code>, which
+            shortens each follower's fetch timer by its rank, and the best-replicated voter starts at once
+            (<code>KafkaRaftClient.java:1305-1313</code>). That removes the fetch timeout from the sum.
+          </p>
+          <p>
+            A leader has its own detector. With both followers stopped, it logged the check-quorum expiry about 3.25 s after the
+            SIGSTOP. That matches 1.5 × fetch timeout (<code>LeaderState.java:153</code>), not the fetch timeout the config doc names
+            (<a href="../transactions/#D24">D24</a>, class C, still at trunk <code>09f2dc1320</code>).
+          </p>
+          <p>
+            What a client saw: an alter-config loop through a broker got its first success 2.4 to 2.8 s after each SIGKILL, with one
+            failed call per round. That failure is the probe's own 1500 ms request timeout, not a count of lost writes. A SIGKILLed
+            broker was fenced 8.2 to 9.0 s after the kill, and a SIGSTOPped one 9.7 s after, inside the 7 to 10.1 s window the session,
+            heartbeat and sweep predict. A SIGCONTed broker came back in the same epoch within 22 ms; a restarted one
+            re-registered with a new epoch. A pause does not cost a registration, and a restart does. No iptables here, so SIGSTOP
+            stands in for a silent peer, not for an asymmetric partition.
+          </p>
+          <p>
+            The KIPs match the code on intent, and lag it on status. KIP-595 states the pull design and the reason for
+            <code>BeginQuorumEpoch</code>. KIP-996 states the pre-vote rule, and its page still says "Implementing". KIP-631's timeouts
+            differ from the code's, and code wins (<a href="../transactions/#D29">D29</a>). KIP-833 marked KRaft
+            production-ready for new clusters in 3.3.
+          </p>
+
+          <h2 id="p3-quorum"><span class="secnum">08</span>Losing the quorum</h2>
+          <p>
+            Kill two of three controllers and the log that decides everything stops moving. The data plane does not stop. Existing
+            leaders and ISRs need no controller for the normal path, because the line in <a href="#p3-ladder">§01</a> moves on fetches.
+            Every state change stops, and that reaches further than it first looks.
+          </p>
+          <p>
+            A broker has no self-fencing. A failed heartbeat just schedules another (<code>BrokerLifecycleManager.java:623-635</code>).
+            It finds the controller by asking its Raft client who leads, and with no leader it has no controller node
+            (<code>RaftControllerNodeProvider.java:61-65</code>) <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-no-quorum">
+            <div class="figure-head">
+              <span class="figure-label">Figure 9</span>
+              <p class="figure-title">What still works with no quorum, and what a dead broker adds</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Operation</th><th>2 of 3 controllers dead</th><th>Plus a dead broker</th></tr></thead>
+                <tbody>
+                  <tr><td><code>acks=1</code>, live leader</td><td style="background: var(--green-soft)">Works: offset returned</td><td style="background: var(--orange-soft)">Acked but invisible: HW stays at 8, offsets 8 and 9 acked</td></tr>
+                  <tr><td><code>acks=all</code>, non-idempotent</td><td style="background: var(--green-soft)">Works: offset returned</td><td style="background: var(--orange-soft)">Stalls, then <code>TimeoutException</code> at 8004 ms; two copies written</td></tr>
+                  <tr><td>Produce to a partition the dead broker led</td><td>Not applicable</td><td style="background: var(--red-soft)">Fails: <code>TimeoutException</code> at 8001 ms</td></tr>
+                  <tr><td>First idempotent producer on the cluster</td><td style="background: var(--orange-soft)">Stalls: pending 210 s of an 8 s timeout, until the PID arrived</td><td>Not separately run</td></tr>
+                  <tr><td>New idempotent producer, a broker holds a block</td><td style="background: var(--green-soft)">Works: offset returned</td><td>Not run</td></tr>
+                  <tr><td><code>describeTopics</code></td><td style="background: var(--green-soft)">Works, from the broker's image</td><td style="background: var(--orange-soft)">Works, and still names the dead broker as leader and in the ISR</td></tr>
+                  <tr><td>Assign-mode consumer, no group</td><td style="background: var(--green-soft)">Works</td><td>Reads up to the frozen HW: 8 records</td></tr>
+                  <tr><td>First-ever consumer group</td><td style="background: var(--red-soft)">Fails: <code>__consumer_offsets</code> cannot be created</td><td>Not run</td></tr>
+                  <tr><td>Create topic</td><td style="background: var(--red-soft)">Fails: <code>TimeoutException</code></td><td>Not run</td></tr>
+                  <tr><td>ISR shrink, fencing</td><td>Nothing to do yet</td><td style="background: var(--red-soft)">Cannot happen: nobody can write the change</td></tr>
+                  <tr><td>Broker restart</td><td>Not run separately; same deadline by code</td><td style="background: var(--red-soft)">Exits: the dead broker, restarted, took 60 s from STARTING to shutdown</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Topic <code>min.insync.replicas=2</code>, replication factor 2 on brokers 11 and 12, <code>delivery.timeout.ms=8000</code>
+              (<code>exp3_quorumloss.sh</code>, with the hang re-run in <code>verify-b/q_rerun.sh</code>). Single runs on loopback.
+              <span class="recon">measured here</span>
+            </p>
+          </figure>
+
+          <p>
+            With a controller alive, fencing is a sweep. Heartbeats update a lock-free contact-time map from the request handler
+            thread, so a backlogged controller cannot make a healthy broker look dead. The sweep samples eight times per session, for
+            at most 112.5% of the session timeout, 10,125 ms by default, and fences one broker per pass
+            (<code>QuorumController.java:1987-1989</code>, <code>:1681-1689</code>). All of that is a controller writing records. With no
+            quorum, none of it can land.
+          </p>
+
+          <h3>A line of acked writes nobody can see</h3>
+          <p>
+            Killing a broker with no quorum freezes the view of the cluster. A leader cannot shrink the ISR without the controller,
+            so the HW cannot pass the dead follower, and <code>acks=1</code> keeps acking:
+          </p>
+<pre><code>1793983285876 prod p0 acks=1 OK offset=9 6
+1793983288610 prod p0 acks=allni TimeoutException: Expiring 1 record(s) for q-0:8004 ms has passed since batch creation. ...
+1793983299724 prod p1 acks=1 TimeoutException: Expiring 1 record(s) for q-1:8001 ms has passed since batch creation. ...
+q:0:8</code></pre>
+          <p>
+            <code>q:0:8</code> is the HW, with offset 9 acked above it. After quorum returned with the follower still dead, the HW
+            stayed frozen, now by the below-min-ISR gate. It moved only when the follower rejoined, and the acked records then
+            became readable: held, not lost, in this run (<a href="../transactions/#D68">D68</a>, class D, confirmed by verifier). The non-idempotent send that
+            timed out also wrote two copies (request timeout 4 s, delivery 8 s), a count inferred from the offsets and one send.
+          </p>
+
+          <h3>A timeout that does not fire</h3>
+          <p>
+            A broker with no producer-ID block answers <code>InitProducerId</code> with a retriable error while it asks the
+            controller for one (<code>RPCProducerIdManager.java:97-100</code>). The Java producer's sender loop returns early while
+            that request is in flight or queued, and batch expiry lives in the step it skips
+            (<code>Sender.java:333-344</code>; <a href="../clients/#p4-idempotence">Part 4</a> reads it). So
+            <code>delivery.timeout.ms</code> cannot fire. From two re-runs, as logged, one line each (<code>verify-b/q-run1/</code>, <code>q-run2/</code>):
+          </p>
+<pre><code>+210398ms future.isDone=false
++105603ms callback FAILED TimeoutException: Expiring 1 record(s) for q-0:92904 ms has passed since batch creation.</code></pre>
+          <p>
+            1,943 round trips, all <code>errorCode=14</code>. Once a controller returned and the PID arrived, the record failed at
+            once. The doc calls the setting "An upper bound". This is <a href="../transactions/#D3">D3</a>, class A, a latent bug, still at trunk
+            <code>09f2dc1320</code>. No Jira matched two text searches, which is not proof none exists. franz-go failed at 27.9 s in one
+            run, for a reason not traced. librdkafka was not tested. By code <code>flush()</code> and no-arg <code>close()</code> wait on it too (not run), and only the no-block case was run. A broker that already holds a block passes the same test; on
+            this evidence blocks hold 1000 IDs.
+          </p>
+
+          <h3>The one way a broker gives up</h3>
+          <p>
+            A running broker keeps retrying. A starting one has a deadline.
+            <code>server/…/server/BrokerLifecycleManager.java:732-740</code>:
+          </p>
+<pre><code>    private class RegistrationTimeoutEvent implements EventQueue.Event {
+        @Override
+        public void run() {
+            if (!initialRegistrationSucceeded) {
+                logger.error("Shutting down because we were unable to register with the controller quorum.");
+                eventQueue.beginShutdown("registrationTimeout");
+            }
+        }
+    }</code></pre>
+          <p>
+            <code>initial.broker.registration.timeout.ms</code> is 60 s. Measured: exactly 60 s from STARTING to the shutdown line, and
+            the process exited 70.0 s after launch, about 10 s of it JVM start. It does not serve in those 60 s. A rolling restart during a
+            controller outage removes brokers that were serving (<a href="../transactions/#D69">D69</a>). A young
+            cluster is more exposed, since it cannot form a first consumer group or auto-create anything
+            (<a href="../transactions/#D70">D70</a>).
+          </p>
+
+          <h3>Coming back</h3>
+          <p>
+            The lone surviving voter cycled through Prospective 34 times in the first two minutes, and the epoch did not move: the next
+            leader, 4.5 minutes later, was epoch 2. That is pre-vote seen from outside. On restore, a broker dead for 4.5 minutes was
+            fenced 9.06 s after the new controller activated, not at once, because a new active controller gives every unfenced broker a
+            fresh session (<code>ClusterControlManager.java:315-323</code>; <a href="../transactions/#D71">D71</a>). The 13.7 s to
+            a leader in the run includes restarting a JVM and the polling tool, so it is not an election time.
+          </p>
+          <p>
+            A partition with no leader meets one more line in another log. <a href="../transactions/#p5-hang">Part 5</a> covers
+            KAFKA-20734 (<a href="../transactions/#D10">D10</a>), where a transaction marker has nowhere to go; it has no tagged fix as of 6 November 2026.
+          </p>
+
+          <h2 id="p3-sources"><span class="secnum">09</span>Sources</h2>
+          <ul>
+            <li><a href="https://github.com/apache/kafka/tree/4.4.0">apache/kafka 4.4.0</a> (<code>1156b2752aaa</code>): <code>core/</code>, <code>storage/</code>, <code>metadata/</code>, <code>raft/</code>, <code>server/</code>, <code>docs/</code>. Upstream checks against trunk <code>09f2dc1320</code>, read and never built.</li>
+            <li><a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas">KIP-966</a> § Motivation, § Unclean Recovery, Delivery plan; <a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-595%3A+A+Raft+Protocol+for+the+Metadata+Quorum">KIP-595</a>; <a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-996%3A+Pre-Vote">KIP-996</a>.</li>
+            <li>Lab evidence: <code>~/kafka-ref/lab/results/replication/</code>, <code>kraft/</code> and <code>verify-b/</code>.</li>
+          </ul>
+          <p>Re-running the lab, and the checks this box could not make (the last two were not run here):</p>
+<pre><code>./stall.sh default                     # frozen follower
+./c_leader_failure.sh                  # frozen and dead leader
+./e34_tail_loss.sh                     # the mock: truncate -s by hand
+bash lab/results/kraft/exp3_quorumloss.sh
+# real crash: E4's shape on three VMs, echo b &gt; /proc/sysrq-trigger
+#   within 30 s of the last acked write
+# partition: iptables -A INPUT -s &lt;peer&gt; -j DROP during exp2_failover.sh</code></pre>
+          <p class="footnote">
+            <strong>Provenance.</strong> Paths, lines and excerpts were re-read from the pinned checkout. Traces are real output from small clusters on
+            loopback on a shared 2-vCPU box; timings are relative, never capacity, and each scenario is a single run unless stated. Every loss count from a
+            tail cut is simulated damage on one host: <code>truncate -s</code> by hand stands in for lost page cache, 987 of 2,000 is a value set by the mock
+            and never a loss rate, and no real power cut was run. 8,731 is rate × freeze. Figure timelines and the Fetch exchange are mine, from the code.
+            Not verified: how much a real crash loses (<code>vm.dirty_*</code>, the filesystem); three dedicated voters; a scrape of
+            <code>UncleanLeaderElectionsPerSec</code>; a consumer past the new log end; ELR during a reassignment changing replication factor
+            (<a href="../transactions/#D67">D67</a>) or after changing min ISR; asymmetric partitions; snapshot scale; KIP-966 Part 2's release plan. Nothing was
+            reported upstream; the register is in <a href="../transactions/#p5-register">Part 5</a>.
+          </p>
+        </section>
+      </article>
+
+    </main>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <p>
+          <a href="../">Kafka, taken apart</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../the-log/">Part 1: The log on disk</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../the-wire/">Part 2: One request, on the wire and through the broker</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../clients/">Part 4: Producers and consumer groups</a>
+          <span aria-hidden="true"> · </span>
+          <a href="../transactions/">Part 5: Exactly-once, as it is</a>
+          <span aria-hidden="true"> · </span>
+          <a href="mailto:suraj@xo.builders">suraj@xo.builders</a>
+        </p>
+      </div>
+    </footer>
+    <script>
+      /*
+       * Inline copy of shared/paper.js — reading time, progress bar,
+       * floating TOC, contents rail, scroll-spy. Posts stay self-contained
+       * (a post never depends on the viewer); keep this in sync with
+       * shared/paper.js when that file changes. See AGENTS.md §5.
+       */
+(() => {
+  "use strict";
+
+  /* Reading time — #reading-time, computed from main's innerText. */
+  const readingTime = document.querySelector("#reading-time");
+  if (readingTime) {
+    const readingText = document.querySelector("main")?.innerText || "";
+    const wordCount = readingText.trim().split(/\s+/).filter(Boolean).length;
+    const roundedMinutes = Math.max(5, Math.round(wordCount / 225 / 5) * 5);
+    readingTime.textContent = `About ${roundedMinutes} minutes`;
+  }
+
+  const progress = document.querySelector(".progress");
+  const floatingToc = document.querySelector(".floating-toc");
+  const tocButton = floatingToc
+    ? floatingToc.querySelector(".toc-button")
+    : null;
+  const tocButtonLabel = floatingToc
+    ? floatingToc.querySelector(".toc-button-label")
+    : null;
+  const tocLinks = floatingToc
+    ? [...floatingToc.querySelectorAll(".toc-menu a")]
+    : [];
+  const contentsRail = document.querySelector(".contents-rail");
+  const railLinks = contentsRail
+    ? [...contentsRail.querySelectorAll("a")]
+    : [];
+  const contentsLinks = [...tocLinks, ...railLinks];
+  const introduction = document.querySelector("#introduction");
+
+  /* Floating TOC — open/close, Escape, click-outside, close on navigate. */
+  if (floatingToc && tocButton) {
+    const setTocOpen = (open) => {
+      floatingToc.classList.toggle("open", open);
+      tocButton.setAttribute("aria-expanded", String(open));
+    };
+
+    tocButton.addEventListener("click", () => {
+      setTocOpen(!floatingToc.classList.contains("open"));
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!floatingToc.contains(event.target)) setTocOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && floatingToc.classList.contains("open")) {
+        setTocOpen(false);
+        tocButton.focus();
+      }
+    });
+
+    tocLinks.forEach((link) => {
+      link.addEventListener("click", () => setTocOpen(false));
+    });
+  }
+
+  /*
+   * Progress bar + nav reveal, rAF-throttled. The bar width is set
+   * directly with no transition, so prefers-reduced-motion is honored
+   * as-is (paper.css additionally zeroes all transition durations under
+   * the reduced-motion media query).
+   */
+  if (progress || floatingToc || contentsRail) {
+    let ticking = false;
+
+    const updateScroll = () => {
+      ticking = false;
+      if (progress) {
+        const available = document.documentElement.scrollHeight - innerHeight;
+        progress.style.width =
+          (available > 0 ? (scrollY / available) * 100 : 0) + "%";
+      }
+      if (floatingToc) {
+        floatingToc.classList.toggle("visible", scrollY > 420);
+      }
+      if (contentsRail) {
+        const threshold = introduction ? introduction.offsetTop - 180 : 420;
+        contentsRail.classList.toggle("visible", scrollY > threshold);
+      }
+    };
+
+    addEventListener(
+      "scroll",
+      () => {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(updateScroll);
+      },
+      { passive: true },
+    );
+    updateScroll();
+  }
+
+  /*
+   * Scroll-spy — observe every element inside <main> (or body) whose id
+   * has a corresponding href="#<id>" link in the rail or TOC; highlight
+   * those links and update the TOC button label.
+   */
+  if (contentsLinks.length && "IntersectionObserver" in window) {
+    const linkedIds = new Set(
+      contentsLinks.map((link) => (link.hash || "").slice(1)).filter(Boolean),
+    );
+    const scope = document.querySelector("main") || document.body;
+    const spyTargets = [...scope.querySelectorAll("[id]")].filter((element) =>
+      linkedIds.has(element.id),
+    );
+
+    if (spyTargets.length) {
+      const sectionObserver = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort(
+              (a, b) => a.boundingClientRect.top - b.boundingClientRect.top,
+            );
+
+          if (!visible[0]) return;
+          const id = visible[0].target.id;
+
+          contentsLinks.forEach((link) => {
+            link.classList.toggle("active", link.hash === "#" + id);
+          });
+
+          const activeLink = tocLinks.find((link) => link.hash === "#" + id);
+          if (activeLink && tocButtonLabel) {
+            tocButtonLabel.textContent = activeLink.classList.contains(
+              "toc-parent",
+            )
+              ? activeLink.textContent
+              : "§ " + activeLink.textContent.replace(" · ", " ");
+          }
+        },
+        { rootMargin: "-14% 0px -72% 0px", threshold: 0 },
+      );
+
+      spyTargets.forEach((section) => sectionObserver.observe(section));
+    }
+  }
+})();
+    </script>
+  </body>
+</html>

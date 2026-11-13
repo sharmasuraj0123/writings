@@ -1,0 +1,129 @@
+          <h2 id="p3-promise"><span class="secnum">{{S}}</span>What the ack promises</h2>
+          <p>
+            That test is <code>Partition.checkEnoughReplicasReachOffset</code>, and it is everything an <code>acks=all</code>
+            success means. Two conditions: the HW has passed the record, and the maximal ISR is at least the effective min ISR
+            (<code>Partition.scala:969-979</code>). Neither mentions a disk. The design doc defines "committed" by the same two
+            conditions and states the guarantee in one sentence. <code>docs/design/design.md:309</code>: "The guarantee that Kafka
+            offers is that a committed message will not be lost, as long as there is at least one in sync replica alive, at all
+            times." <span class="src">from the code</span>
+          </p>
+          <p>
+            Read that test's other branch too. When the HW has passed but the ISR has since dropped below min, the answer is
+            <code>NOT_ENOUGH_REPLICAS_AFTER_APPEND</code>: an error, for a record that is committed. The exception is retriable,
+            which is a duplicate path without idempotence (<code>Errors.java:225</code>). The record is there; the client is told
+            otherwise. <a href="../transactions/#D55">D55</a> collects the cases.
+          </p>
+          <p>
+            Now the disk. By default Kafka never fsyncs on a timer or on a message count: both knobs default to
+            <code>Long.MAX_VALUE</code> (<code>ServerLogConfigs.java:101</code>, <code>:109</code>). The only flush in the append
+            path is the message-count check <a href="../the-log/#p1-append">Part 1 quotes</a>, and leader and follower appends
+            share it, so neither side syncs before an ack (<code>UnifiedLog.java:1300</code>). The follower half of that is code
+            reading plus the recovery points below; the fsync-counting shim ran at replication factor 1.
+          </p>
+          <p>
+            Two things do get fsynced by default: a rolled segment, asynchronously, on the scheduler, up to the new segment's base
+            offset; and everything, on clean shutdown (<code>UnifiedLog.java:2242-2245</code>). A real flush covers the log and
+            its offset, time and transaction indexes, then moves the recovery point (<code>LogSegment.java:631-634</code>)
+            <span class="src">from the code</span>. In the run counted in Part 1, about 15,573 records were acked into a topic
+            whose <code>.log</code> saw one fsync, from <code>kafka-scheduler</code>, for the roll, in a window of about 25 s with
+            <code>segment.bytes=8388608</code> and replication factor 1. At the 1 GiB default that window has no roll
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Here is the same thing at replication factor 3. Two topics, about 2,000 acked records each, and the checkpoint read 70
+            s later, past its 60 s interval. Topic <code>t</code> has defaults; <code>tf</code> has <code>flush.messages=1</code>
+            (<code>./a_hw_isr.sh</code>, one run) <span class="recon">measured here</span>:
+          </p>
+<pre><code>t+0184.0s HW t=t:0:2005  HW tf=tf:0:2000
+t+0184.0s n2 recovery-point: tf 0 2000 t 0 0
+t+0184.0s n3 recovery-point: tf 0 2000 t 0 0
+t+0184.0s n4 recovery-point: tf 0 2000 t 0 0</code></pre>
+          <p>
+            2,005 acknowledged records sat above a recovery point of 0 on all three replicas. <code>flush.messages=1</code> kept
+            the recovery point at the HW. The label matters: a recovery point of 0 shows Kafka did not flush. Kernel writeback may
+            still have written the bytes. That writeback runs on the kernel's clock, and no Kafka line records it. The HW checkpoint on
+            every replica did agree with the leader's HW, once its 5 s timer had fired.
+          </p>
+          <p>
+            That gives three lines on one partition, moved by three different actors. Fetches move the HW. The scheduler moves the
+            recovery point. The kernel moves the bytes, and tells nobody. <a href="../the-log/#p1-recovery">Part 1</a> shows what depends on the second: CRCs are
+            checked only above the recovery point.
+          </p>
+
+          <figure class="figure wide" id="fig-safe">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Where a record is safe, over time, with the HW and the recovery point tracked</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 346" role="img" aria-label="Timeline of one record: append to the leader page cache, fetched by followers, high watermark passes and the ack goes out, segment roll flushes it. Bytes survive a process kill from the append, a machine from the ack, all machines only from the flush. Kernel writeback runs independently throughout.">
+                <defs><marker id="fig-safe-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker></defs>
+                <text x="20" y="22" class="svg-lane">ONE RECORD, OVER TIME (NOT TO SCALE)</text>
+                <line x1="250" y1="62" x2="975" y2="62" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-safe-k)"/>
+                <line x1="280" y1="56" x2="280" y2="68" stroke="#252525" stroke-width="2"/>
+                <text x="278" y="38" class="svg-step">append</text>
+                <text x="278" y="52" class="svg-sub">leader page cache</text>
+                <line x1="430" y1="56" x2="430" y2="68" stroke="#252525" stroke-width="2"/>
+                <text x="428" y="38" class="svg-step">fetched</text>
+                <text x="428" y="52" class="svg-sub">follower page caches</text>
+                <line x1="590" y1="56" x2="590" y2="68" stroke="#252525" stroke-width="2"/>
+                <text x="588" y="38" class="svg-step">HW passes</text>
+                <text x="588" y="52" class="svg-sub">the ack goes out</text>
+                <line x1="810" y1="56" x2="810" y2="68" stroke="#252525" stroke-width="2"/>
+                <text x="808" y="38" class="svg-step">segment rolls</text>
+                <text x="808" y="52" class="svg-sub">async flush</text>
+                <text x="20" y="97" class="svg-step">Bytes in a file</text>
+                <text x="20" y="112" class="svg-sub">survive a process kill</text>
+                <rect x="280" y="86" width="695" height="28" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="288" y="105" class="svg-sub">a new leader may still lack them until the HW passes</text>
+                <text x="20" y="143" class="svg-step">Committed</text>
+                <text x="20" y="158" class="svg-sub">survives one machine</text>
+                <rect x="590" y="132" width="385" height="28" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="598" y="151" class="svg-sub">one replica losing half its log (mock): 0 lost</text>
+                <text x="20" y="189" class="svg-step">Flushed by Kafka</text>
+                <text x="20" y="204" class="svg-sub">survives all machines</text>
+                <rect x="810" y="178" width="165" height="28" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="818" y="197" class="svg-sub">on disk</text>
+                <text x="20" y="235" class="svg-step">Kernel writeback</text>
+                <text x="20" y="250" class="svg-sub">independent of Kafka</text>
+                <rect x="280" y="224" width="695" height="28" rx="2" fill="#ece6f3" stroke="#765b98" stroke-dasharray="5 3"/>
+                <text x="288" y="243" class="svg-sub" fill="#765b98">may write the bytes at any point here; no Kafka line records it</text>
+                <text x="20" y="281" class="svg-step">HW</text>
+                <line x1="280" y1="277" x2="590" y2="277" stroke="#b8b8b1" stroke-width="2"/>
+                <line x1="590" y1="277" x2="975" y2="277" stroke="#765b98" stroke-width="3"/>
+                <text x="288" y="294" class="svg-sub">below the record</text>
+                <text x="598" y="294" class="svg-sub" fill="#765b98">above the record</text>
+                <text x="20" y="321" class="svg-step">Recovery point</text>
+                <line x1="280" y1="317" x2="810" y2="317" stroke="#b8b8b1" stroke-width="2"/>
+                <line x1="810" y1="317" x2="975" y2="317" stroke="#765b98" stroke-width="3"/>
+                <text x="288" y="334" class="svg-sub">below the record; measured at 0 for 2,005 acked records</text>
+                <text x="818" y="334" class="svg-sub" fill="#765b98">above the record</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              The ack lands at the Committed lane, and the Flushed lane may not start for a long time. Which lane a failure tests decides
+              what it costs. The timeline's order is read from the code; it is a <span class="recon">reconstruction</span>, not a
+              timing. The one-replica result is <code>measured-vs-mock</code>: half a follower's file was cut by hand, one run.
+            </p>
+          </figure>
+
+          <h3>The design, not an oversight</h3>
+          <p>
+            None of this is hidden. <code>docs/operations/hardware-and-os.md:64</code>: "Note that durability in Kafka does not
+            require syncing data to disk, as a failed node will always recover from its replicas." Two lines on, <code>:66</code>:
+            "We recommend using the default flush settings which disable application fsync entirely." The register files this as
+            <a href="../transactions/#D41">D41</a>, class D, status intended. The design doc gives the cost of the
+            alternative as "two to three orders of magnitude" (<code>design.md:335</code>). That figure was not reproduced here.
+          </p>
+          <p>
+            "Will always recover" has an edge: it is not true when the failed node is elected before the others. That is
+            <a href="../transactions/#D18">D18</a>, class C, minor, because it falls outside the design doc's stated guarantee, and
+            its example, which §05 walks through, is <code>measured-vs-mock</code>. KIP-966's Motivation names the same scenario:
+            the last ISR member loses unflushed data, is re-elected, and followers truncate to it. Its next sentence states the
+            limit: "MinISR-1 tolerance to data loss unclean shutdown events".
+          </p>
+          <p>
+            So the ack is a statement about the HW. It moves on fetches, and fetches read page cache. Replication covers one
+            machine going away, not a window in which every copy loses its unflushed tail. How often that window opens on real
+            hardware was not measured here.
+          </p>

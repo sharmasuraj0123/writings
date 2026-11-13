@@ -1,0 +1,172 @@
+          <h2 id="p3-epochs"><span class="secnum">{{S}}</span>Forks and truncation</h2>
+          <p>
+            Replicas diverge when leadership moves. Kafka's answer is a number stamped in every batch: the leader epoch. Each
+            replica rebuilds its epoch-to-start-offset map from those stamps as it appends
+            (<code>UnifiedLog.java:1226-1229</code>). A new leader records its epoch's start offset as its current LEO, and
+            never truncates itself: everything up to its LEO becomes authoritative, including records never committed under the old
+            leader (<code>Partition.scala:636-638</code>, <code>:649</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            A follower of a new leader does not truncate first either. It keeps fetching from its LEO and carries its last epoch,
+            and the leader decides. If that epoch does not match the leader's cache, the leader returns an empty read plus a
+            diverging-epoch hint (<code>:1401-1408</code>). A diverging fetch does not count as progress
+            (<code>:1313</code>). An epoch's end offset is the start of the next higher epoch the leader knows
+            (<code>LeaderEpochFileCache.java:297</code>). The follower truncates to the lower of the two end offsets, or to an
+            intermediate point if it does not know that epoch, and asks again
+            (<code>AbstractFetcherThread.scala:634-641</code>). The truncating fetch applies no data, so the follower never exposes
+            a HW over bytes it is about to delete (<code>:357-359</code>). Purgatory does not delay any of it: a parked follower
+            fetch completes as soon as divergence is seen (<code>DelayedFetch.scala:109</code>).
+          </p>
+          <p>
+            Every epoch-bearing read also compares epochs: an older request is fenced, a newer one told to retry
+            (<code>Partition.scala:375-378</code>). A deposed leader finds out on its next request. That sentence is the whole
+            problem, as a frozen leader shows.
+          </p>
+
+          <h3>A frozen leader wakes up</h3>
+          <p>
+            <code>./c_leader_failure.sh</code>: leader SIGSTOPped for 29 s, with 300 msg/s offered to one topic at each
+            <code>acks</code> level, <code>min.insync.replicas=2</code>, one run <span class="recon">measured here</span>:
+          </p>
+<pre><code>acks=all: acked=13911 read_back=13911 acked_but_missing=0
+acks=1:   acked=13860 read_back=5129 acked_but_missing=8731 first_lost_offset=1645 last_lost_offset=10375
+[2026-11-06 17:05:55,985] INFO [UnifiedLog partition=c1-0, dir=/home/coder/kafka-ref/lab/scratch/replication/c/n2/data] Truncating to offset 1645 (org.apache.kafka.storage.internals.log.UnifiedLog)</code></pre>
+          <p>
+            Under <code>acks=all</code>, every acked value came back, and 49 in-flight sends failed with
+            <code>NotLeaderOrFollower</code>. Under <code>acks=1</code>, on SIGCONT the deposed leader appended and acked what the
+            producer had buffered for 29 s, then learned of the new leader and truncated all of it. 8,731 acked records
+            went. It wakes up still believing it leads, and the check that would tell it arrives after it has answered. The
+            deposed leader cut its <code>acks=all</code> topic too, at offset 1633, but those records had never been acked.
+          </p>
+          <p>
+            The two logs after truncation agree at the fork, batch by batch (<code>kafka-dump-log.sh --files</code> on n2 and n3,
+            columns trimmed):
+          </p>
+<pre><code>baseOffset: 1628 lastOffset: 1644 partitionLeaderEpoch: 0
+baseOffset: 1645 lastOffset: 1699 partitionLeaderEpoch: 1
+baseOffset: 1700 lastOffset: 1705 partitionLeaderEpoch: 1</code></pre>
+
+          <figure class="figure wide" id="fig-fork">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The fork: a deposed leader's epoch 0 tail, the Fetch exchange, and the cut at offset 1645</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 372" role="img" aria-label="Two replica logs share epoch 0 up to offset 1644. The deposed leader n2 has an epoch 0 tail from 1645 to 10375. New leader n3 has epoch 1 from 1645. A Fetch from n2 carries last epoch 0, n3 returns an empty read with a diverging epoch hint, and n2 truncates to 1645, then matches n3.">
+                <defs><marker id="fig-fork-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker><marker id="fig-fork-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker></defs>
+                <text x="20" y="22" class="svg-lane">BEFORE THE FETCH</text>
+                <text x="20" y="54" class="svg-step">n2, deposed</text>
+                <text x="20" y="70" class="svg-sub">woke from SIGSTOP</text>
+                <rect x="170" y="40" width="250" height="34" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="178" y="55" class="svg-sub">epoch 0</text>
+                <text x="178" y="69" class="svg-sub">... 1628-1644</text>
+                <rect x="420" y="40" width="540" height="34" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="428" y="55" class="svg-sub">epoch 0, acked while deposed</text>
+                <text x="428" y="69" class="svg-sub">1645 ... 10375</text>
+                <text x="20" y="110" class="svg-step">n3, new leader</text>
+                <text x="20" y="126" class="svg-sub">epoch 1 from 1645</text>
+                <rect x="170" y="96" width="250" height="34" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="178" y="111" class="svg-sub">epoch 0</text>
+                <text x="178" y="125" class="svg-sub">... 1628-1644</text>
+                <rect x="420" y="96" width="150" height="34" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="428" y="111" class="svg-sub">epoch 1</text>
+                <text x="428" y="125" class="svg-sub">1645-1699</text>
+                <rect x="570" y="96" width="150" height="34" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="578" y="111" class="svg-sub">epoch 1</text>
+                <text x="578" y="125" class="svg-sub">1700-1705 ...</text>
+                <text x="20" y="164" class="svg-lane">THE EXCHANGE</text>
+                <text x="20" y="188" class="svg-sub">n2 to n3</text>
+                <line x1="170" y1="184" x2="720" y2="184" stroke="#252525" stroke-width="2.2" marker-end="url(#fig-fork-k)"/>
+                <text x="176" y="178" class="svg-sub">Fetch: offset at n2's LEO, lastFetchedEpoch 0</text>
+                <text x="20" y="224" class="svg-sub">n3 to n2</text>
+                <line x1="720" y1="220" x2="170" y2="220" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-fork-b)"/>
+                <text x="176" y="214" class="svg-sub" fill="#3c6f97">empty read, diverging epoch 0, end offset 1645</text>
+                <text x="176" y="250" class="svg-sub">Does not count as progress. No data on this fetch.</text>
+                <text x="20" y="284" class="svg-lane">AFTER THE CUT</text>
+                <text x="20" y="316" class="svg-step">n2</text>
+                <text x="20" y="332" class="svg-sub">Truncating to 1645</text>
+                <rect x="170" y="302" width="250" height="34" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="178" y="317" class="svg-sub">epoch 0</text>
+                <text x="178" y="331" class="svg-sub">... 1628-1644</text>
+                <rect x="420" y="302" width="150" height="34" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="428" y="317" class="svg-sub">epoch 1</text>
+                <text x="428" y="331" class="svg-sub">1645-1699</text>
+                <rect x="570" y="302" width="150" height="34" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="578" y="317" class="svg-sub">epoch 1</text>
+                <text x="578" y="331" class="svg-sub">1700-1705 ...</text>
+                <rect x="720" y="302" width="240" height="34" rx="2" fill="#ffffff" stroke="#ad4b43" stroke-dasharray="4 3"/>
+                <text x="728" y="317" class="svg-sub" fill="#ad4b43">8,731 acked records gone</text>
+                <text x="728" y="331" class="svg-sub" fill="#ad4b43">10375 - 1645 + 1 = 8,731</text>
+                <line x1="420" y1="34" x2="420" y2="136" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3"/>
+                <line x1="420" y1="296" x2="420" y2="342" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3"/>
+                <text x="426" y="360" class="svg-sub" fill="#765b98">the fork at 1645: both checkpoints then read epoch 0 from 0, epoch 1 from 1645</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Offsets, epochs and batches are real, from the <code>acks=1</code> topic in one run. Both epoch checkpoints agree
+              afterwards: epoch 0 from offset 0, epoch 1 from 1645. The message order is read from the code, so the exchange is a
+              <span class="recon">reconstruction</span> around real numbers. Widths are not to scale.
+            </p>
+          </figure>
+
+          <figure class="figure" id="fig-acks-freeze">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title"><code>acks=1</code> and <code>acks=all</code>, same 29 s freeze</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 704 224" role="img" aria-label="Paired bars. acks=all acked 13,911, read back 13,911, lost 0. acks=1 acked 13,860, read back 5,129, lost 8,731.">
+                <text x="20" y="22" class="svg-lane">RECORDS, 29 s FREEZE, 300 msg/s OFFERED</text>
+                <text x="20" y="57" class="svg-step">acks=all</text>
+                <text x="110" y="57" class="svg-sub">acked</text>
+                <rect x="190" y="44" width="400.0" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="598.0" y="57" class="svg-step">13,911</text>
+                <text x="110" y="83" class="svg-sub">read back</text>
+                <rect x="190" y="70" width="400.0" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="598.0" y="83" class="svg-step">13,911</text>
+                <text x="110" y="109" class="svg-sub">lost</text>
+                <rect x="190" y="96" width="1.5" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="199.5" y="109" class="svg-step">0</text>
+                <text x="20" y="149" class="svg-step">acks=1</text>
+                <text x="110" y="149" class="svg-sub">acked</text>
+                <rect x="190" y="136" width="398.5" height="18" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="596.5" y="149" class="svg-step">13,860</text>
+                <text x="110" y="175" class="svg-sub">read back</text>
+                <rect x="190" y="162" width="147.5" height="18" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="345.5" y="175" class="svg-step">5,129</text>
+                <text x="110" y="201" class="svg-sub">lost</text>
+                <rect x="190" y="188" width="251.1" height="18" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="449.1" y="201" class="svg-step">8,731</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              8,731 is rate × freeze: 300 msg/s for 29 s is about 8,700 records. It is a dial, not a loss rate. The ledger tool ran
+              with <code>retries=0</code>, which also turns idempotence off. Single run.
+            </p>
+          </figure>
+
+          <p>
+            The effect has a window. It needs a pause over the 9 s session, so leadership moves, and under the 30 s request
+            timeout, so buffered sends are still live on waking. <a href="../transactions/#D64">D64</a> files it as class D:
+            a frozen leader is worse for <code>acks=1</code> than a dead one. Upstream status was not checked.
+          </p>
+          <p>
+            A dead leader, in the same harness: SIGKILL under load lost nothing in this run at either level, because the surviving
+            followers already held the acked records. The <code>acks=1</code> zero is one sample, not a guarantee. It also delayed
+            clients less. The longest ack gap was 8.9 s after SIGKILL against about 29 s frozen, even though the controller had
+            moved leadership by the first sample after 18 s. A closed socket is news, and a silent one is not.
+          </p>
+          <p>
+            The SIGKILL run shows the mirror image of loss as well: under <code>acks=all</code>, 26,249 acked and 26,252 read back. An
+            error at the client does not mean the record is absent.
+          </p>
+          <p>
+            One edge to carry into the next section. Truncating below a broker's own HW is neither refused nor raised as an error.
+            The log writes a warning and proceeds, and the HW drops with the log (<code>:2396-2397</code>).
+            <code>storage/…/log/UnifiedLog.java:2370-2371</code>:
+          </p>
+<pre><code>                    if (targetOffset &lt; hwm) {
+                        logger.warn("Truncating {}{} to offset {} below high watermark {}", isFuture() ? "future " : "", topicPartition(), targetOffset, hwm);</code></pre>
+          <p>
+            That one line, on the truncating broker, can be the only trace left (<a href="../transactions/#D65">D65</a>).
+          </p>

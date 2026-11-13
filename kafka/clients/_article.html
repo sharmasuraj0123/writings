@@ -1,0 +1,1173 @@
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from the pinned sources, cited as
+              <code>repo/path:line</code>: Apache Kafka 4.4.0 (<code>1156b275</code>), librdkafka v2.16.0
+              (<code>c6c9973c</code>) and franz-go (<code>123ec885</code>). Short prefixes stand for long paths under
+              <code>kafka/</code>: <code>producer/</code> and <code>consumer/</code> are the two packages in
+              <code>clients/src/main/java/org/apache/kafka/clients/</code>; <code>log/</code> is
+              <code>storage/src/main/java/org/apache/kafka/storage/internals/log/</code>; <code>group/</code> is
+              <code>group-coordinator/src/main/java/org/apache/kafka/coordinator/group/</code>. <code>common/</code> sits beside
+              <code>clients/</code> in the same tree, and a <code>…</code> elides a module's source root. A bare file name was cited in full earlier.
+              <span class="recon">measured here</span> marks output from the research box: real Java 4.4.0 clients and a
+              franz-go build against live brokers, all on loopback on a shared 2-vCPU machine. Timings show relative
+              behaviour, never capacity. Faults injected through a proxy are named as such. Each scenario is a single run
+              unless a count is given. librdkafka was read, never run, so its figures are computed. Trunk was read, never built.
+              <span class="recon">reconstruction</span> marks a judgement or a drawing made from those sources rather than
+              read in one place.
+            </p>
+            <p>
+              This is Part 4 of 5 of <a href="../">Kafka, taken apart</a>. <a href="../the-log/">Part 1</a> reads the log on
+              disk; <a href="../the-wire/">Part 2</a> follows one request through the broker;
+              <a href="../replication/">Part 3</a> covers what an ack promises, replication and the metadata quorum;
+              <a href="../transactions/">Part 5</a> covers exactly-once, and ends with the findings register.
+            </p>
+          </div>
+
+          <h2 id="p4-threads"><span class="secnum">01</span>Two threads around a queue</h2>
+          <p class="lede">
+            Producer and consumer guarantees stop at sessions and retries. Idempotence depends on broker state that can be
+            absent or expired, and a consumer's position describes what was handed over, not what was finished. KIP-848 trades
+            best-case speed for isolating a slow member. This collection reads Kafka as one append-only log used five times,
+            with each promise a line in such a log. <a href="../the-log/">Part 1</a> read that log,
+            <a href="../the-wire/">Part 2</a> carried a request to it, and <a href="../replication/">Part 3</a> read what an ack
+            says. This part reads the clients at either end. <a href="../transactions/">Part 5</a> picks up where idempotence
+            runs out.
+          </p>
+          <p>
+            Start with <code>send()</code>. It does not send. It runs on the caller's thread, hands bytes to an in-memory
+            queue, and returns a future. One background thread, the <code>Sender</code>, does all the network work
+            (<code>producer/KafkaProducer.java:1110-1126</code>, <code>:513-515</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            The order inside <code>doSend</code> is fixed: wait for metadata, serialize the key, serialize the value, choose a
+            partition, check the size, append (<code>KafkaProducer.java:1069-1105</code>). So your serializer and any custom
+            partitioner run on your thread. The queue is the <code>RecordAccumulator</code>: one
+            <code>ArrayDeque&lt;ProducerBatch&gt;</code> per partition, and each deque is its own lock
+            (<code>producer/internals/RecordAccumulator.java:320-321</code>). Appends and the Sender's checks contend per partition,
+            not globally.
+          </p>
+
+          <figure class="figure wide" id="fig-threads">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">The two threads, with the deques between them</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 470" role="img" aria-label="The application thread on the left waits for metadata, serializes, chooses a partition and appends to per-partition deques in the middle. The Sender thread on the right finds ready nodes, drains one batch per partition, expires batches and sends. max.block.ms covers the metadata and buffer waits. linger.ms applies to the head batch of each deque. Callbacks run on the Sender thread.">
+                <defs>
+                  <marker id="fig-threads-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-threads-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-threads-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">APPLICATION THREAD</text>
+                <text x="360" y="24" class="svg-lane">RECORDACCUMULATOR</text>
+                <text x="760" y="24" class="svg-lane">SENDER THREAD (ONE)</text>
+
+                <!-- application column -->
+                <rect x="20" y="40" width="270" height="48" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="32" y="60" class="svg-step">Wait for metadata</text>
+                <text x="32" y="77" class="svg-sub">subtracted from max.block.ms</text>
+                <rect x="20" y="100" width="270" height="48" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="32" y="120" class="svg-step">Serialize key, then value</text>
+                <text x="32" y="137" class="svg-sub">your code, your thread</text>
+                <rect x="20" y="160" width="270" height="48" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="32" y="180" class="svg-step">Choose a partition, check the size</text>
+                <text x="32" y="197" class="svg-sub">custom partitioner runs here</text>
+                <rect x="20" y="220" width="270" height="48" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="32" y="240" class="svg-step">Append (may wait for a buffer)</text>
+                <text x="32" y="257" class="svg-sub">the rest of max.block.ms</text>
+                <line x1="155" y1="88" x2="155" y2="100" stroke="#252525" stroke-width="2" marker-end="url(#fig-threads-ctl)"/>
+                <line x1="155" y1="148" x2="155" y2="160" stroke="#252525" stroke-width="2" marker-end="url(#fig-threads-ctl)"/>
+                <line x1="155" y1="208" x2="155" y2="220" stroke="#252525" stroke-width="2" marker-end="url(#fig-threads-ctl)"/>
+                <line x1="155" y1="268" x2="155" y2="286" stroke="#252525" stroke-width="2" marker-end="url(#fig-threads-ctl)"/>
+                <rect x="20" y="286" width="270" height="48" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="32" y="306" class="svg-step">send() returns a future</text>
+                <text x="32" y="323" class="svg-sub">nothing has crossed a socket</text>
+                <text x="20" y="356" class="svg-note">The orange waits share one budget: max.block.ms,</text>
+                <text x="20" y="374" class="svg-note">60 s. Serializer and partitioner time is not counted.</text>
+
+                <!-- deques -->
+                <rect x="350" y="40" width="370" height="248" rx="6" fill="#f7f7f5" stroke="#deded9"/>
+                <text x="364" y="66" class="svg-sub">partition 0</text>
+                <rect x="448" y="50" width="62" height="28" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="516" y="50" width="62" height="28" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="584" y="50" width="122" height="28" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="594" y="68" class="svg-sub">head: closed</text>
+                <text x="364" y="116" class="svg-sub">partition 1</text>
+                <rect x="584" y="100" width="122" height="28" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="594" y="118" class="svg-sub">head: lingering</text>
+                <text x="364" y="166" class="svg-sub">partition 2</text>
+                <rect x="516" y="150" width="62" height="28" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <rect x="584" y="150" width="122" height="28" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="594" y="168" class="svg-sub">head</text>
+                <text x="364" y="204" class="svg-note">One deque per partition, each its own lock.</text>
+                <text x="364" y="222" class="svg-note">The head leaves when full, or after linger.ms (5 ms) from creation.</text>
+                <rect x="364" y="234" width="342" height="42" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="376" y="252" class="svg-step">BufferPool</text>
+                <text x="376" y="268" class="svg-sub">buffer.memory 32 MiB, free list of batch.size</text>
+
+                <!-- data edge: append to deques -->
+                <polyline points="290,234 332,234 332,114 348,114" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-threads-data)"/>
+                <text x="294" y="226" class="svg-sub" style="fill:#3c6f97">bytes</text>
+
+                <!-- wake edge -->
+                <path d="M290,258 C340,340 620,340 758,322" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-threads-ctl)"/>
+                <text x="424" y="358" class="svg-sub" style="fill:#252525">wakeup only if a batch filled or a new one began</text>
+
+                <!-- sender column -->
+                <rect x="760" y="40" width="300" height="48" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="772" y="60" class="svg-step">ready: which nodes have a sendable head?</text>
+                <text x="772" y="77" class="svg-sub">the test is in the next section</text>
+                <rect x="760" y="100" width="300" height="48" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="772" y="120" class="svg-step">client.ready: drop unconnected, saturated</text>
+                <text x="772" y="137" class="svg-sub">5 in flight per connection</text>
+                <rect x="760" y="160" width="300" height="48" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="772" y="180" class="svg-step">drain: at most one batch per partition</text>
+                <text x="772" y="197" class="svg-sub">sequence numbers assigned here</text>
+                <rect x="760" y="220" width="300" height="48" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="772" y="240" class="svg-step">expire batches past delivery.timeout.ms</text>
+                <text x="772" y="257" class="svg-sub">after drain, before send, same pass</text>
+                <rect x="760" y="280" width="300" height="48" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="772" y="300" class="svg-step">send, then client.poll</text>
+                <text x="772" y="317" class="svg-sub">one Produce per node</text>
+                <line x1="910" y1="88" x2="910" y2="100" stroke="#252525" stroke-width="2" marker-end="url(#fig-threads-ctl)"/>
+                <line x1="910" y1="148" x2="910" y2="160" stroke="#252525" stroke-width="2" marker-end="url(#fig-threads-ctl)"/>
+                <line x1="910" y1="208" x2="910" y2="220" stroke="#252525" stroke-width="2" marker-end="url(#fig-threads-ctl)"/>
+                <line x1="910" y1="268" x2="910" y2="280" stroke="#252525" stroke-width="2" marker-end="url(#fig-threads-ctl)"/>
+                <polyline points="720,184 758,184" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-threads-data)"/>
+
+                <!-- callback edge -->
+                <path d="M880,328 C860,430 500,430 292,318" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-threads-state)"/>
+                <text x="424" y="448" class="svg-sub" style="fill:#765b98">callbacks fire in append order, on the Sender thread: a slow one stalls every partition</text>
+              </svg>
+            </div>
+            <p class="figure-caption">Drawn from the code. Thin blue is data, thick black is control, dashed purple is an effect. The queue is the boundary: everything left of it blocks your thread, everything right of it runs on one thread shared by all partitions. <span class="recon">reconstruction</span></p>
+          </figure>
+
+          <p>
+            <code>max.block.ms</code>, 60 s by default, is one budget. Metadata time is subtracted before the append is called,
+            and serializer and partitioner time are not counted (<code>KafkaProducer.java:1076</code>). The second wait is memory.
+            <code>buffer.memory</code>, 32 MiB, is a pool of <code>batch.size</code> buffers with a free list, and only buffers of
+            exactly that size are recycled (<code>producer/internals/BufferPool.java:156</code>, <code>:484-488</code>). Waiters queue
+            FIFO. Past the timeout they get <code>BufferExhaustedException</code>. Memory exhaustion is back-pressure on your thread,
+            not a dropped record, until the budget runs out.
+          </p>
+          <p>
+            Append is careful about that wait. It tries the last batch under the lock, allocates a buffer outside the lock, then retakes
+            the lock and tries again before creating a batch, because another thread may have made one while this one blocked on memory
+            (<code>RecordAccumulator.java:326-343</code>). A record larger than <code>batch.size</code> is not an error. It gets its own
+            larger buffer (<code>:332-333</code>), limited by <code>max.request.size</code> and <code>buffer.memory</code>. Such a buffer
+            goes back as raw accounting and leaves to the garbage collector. <code>batch.size=0</code> means a batch size of 1, which the
+            builder treats as one record per batch (<code>KafkaProducer.java:458</code>).
+          </p>
+          <p>
+            Waking the Sender is rarer than people assume. <code>KafkaProducer.java:1122-1125</code>:
+          </p>
+<pre><code>            if (result.batchIsFull || result.newBatchCreated) {
+                log.trace("Waking up the sender since topic {} partition {} is either full or getting a new batch", record.topic(), appendCallbacks.getPartition());
+                this.sender.wakeup();
+            }</code></pre>
+          <p>
+            Later records appended to a non-full batch do not wake it, because the Sender already sleeps for the remaining linger.
+          </p>
+          <p>
+            Errors from <code>send()</code> come back two ways: <code>ApiException</code> through the future and callback, anything
+            else thrown at the caller (<code>KafkaProducer.java:1128-1146</code>). A producer that only checks the future misses
+            <code>InterruptException</code>. One that only uses try/catch misses timeouts.
+          </p>
+          <p>
+            On the other side, <code>sendProducerData</code> is the pipeline in Figure 1
+            (<code>producer/internals/Sender.java:383-453</code>). One Produce carries batches for many partitions led by one node,
+            at most one per partition, and the broker rejects two (<code>common/requests/ProduceRequest.java:228-230</code>).
+            <code>max.request.size</code> bounds the request, but a single oversized batch still goes alone
+            (<code>RecordAccumulator.java:937-940</code>). Each node keeps a rotating drain index, so a large partition set cannot starve
+            its tail. Callbacks fire in append order on the Sender
+            thread (<code>producer/internals/ProducerBatch.java:322-331</code>), so a slow callback stalls I/O for every partition.
+            <code>flush()</code> makes every partition sendable and waits for all batches, split ones included.
+            On shutdown the Sender keeps running until undrained batches and in-flight requests are done, unless forced
+            (<code>Sender.java:258-295</code>). A <code>close()</code> whose timeout expires is what turns unsent records into failures.
+          </p>
+          <p>
+            Two more things happen on that one thread. Closing a batch is the expensive step, and it runs outside the deque lock. This is where the v2 header
+            from <a href="../the-log/#p1-batch">Part 1</a>, with its producer ID, epoch and base sequence, gets written
+            (<code>RecordAccumulator.java:976-978</code>). And a partition with an unknown leader makes the Sender request metadata while its batches stay queued,
+            subject only to the delivery timeout (<code>:765</code>).
+          </p>
+
+          <h2 id="p4-linger"><span class="secnum">02</span>What linger actually does</h2>
+          <p>
+            Linger is usually described as "wait a little to batch more". The test is simpler, and it has more exits than that.
+            <code>producer/internals/RecordAccumulator.java:656-667</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>        if (!readyNodes.contains(leader) &amp;&amp; !isMuted(part)) {
+            long timeToWaitMs = backingOff ? retryBackoff.backoff(backoffAttempts &gt; 0 ? backoffAttempts - 1 : 0) : lingerMs;
+            boolean expired = waitedTimeMs &gt;= timeToWaitMs;
+            boolean transactionCompleting = transactionManager != null &amp;&amp; transactionManager.isCompleting();
+            boolean sendable = full
+                    || expired
+                    || exhausted
+                    || closed
+                    || flushInProgress()
+                    || transactionCompleting;
+            if (sendable &amp;&amp; !backingOff) {
+                readyNodes.add(leader);</code></pre>
+          <p>
+            Three details change how this reads. <code>linger.ms</code> is measured from the batch's creation, not from the last
+            append, so new records do not extend the wait (<code>ProducerBatch.java:98</code>, <code>:484</code>). A partition with
+            more than one queued batch counts as <code>full</code>, so once a batch is closed behind another the head stops lingering
+            (<code>RecordAccumulator.java:759</code>). And <code>exhausted</code> means a thread is waiting on the pool: a full pool
+            cancels linger for every partition (<code>:713</code>).
+          </p>
+          <p>
+            Batching also happens at <code>linger.ms=0</code>. A node that cannot take another request leaves the drain set, so
+            records pile into batches while requests are in flight (<code>Sender.java:403-408</code>). Linger is not the only source
+            of batches. The limit that triggers this, <code>max.in.flight.requests.per.connection</code>, is 5 per connection, not per
+            partition (<code>InFlightRequests.java:98-99</code>). A due metadata refresh gates sending the same way
+            (<code>NetworkClient.java:586</code>). Linger's default has been 5 ms since 4.0, and that upgrade changes behaviour for anyone who relied on 0
+            (<a href="../transactions/#p5-register">register D103</a>, class E, behaviour change, documented).
+          </p>
+
+          <figure class="figure wide" id="fig-ready">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title">A batch's life: fill rises, and any one of these exits ends it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 280" role="img" aria-label="A time axis from batch creation. Fill level rises toward batch.size. The exits are: full at batch.size or another batch queued behind, linger.ms elapsed since creation, memory exhausted, and flush, close or transaction completion. A low-rate batch exits at linger; a high-rate batch exits at batch.size.">
+                <defs>
+                  <marker id="fig-ready-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">FILL LEVEL</text>
+                <line x1="70" y1="230" x2="640" y2="230" stroke="#252525" stroke-width="2" marker-end="url(#fig-ready-ctl)"/>
+                <line x1="70" y1="230" x2="70" y2="40" stroke="#b8b8b1"/>
+                <text x="560" y="250" class="svg-sub">time since creation</text>
+                <line x1="70" y1="70" x2="640" y2="70" stroke="#ad4b43" stroke-dasharray="4 3"/>
+                <text x="78" y="62" class="svg-sub" style="fill:#ad4b43">batch.size (16 KiB)</text>
+                <line x1="430" y1="40" x2="430" y2="230" stroke="#d98226" stroke-dasharray="4 3"/>
+                <text x="436" y="218" class="svg-sub" style="fill:#d98226">linger.ms</text>
+                <!-- high rate -->
+                <polyline points="70,230 250,70" fill="none" stroke="#3c6f97" stroke-width="2"/>
+                <circle cx="250" cy="70" r="5" fill="#3c6f97"/>
+                <text x="258" y="92" class="svg-sub" style="fill:#3c6f97">high rate: exits full</text>
+                <!-- low rate -->
+                <polyline points="70,230 430,170" fill="none" stroke="#367f59" stroke-width="2"/>
+                <circle cx="430" cy="170" r="5" fill="#367f59"/>
+                <text x="230" y="160" class="svg-sub" style="fill:#367f59">low rate: exits on linger</text>
+
+                <text x="690" y="24" class="svg-lane">THE EXITS (sendable)</text>
+                <rect x="690" y="40" width="370" height="44" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="702" y="58" class="svg-step">full</text>
+                <text x="702" y="75" class="svg-sub">at the limit, or another batch queued behind</text>
+                <rect x="690" y="92" width="370" height="44" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="702" y="110" class="svg-step">expired</text>
+                <text x="702" y="127" class="svg-sub">linger.ms since creation, or backoff elapsed</text>
+                <rect x="690" y="144" width="370" height="44" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="702" y="162" class="svg-step">exhausted</text>
+                <text x="702" y="179" class="svg-sub">a thread is waiting on the BufferPool</text>
+                <rect x="690" y="196" width="370" height="44" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="702" y="214" class="svg-step">closed, flushInProgress, transactionCompleting</text>
+                <text x="702" y="231" class="svg-sub">the application asked for it</text>
+              </svg>
+              <table>
+                <thead><tr><th>Rate /s</th><th>linger</th><th>batch.size</th><th>Codec</th><th>Records/req</th><th>Requests</th><th>Queue ms</th><th>Ratio</th></tr></thead>
+                <tbody>
+                  <tr style="background: var(--green-soft)"><td>1,000</td><td>0</td><td>16,384</td><td>none</td><td>4.2</td><td>1,425</td><td>2.2</td><td>1.000</td></tr>
+                  <tr style="background: var(--green-soft)"><td>1,000</td><td>5</td><td>16,384</td><td>none</td><td>7.3</td><td>830</td><td>5.5</td><td>1.000</td></tr>
+                  <tr style="background: var(--green-soft)"><td>1,000</td><td>50</td><td>16,384</td><td>none</td><td>53.1</td><td>117</td><td>48.7</td><td>1.000</td></tr>
+                  <tr style="background: var(--blue-soft)"><td>20,000</td><td>0</td><td>16,384</td><td>none</td><td>43.1</td><td>2,788</td><td>3.9</td><td>1.000</td></tr>
+                  <tr style="background: var(--blue-soft)"><td>20,000</td><td>5</td><td>16,384</td><td>none</td><td>77.6</td><td>1,551</td><td>14.1</td><td>1.000</td></tr>
+                  <tr style="background: var(--blue-soft)"><td>20,000</td><td>50</td><td>16,384</td><td>none</td><td>78.0</td><td>1,543</td><td>7.1</td><td>1.000</td></tr>
+                  <tr style="background: var(--red-soft)"><td>20,000</td><td>5</td><td>1,024</td><td>none</td><td>4.0</td><td>30,004</td><td>6,277.2</td><td>1.000</td></tr>
+                  <tr><td>20,000</td><td>5</td><td>262,144</td><td>none</td><td>150.2</td><td>803</td><td>5.5</td><td>1.000</td></tr>
+                  <tr><td>20,000</td><td>5</td><td>16,384</td><td>lz4</td><td>72.6</td><td>1,658</td><td>33.5</td><td>0.994</td></tr>
+                  <tr><td>20,000</td><td>5</td><td>16,384</td><td>zstd</td><td>111.8</td><td>1,077</td><td>7.9</td><td>0.608</td></tr>
+                  <tr><td>20,000</td><td>5</td><td>16,384</td><td>gzip</td><td>108.5</td><td>1,110</td><td>5.9</td><td>0.632</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">Measured with <code>kafka-producer-perf-test.sh</code>: one run per row, 6 s of 200-byte records, one partition, RF 1, loopback on a shared 2-vCPU box. Relative only, never capacity. Ratios describe the tool's random text and nothing else. Read the batch columns. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            At a low rate, linger sets the batch: at 1,000 records/s, 0, 5 and 50 ms gave 4.2, 7.3 and 53.1 records per request. The
+            perf tool throttles in bursts, so part of the 4.2 is its burstiness. At a high rate <code>batch.size</code> takes over:
+            at 20,000 records/s, linger 5 and 50 both reached about 78 records, the 16 KiB limit. Linger 5 averaged 17.65 ms produce
+            latency and linger 50 averaged 8.33 ms, the reverse of what queueing predicts. That gap is noise, which is why only the
+            batch counts should be read.
+          </p>
+          <p>
+            Too small a <code>batch.size</code> collapses the producer: 1,024 bytes took 30,004 requests against 1,551, and queue time
+            rose to 6,277 ms from 14 ms. Raising it to 262,144 cut requests to 803 at about 31.5 KB per batch, well below the limit, because
+            the batch leaves on linger first. Compression fits more records in a batch by the ratio it achieves, because
+            <code>batch.size</code> bounds estimated compressed bytes. That estimate learns asymmetrically, 0.05 up and 0.005 down, on
+            purpose (<code>common/record/internal/CompressionRatioEstimator.java:29-31</code>). When it is wrong and the broker answers
+            <code>MESSAGE_TOO_LARGE</code>, the client splits the batch and resends without spending a retry
+            (<code>Sender.java:678-688</code>). That split matters again below.
+          </p>
+          <p>
+            One warning about the tool itself. <code>--command-property</code> keeps only its last occurrence when repeated, silently.
+            An invalid first run of this table differed from the corrected one by a factor of 19.5
+            (<a href="../transactions/#p5-register">register D78</a>, class D, gotcha; upstream status not checked).
+          </p>
+
+          <h2 id="p4-partition"><span class="secnum">03</span>Choosing a partition</h2>
+          <p>
+            The order is fixed: explicit partition, custom partitioner, key hash, then "unknown", which means the accumulator picks
+            inside <code>append</code> (<code>KafkaProducer.java:1557-1574</code>) <span class="src">from the code</span>. The key hash
+            is <code>toPositive(murmur2(key)) % numPartitions</code> (<code>producer/internals/BuiltInPartitioner.java:412</code>). The
+            mapping is a function of the partition count, so adding partitions moves keys. Per-key order holds only while the count
+            does, and only per producer instance.
+          </p>
+          <p>
+            Unkeyed records stick to one partition until about <code>batch.size</code> bytes are appended, then switch. The switch waits
+            for a batch boundary, up to twice that. <code>BuiltInPartitioner.java:249-258</code>:
+          </p>
+<pre><code>        if (producedBytes &gt;= stickyBatchSize * 2) {
+            log.trace("Produced {} bytes, exceeding twice the batch size of {} bytes, with switching set to {}",
+                producedBytes, stickyBatchSize, enableSwitch);
+        }
+
+        if (producedBytes &gt;= stickyBatchSize &amp;&amp; enableSwitch || producedBytes &gt;= stickyBatchSize * 2) {
+            // We've produced enough to this partition, switch to next.
+            StickyPartitionInfo newPartitionInfo = new StickyPartitionInfo(nextPartition(cluster));
+            stickyPartitionInfo.set(newPartitionInfo);
+        }</code></pre>
+          <p>
+            Counting bytes, not batches, is KIP-794's fix for a feedback loop: under the earlier partitioner, slow brokers held the sticky
+            assignment longer and got more data. Adaptive partitioning, on by default, then picks the next partition by inverse queue
+            length, and stays off until every partition has had a batch queued (<code>RecordAccumulator.java:701-702</code>). A custom
+            partitioner turns it off entirely (<code>KafkaProducer.java:448</code>). New in 4.4, and off by default,
+            <code>partitioner.rack.aware</code> applies only to the unkeyed choice. In one run, 60,000 unkeyed records over 6 partitions
+            landed 8,096 to 12,364 per partition, at about 13.3 KB per batch <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The clients disagree, and Figure 3 sets them side by side. The librdkafka column was read, not run. Its unkeyed
+            sticky partitioner switches on time, <code>sticky.partitioning.linger.ms</code>, by default twice the linger, which is the
+            pre-KIP-794 idea in a different form (<code>librdkafka/src/rdkafka_msg.c:1140-1141</code>). franz-go switches at 64 KiB, not at
+            <code>batch.size</code>.
+          </p>
+
+          <figure class="figure wide" id="fig-defaults">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">Same protocol, three sets of defaults</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead><tr><th>Default</th><th>Java 4.4.0</th><th>librdkafka v2.16.0 (read, not run)</th><th>franz-go (read)</th></tr></thead>
+                <tbody>
+                  <tr style="background: var(--red-soft)"><td>Idempotence</td><td>on</td><td>off</td><td>on</td></tr>
+                  <tr><td>Linger</td><td>5 ms</td><td>5 ms</td><td>10 ms</td></tr>
+                  <tr><td>Batch limit</td><td>16,384 bytes</td><td>1,000,000 bytes, 10,000 messages</td><td>1,000,012 bytes</td></tr>
+                  <tr style="background: var(--red-soft)"><td>In flight</td><td>5 per connection</td><td>1,000,000 (5 per partition when idempotent)</td><td>5 per broker when idempotent, 1 until the first response</td></tr>
+                  <tr style="background: var(--red-soft)"><td>Key hash</td><td>murmur2</td><td>CRC32 (<code>consistent_random</code>)</td><td>murmur2</td></tr>
+                  <tr><td>Unkeyed switch</td><td><code>batch.size</code> bytes</td><td>time, twice the linger</td><td>64 KiB</td></tr>
+                  <tr style="background: var(--orange-soft)"><td>Compression</td><td>none</td><td>none</td><td>snappy, falling back to none</td></tr>
+                  <tr style="background: var(--orange-soft)"><td>Delivery timeout</td><td>120 s</td><td>300 s</td><td>unlimited</td></tr>
+                  <tr><td><code>group.protocol</code></td><td>classic</td><td>classic</td><td>classic</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">From the pinned sources. Red rows change what a guarantee or a key's placement means; orange rows change cost or time. Java's values were also printed from a live config. <span class="src">from the code</span></p>
+          </figure>
+
+          <p>
+            Keyed placement is the practical trap. Java and franz-go agreed on all 1,000 test keys <span class="recon">measured here</span>.
+            librdkafka's default hashes with CRC32. Its figure is computed from the formula with its own <code>crc_table</code>, at 12
+            partitions, and librdkafka was not run: 85 of 1,000 keys match Java. That is near the 1-in-12 chance rate, it scales as 1/N,
+            and it is not a property of those keys. The same key lands elsewhere unless <code>partitioner=murmur2_random</code> is set,
+            which the config text names as the Java equivalent (<code>librdkafka/src/rdkafka_conf.c:1836</code>,
+            <a href="../transactions/#p5-register">register D77</a>, class D, gotcha). franz-go's own comment is stale: "This client's
+            default is to disable lingering", where the default has been 10 ms since v1.20.0
+            (<code>franz-go/pkg/kgo/partitioner.go:273</code>, <a href="../transactions/#p5-register">register D31</a>, class C, doc drift,
+            still on master).
+          </p>
+
+          <h2 id="p4-idempotence"><span class="secnum">04</span>Idempotence, and where it runs out</h2>
+          <p>
+            <code>enable.idempotence</code> is on by default, and it is built on a <code>TransactionManager</code> even with no
+            transactions. A producer gets a producer ID (PID) from any broker, at epoch 0, from a block of 1,000 leased from the
+            controller. Every instance burns a fresh PID, and a restart cannot resume the old one
+            (<code>core/…/coordinator/transaction/TransactionCoordinator.scala:127-130</code>). Sequence numbers are per partition, count
+            records, and are assigned at drain, not at <code>send</code>. Once assigned they never change on retry.
+            <code>RecordAccumulator.java:958-967</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>                    // If the batch already has an assigned sequence, then we should not change the producer id and
+                    // sequence number, since this may introduce duplicates. In particular, the previous attempt
+                    // may actually have been accepted, and if we change the producer id and sequence here, this
+                    // attempt will also be accepted, causing a duplicate.
+                    //
+                    // Additionally, we update the next sequence number bound for the partition, and also have
+                    // the transaction manager track the batch so as to ensure that sequence ordering is maintained
+                    // even if we receive out of order responses.
+                    batch.setProducerState(producerIdAndEpoch, transactionManager.sequenceNumber(batch.topicPartition), isTransactional);
+                    transactionManager.incrementSequenceNumber(batch.topicPartition, batch.recordCount);</code></pre>
+          <p>
+            The other half is on the broker. Per partition and per PID it keeps a <code>ProducerStateEntry</code>: the epoch and the
+            metadata of the last 5 batches. <code>NUM_BATCHES_TO_RETAIN</code> is why the client's limit is 5. A duplicate is an exact
+            match, with no partial case. <code>log/ProducerStateEntry.java:128-137</code>:
+          </p>
+<pre><code>    Optional&lt;BatchMetadata&gt; findDuplicateBatch(RecordBatch batch) {
+        return batch.producerEpoch() != producerEpoch ? Optional.empty() : batchWithSequenceRange(batch.baseSequence(), batch.lastSequence());
+    }
+
+    // Return the batch metadata of the cached batch having the exact sequence range, if any.
+    private Optional&lt;BatchMetadata&gt; batchWithSequenceRange(int firstSeq, int lastSeq) {
+        return batchMetadata.stream()
+            .filter(metadata -&gt; firstSeq == metadata.firstSeq() &amp;&amp; lastSeq == metadata.lastSeq())
+            .findFirst();
+    }</code></pre>
+          <p>
+            A match is answered with the first write's offsets and writes nothing, so the callback looks like a first-time success
+            (<code>log/UnifiedLog.java:1261-1270</code>). Anything else must start exactly one past the last sequence, unless the broker has
+            no epoch for this PID. <code>log/ProducerAppendInfo.java:186-188</code>:
+          </p>
+<pre><code>            // If there is no current producer epoch (possibly because all producer records have been deleted due to
+            // retention or the DeleteRecords API) accept writes with any sequence number
+            if (!(currentEntry.producerEpoch() == RecordBatch.NO_PRODUCER_EPOCH || inSequence(currentLastSeq, appendFirstSeq))) {</code></pre>
+          <p>
+            With no state, a late retry is just new data. Every edge below comes from that condition, or from the client's half of the
+            bargain.
+          </p>
+
+          <figure class="figure wide" id="fig-tree">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">The broker's decision for one client batch, with the no-state hole</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 372" role="img" aria-label="Four checks in order. Same epoch and an exact sequence range among the last five batches: answer with the first write's offsets and write nothing. Older epoch: refuse with InvalidProducerEpochException. No stored epoch for this PID: accept any sequence, the highlighted hole. Otherwise the batch must start at last sequence plus one, or at sequence 0 for a new epoch; if not, OutOfOrderSequenceException; if so, append.">
+                <defs>
+                  <marker id="fig-tree-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">CHECK, IN CODE ORDER</text>
+                <text x="620" y="22" class="svg-lane">IF YES</text>
+
+                <rect x="20" y="36" width="500" height="58" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="34" y="58" class="svg-step">Same epoch, and exact first and last sequence among the last 5?</text>
+                <text x="34" y="78" class="svg-sub">UnifiedLog: findDuplicateBatch, client appends only</text>
+                <line x1="520" y1="65" x2="618" y2="65" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <rect x="620" y="36" width="440" height="58" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="634" y="58" class="svg-step">Answer with the first write's offsets. Write nothing.</text>
+                <text x="634" y="78" class="svg-sub">callback looks like a first-time success</text>
+
+                <rect x="20" y="112" width="500" height="58" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="34" y="134" class="svg-step">Epoch older than the stored epoch?</text>
+                <text x="34" y="154" class="svg-sub">fences a pre-bump batch still in flight</text>
+                <line x1="520" y1="141" x2="618" y2="141" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <rect x="620" y="112" width="440" height="58" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="634" y="134" class="svg-step">Refuse: InvalidProducerEpochException</text>
+                <text x="634" y="154" class="svg-sub">ProducerAppendInfo.java:151</text>
+
+                <rect x="20" y="188" width="500" height="58" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <text x="34" y="210" class="svg-step">No stored epoch for this PID?</text>
+                <text x="34" y="230" class="svg-sub">first write, expired state, retention, DeleteRecords</text>
+                <line x1="520" y1="217" x2="618" y2="217" stroke="#d98226" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <rect x="620" y="188" width="440" height="58" rx="4" fill="#f7e3c8" stroke="#d98226" stroke-width="2"/>
+                <text x="634" y="210" class="svg-step">Accept any sequence.</text>
+                <text x="634" y="230" class="svg-sub">the hole: a late retry is just new data</text>
+
+                <rect x="20" y="264" width="500" height="58" rx="4" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="34" y="286" class="svg-step">Starts at last sequence + 1 (or 0, for a new epoch)?</text>
+                <text x="34" y="306" class="svg-sub">wraps at Integer.MAX_VALUE</text>
+                <line x1="520" y1="293" x2="618" y2="293" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <rect x="620" y="264" width="210" height="58" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="634" y="286" class="svg-step">Append</text>
+                <text x="634" y="306" class="svg-sub">update the 5-entry deque</text>
+                <rect x="840" y="264" width="220" height="58" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="852" y="286" class="svg-step">If no: refuse</text>
+                <text x="852" y="306" class="svg-sub">OutOfOrderSequenceException</text>
+
+                <line x1="270" y1="94" x2="270" y2="112" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <line x1="270" y1="170" x2="270" y2="188" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <line x1="270" y1="246" x2="270" y2="264" stroke="#252525" stroke-width="2" marker-end="url(#fig-tree-ctl)"/>
+                <text x="280" y="107" class="svg-sub">no</text>
+                <text x="280" y="183" class="svg-sub">no</text>
+                <text x="280" y="259" class="svg-sub">no</text>
+                <text x="20" y="352" class="svg-note">Followers rebuild this state from what they replicate, so the window survives a leader change if the batch was replicated (read in code, not run).</text>
+              </svg>
+            </div>
+            <p class="figure-caption">Drawn from <code>UnifiedLog.java</code> and <code>ProducerAppendInfo.java</code>. The orange row is the condition the rest of this section keeps returning to. <span class="recon">reconstruction</span></p>
+          </figure>
+
+          <h3>The case it was built for</h3>
+          <p>
+            A proxy swallowed one response and closed the connection, a fault injected on purpose. Broker and client were real. Without
+            idempotence the log holds two copies and the callback names the second offset. With it, the same request bytes arrive twice,
+            one copy lands, and the callback gets offset 0. franz-go behaved the same way in both cases.
+          </p>
+
+          <figure class="figure wide" id="fig-lost-ack">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">A lost ack, without and with idempotence</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 318" role="img" aria-label="Two panels with client, proxy and log lanes. Idempotence off: produce corr 4 appends at offset 0, the proxy drops the response, produce corr 7 appends at offset 1, and the callback says offset 1. Idempotence on: produce corr 6 appends at offset 0 sequence 0, the response is dropped, produce corr 9 is recognised as a duplicate, and the callback says offset 0.">
+                <defs>
+                  <marker id="fig-lost-ack-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-lost-ack-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="20" class="svg-lane">IDEMPOTENCE OFF</text>
+                <text x="570" y="20" class="svg-lane">IDEMPOTENCE ON</text>
+                <!-- panel A lanes -->
+                <text x="40" y="44" class="svg-sub">client</text><text x="196" y="44" class="svg-sub">proxy</text><text x="340" y="44" class="svg-sub">log</text>
+                <line x1="56" y1="52" x2="56" y2="240" stroke="#b8b8b1"/><line x1="212" y1="52" x2="212" y2="240" stroke="#b8b8b1"/><line x1="352" y1="52" x2="352" y2="240" stroke="#b8b8b1"/>
+                <line x1="56" y1="76" x2="350" y2="76" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-lost-ack-data)"/>
+                <text x="66" y="70" class="svg-sub" style="fill:#3c6f97">produce corr=4, 127 B</text>
+                <rect x="362" y="62" width="168" height="26" rx="3" fill="#f3dfdc" stroke="#ad4b43"/><text x="372" y="79" class="svg-sub" style="fill:#252525">offset 0, seq -1</text>
+                <line x1="352" y1="104" x2="216" y2="104" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-lost-ack-state)"/>
+                <text x="224" y="98" class="svg-sub" style="fill:#ad4b43">response dropped</text>
+                <text x="66" y="128" class="svg-sub">NETWORK_EXCEPTION, retry</text>
+                <line x1="56" y1="150" x2="350" y2="150" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-lost-ack-data)"/>
+                <text x="66" y="144" class="svg-sub" style="fill:#3c6f97">produce corr=7, 127 B</text>
+                <rect x="362" y="136" width="168" height="26" rx="3" fill="#f3dfdc" stroke="#ad4b43"/><text x="372" y="153" class="svg-sub" style="fill:#252525">offset 1, seq -1</text>
+                <line x1="352" y1="184" x2="58" y2="184" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-lost-ack-state)"/>
+                <text x="66" y="178" class="svg-sub" style="fill:#765b98">callback A ok offset=1</text>
+                <text x="40" y="266" class="svg-step">Two copies, identical bytes</text>
+                <text x="40" y="285" class="svg-sub">crc 2811889636, both; producerId -1</text>
+                <text x="40" y="303" class="svg-sub">the broker cannot tell a retry from new data</text>
+
+                <line x1="550" y1="10" x2="550" y2="306" stroke="#deded9"/>
+
+                <!-- panel B lanes -->
+                <text x="590" y="44" class="svg-sub">client</text><text x="746" y="44" class="svg-sub">proxy</text><text x="890" y="44" class="svg-sub">log</text>
+                <line x1="606" y1="52" x2="606" y2="240" stroke="#b8b8b1"/><line x1="762" y1="52" x2="762" y2="240" stroke="#b8b8b1"/><line x1="902" y1="52" x2="902" y2="240" stroke="#b8b8b1"/>
+                <line x1="606" y1="76" x2="900" y2="76" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-lost-ack-data)"/>
+                <text x="616" y="70" class="svg-sub" style="fill:#3c6f97">produce corr=6, 127 B</text>
+                <rect x="908" y="62" width="160" height="26" rx="3" fill="#dfede5" stroke="#367f59"/><text x="916" y="79" class="svg-sub" style="fill:#252525">offset 0, seq 0</text>
+                <line x1="902" y1="104" x2="766" y2="104" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-lost-ack-state)"/>
+                <text x="774" y="98" class="svg-sub" style="fill:#ad4b43">response dropped</text>
+                <text x="616" y="128" class="svg-sub">NETWORK_EXCEPTION, retry</text>
+                <line x1="606" y1="150" x2="900" y2="150" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-lost-ack-data)"/>
+                <text x="616" y="144" class="svg-sub" style="fill:#3c6f97">produce corr=9, same bytes</text>
+                <rect x="908" y="136" width="160" height="26" rx="3" fill="#ffffff" stroke="#b8b8b1"/><text x="916" y="153" class="svg-sub" style="fill:#252525">duplicate: no write</text>
+                <line x1="902" y1="184" x2="608" y2="184" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-lost-ack-state)"/>
+                <text x="616" y="178" class="svg-sub" style="fill:#765b98">callback A ok offset=0</text>
+                <text x="590" y="266" class="svg-step">One copy, and the first write's offset</text>
+                <text x="590" y="285" class="svg-sub">crc 886892178; producerId 0, epoch 0</text>
+                <text x="590" y="303" class="svg-sub">the exact-range match in the 5-entry deque</text>
+              </svg>
+            </div>
+            <p class="figure-caption">Measured with a fault-injecting proxy that withholds the ack; broker and client real, one run each, loopback. <span class="recon">measured here</span></p>
+          </figure>
+
+          <h3>Order, and the first-batch overtake</h3>
+          <p>
+            Muting a partition is only used when <code>max.in.flight=1</code> (<code>Sender.java:420-424</code>). With 5 in flight, order
+            rests on the sequence check: a failed head makes every later request fail too, and they retry in sequence order. That needs the
+            broker to have a last sequence to compare against. On a producer's first batch to a partition it has none.
+          </p>
+
+          <figure class="figure wide" id="fig-order">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">When the first of two in-flight batches fails: the log after each run</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead><tr><th>Fault</th><th>Idempotence, in flight</th><th>Partition</th><th>Log (offset)</th><th>Result</th></tr></thead>
+                <tbody>
+                  <tr><td>proxy byte flip</td><td>off, 5</td><td>new</td><td>B(0) A(1)</td><td>reordered</td></tr>
+                  <tr><td>proxy byte flip</td><td>off, 1</td><td>new</td><td>A(0) B(1)</td><td>in order</td></tr>
+                  <tr><td>proxy byte flip</td><td>on, 5</td><td>this producer wrote before</td><td>S(0) A(1) B(2)</td><td>in order; B bounced with <code>OUT_OF_ORDER</code></td></tr>
+                  <tr style="background: var(--red-soft)"><td>proxy byte flip</td><td>on, 5</td><td>never written</td><td>B(0, seq 1)</td><td><strong>A lost</strong>, reported as <code>TimeoutException</code>; B kept</td></tr>
+                  <tr style="background: var(--red-soft)"><td>proxy byte flip</td><td>on, 5</td><td>holds another producer's data</td><td>X(0, pid 3) B(1, pid 4, seq 1)</td><td><strong>A lost</strong>, reported; B kept</td></tr>
+                  <tr style="background: var(--red-soft)"><td><strong>none</strong>: <code>MESSAGE_TOO_LARGE</code> split</td><td>on, 5</td><td>2 empty, 3 prefilled</td><td>prefilled: P(0) B(1, seq 3)</td><td><strong>A1 to A3 lost</strong>, each reported; 5 of 5 runs</td></tr>
+                  <tr style="background: var(--green-soft)"><td><strong>none</strong>: same split</td><td>on, 1</td><td>prefilled</td><td>A1(1) … B(4)</td><td>in order; control, one run</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">The proxy rows are injected: a flipped byte draws a real broker rejection, and a 400 ms hold stands in for a client that has already pipelined B. The no-proxy rows inject nothing, at deliberately small sizes: topic limit 1,500 bytes, <code>batch.size</code> 2,000. All on loopback. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            Reject A while B is in flight. The broker has no state, so B lands at a non-zero sequence. A then fails
+            <code>OUT_OF_ORDER_SEQUENCE_NUMBER</code> on every retry, 9 in the proxy run, until the delivery timeout expires it. With
+            idempotence on and <code>acks=all</code>, the log holds B and not A. This is not silent: the application gets a
+            <code>TimeoutException</code> for A, and B stays. An application that logs the failure and moves on has a hole in its order.
+          </p>
+          <p>
+            It needs no proxy. A batch over the topic's <code>max.message.bytes</code> is split while the next batch lands, in 5 of 5 runs,
+            and <code>max.in.flight=1</code> kept order. Those sizes were chosen to force it. In practice the route would be a wrong
+            compression estimate or a <code>batch.size</code> above the topic limit, and neither was run. How often this happens in production
+            is unknown; nothing here measures it. Transactions v2 producers are excluded by the check at
+            <code>ProducerAppendInfo.java:158-163</code> (KAFKA-18202).
+          </p>
+          <p>
+            Upstream knows, and its position is mixed. The never-written case (<a href="../transactions/#p5-register">register D7</a>, class B)
+            is fixed after 4.4.0 in <code>81b993044e</code>, KAFKA-15591, fix version 4.5.0, absent from the <code>4.4</code> branch. Its commit
+            message says "silent", which is true only if callbacks are ignored. The case of a partition that already holds records
+            (<a href="../transactions/#p5-register">register D4</a>, class A) stands: a non-zero first sequence can be legitimate there after
+            retention or expiry. KAFKA-19880 reports it and is Open; KAFKA-14312 was closed Won't Fix in 2024 as not a bug. It stands on trunk by the
+            fix commit's own statement; trunk was not run. By reading, this path is a fatal error in librdkafka, not run. franz-go holds back
+            pipelining until the first ack, a gate built for this race and not run here (<code>franz-go/pkg/kgo/sink.go:1285-1291</code>).
+          </p>
+
+          <h3>What "failed" means</h3>
+          <p>
+            The delivery timeout also fires on batches already in flight. <code>Sender.java:195-205</code>:
+          </p>
+<pre><code>                    if (batch.hasReachedDeliveryTimeout(accumulator.getDeliveryTimeoutMs(), now)) {
+                        iter.remove();
+                        // expireBatches is called in Sender.sendProducerData, before client.poll.
+                        // The !batch.isDone() invariant should always hold. An IllegalStateException
+                        // exception will be thrown if the invariant is violated.
+                        if (!batch.isDone()) {
+                            expiredBatches.add(batch);
+                        } else {
+                            throw new IllegalStateException(batch.topicPartition + " batch created at " +
+                                batch.createdMs + " gets unexpected final state " + batch.finalState());
+                        }</code></pre>
+          <p>
+            A batch's final state cannot change once set, so a late broker success is only a debug log line
+            (<code>ProducerBatch.java:301-302</code>). "Failed" means unknown. The docs warn: "avoid application level re-sends since these
+            cannot be de-duplicated" (<code>KafkaProducer.java:177-178</code>). The message does not
+            (<a href="../transactions/#p5-register">register D74</a>, class D, gotcha, documented).
+          </p>
+
+          <figure class="figure wide" id="fig-failed">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">Two failure callbacks, two copies; franz-go, one success and a long wait</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 262" role="img" aria-label="Java client: callback A FAILED at 4615 ms, the application resends, the producer bumps to epoch 1, callback A FAILED at 7618 ms. The log holds offset 0 sequence 0 epoch 0 and offset 1 sequence 0 epoch 1. franz-go under the same outage: callback A ok at 10025 ms, offset 0, one copy, no failure surfaced.">
+                <defs>
+                  <marker id="fig-failed-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-failed-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="22" class="svg-lane">JAVA CALLBACKS</text>
+                <line x1="20" y1="82" x2="700" y2="82" stroke="#252525" stroke-width="2" marker-end="url(#fig-failed-ctl)"/>
+                <rect x="60" y="36" width="176" height="34" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="70" y="51" class="svg-sub" style="fill:#252525">+4615 ms: A FAILED</text>
+                <text x="70" y="64" class="svg-sub">TimeoutException</text>
+                <rect x="252" y="36" width="192" height="34" rx="3" fill="#ffffff" stroke="#b8b8b1"/>
+                <text x="262" y="51" class="svg-sub" style="fill:#252525">+4616 ms: app re-sends</text>
+                <text x="262" y="64" class="svg-sub">bump: PID 5, epoch 1</text>
+                <rect x="460" y="36" width="176" height="34" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="470" y="51" class="svg-sub" style="fill:#252525">+7618 ms: A FAILED</text>
+                <text x="470" y="64" class="svg-sub">TimeoutException</text>
+                <text x="20" y="116" class="svg-lane">JAVA LOG</text>
+                <rect x="60" y="128" width="284" height="44" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="72" y="146" class="svg-step">offset 0: A</text>
+                <text x="72" y="163" class="svg-sub">PID 5, epoch 0, sequence 0</text>
+                <rect x="352" y="128" width="284" height="44" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="364" y="146" class="svg-step">offset 1: A</text>
+                <text x="364" y="163" class="svg-sub">PID 5, epoch 1, sequence 0</text>
+                <path d="M148,70 L148,126" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-failed-state)"/>
+                <path d="M548,70 L500,126" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-failed-state)"/>
+                <text x="20" y="204" class="svg-note">Five attempts of each send. Same sequence, new epoch, so the broker cannot match the re-send to the original.</text>
+                <text x="20" y="224" class="svg-note">Both callbacks said failed, and both records are in the log.</text>
+
+                <line x1="720" y1="14" x2="720" y2="246" stroke="#deded9"/>
+                <text x="740" y="22" class="svg-lane">FRANZ-GO, SAME OUTAGE</text>
+                <rect x="740" y="36" width="320" height="34" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="750" y="51" class="svg-sub" style="fill:#252525">+10025 ms: A ok, offset=0, pid=1, epoch=0</text>
+                <text x="750" y="64" class="svg-sub">RecordDeliveryTimeout was 3 s</text>
+                <rect x="740" y="128" width="320" height="44" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="752" y="146" class="svg-step">offset 0: A</text>
+                <text x="752" y="163" class="svg-sub">one copy, no failure surfaced</text>
+                <text x="740" y="204" class="svg-note">No false failure, and no answer for as long</text>
+                <text x="740" y="224" class="svg-note">as the outage lasts.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">Measured through a proxy (<code>drop_until 6</code>) that drops responses, single runs, loopback. Java had <code>delivery.timeout.ms=3000</code>. The two clients made opposite choices about the same unknown. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            kgo enforces its timeout only when safe, never on a record whose request has no answer yet (<code>franz-go/pkg/kgo/config.go:1507-1512</code>),
+            and it marks a batch unsure when the broker's answer leaves the outcome open. <code>franz-go/pkg/kgo/sink.go:1081-1088</code>:
+          </p>
+<pre><code>	// If the response was from a timeout, or the record was written but
+	// not to enough replicas, we actually do not know whether the record
+	// was persisted or not. We need to poison this batch: if we encounter
+	// a retryable error the NEXT time we produce, we still are unsure of
+	// the final state, and we need to block canceling producing.
+	if rp.ErrorCode == kerr.RequestTimedOut.Code || rp.ErrorCode == kerr.NotEnoughReplicasAfterAppend.Code {
+		batch.unsureIfProduced = true
+	}</code></pre>
+
+          <h3>Two more ends, and the traps in the config</h3>
+          <p>
+            Producer state expires. With <code>producer.id.expiration.ms</code> set to 3 s, a 500 ms check, and a proxy withholding the response
+            for 6 s, the log held the same PID, epoch and sequence twice, and the callback said success. <strong>That 3 s is a lab setting, not default
+            behaviour.</strong> The default is 24 h, checked every 10 min, against a 2 min delivery timeout. With defaults the same result needs retention
+            or <code>DeleteRecords</code> to remove the write, or an old <code>CreateTime</code>, because the clock is record time; that route was read, not
+            run (<a href="../transactions/#p5-register">register D79</a>, class D, documented in part).
+          </p>
+          <p>
+            <code>delivery.timeout.ms</code> is documented as "An upper bound", and there is one case where it is not. While InitProducerId cannot complete,
+            a pass of the Sender returns early and never reaches expiry. <code>Sender.java:333-344</code>:
+          </p>
+<pre><code>                if (maybeSendAndPollTransactionalRequest()) {
+                    return;
+                }
+            } catch (AuthenticationException e) {
+                // This is already logged as error, but propagated here to perform any clean ups.
+                log.trace("Authentication exception while processing transactional request", e);
+                transactionManager.authenticationFailed(e);
+            }
+        }
+
+        long currentTimeMs = time.milliseconds();
+        long pollTimeout = sendProducerData(currentTimeMs);</code></pre>
+          <p>
+            With two controllers killed (<a href="../replication/#p3-quorum">Part 3</a>), a first idempotent Java producer's record stayed pending for 210 s
+            against an 8 s timeout, over 1,943 InitProducerId round trips, all <code>errorCode=14</code>. In a second run, with the quorum restored, it failed
+            at once when the PID arrived: "92904 ms has passed since batch creation". Each is a single run, and only the no-block case was run;
+            <code>flush()</code> and no-arg <code>close()</code> wait on it too by reading. franz-go failed at 27.9 s in one run, unexplained. librdkafka was not
+            tested (<a href="../transactions/#p5-register">register D3</a>, class A, still at trunk <code>09f2dc1320</code>; no Jira matched two text searches,
+            which is not proof none exists).
+          </p>
+          <p>
+            Config conflicts differ by case. <code>acks=1</code> or <code>retries=0</code> turn idempotence off with an INFO log as the only signal
+            (<a href="../transactions/#D75">D75</a>, class D). <code>max.in.flight=6</code> throws, though the doc says conflicts disable idempotence
+            (<a href="../transactions/#D30">D30</a>, class C, still at trunk). <code>DUPLICATE_SEQUENCE_NUMBER</code> handling is dead against a 4.4
+            broker, because in-window duplicates get success (<a href="../transactions/#D76">D76</a>, class D). franz-go <code>5d3342df</code>, dated
+            2026-10-06, changes what follows a failed sent batch, so check which side you pin
+            (<a href="../transactions/#D104">D104</a>, class E).
+          </p>
+
+          <h2 id="p4-read"><span class="secnum">05</span>A pull loop and a stored number</h2>
+          <p>
+            A consumer pulls. A fetch reads only up to the high watermark, or the last stable offset under <code>read_committed</code>
+            (<code>server-common/…/server/storage/log/FetchIsolation.java:31-39</code>) <span class="src">from the code</span>. With nothing to return it
+            parks in purgatory, as <a href="../the-wire/#p2-purgatory">Part 2</a> showed, for <code>fetch.min.bytes=1</code> or
+            <code>fetch.max.wait.ms=500</code>.
+          </p>
+          <p>
+            The Java client fetches per broker, with at most one request in flight per node. It also skips a node entirely while any of that
+            node's partitions still has buffered data, so that the omitted partitions do not fall out of the fetch session
+            (<code>consumer/internals/AbstractFetch.java:462-469</code>). That is why routine Java traffic never queues behind the muted socket. The one
+            exception is the session-closing Fetch. Sessions keep the loop cheap, since every fetch would otherwise relist every partition, and losing
+            one heals itself with a full fetch. <code>max.poll.records</code>, 500 by default, applies when the client drains its buffer. It limits what
+            <code>poll()</code> returns, not what the broker sends.
+          </p>
+          <p>
+            Now the line this section is about. The in-memory position advances when records are handed to <code>poll()</code>, before the application
+            has processed them (<code>consumer/internals/FetchCollector.java:185-204</code>). Auto-commit commits <code>allConsumed()</code>, the current
+            positions, inside the next <code>poll()</code>, every 5 s by default (<code>consumer/internals/SubscriptionState.java:797-801</code>). A
+            single-threaded loop therefore gets at-least-once. A SIGKILL redelivered 34 and 52 records in two single runs
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            A commit is a record. A group lives on one <code>__consumer_offsets</code> partition, chosen by the Java hash of the group id, and that
+            partition's leader is its coordinator. Here is a real commit of <code>new OffsetAndMetadata(42L, "hello")</code>, which carries no leader epoch,
+            decoded by hand, with the long line wrapped <span class="recon">measured here</span>:
+          </p>
+<pre><code>record offset=2 file_pos_of_batch=453
+ key   hex 00 01 00 0b 67 72 70 2d 63 6c 61 73 73 69 63 00 04 6f 66 66 73 00 00 00 00
+ key   type=1 group='grp-classic' topic='offs' partition=0
+ value hex 00 04 00 00 00 00 00 00 00 2a ff ff ff ff 06 68 65 6c 6c 6f 00 00 01 a1 b1 a0 eb df
+           01 00 10 f2 a0 a6 99 7f 1c 4a ba b8 94 16 17 49 e8 af 89
+ value version=4 offset=42 leaderEpoch=-1 metadata='hello' commitTimestamp=1793981475807</code></pre>
+          <p>
+            Key: <code>00 01</code> is record type 1, then the group, the topic name and the partition. Value: version 4, eight bytes of offset
+            (<code>2a</code> is 42), leader epoch −1, a compact string, the timestamp, then one tagged field holding the topic UUID. The key uses int16-length
+            strings and the value is flexible, inside an ordinary v2 batch from <a href="../the-log/">Part 1</a>. Classic, consumer-protocol and standalone
+            groups all wrote this same shape.
+          </p>
+          <p>
+            Deleting an offset is a tombstone on the same key, which is what lets a compacted topic forget it. From a real segment, the second batch begins at
+            <code>0x8b</code>:
+          </p>
+<pre><code>00000090  00 00 01 00 00 00 54 00 00 00 00 02 e4 65 38 8e  ......T......e8.
+000000a0  00 00 00 00 00 00 00 00 01 a1 b1 a0 f5 ea 00 00  ................
+000000b0  01 a1 b1 a0 f5 ea ff ff ff ff ff ff ff ff ff ff  ................
+000000c0  00 00 00 00 00 00 00 01 44 00 00 00 38 00 01 00  ........D...8...
+000000d0  0e 67 72 70 2d 73 74 61 6e 64 61 6c 6f 6e 65 00  .grp-standalone.
+000000e0  04 6f 66 66 73 00 00 00 00 01 00                 .offs......</code></pre>
+          <p>
+            The last two bytes are the point: <code>01</code> is a zigzag −1, a null value, and <code>00</code> is zero headers. Commits append with
+            <code>requiredAcks = 1</code>, and the runtime parks the response until the high watermark passes the written offset
+            (<code>core/…/coordinator/group/CoordinatorPartitionWriter.scala:169-172</code>), so a commit answers only once that line in that log has moved.
+            Offsets are kept 7 days, but expiry only touches topics the group is not subscribed to. A <code>requireStable</code> fetch reports
+            <code>UNSTABLE_OFFSET_COMMIT</code> around an open transactional offset, though a service comment still says the coordinator cannot easily do that
+            (<a href="../transactions/#p5-register">register D34</a>, class C, no effect).
+          </p>
+          <p>
+            Two lag numbers follow. <code>kafka-consumer-groups</code> reports end offset minus committed offset: 50 − 42 = 8 in the lab. The client's
+            <code>records-lag</code> is high watermark or LSO minus position. They disagree by design, up to 5 s with auto-commit, and neither counts records
+            (<a href="../transactions/#p5-register">register D84</a>, class D). The project's docs state that exactly-once for other destination systems needs
+            cooperation from those systems (<code>docs/design/design.md:207</code>), which <a href="../transactions/">Part 5</a> takes up.
+          </p>
+
+          <h2 id="p4-rebalance"><span class="secnum">06</span>The barrier and the heartbeat</h2>
+          <p>
+            Groups decide who owns what. The classic protocol is a five-state machine around one barrier: any change moves the group to
+            PreparingRebalance, heartbeats tell members to come, and their join requests park until everyone is in or a timer fires.
+            <code>group/GroupMetadataManager.java:7847-7858</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>        if (group.hasAllMembersJoined()) {
+            // All members have joined. Proceed to sync phase.
+            return completeClassicGroupJoin(group);
+        } else {
+            timer.schedule(
+                classicGroupJoinKey,
+                group.rebalanceTimeoutMs(),
+                TimeUnit.MILLISECONDS,
+                false,
+                () -&gt; completeClassicGroupJoin(group.groupId())
+            );
+            return EMPTY_RESULT;</code></pre>
+          <p>
+            That timeout is the largest across the group, and the Java client sets it from <code>max.poll.interval.ms</code>, 5 minutes, so one busy
+            member can hold a rebalance open that long (<code>clients/GroupRebalanceConfig.java:55</code>). A heartbeat during PreparingRebalance still renews
+            the session, so heartbeats keep a stuck member alive while it holds up the group. The broker never computes a classic assignment: the leader
+            gets the member list in its join response and returns the assignment in SyncGroup.
+          </p>
+          <p>
+            Under eager, a client revokes every partition before it rejoins. Under cooperative it revokes only those it no longer owns, keeps the rest during
+            the rebalance, and needs a follow-up round whenever a partition moves (KIP-429). The Java default lists Range and CooperativeSticky, and the client
+            takes the highest protocol all listed assignors share, so the out-of-the-box classic consumer is eager
+            (<code>consumer/internals/ConsumerCoordinator.java:257-271</code>).
+          </p>
+
+          <h3>KIP-848: one member at a time</h3>
+          <p>
+            KIP-848 replaces Join, Sync and Heartbeat with one RPC, where the epoch does the signalling: 0 joins, −1 leaves, −2 is a static member stepping out. A
+            heartbeat updates the member, updates the target assignment if the group epoch is ahead, and reconciles this member. The broker computes the assignment,
+            inline on the heartbeat path, and client-side assignors from the KIP's design are not implemented. An offload setting defaults to true, but nothing at the
+            pin reads it, and the configs became internal (<a href="../transactions/#p5-register">register D32</a>, class C, doc drift; getters only at trunk). Reconciliation holds no
+            barrier. It is set arithmetic on one member. <code>group/modern/consumer/CurrentAssignmentBuilder.java:393-405</code>:
+          </p>
+<pre><code>            // New Assigned Partitions = Previous Assigned Partitions ∩ Target
+            Map&lt;Integer, Integer&gt; assignedPartitions = new HashMap&lt;&gt;(currentAssignedPartitions);
+            assignedPartitions.keySet().retainAll(target);
+
+            // Partitions Pending Revocation = Previous Assigned Partitions - New Assigned Partitions
+            Map&lt;Integer, Integer&gt; partitionsPendingRevocation = new HashMap&lt;&gt;(currentAssignedPartitions);
+            partitionsPendingRevocation.keySet().removeAll(assignedPartitions.keySet());
+
+            // Partitions Pending Assignment = Target - New Assigned Partitions - Unreleased Partitions
+            Set&lt;Integer&gt; partitionsPendingAssignment = new HashSet&lt;&gt;(target);
+            partitionsPendingAssignment.removeAll(assignedPartitions.keySet());
+            hasUnreleasedPartitions = partitionsPendingAssignment.removeIf(partitionId -&gt;
+                currentPartitionEpoch.apply(topicId, partitionId) != -1 &amp;&amp;</code></pre>
+          <p>
+            A partition another member still owns is held back from the newcomer until released, so one partition never has two owners while the rest of the group runs.
+            A member that owes a revocation gets a personal rebalance timeout, and missing it fences that member alone (read, not run). All of this persists next to the
+            offsets. A join and a leave on disk, trimmed from <code>kafka-dump-log.sh --offsets-decoder</code> <span class="recon">measured here</span>:
+          </p>
+<pre><code>| offset: 0 ... key: {"type":"5","data":{"groupId":"grp-consumer","memberId":"VQTDsv9nQgSCkHbTV_BQpQ"}} ...
+| offset: 1 ... key: {"type":"3","data":{"groupId":"grp-consumer"}} payload: {...{"epoch":2,"metadataHash":573870876925506249}}
+| offset: 2 ... key: {"type":"7",...} payload: {...{"topicPartitions":[{"topicId":"8qCmmX8cSrq4lBYXSeiviQ","partitions":[0]}]}}
+| offset: 3 ... key: {"type":"6","data":{"groupId":"grp-consumer"}} payload: {...{"assignmentEpoch":2,...}}
+| offset: 4 ... key: {"type":"8",...} payload: {...{"memberEpoch":2,"previousMemberEpoch":0,"state":0,...
+| offset: 5 ... key: {"type":"1","data":{"group":"grp-consumer","topic":"offs","partition":0}} payload: {...{"offset":42,...
+| offset: 6 ... key: {"type":"8",...} payload: &lt;DELETE&gt;
+| offset: 7 ... key: {"type":"7",...} payload: &lt;DELETE&gt;
+| offset: 8 ... key: {"type":"5",...} payload: &lt;DELETE&gt;
+| offset: 9 ... key: {"type":"3","data":{"groupId":"grp-consumer"}} payload: {...{"epoch":3}}
+| offset: 10 ... key: {"type":"6","data":{"groupId":"grp-consumer"}} payload: {...{"assignmentEpoch":3}}</code></pre>
+          <p>
+            No type 4 record appears. The schema says that record was replaced in 4.1 by KIP-1101, though a heartbeat comment at the pin still names it
+            (<a href="../transactions/#p5-register">register D9</a>, class B, fixed after 4.4.0 in <code>72955baae9</code>, no tag). Since 4.3, target assignment is also rate-limited.
+            <code>GroupMetadataManager.java:4187-4208</code>:
+          </p>
+<pre><code>    static boolean canComputeNextTargetAssignment(
+        long assignmentTimestampMs,
+        int assignmentIntervalMs,
+        long currentTimeMs
+    ) {
+        // The next target assignment can be computed immediately
+        //  * when there is no existing target assignment,
+        //  * or we do not know when the existing target assignment was computed.
+        if (assignmentTimestampMs == 0) {
+            return true;
+        }
+
+        // The next target assignment can be computed immediately when the assignment interval is
+        // zero. This provides an escape hatch if the wall clock undergoes a large backwards
+        // correction.
+        if (assignmentIntervalMs == 0) {
+            return true;
+        }
+
+        // Otherwise, we wait for the assignment interval to elapse.
+        return currentTimeMs &gt;= assignmentTimestampMs + assignmentIntervalMs;
+    }</code></pre>
+          <p>
+            A deferred assignment has no timer of its own. It waits for a later heartbeat from any member. One such wait is on disk, in a share group that uses the same path:
+            4,835 ms (<a href="../transactions/#p5-register">register D105</a>, class E, behaviour change).
+          </p>
+
+          <h3>Measured: 7 members, no state</h3>
+          <p>
+            "Stop" is the longest gap with zero records consumed on any partition. "Done" is the last listener event after the change. At 100 records/s over 12 partitions a
+            healthy partition sees a record about every 120 ms, so stop values near 100 ms are the measuring floor. Loopback, Java client only, relative only
+            <span class="recon">measured here</span>:
+          </p>
+          <table>
+            <thead><tr><th>Event</th><th>Mode</th><th>Runs</th><th>Stop ms</th><th>Idle &gt; 1 s</th><th>Idle p·s</th><th>Done ms</th><th>Re-read</th></tr></thead>
+            <tbody>
+              <tr><td>Scale-out 6→7</td><td>eager</td><td>4</td><td>85–381</td><td>0</td><td>0</td><td>2730–3049</td><td>0</td></tr>
+              <tr><td></td><td>cooperative</td><td>2</td><td>71–77</td><td>1</td><td>3.1–3.2</td><td>5977–6096</td><td>0–1</td></tr>
+              <tr><td></td><td>consumer, 5 s</td><td>4</td><td>66–84</td><td>1</td><td>2.7–2.9</td><td>5240–5326</td><td>0</td></tr>
+              <tr><td></td><td>consumer, 1 s</td><td>2</td><td>60–82</td><td>0–1</td><td>0–1.1</td><td>1423–1448</td><td>0</td></tr>
+              <tr><td>Graceful leave</td><td>eager</td><td>1</td><td>98</td><td>2</td><td>5.6</td><td>2743</td><td>0</td></tr>
+              <tr><td></td><td>consumer, 5 s</td><td>1</td><td>81</td><td>2</td><td>6.3</td><td>3075</td><td>0</td></tr>
+              <tr><td></td><td>consumer, 1 s</td><td>1</td><td>38</td><td>2</td><td>2.4</td><td>998</td><td>0</td></tr>
+              <tr style="background: var(--red-soft)"><td>Busy member</td><td>eager</td><td>1</td><td><strong>22398</strong></td><td><strong>12</strong></td><td><strong>275.2</strong></td><td>25061</td><td>0</td></tr>
+              <tr><td></td><td>cooperative</td><td>1</td><td>89</td><td>3</td><td>53.1</td><td>28064</td><td>175</td></tr>
+              <tr><td></td><td>consumer, 5 s</td><td>1</td><td>67</td><td>3</td><td>53.1</td><td>5547</td><td>0</td></tr>
+              <tr><td></td><td>consumer, 1 s</td><td>1</td><td>135</td><td>3</td><td>51.5</td><td>1725</td><td>0</td></tr>
+              <tr><td>SIGKILL</td><td>eager</td><td>1</td><td>115</td><td>10</td><td>120.1</td><td>47743</td><td>34</td></tr>
+              <tr><td></td><td>consumer, 5 s</td><td>1</td><td>52</td><td>2</td><td>86.1</td><td>42956</td><td>52</td></tr>
+            </tbody>
+          </table>
+          <p>
+            Eager looks best in the quiet row, and that is a best case: its members had finished the same rebalance together, so their heartbeats landed within about
+            240 ms of each other. The consumer protocol moved one partition and paused no other, but finished later, 5.2 to 5.3 s against 2.7 to 3.0 s, with the moved partition idle 2.7 to
+            2.9 s, because each step waits for a 5 s heartbeat. A 1 s heartbeat cut it to about 1.4 s, so cadence sets the speed here, not the assignor. A graceful leave cost about the
+            same in all default modes (one run each).
+          </p>
+
+          <figure class="figure wide" id="fig-busy">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">The busy member, two ways: one member sleeps 25 s between polls while a joiner arrives</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 340" role="img" aria-label="Two swimlane panels of 12 partitions over 45 seconds. Eager classic: ten partitions go idle from about 2.7 to 25 seconds, and the sleeper's two are idle from 0 to 25 seconds, so all twelve are dark together for 22.4 seconds. Consumer protocol: only the sleeper's two partitions are idle for 25 seconds, and one partition being handed over is idle for 2,981 milliseconds; the rest keep flowing.">
+                <text x="50" y="24" class="svg-lane">EAGER CLASSIC</text>
+                <text x="50" y="42" class="svg-sub">all 12 stopped for 22.4 s, until the sleeper polled</text>
+                <text x="590" y="24" class="svg-lane">CONSUMER PROTOCOL, 5 S HEARTBEAT</text>
+                <text x="590" y="42" class="svg-sub">global stop 67 ms; joiner served at 5.5 s, sleeper still asleep</text>
+                <text x="42" y="63" text-anchor="end" class="svg-sub">p0</text>
+                <rect x="50" y="52" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="52" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="79" text-anchor="end" class="svg-sub">p1</text>
+                <rect x="50" y="68" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="68" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="95" text-anchor="end" class="svg-sub">p2</text>
+                <rect x="50" y="84" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="84" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="111" text-anchor="end" class="svg-sub">p3</text>
+                <rect x="50" y="100" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="100" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="127" text-anchor="end" class="svg-sub">p4</text>
+                <rect x="50" y="116" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="116" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="143" text-anchor="end" class="svg-sub">p5</text>
+                <rect x="50" y="132" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="132" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="159" text-anchor="end" class="svg-sub">p6</text>
+                <rect x="50" y="148" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="148" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="175" text-anchor="end" class="svg-sub">p7</text>
+                <rect x="50" y="164" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="164" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="191" text-anchor="end" class="svg-sub">p8</text>
+                <rect x="50" y="180" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="180" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="207" text-anchor="end" class="svg-sub">p9</text>
+                <rect x="50" y="196" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="75.1" y="196" width="208.8" height="12" fill="#ad4b43"/>
+                <text x="42" y="223" text-anchor="end" class="svg-sub">p10</text>
+                <rect x="50" y="212" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="50.3" y="212" width="233.5" height="12" fill="#252525"/>
+                <text x="42" y="239" text-anchor="end" class="svg-sub">p11</text>
+                <rect x="50" y="228" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="50.3" y="228" width="233.5" height="12" fill="#252525"/>
+                <line x1="50" y1="250" x2="470" y2="250" stroke="#b8b8b1"/>
+                <line x1="50" y1="250" x2="50" y2="254" stroke="#b8b8b1"/><text x="50" y="267" class="svg-sub">0 s</text>
+                <line x1="143" y1="250" x2="143" y2="254" stroke="#b8b8b1"/><text x="143" y="267" class="svg-sub">10 s</text>
+                <line x1="237" y1="250" x2="237" y2="254" stroke="#b8b8b1"/><text x="237" y="267" class="svg-sub">20 s</text>
+                <line x1="330" y1="250" x2="330" y2="254" stroke="#b8b8b1"/><text x="330" y="267" class="svg-sub">30 s</text>
+                <line x1="423" y1="250" x2="423" y2="254" stroke="#b8b8b1"/><text x="423" y="267" class="svg-sub">40 s</text>
+                <text x="582" y="63" text-anchor="end" class="svg-sub">p0</text>
+                <rect x="590" y="52" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="79" text-anchor="end" class="svg-sub">p1</text>
+                <rect x="590" y="68" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="617.9" y="68" width="27.8" height="12" fill="#d98226"/>
+                <text x="582" y="95" text-anchor="end" class="svg-sub">p2</text>
+                <rect x="590" y="84" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="111" text-anchor="end" class="svg-sub">p3</text>
+                <rect x="590" y="100" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="127" text-anchor="end" class="svg-sub">p4</text>
+                <rect x="590" y="116" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="590.4" y="116" width="233.4" height="12" fill="#252525"/>
+                <text x="582" y="143" text-anchor="end" class="svg-sub">p5</text>
+                <rect x="590" y="132" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <rect x="590.4" y="132" width="233.4" height="12" fill="#252525"/>
+                <text x="582" y="159" text-anchor="end" class="svg-sub">p6</text>
+                <rect x="590" y="148" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="175" text-anchor="end" class="svg-sub">p7</text>
+                <rect x="590" y="164" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="191" text-anchor="end" class="svg-sub">p8</text>
+                <rect x="590" y="180" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="207" text-anchor="end" class="svg-sub">p9</text>
+                <rect x="590" y="196" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="223" text-anchor="end" class="svg-sub">p10</text>
+                <rect x="590" y="212" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <text x="582" y="239" text-anchor="end" class="svg-sub">p11</text>
+                <rect x="590" y="228" width="420" height="12" fill="#dfede5" stroke="none"/>
+                <line x1="590" y1="250" x2="1010" y2="250" stroke="#b8b8b1"/>
+                <line x1="590" y1="250" x2="590" y2="254" stroke="#b8b8b1"/><text x="590" y="267" class="svg-sub">0 s</text>
+                <line x1="683" y1="250" x2="683" y2="254" stroke="#b8b8b1"/><text x="683" y="267" class="svg-sub">10 s</text>
+                <line x1="777" y1="250" x2="777" y2="254" stroke="#b8b8b1"/><text x="777" y="267" class="svg-sub">20 s</text>
+                <line x1="870" y1="250" x2="870" y2="254" stroke="#b8b8b1"/><text x="870" y="267" class="svg-sub">30 s</text>
+                <line x1="963" y1="250" x2="963" y2="254" stroke="#b8b8b1"/><text x="963" y="267" class="svg-sub">40 s</text>
+                <rect x="50" y="292" width="16" height="12" fill="#dfede5" stroke="#367f59"/><text x="72" y="302" class="svg-sub">consuming</text>
+                <rect x="170" y="292" width="16" height="12" fill="#252525"/><text x="192" y="302" class="svg-sub">the sleeper's own two: idle under any protocol</text>
+                <rect x="590" y="292" width="16" height="12" fill="#ad4b43"/><text x="612" y="302" class="svg-sub">idle behind the barrier</text>
+                <rect x="800" y="292" width="16" height="12" fill="#d98226"/><text x="822" y="302" class="svg-sub">handed over: idle 2,981 ms</text>
+                <text x="50" y="330" class="svg-note">x is seconds since the event: one member starts a 25 s sleep between polls and a joiner arrives. Lane edges come from listener events.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">7 stateless members, single run each, Java client, loopback. 50 of eager's 275.2 partition-seconds, and of the consumer protocol's 53.1, belong to the sleeper's own two partitions. The assignor happened to take the moved partition from a different member, so this run did not exercise a slow member that must itself revoke. KIP-848's claims concern larger groups with slow members; this is not that. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            Cooperative sits between them. Other partitions kept flowing, 89 ms global gap, but the joiner got nothing until the barrier cleared, 28 s against 5.5 s. It also redelivered 175
+            records in one run. A classic client refuses offset commits while rebalancing (<code>ConsumerCoordinator.java:1312-1322</code>), so partition 8 kept being consumed with commits failing,
+            then moved. The refusal is read in code; the link to 175 is inferred, and it holds arithmetically: 175 ÷ 8.33 records/s is 21 s, and the rebalance was open about 22 s
+            (<a href="../transactions/#p5-register">register D82</a>, class D, gotcha).
+          </p>
+          <p>
+            After a SIGKILL the group first reacted at about 44.7 s and 43 s, in one run each: the session timeout, plus the next heartbeat carrying the news. Then they differ. Under eager, 8
+            surviving partitions idled about 3.1 s, because one member's heartbeat came 3 s after the others' and the barrier waited for it, and why it was out of phase was not determined.
+            Under the consumer protocol no surviving partition idled.
+          </p>
+          <p>
+            Classic is still the default: <code>group.protocol</code> is <code>classic</code> in Java 4.4.0 (<code>ConsumerConfig.java:121-123</code>), librdkafka and franz-go, so nobody gets KIP-848
+            without opting in. Migration is online, but the knobs change. <code>session.timeout.ms</code> and <code>heartbeat.interval.ms</code> are rejected on the client, a session under 45 s needs
+            a broker change, and a quiet scale-out gets slower by default (<a href="../transactions/#p5-register">register D83</a>, class D). One small thing: a fencing log for a plain classic commit says
+            <code>txn-offset-commit</code>, because <code>validateOffsetCommit</code> passes its label inverted (<a href="../transactions/#p5-register">register D8</a>, class B, log text only, fixed after 4.4.0 in
+            <code>a3e4a7e42c</code>, no tag).
+          </p>
+
+          <h2 id="p4-static-share"><span class="secnum">07</span>Static members and share groups</h2>
+          <p>
+            <code>group.instance.id</code> gives a member an identity that outlives its process. A static classic member on the default close sends no LeaveGroup, and a rejoin during Stable
+            with the same protocol just swaps the member id (<code>group/GroupMetadataManager.java:8142-8143</code>) <span class="src">from the code</span>. Under KIP-848 a static leave writes epoch −2 and keeps
+            the assignment for the returning instance. In one run under each protocol, a 10 s restart caused no rebalance: other partitions saw at most 148 ms gaps, and the member got its
+            same two partitions back <span class="recon">measured here</span>. A static member still needs the session timer: <code>CloseOptions.LEAVE_GROUP</code> is how it leaves for good, and otherwise it is removed only when the
+            session expires (<code>consumer/internals/ConsumerMembershipManager.java:507-508</code>).
+          </p>
+          <p>
+            The protocols treat a duplicate id in opposite ways (<code>GroupMetadataManager.java:1723-1727</code>, <code>:7219-7226</code>). Classic replaces the old holder, at its next heartbeat. Both consumed the same
+            partitions for about 2.6 s, and that run counted 76 duplicate deliveries, which also include the newcomer re-reading from the last commit. KIP-848 refuses the newcomer with
+            <code>UNRELEASED_INSTANCE_ID</code>, immediately, and the Java client treats that as fatal, so no duplicates. <strong>This is intended</strong>: KIP-848 says the new member "is rejected" and "the
+            consumer should fail". It follows that a crashed static member, which never sent −2, blocks its own replacement until session expiry, 45 s by default. That was derived from code and the
+            live-duplicate test; a crash-restart was not run end to end (<a href="../transactions/#p5-register">register D80</a>, class D, intended per KIP-848).
+          </p>
+
+          <h3>Share groups: leases, not ownership</h3>
+          <p>
+            Share groups, production-ready since 4.2, drop partition ownership. Several members can read one partition, and the broker holds per-record state: five states in the code, one
+            more than KIP-932's four, because KIP-1191 added ARCHIVING for the dead-letter queue (<code>server/…/server/share/fetch/RecordState.java:27-31</code>). Defaults per partition: 2,000 record locks in flight,
+            a 30 s lock and a delivery limit of 5. At the cap the partition just stops acquiring, so a slow consumer stalls it at 2,000 records.
+          </p>
+
+          <figure class="figure wide" id="fig-share">
+            <div class="figure-head">
+              <span class="figure-label">Figure 9</span>
+              <p class="figure-title">A record's life in a share group, with the real poll sequence</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 372" role="img" aria-label="State machine: AVAILABLE goes to ACQUIRED on fetch, raising the delivery count. ACQUIRED goes to ACKNOWLEDGED on ACCEPT, back to AVAILABLE on RELEASE or lock expiry, and to ARCHIVED on REJECT. At the delivery limit a record goes to ARCHIVED, or through ARCHIVING with a dead-letter queue. Below, the real poll sequence: five offsets at counts 2, 3 and 4, then each alone at count 5.">
+                <defs>
+                  <marker id="fig-share-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <rect x="30" y="56" width="170" height="52" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="44" y="78" class="svg-step">AVAILABLE</text><text x="44" y="96" class="svg-sub">state 0</text>
+                <rect x="330" y="56" width="170" height="52" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="344" y="78" class="svg-step">ACQUIRED</text><text x="344" y="96" class="svg-sub">state 1, not persisted</text>
+                <rect x="640" y="20" width="190" height="52" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="654" y="42" class="svg-step">ACKNOWLEDGED</text><text x="654" y="60" class="svg-sub">state 2</text>
+                <rect x="640" y="108" width="190" height="52" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="654" y="130" class="svg-step">ARCHIVING</text><text x="654" y="148" class="svg-sub">state 3, DLQ only</text>
+                <rect x="880" y="108" width="170" height="52" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="894" y="130" class="svg-step">ARCHIVED</text><text x="894" y="148" class="svg-sub">state 4</text>
+
+                <line x1="200" y1="72" x2="328" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="212" y="64" class="svg-sub">fetch, count + 1</text>
+                <polyline points="330,96 200,96" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="206" y="114" class="svg-sub">RELEASE, or lock expiry</text>
+                <polyline points="500,66 570,66 570,46 638,46" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="512" y="60" class="svg-sub">ACCEPT</text>
+                <polyline points="500,92 570,92 570,178 965,178 965,162" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="582" y="194" class="svg-sub">REJECT, or the limit (count 5) with no DLQ</text>
+                <polyline points="570,134 638,134" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="504" y="128" class="svg-sub">limit, DLQ</text>
+                <line x1="830" y1="134" x2="878" y2="134" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+
+                <text x="30" y="226" class="svg-lane">THE REAL SEQUENCE (ONE PARTITION, RELEASE ALL)</text>
+                <text x="30" y="254" class="svg-sub">count 1</text>
+                <text x="100" y="254" class="svg-sub">0 to 9 in one poll: 0-3 ACCEPT, 4 RELEASE, 5 REJECT, 6-9 RELEASE</text>
+                <text x="30" y="282" class="svg-sub">2, 3, 4</text>
+                <rect x="100" y="268" width="150" height="22" rx="3" fill="#e0ebf2" stroke="#3c6f97"/><text x="110" y="283" class="svg-sub" style="fill:#252525">4 6 7 8 9</text>
+                <rect x="256" y="268" width="150" height="22" rx="3" fill="#e0ebf2" stroke="#3c6f97"/><text x="266" y="283" class="svg-sub" style="fill:#252525">4 6 7 8 9</text>
+                <rect x="412" y="268" width="150" height="22" rx="3" fill="#e0ebf2" stroke="#3c6f97"/><text x="422" y="283" class="svg-sub" style="fill:#252525">4 6 7 8 9</text>
+                <text x="580" y="283" class="svg-note">batches of 5 did not shrink at counts 2 to 4</text>
+                <text x="30" y="316" class="svg-sub">5</text>
+                <rect x="100" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="115" y="317" class="svg-sub" style="fill:#252525">4</text>
+                <rect x="146" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="161" y="317" class="svg-sub" style="fill:#252525">6</text>
+                <rect x="192" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="207" y="317" class="svg-sub" style="fill:#252525">7</text>
+                <rect x="238" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="253" y="317" class="svg-sub" style="fill:#252525">8</text>
+                <rect x="284" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="299" y="317" class="svg-sub" style="fill:#252525">9</text>
+                <text x="340" y="317" class="svg-note">one poll each on the last attempt, then archived: max delivery count seen is 5</text>
+                <text x="30" y="352" class="svg-note">Offset 5 was rejected and never came back; offsets 0 to 3 were accepted and never came back.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">States from <code>RecordState.java</code>; the sequence is from <code>share.out</code>, one short run of about 40 s on loopback. It says nothing about larger groups or steady state. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            The code also shrinks batches as the count rises (<code>core/…/server/share/SharePartition.java:2006-2017</code>). The lab shows only the last-attempt rule. An unacknowledged lock with a 15 s
+            setting lapsed about 15 s later, and another consumer got the records with a raised count. The KIP itself says the delivery count is imprecise and delivery is at-least-once, and order is
+            promised only within a batch. Durable state lives in <code>__share_group_state</code>, not <code>__consumer_offsets</code>, with snapshots after 500 updates. Acquisition is not persisted, and
+            one unacknowledged record pins the start offset. <code>share.auto.offset.reset</code> defaults to <code>latest</code>, so records produced before the group first reads are skipped. The state topic
+            defaults to 50 partitions, RF 3 and min ISR 2, so a cluster of fewer than three brokers must lower them first. The persisted start offset never moves backwards, whatever a stale writer sends
+            (<code>share-coordinator/…/coordinator/share/ShareCoordinatorShard.java:662-700</code>).
+          </p>
+          <p>
+            Consumers acknowledge in one of two modes. In implicit mode the next <code>poll()</code> or commit acknowledges everything fetched. In explicit mode, unacknowledged records make it throw
+            (<code>consumer/internals/ShareConsumerImpl.java:1208-1220</code>). There are four types: ACCEPT, RELEASE, REJECT and RENEW, the last extending a lock (KIP-1222). Assignment reuses the same rate-limited
+            heartbeat path as KIP-848, with <code>SimpleAssignor</code> allowing several members on a partition, and a default limit of 200 members where consumer groups are unbounded. A default-bootstrapped 4.4
+            cluster had share groups usable without setting a feature flag by hand, and on disk acknowledged state is range-compressed, using state ids 0, 2 and 4 <span class="recon">measured here</span>. A lock-expiry
+            release that fails to persist is applied anyway, so memory can run ahead of the state topic (<code>SharePartition.java:3024</code>; read, not run).
+          </p>
+          <p>
+            Three edges. In implicit mode, <code>close()</code> right after <code>poll()</code> releases that batch: 400 records were delivered and handed over, then left available at count 1 with lag 400. The
+            Javadoc says so (<code>consumer/KafkaShareConsumer.java:130</code>), but finished work is redelivered and counts against the limit (<a href="../transactions/#p5-register">register D81</a>, class D, documented). The
+            schema documents state ids <code>0:Available,2:Acked,4:Archived</code>, while the lock-expiry path can persist 3 with a DLQ (<a href="../transactions/#p5-register">register D33</a>, class C; read, no DLQ run). And the
+            DLQ is best effort (<a href="../transactions/#p5-register">register D85</a>, class D; no failure run). <code>core/…/server/share/SharePartition.java:3409-3412</code>:
+          </p>
+<pre><code>        )).whenComplete((v1, dlqException) -&gt; {
+            if (dlqException != null) {
+                log.error("Failed to write to DLQ, proceeding to ARCHIVED regardless.", dlqException);
+            }</code></pre>
+          <p>
+            One result must not be overread. Two implicit-mode consumers on one partition printed <code>x=400 y=0</code>: the first took all 400 of 400. That is an artefact of a test loop that stopped at 400
+            records. It shows one fetch can acquire a backlog up to its batch limit, and it says nothing about how share groups spread records. Steady-state distribution was not measured.
+          </p>
+
+          <h2 id="p4-sources"><span class="secnum">08</span>Sources</h2>
+          <ul>
+            <li><a href="https://github.com/apache/kafka/tree/1156b2752aaa28eafc0b4c4d387e63356793268d">apache/kafka 4.4.0</a> (<code>1156b275</code>): the producer, consumer, storage and group-coordinator modules.</li>
+            <li><a href="https://github.com/confluentinc/librdkafka/tree/v2.16.0">librdkafka v2.16.0</a>, read only, and <a href="https://github.com/twmb/franz-go/tree/123ec885bc9766fe08389f7c1b29d652be12ece8">franz-go</a> (<code>123ec885</code>), built and run for the producer cases.</li>
+            <li><a href="https://issues.apache.org/jira/browse/KAFKA-19880">KAFKA-19880</a>, <a href="https://issues.apache.org/jira/browse/KAFKA-15591">KAFKA-15591</a>, <a href="https://issues.apache.org/jira/browse/KAFKA-14312">KAFKA-14312</a>, KIP-794, KIP-848, KIP-932.</li>
+            <li>The verifier runs in <code>verify-b/</code> override the earlier topic results where they differ.</li>
+            <li>Lab evidence: <code>~/kafka-ref/lab/results/producer/</code>, <code>groups/</code>, <code>verify-b/</code>. Research: <code>~/kafka-ref/dossiers/DOSSIER.md</code>.</li>
+          </ul>
+          <p>To re-run, or to run what this box did not:</p>
+<pre><code>cd ~/kafka-ref/lab/results
+bash producer/e2_all.sh; bash producer/e3_all.sh; bash producer/e5_all.sh
+bash verify-b/p1_noproxy.sh                # first-batch overtake, no fault
+bash verify-b/q_rerun.sh                   # InitProducerId hang; add flush() to Hang.java
+bash groups/run_rebal.sh; bash groups/run_decode.sh     # add a SIGKILL-and-restart case</code></pre>
+          <p class="footnote">
+            <strong>Provenance.</strong> Paths, lines and excerpts were re-read from the pinned checkouts. Logs and bytes are real. Timings are loopback on a shared 2-vCPU box: relative, never capacity; rebalance samples are 1 to 4 runs.
+            Mine: the figure drawings and swimlane edges. Inferred: the link from refused commits to 175 redeliveries. Not verified: how often the overtake occurs in production; whether franz-go's gate avoids it; <code>flush()</code> during the hang; the backdated-timestamp route; a crash-restart under KIP-848;
+            a slow member that must itself revoke; coordinator failover; any Go client for groups; share state across failover or with a DLQ. librdkafka was read, never run, and its CRC figure is computed. Trunk <code>09f2dc1320</code> was read,
+            never built. Nothing was reported upstream; the register is in <a href="../transactions/#p5-register">Part 5</a>.
+          </p>
+        </section>
+      </article>

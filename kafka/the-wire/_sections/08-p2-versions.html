@@ -1,0 +1,127 @@
+          <h2 id="p2-versions"><span class="secnum">{{S}}</span>ApiVersions, and Produce v0</h2>
+          <p>
+            If everything is versioned, something has to be readable without knowing the version. That is ApiVersions, key 18, the
+            protocol's one fixed point. A client treats a node as ready only after its response
+            (<code>NetworkClient.java:1151-1157</code>), and every captured Java connection, 8 of 8, opened with it
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The client sends its highest version blind, so the broker has to accept anything.
+            <code>clients/…/common/protocol/ApiKeys.java:247-250</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>        // ApiVersions API is a particular case. The client always send the highest version
+        // that it supports and the server fails back to version 0 if it does not know it.
+        // Hence, we have to accept any versions here, even unsupported ones.
+        if (this == ApiKeys.API_VERSIONS) return true;</code></pre>
+          <p>
+            A version the broker does not know is not parsed. It is treated as v0, and the answer uses the v0 schema. The header
+            holds still too, hard-coded by the generator for this one key.
+            <code>generator/…/message/ApiMessageTypeGenerator.java:362-365</code>:
+          </p>
+<pre><code>            if (type.equals("response") &amp;&amp; apiKey == 18) {
+                buffer.printf("// ApiVersionsResponse always includes a v0 header.%n");
+                buffer.printf("// See KIP-511 for details.%n");
+                buffer.printf("return (short) 0;%n");</code></pre>
+          <p>
+            So a client that knows nothing about this broker can still read the answer. Here is the lab's ApiVersions v99, whose
+            whole response is 16 bytes <span class="recon">measured here</span>:
+          </p>
+<pre><code>00000007   correlation id = 7, then no header tag byte
+0023       error 35, UNSUPPORTED_VERSION
+00000001   one entry, in a fixed-width v0 array
+0012       key 18
+0000 0005  supports 0 to 5</code></pre>
+          <p>
+            The Java client retries with the stated maximum. franz-go detects the case from raw bytes, because the error's low byte
+            sits at position 1 of a v0 body, and caches the maximum to skip the extra round trip. For every other API, the client
+            picks the highest version both sides allow, per node. The docs say those results hold only for that connection.
+          </p>
+          <p>
+            The live v5 answer is 876 bytes and starts <code>00000001 0000 4e</code>: correlation id, error, then a compact array
+            length for 77 entries, with no header tag byte between them. Its first entry is
+            <code>0000 0000 000d 00</code>: key 0, Produce, minimum 0, maximum 13. Remember that zero.
+          </p>
+          <p>
+            A client that gets an unknown key sets it aside, so brokers can add APIs without breaking older clients. The broker also
+            answers before authentication, which reveals its version on a SASL listener (<code>KafkaApis.scala:1545-1550</code>).
+            Forwardable APIs are advertised as the intersection of broker and active controller ranges.
+          </p>
+
+          <h3>New in 4.4: am I talking to the right broker?</h3>
+          <p>
+            ApiVersions v5 (KIP-1242) lets a client name the cluster and node it meant to reach. A mismatch returns
+            <code>REBOOTSTRAP_REQUIRED</code> (D100, class E; KAFKA-20246, fix version 4.4.0). The capture shows both forms. A bootstrap
+            connection's frame has size 54; a node connection's has size 76, and the 22 extra bytes are the cluster id. Decoded by hand
+            from the real frames <span class="recon">measured here</span>:
+          </p>
+<pre><code>bootstrap  0000 0036 | 0012 0005 00000000 000d wire-producer 00 | 12 apache-kafka-java 06 4.4.0 | 00          | ffffffff | 00
+node       0000 004c | 0012 0005 00000004 000d wire-producer 00 | 12 apache-kafka-java 06 4.4.0 | 17 hitQ…wOA  | 00000001 | 00</code></pre>
+
+          <h3>The line at 2.1, and the exception</h3>
+          <p>
+            The project kept every version since 0.8.0 until KIP-896 set the baseline at Kafka 2.1 for 4.0, with exceptions where
+            existing clients needed older versions. At the pin, Produce starts at v3 and Fetch at v4. The README now says "Dropping
+            support for old message versions is no longer allowed without a KIP". The compatibility docs' summary, "Pre-0.10.x protocols
+            are fully removed in Kafka 4.0", is not the real rule: the code keeps Metadata <code>0-13</code> and JoinGroup <code>0-9</code>
+            (D16, class C; still at trunk). JoinGroup v0 and v1 are a restoration, brought back in 4.0.1 and 4.1.0 by KAFKA-19444 because
+            librdkafka's SASL GSSAPI check needed v0.
+          </p>
+          <p>
+            Then the oddest line in the protocol. <code>ApiKeys.java:157-160</code>:
+          </p>
+<pre><code>    // Versions 0-2 were removed in Apache Kafka 4.0, version 3 is the new baseline. Due to a bug in librdkafka,
+    // version `0` has to be included in the api versions response (see KAFKA-18659). In order to achieve that,
+    // we adjust `toApiVersion` to return `0` for the min version of `produce` in the broker listener.
+    public static final short PRODUCE_API_VERSIONS_RESPONSE_MIN_VERSION = 0;</code></pre>
+          <p>
+            The adjustment is at <code>ApiKeys.java:290-291</code>:
+          </p>
+<pre><code>        short oldestVersion = (this == PRODUCE &amp;&amp; listenerType.map(l -&gt; l == ApiMessageType.ListenerType.BROKER).orElse(false)) ?
+            PRODUCE_API_VERSIONS_RESPONSE_MIN_VERSION : oldestVersion();</code></pre>
+          <p>
+            The bug: older librdkafka asked whether Produce v0 was supported before compressing, through this call:
+          </p>
+<pre><code>rd_kafka_broker_ApiVersion_supported(rkb, RD_KAFKAP_Produce, 0, ApiVersion, NULL)</code></pre>
+          <p>
+            With gzip and snappy at the zero default, that asked for exactly v0. A broker without v0 would have turned compression
+            off, with a NOTICE at most once a day. The accepted fix was to advertise v0 to v2 and reject them. Figure
+            {{fig-versions}} is the result.
+          </p>
+
+          <figure class="figure" id="fig-versions">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What the broker says versus what it does</p>
+            </div>
+            <div class="figure-body">
+              <table>
+                <thead><tr><th>API</th><th>Advertised</th><th>Schema</th><th>Sent</th><th>Result</th></tr></thead>
+                <tbody>
+                  <tr style="background: var(--red-soft)"><td><strong>Produce</strong> (0)</td><td><strong>0 to 13</strong></td><td><strong>3 to 13</strong></td><td>v2</td><td>socket closed after 7 ms, 0 bytes</td></tr>
+                  <tr><td>Fetch (1)</td><td>4 to 18</td><td>4 to 18</td><td>v3</td><td>socket closed after 3 ms, 0 bytes</td></tr>
+                  <tr><td>Metadata (3)</td><td>0 to 13</td><td>0 to 13</td><td>v99</td><td>socket closed after 3 ms, 0 bytes; v0 advertised, not sent</td></tr>
+                  <tr><td>JoinGroup (11)</td><td>0 to 9</td><td>0 to 9</td><td>nothing</td><td>advertised, not sent</td></tr>
+                  <tr style="background: var(--purple-soft)"><td>InitProducerId (22)</td><td>0 to 5</td><td>0 to 6, top unstable</td><td>nothing</td><td>advertised range hides the unstable top</td></tr>
+                  <tr><td>LeaderAndIsr (4)</td><td>not advertised</td><td>none</td><td>v0</td><td>socket closed after 2 ms, 0 bytes</td></tr>
+                  <tr><td>Unknown key 999</td><td>not advertised</td><td>no schema</td><td>key 999</td><td>socket closed after 3 ms, 0 bytes</td></tr>
+                  <tr style="background: var(--green-soft)"><td>ApiVersions (18)</td><td>0 to 5</td><td>0 to 5</td><td>v0, v99</td><td>v0 answered; v99 answered with error 35, in 16 bytes</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">Timings are one run on loopback, hand-built frames straight to the broker: relative only. Only Produce advertises something it refuses, and it does so on purpose. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            So the advertised Produce minimum is false by design: advertised 0, usable 3 (D53, class D, intended; still at trunk). A
+            client that trusts the range and picks low gets end-of-file, not an error. KAFKA-18659's plan said reject "with
+            <code>UnsupportedVersion</code> error". What reaches the client is a closed socket and zero bytes, because the header check
+            <a href="#p2-pools">throws on the network thread</a> and that path has no response to send (D17, class C).
+            <code>docs/design/protocol.md:102</code> says only "reject", which is accurate.
+          </p>
+          <p>
+            At librdkafka's pin, the check that caused this is fixed: <code>rd_kafka_broker_ApiVersion_at_least</code> now tests an open
+            range. So the workaround protects only older builds, which is an inference from reading, not a run. Whether Kafka can drop
+            the advertisement depends on how many pre-v2.11.1 clients remain, and nothing here measures that. The metric KIP-896 relied on cannot help:
+            <code>DeprecatedRequestsPerSec</code> is wired, but no schema at the pin declares <code>deprecatedVersions</code>, so in
+            4.4 it cannot fire (D54, class D).
+          </p>

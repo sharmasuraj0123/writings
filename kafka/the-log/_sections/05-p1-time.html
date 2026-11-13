@@ -1,0 +1,101 @@
+          <h2 id="p1-time"><span class="secnum">{{S}}</span>Rolls and retention run on record time</h2>
+          <p>
+            Two jobs need to know how old a segment is, and both answer from the records. A record's
+            timestamp is, by default, whatever the producer wrote. So a producer can roll segments early, stall retention, or have
+            its data deleted in seconds. The register carries this as <a href="../transactions/#D42">D42</a>, class D
+            (gotcha).
+          </p>
+
+          <h3>The roll</h3>
+          <p>
+            A segment rolls on any of five conditions: too big for the incoming batch, too old, offset index full, time index full,
+            or next offset not representable relative to the base. <code>storage/…/log/LogSegment.java:167-173</code>:
+          </p>
+<pre><code>    public boolean shouldRoll(RollParams rollParams) throws IOException {
+        boolean reachedRollMs = timeWaitedForRoll(rollParams.now(), rollParams.maxTimestampInMessages()) &gt; rollParams.maxSegmentMs() - rollJitterMs;
+        int size = size();
+        return size &gt; rollParams.maxSegmentBytes() - rollParams.messagesSize() ||
+            (size &gt; 0 &amp;&amp; reachedRollMs) ||
+            offsetIndex().isFull() || timeIndex().isFull() || !canConvertToRelativeOffset(rollParams.maxOffsetInMessages());
+    }</code></pre>
+          <p>
+            The defaults are 1 GiB and 7 days. "Too old" is the surprising one. <code>LogSegment.java:709-716</code>:
+          </p>
+<pre><code>    public long timeWaitedForRoll(long now, long messageTimestamp) {
+        // Load the timestamp of the first message into memory
+        loadFirstBatchTimestamp();
+        long ts = rollingBasedTimestamp.orElse(-1L);
+        if (ts &gt;= 0)
+            return messageTimestamp - ts;
+        return now - created;
+    }</code></pre>
+          <p>
+            That compares the incoming batch's record timestamp with the first batch's timestamp in the segment. The wall clock is
+            used only if that batch has no timestamp. And since the check runs inside append
+            (<code>UnifiedLog.java:1248</code>), a segment that gets no writes never rolls at this check
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The lab shows this three ways, in single runs <span class="recon">measured here</span>:
+          </p>
+          <ul>
+            <li>With <code>segment.ms=60000</code>, a segment rolled on one record stamped 81 s ahead of the first batch, while the
+              wall clock moved 5 s between the two surrounding <code>date</code> calls.</li>
+            <li>A default topic rolled straight after a backdated transactional batch. The control marker carries wall-clock time,
+              10 months ahead of the data's timestamp, which exceeded the 7-day default. The first segment held 2 offsets and 95
+              bytes.</li>
+            <li>An old-stamped record does not trigger a roll at all. Record timestamp minus first-batch timestamp is negative, so
+              offsets 2 and 3 joined a segment despite <code>segment.ms=1000</code>.</li>
+          </ul>
+          <p>
+            A roll does four things in order: complete the old segment, open a new one at max(expected, LEO), snapshot producer
+            state, and schedule an asynchronous flush of everything below the new base (<code>LocalLog.java:592</code>,
+            <code>:633</code>, <code>UnifiedLog.java:2245</code>). Becoming inactive appends the largest timestamp to the time index
+            and trims both indexes to real size: the 72 and 120 bytes of Figure {{fig-directory}}.
+          </p>
+
+          <h3>Retention</h3>
+          <p>
+            Retention is a broker timer, every 5 minutes by default, with 7-day time retention and unlimited size retention. The
+            policy decides which checks run: <code>delete</code> runs start-offset, size and time; <code>compact</code> alone runs
+            only the start-offset check (<code>UnifiedLog.java:1984-2000</code>). Time retention compares the clock with the segment's
+            largest record timestamp, falling back to file mtime only if no record has a timestamp. A future timestamp makes the
+            difference negative, so the segment waits; since 4.1.0 this logs a warning (KAFKA-18929). Bounds on the producer are
+            lopsided. <code>message.timestamp.after.max.ms</code> defaults to one hour, while the "before" bound defaults to
+            unlimited, so arbitrarily old timestamps are accepted (<code>ServerLogConfigs.java:132-139</code>).
+          </p>
+          <p>
+            The walk is the part to read. <code>storage/…/log/UnifiedLog.java:1906-1919</code>:
+          </p>
+<pre><code>                // We don't delete segments with offsets at or beyond the high watermark to ensure that the log start
+                // offset can never exceed it.
+                boolean predicateResult = highWatermark() &gt;= upperBoundOffset &amp;&amp; predicate.execute(segment, nextSegmentOpt);
+
+                // Roll the active segment when it breaches the configured retention policy. The rolled segment will be
+                // eligible for deletion and gets removed in the next iteration.
+                if (predicateResult &amp;&amp; remoteLogEnabled() &amp;&amp; nextSegmentOpt.isEmpty() &amp;&amp; segment.size() &gt; 0) {
+                    shouldRoll = true;
+                }
+                if (predicateResult &amp;&amp; !isLastSegmentAndEmpty &amp;&amp; isSegmentEligibleForDeletion(nextSegmentOpt, upperBoundOffset)) {
+                    deletable.add(segment);
+                    segmentOpt = nextSegmentOpt;
+                } else {
+                    segmentOpt = Optional.empty();</code></pre>
+          <p>
+            It walks from the oldest segment and stops at the first one not eligible, so one young segment shields every
+            older-stamped segment behind it. Nothing at or above the high watermark can go. Size retention removes only whole
+            segments, and only while the excess still covers the whole segment, so a log settles between
+            <code>retention.bytes</code> and <code>retention.bytes</code> plus one segment <span class="recon">reconstruction</span>.
+            If every segment qualifies, including the active one, the log first rolls a new empty one, because a log must always
+            have one. The log start offset moves before segments leave the lookup map. Files are then renamed <code>.deleted</code>
+            and removed after <code>file.delete.delay.ms</code>, default 60 s, so in-flight readers of the open channels are safe.
+          </p>
+          <p>
+            One run, two topics, with <code>retention.ms=1h</code>, records stamped 2 h old, and a 2 s check interval
+            <span class="recon">measured here</span>. In the control, segments went away as soon as they stopped being last, and
+            <code>.deleted</code> files sat on disk for the configured 6 s. In the second topic, retention removed an active segment
+            holding only old records. The topic's first record was gone within seconds, before the script's next produce arrived, so
+            backdated data can vanish fast. Then two 2-hour-old records sat in a segment whose first record was fresh, and 14 s of
+            checks left them alone. One young record protects its whole segment. The cross-segment half of that
+            shielding (<a href="../transactions/#D43">D43</a>) is read in code and not measured.
+          </p>

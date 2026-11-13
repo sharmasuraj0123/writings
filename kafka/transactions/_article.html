@@ -1,0 +1,1292 @@
+      <article>
+        <section class="prose">
+          <div class="callout">
+            <span class="k">How to read the badges</span>
+            <p>
+              <span class="src">from the code</span> marks a fact read from the pinned source, cited as
+              <code>repo/path:line</code>: Apache Kafka 4.4.0 (<code>1156b275</code>), franz-go main (<code>123ec885</code>), librdkafka v2.16.0 (<code>c6c9973c</code>). Paths are relative to the
+              <code>kafka/</code> checkout unless a repo is named; <code>core/…/txn/</code> abbreviates
+              <code>core/src/main/scala/kafka/coordinator/transaction/</code>. A bare file name is under a tree named nearby.
+              <span class="recon">measured here</span> marks output from small clusters on loopback, on a shared
+              2-vCPU machine with one disk and no iptables. Timings show relative behaviour, never capacity. Each
+              scenario is a single run unless it says otherwise. librdkafka was read, never run, and trunk was read, never built.
+              Faults here are process kills and <code>SIGSTOP</code>; no real power cut was run.
+              <span class="recon">reconstruction</span> marks a judgement drawn from those sources rather
+              than read in one place. Register ids such as D10 point at the <a href="#p5-register">findings register</a> below.
+            </p>
+            <p>
+              This is Part 5 of 5 of <a href="../">Kafka, taken apart</a>. <a href="../the-log/">Part 1</a> reads the
+              log on disk; <a href="../the-wire/">Part 2</a> follows one request on the wire and through the broker;
+              <a href="../replication/">Part 3</a> reads replication and the metadata quorum; <a href="../clients/">Part 4</a>
+              covers producers and consumer groups.
+            </p>
+          </div>
+
+          <h2 id="p5-two-logs"><span class="secnum">01</span>Two logs, one transaction</h2>
+          <p class="lede">
+            A Kafka transaction is two logs agreeing after the fact: a decision in one, markers in others, a stall in between, and
+            a known bug when the marker has nowhere to go. Exactly-once stops where Kafka stops. This collection's claim is that
+            Kafka is one log used five times, and that nearly every promise is a line in a log: which line, in which log, moved by
+            whom. This part reads the last stable offset, the line that makes a transaction visible. It ends with the findings
+            register for all five parts.
+          </p>
+          <p>
+            Every broker runs a transaction coordinator. A transactional id maps to one by hashing onto a partition of an internal
+            topic, <code>__transaction_state</code> (<code>core/…/txn/TransactionStateManager.scala:439</code>). Changing that
+            topic's partition count would break the mapping, so the coordinator refuses to load if the count moved
+            (<code>:645</code>). The topic defaults to 50 partitions, replication factor 3, min ISR 2 and 100 MiB segments
+            (<code>TransactionLogConfig.java:32-45</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            That topic is the first log. It is compacted, with the transactional id as the only key, so compaction keeps the latest
+            state of each id (<code>TransactionLogKey.json:19-23</code>). It sets <code>unclean.leader.election.enable=false</code>
+            whatever the cluster default says (<code>core/…/txn/TransactionCoordinator.scala:1017-1019</code>), and that flag does
+            not stop <a href="../replication/#p3-elections">last-known-leader election</a>; that much is code reading, not run on this
+            topic. The coordinator's memory follows its log: it updates only after the append is replicated with
+            <code>acks=-1</code>, and the replication timeout is the transaction's own timeout, not
+            <code>request.timeout.ms</code> (<code>TransactionStateManager.scala:802-803</code>).
+          </p>
+          <p>
+            Each value stores the producer id and epoch, the timeout, the status byte, the partitions and two timestamps. <code>PreviousProducerId</code>, <code>NextProducerId</code>,
+            <code>NextProducerEpoch</code> and <code>ClientTransactionVersion</code> are tagged fields of value version 1 (<code>TransactionLogValue.json:28-50</code>). Some of that schema
+            promises more than the code does: <code>PreviousProducerId</code> always holds the current id in practice, and nobody sets <code>NextProducerEpoch</code> (<a href="#D36">D36</a>,
+            <a href="#D37">D37</a>).
+          </p>
+          <p>
+            A client's requested timeout above the broker's cap fails <code>InitProducerId</code> outright. The cap defaults to 15 minutes; the Java client default is 60 seconds
+            (<code>TransactionStateManager.scala:436</code>, <code>ProducerConfig.java:579-581</code>). A null transactional id takes the short path: a fresh producer id at epoch 0 and no log
+            write. That is the plain idempotent producer from <a href="../clients/">Part 4</a> (<code>TransactionCoordinator.scala:127-130</code>).
+          </p>
+          <p>
+            The second log is every data partition the transaction touches. It keeps state of its own: the leader's
+            <code>ProducerStateManager</code> tracks each producer's epoch and open transaction, with a sorted map of open
+            transactions and a second map of decided-but-unreplicated ones (<code>ProducerStateManager.java:89-93</code>). Nothing
+            but markers joins the two.
+          </p>
+
+          <h3>Commit, in order</h3>
+          <p>
+            <code>EndTxn</code> first appends <code>PREPARE_COMMIT</code> or <code>PREPARE_ABORT</code> to the transaction log
+            (<code>TransactionCoordinator.scala:856-857</code>). That durable record is the decision. The client gets its reply
+            next, before any marker is written. <code>core/…/txn/TransactionCoordinator.scala:973-979</code>:
+          </p>
+<pre><code>                case Right((txnMetadata, newPreSendMetadata)) =&gt;
+                  // we can respond to the client immediately and continue to write the txn markers if
+                  // the log append was successful
+                  responseCallback(Errors.NONE, newPreSendMetadata.producerId, newPreSendMetadata.producerEpoch)
+
+                  txnMarkerChannelManager.addTxnMarkersToSend(coordinatorEpoch, txnMarkerResult, txnMetadata, newPreSendMetadata)
+              }</code></pre>
+          <p>
+            Markers are grouped by partition leader and sent as <code>WriteTxnMarkers</code> by one dedicated sender thread per
+            broker, over its own network client (<code>TransactionMarkerChannelManager.scala:123</code>, <code>:345</code>). The
+            leader appends each with <code>acks=-1</code> as a coordinator-origin write, unless the partition is in <code>__consumer_offsets</code>, where it goes through the group coordinator
+            (<code>KafkaApis.scala:1834-1835</code>, <code>:1872-1874</code>). As each partition acks, it leaves the transaction's partition set; when the set
+            is empty the coordinator writes <code>COMPLETE_*</code> (<code>TransactionMarkerRequestCompletionHandler.scala:138-139</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Retries have no count limit: disconnects and not-leader or not-enough-replicas errors re-enqueue against possibly new
+            leaders (<code>:149-158</code>). Two endings are final. <code>INVALID_PRODUCER_EPOCH</code> or
+            <code>TRANSACTION_COORDINATOR_FENCED</code> drops the marker for good, and <code>UNSUPPORTED_*</code> removes the partition
+            as if done (<code>:160-166</code>). A third ending, an empty leader lookup, is the subject of
+            <a href="#p5-hang">Hanging, and KAFKA-20734</a>.
+          </p>
+
+          <figure class="figure wide" id="fig-two-logs">
+            <div class="figure-head">
+              <span class="figure-label">Figure 1</span>
+              <p class="figure-title">One transaction across the coordinator's log and two data partitions</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 400" role="img" aria-label="Timeline. The client's first send writes Ongoing to the transaction log, and data batches land on partitions A and B at epoch 0. EndTxn writes PrepareCommit, the decision. The client's commit call returns. A COMMIT marker at epoch 1 lands on partition A, later one on partition B, then the coordinator writes CompleteCommit. Each partition's records stay stalled until its own marker.">
+                <defs>
+                  <marker id="fig-two-logs-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-two-logs-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker>
+                </defs>
+                <text x="16" y="54" class="svg-lane">CLIENT</text>
+                <text x="16" y="132" class="svg-lane">TXN LOG</text>
+                <text x="16" y="148" class="svg-sub">__transaction_state</text>
+                <text x="16" y="239" class="svg-lane">PARTITION A</text>
+                <text x="16" y="329" class="svg-lane">PARTITION B</text>
+                <g stroke="#deded9" stroke-width="1">
+                  <line x1="165" y1="50" x2="985" y2="50"/><line x1="165" y1="135" x2="985" y2="135"/><line x1="165" y1="235" x2="985" y2="235"/><line x1="165" y1="325" x2="985" y2="325"/>
+                </g>
+                <rect x="370" y="231" width="280" height="8" fill="#f7e3c8"/>
+                <rect x="450" y="321" width="340" height="8" fill="#f7e3c8"/>
+                <rect x="740" y="231" width="245" height="8" fill="#dfede5"/>
+                <rect x="880" y="321" width="105" height="8" fill="#dfede5"/>
+                <text x="376" y="224" class="svg-note">stalled: LSO waits at the first data batch</text>
+                <text x="456" y="314" class="svg-note">stalled: LSO waits at the first data batch</text>
+                <text x="746" y="224" class="svg-note">reads A</text>
+                <text x="884" y="314" class="svg-note">reads B</text>
+
+                <rect x="175" y="118" width="90" height="34" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="220" y="133" text-anchor="middle" class="svg-step">Ongoing</text>
+                <text x="220" y="146" text-anchor="middle" class="svg-sub">epoch 0</text>
+                <rect x="285" y="218" width="85" height="34" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="327" y="233" text-anchor="middle" class="svg-step">data</text>
+                <text x="327" y="246" text-anchor="middle" class="svg-sub">epoch 0</text>
+                <rect x="365" y="308" width="85" height="34" rx="3" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="407" y="323" text-anchor="middle" class="svg-step">data</text>
+                <text x="407" y="336" text-anchor="middle" class="svg-sub">epoch 0</text>
+                <rect x="480" y="118" width="112" height="34" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="536" y="133" text-anchor="middle" class="svg-step">PrepareCommit</text>
+                <text x="536" y="146" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <text x="536" y="170" text-anchor="middle" class="svg-note">the decision</text>
+                <rect x="650" y="218" width="90" height="34" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="695" y="233" text-anchor="middle" class="svg-step">COMMIT</text>
+                <text x="695" y="246" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <rect x="790" y="308" width="90" height="34" rx="3" fill="#dfede5" stroke="#367f59"/>
+                <text x="835" y="323" text-anchor="middle" class="svg-step">COMMIT</text>
+                <text x="835" y="336" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <rect x="880" y="118" width="108" height="34" rx="3" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="934" y="133" text-anchor="middle" class="svg-step">CompleteCommit</text>
+                <text x="934" y="146" text-anchor="middle" class="svg-sub">epoch 1</text>
+
+                <text x="220" y="38" text-anchor="middle" class="svg-step">first send</text>
+                <line x1="220" y1="50" x2="220" y2="116" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <line x1="327" y1="50" x2="327" y2="216" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-two-logs-b)"/>
+                <line x1="407" y1="50" x2="407" y2="306" stroke="#3c6f97" stroke-width="1" marker-end="url(#fig-two-logs-b)"/>
+                <text x="520" y="38" text-anchor="middle" class="svg-step">EndTxn</text>
+                <line x1="520" y1="50" x2="520" y2="116" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <text x="580" y="38" class="svg-step">commitTransaction returns</text>
+                <line x1="575" y1="116" x2="575" y2="52" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <line x1="695" y1="135" x2="695" y2="216" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <line x1="835" y1="135" x2="835" y2="306" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-two-logs-k)"/>
+                <text x="703" y="182" class="svg-sub">WriteTxnMarkers</text>
+                <text x="843" y="182" class="svg-sub">WriteTxnMarkers</text>
+                <path d="M740,362 H880" fill="none" stroke="#765b98" stroke-width="1.4" stroke-dasharray="5 4"/>
+                <text x="810" y="378" text-anchor="middle" class="svg-note">a reader of both can see A and not B</text>
+                <text x="16" y="392" class="svg-note">Order and spacing are illustrative; markers land in no fixed order.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Reconstruction from the code, with epochs as measured in <code>exp1.out</code>. Commit returning sits between the decision
+              and the markers. "Reads" means a <code>read_committed</code> reader. Under TV2 the epoch moves at <code>Prepare*</code>, so markers carry one above their data.
+            </p>
+          </figure>
+
+          <h3>Decided, not visible</h3>
+          <p>
+            The lab probed the coordinator straight after <code>commitTransaction</code> or <code>abortTransaction</code> returned, in
+            all 10 commits and 3 aborts across Java TV2, Java TV0 and franz-go. Every one showed <code>PrepareCommit</code> or
+            <code>PrepareAbort</code> <span class="recon">measured here</span>. That shows <code>COMPLETE_*</code> not yet applied, not
+            that no marker had landed. This is register <a href="#D86">D86</a>. One init plus three transactions wrote ten records to
+            <code>__transaction_state</code>, so under TV2 a transaction costs three coordinator writes: <code>Ongoing</code>, <code>Prepare*</code> and <code>Complete*</code>. After the last marker,
+            <code>describe-producers</code> shows the partition holding the bumped epoch, last sequence -1 and no open transaction.
+          </p>
+          <p>
+            Markers land partition by partition. There is no global commit point, so a reader of two partitions can see one side of a
+            committed transaction before the other <span class="recon">reconstruction</span>.
+          </p>
+
+          <h3>Eight states</h3>
+          <p>
+            There are eight states, and the status byte on disk is 0 to 7 (<code>TransactionState.java:39-82</code>). Two of them never
+            reach the log. <code>PREPARE_EPOCH_FENCE</code> exists only as an in-memory pending state on the way to
+            <code>PREPARE_ABORT</code> (<code>TransactionMetadata.java:414-415</code>), and <code>DEAD</code> is a tombstone plus removal
+            from memory (<code>:426</code>). Every transition has two steps: <code>prepareTransitionTo</code> sets a pending state that
+            blocks others, and <code>completeTransitionTo</code> applies it after the append (<code>:341-349</code>, <code>:444</code>). A
+            request that arrives meanwhile gets the retriable <code>CONCURRENT_TRANSACTIONS</code>, not a queue slot
+            (<code>TransactionCoordinator.scala:439-444</code>). The legal moves are a table of previous states. <code>transaction-coordinator/…/TransactionState.java:94-103</code>:
+          </p>
+<pre><code>    public static final Map&lt;TransactionState, Set&lt;TransactionState&gt;&gt; VALID_PREVIOUS_STATES = Map.of(
+        EMPTY, Set.of(EMPTY, COMPLETE_COMMIT, COMPLETE_ABORT),
+        ONGOING, Set.of(ONGOING, EMPTY, COMPLETE_COMMIT, COMPLETE_ABORT),
+        PREPARE_COMMIT, Set.of(ONGOING),
+        PREPARE_ABORT, Set.of(ONGOING, PREPARE_EPOCH_FENCE, EMPTY, COMPLETE_COMMIT, COMPLETE_ABORT),
+        COMPLETE_COMMIT, Set.of(PREPARE_COMMIT),
+        COMPLETE_ABORT, Set.of(PREPARE_ABORT),
+        DEAD, Set.of(EMPTY, COMPLETE_ABORT, COMPLETE_COMMIT),
+        PREPARE_EPOCH_FENCE, Set.of(ONGOING)
+    );</code></pre>
+
+          <figure class="figure wide" id="fig-states">
+            <div class="figure-head">
+              <span class="figure-label">Figure 2</span>
+              <p class="figure-title"><code>VALID_PREVIOUS_STATES</code>, drawn: eight states, two never persisted</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 410" role="img" aria-label="State machine. Empty goes to Ongoing. Ongoing goes to PrepareCommit, PrepareAbort or the unpersisted PrepareEpochFence, which goes to PrepareAbort. PrepareCommit goes to CompleteCommit, PrepareAbort to CompleteAbort. Both complete states return to Empty or Ongoing and can go to the unpersisted Dead state. TV2 adds edges into PrepareAbort from Empty, CompleteCommit and CompleteAbort.">
+                <defs>
+                  <marker id="fig-states-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker>
+                  <marker id="fig-states-o" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#d98226"/></marker>
+                </defs>
+                <rect x="680" y="52" width="180" height="280" rx="8" fill="#f7f7f5" stroke="#b8b8b1"/>
+                <text x="770" y="192" text-anchor="middle" class="svg-note">either complete state</text>
+
+                <g fill="#ffffff" stroke="#252525" stroke-width="1">
+                  <rect x="30" y="170" width="140" height="54" rx="4"/><rect x="240" y="170" width="140" height="54" rx="4"/>
+                  <rect x="470" y="70" width="150" height="54" rx="4"/><rect x="470" y="260" width="150" height="54" rx="4"/>
+                  <rect x="695" y="70" width="150" height="54" rx="4"/><rect x="695" y="260" width="150" height="54" rx="4"/>
+                </g>
+                <rect x="240" y="320" width="170" height="54" rx="4" fill="#ffffff" stroke="#765b98" stroke-dasharray="5 4"/>
+                <rect x="885" y="165" width="105" height="54" rx="4" fill="#ffffff" stroke="#765b98" stroke-dasharray="5 4"/>
+                <text x="100" y="194" text-anchor="middle" class="svg-step">Empty</text><text x="100" y="211" text-anchor="middle" class="svg-sub">byte 0</text>
+                <text x="310" y="194" text-anchor="middle" class="svg-step">Ongoing</text><text x="310" y="211" text-anchor="middle" class="svg-sub">byte 1</text>
+                <text x="545" y="94" text-anchor="middle" class="svg-step">PrepareCommit</text><text x="545" y="111" text-anchor="middle" class="svg-sub">byte 2</text>
+                <text x="545" y="284" text-anchor="middle" class="svg-step">PrepareAbort</text><text x="545" y="301" text-anchor="middle" class="svg-sub">byte 3</text>
+                <text x="770" y="94" text-anchor="middle" class="svg-step">CompleteCommit</text><text x="770" y="111" text-anchor="middle" class="svg-sub">byte 4</text>
+                <text x="770" y="284" text-anchor="middle" class="svg-step">CompleteAbort</text><text x="770" y="301" text-anchor="middle" class="svg-sub">byte 5</text>
+                <text x="937" y="189" text-anchor="middle" class="svg-step">Dead</text><text x="937" y="206" text-anchor="middle" class="svg-sub">byte 6</text>
+                <text x="325" y="344" text-anchor="middle" class="svg-step">PrepareEpochFence</text><text x="325" y="361" text-anchor="middle" class="svg-sub">byte 7</text>
+
+                <g fill="none" stroke="#252525" stroke-width="1.6">
+                  <path d="M170,197 H238" marker-end="url(#fig-states-k)"/>
+                  <path d="M380,185 L468,110" marker-end="url(#fig-states-k)"/>
+                  <path d="M380,210 L468,275" marker-end="url(#fig-states-k)"/>
+                  <path d="M320,224 V318" marker-end="url(#fig-states-k)"/>
+                  <path d="M410,345 L480,316" marker-end="url(#fig-states-k)"/>
+                  <path d="M620,97 H693" marker-end="url(#fig-states-k)"/>
+                  <path d="M620,280 H693" marker-end="url(#fig-states-k)"/>
+                  <path d="M770,52 V24 H100 V168" marker-end="url(#fig-states-k)"/>
+                  <path d="M310,24 V168" marker-end="url(#fig-states-k)"/>
+                  <path d="M860,192 H883" marker-end="url(#fig-states-k)"/>
+                </g>
+                <g fill="none" stroke="#d98226" stroke-width="2">
+                  <path d="M100,224 V394 H545 V316" marker-end="url(#fig-states-o)"/>
+                  <path d="M693,300 H622" marker-end="url(#fig-states-o)"/>
+                  <path d="M695,120 L605,258" marker-end="url(#fig-states-o)"/>
+                </g>
+                <text x="400" y="18" class="svg-sub">back to Empty or Ongoing</text>
+                <text x="112" y="388" class="svg-sub">TV2 only: abort from an idle state</text>
+                <text x="885" y="238" class="svg-note">also from Empty</text>
+                <text x="885" y="254" class="svg-note">(not drawn)</text>
+                <text x="620" y="360" class="svg-note">Dashed box: never written to the log.</text>
+                <text x="620" y="378" class="svg-note">Orange: edges into PrepareAbort, added for TV2.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              From the table above <span class="src">from the code</span>. <code>PREPARE_COMMIT</code> has one way in.
+              <code>PREPARE_ABORT</code> has five, because under TV2 a client that does not know the server's state can send
+              <code>EndTxn</code> when uncertain.
+            </p>
+          </figure>
+
+          <h2 id="p5-tv2"><span class="secnum">02</span>Transaction Version 2</h2>
+          <p>
+            <code>transaction.version</code> is a cluster feature with three levels. TV1 only turns on flexible log records. TV2 turns on
+            the per-transaction epoch bump, and it is the latest production level
+            (<code>server-common/…/TransactionVersion.java:28-35</code>). It is on by default from 4.0
+            (<code>docs/getting-started/upgrade.md:280</code>; register <a href="#D106">D106</a>). KIP-890's wiki state still says
+            "Approved"; the code wins (<a href="#D38">D38</a>).
+          </p>
+          <p>
+            No request says which protocol it speaks. The broker infers it from wire versions: <code>EndTxn</code> above v4 means TV2, and
+            <code>AddPartitionsToTxn</code> above v3, which only brokers send, also means TV2 (<code>TransactionVersion.java:69-74</code>).
+            The Java client picks from the finalized feature it saw in ApiVersions, and upgrading mid-life forces an epoch bump first
+            (<code>TransactionManager.java:524-529</code>) <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-tv2">
+            <div class="figure-head">
+              <span class="figure-label">Figure 3</span>
+              <p class="figure-title">The same transaction under the old protocol and under TV2</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 330" role="img" aria-label="Two message sequences. Old protocol: InitProducerId, AddPartitionsToTxn, Produce with the leader only verifying, AddOffsetsToTxn, TxnOffsetCommit, EndTxn with a reply at the same epoch. TV2: InitProducerId, Produce version 12 or higher with the leader adding the partition, TxnOffsetCommit version 5 doing both jobs, EndTxn version 5 or higher with a reply carrying the new producer id and epoch. AddPartitionsToTxn and AddOffsetsToTxn from the client are gone.">
+                <defs>
+                  <marker id="fig-tv2-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker>
+                  <marker id="fig-tv2-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker>
+                </defs>
+                <text x="20" y="20" class="svg-lane">OLD PROTOCOL (TV0, TV1)</text>
+                <text x="520" y="20" class="svg-lane">TV2</text>
+                <line x1="500" y1="10" x2="500" y2="320" stroke="#deded9"/>
+                <g class="svg-sub" text-anchor="middle">
+                  <text x="60" y="42" class="svg-sub" text-anchor="middle">client</text><text x="250" y="42" class="svg-sub" text-anchor="middle">coordinator</text><text x="440" y="42" class="svg-sub" text-anchor="middle">leader</text>
+                  <text x="560" y="42" class="svg-sub" text-anchor="middle">client</text><text x="750" y="42" class="svg-sub" text-anchor="middle">coordinator</text><text x="940" y="42" class="svg-sub" text-anchor="middle">leader</text>
+                </g>
+                <g stroke="#b8b8b1" stroke-width="1">
+                  <line x1="60" y1="50" x2="60" y2="315"/><line x1="250" y1="50" x2="250" y2="315"/><line x1="440" y1="50" x2="440" y2="315"/>
+                  <line x1="560" y1="50" x2="560" y2="315"/><line x1="750" y1="50" x2="750" y2="315"/><line x1="940" y1="50" x2="940" y2="315"/>
+                </g>
+                <g fill="none" stroke="#252525" stroke-width="1.6">
+                  <line x1="60" y1="72" x2="248" y2="72" marker-end="url(#fig-tv2-k)"/>
+                  <line x1="60" y1="106" x2="248" y2="106" marker-end="url(#fig-tv2-k)"/>
+                  <line x1="440" y1="170" x2="252" y2="170" marker-end="url(#fig-tv2-k)"/>
+                  <line x1="60" y1="204" x2="248" y2="204" marker-end="url(#fig-tv2-k)"/>
+                  <line x1="60" y1="272" x2="248" y2="272" marker-end="url(#fig-tv2-k)"/>
+                  <line x1="250" y1="304" x2="62" y2="304" marker-end="url(#fig-tv2-k)"/>
+                  <line x1="560" y1="72" x2="748" y2="72" marker-end="url(#fig-tv2-k)"/>
+                  <line x1="940" y1="170" x2="752" y2="170" marker-end="url(#fig-tv2-k)"/>
+                  <line x1="560" y1="272" x2="748" y2="272" marker-end="url(#fig-tv2-k)"/>
+                  <line x1="750" y1="304" x2="562" y2="304" marker-end="url(#fig-tv2-k)"/>
+                </g>
+                <g fill="none" stroke="#3c6f97" stroke-width="1">
+                  <line x1="60" y1="138" x2="438" y2="138" marker-end="url(#fig-tv2-b)"/>
+                  <line x1="60" y1="238" x2="110" y2="238" marker-end="url(#fig-tv2-b)"/>
+                  <line x1="560" y1="138" x2="938" y2="138" marker-end="url(#fig-tv2-b)"/>
+                  <line x1="560" y1="238" x2="610" y2="238" marker-end="url(#fig-tv2-b)"/>
+                </g>
+                <text x="70" y="66" class="svg-sub">InitProducerId</text>
+                <text x="70" y="100" class="svg-sub">AddPartitionsToTxn</text>
+                <text x="70" y="132" class="svg-sub">Produce, v11 or below</text>
+                <text x="262" y="164" class="svg-sub">leader only verifies</text>
+                <text x="70" y="198" class="svg-sub">AddOffsetsToTxn</text>
+                <rect x="114" y="230" width="272" height="16" fill="#ffffff"/><text x="116" y="242" class="svg-sub">TxnOffsetCommit, to the group coordinator</text>
+                <text x="70" y="266" class="svg-sub">EndTxn, v4 or below</text>
+                <text x="70" y="298" class="svg-sub">success; same epoch</text>
+                <text x="570" y="66" class="svg-sub">InitProducerId</text>
+                <rect x="565" y="88" width="178" height="24" rx="3" fill="#f3dfdc"/>
+                <text x="572" y="104" class="svg-sub">no AddPartitionsToTxn</text>
+                <text x="570" y="132" class="svg-sub">Produce, v12 or above</text>
+                <text x="762" y="164" class="svg-sub">leader adds the partition</text>
+                <rect x="565" y="192" width="178" height="24" rx="3" fill="#f3dfdc"/>
+                <text x="572" y="208" class="svg-sub">no AddOffsetsToTxn</text>
+                <rect x="614" y="230" width="216" height="16" fill="#ffffff"/><text x="616" y="242" class="svg-sub">TxnOffsetCommit v5 does both jobs</text>
+                <text x="570" y="266" class="svg-sub">EndTxn, v5 or above</text>
+                <text x="570" y="298" class="svg-sub">new producer id and epoch</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Reconstruction from <code>TransactionManager.java:441-445</code>, <code>:474-476</code>, <code>AddPartitionsToTxnManager.java:99-100</code> and
+              <code>EndTxnResponse.json:28-36</code>. Under TV2 a transaction asks the client for less, and the first Produce pays for the add.
+            </p>
+          </figure>
+
+          <p>
+            Under TV2 the coordinator bumps the epoch at <code>PREPARE_*</code> (<code>TransactionMetadata.java:248</code>). That gives a retry
+            a meaning: same epoch is the next transaction, epoch plus one is a retry (<code>TransactionCoordinator.scala:795-800</code>). A client
+            can now abort with no partitions added, which bumps the epoch, but a commit from <code>Empty</code> is still
+            <code>INVALID_TXN_STATE</code> (<code>:739-743</code>). A Java client sends no <code>EndTxn</code> at all if the transaction had no send
+            or offset commit (<code>TransactionManager.java:939-943</code>). Server-side retry for the add stops at 100 ms total with a 20 ms
+            backoff by default, then the client sees <code>CONCURRENT_TRANSACTIONS</code>
+            (<code>AddPartitionsToTxnConfig.java:30-35</code>). The docs say TV2 moves this wait into produce latency without raising total
+            transaction time (<code>docs/operations/transaction-protocol.md:47</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            A marker now carries a bumped epoch, so the leader's check tightens from "not older" to "strictly newer". An equal-epoch marker with no
+            open transaction is let through and written again, a livelock fix (KAFKA-19999). So the log can hold a duplicate marker; the lab did
+            not produce one. <code>storage/…/log/ProducerAppendInfo.java:117-139</code>:
+          </p>
+<pre><code>    private void checkProducerEpoch(short producerEpoch, long offset, short transactionVersion) {
+        short current = updatedEntry.producerEpoch();
+        boolean invalidEpoch = (transactionVersion &gt;= 2) ? (producerEpoch &lt;= current) : (producerEpoch &lt; current);
+
+        if (invalidEpoch) {
+            // TV2 Idempotent Marker Retry Detection (KAFKA-19999):
+            // When markerEpoch == currentEpoch and no transaction is ongoing, this indicates
+            // a retry of a marker that was already successfully written. Common scenarios:
+            // 1. Coordinator recovery: reloading PREPARE_COMMIT/ABORT from transaction log
+            // 2. Network retry: marker was written but response was lost due to disconnection
+            // In both cases, the transaction has already ended (currentTxnFirstOffset is empty).
+            // We suppress the InvalidProducerEpochException and allow the duplicate marker to
+            // be written to the log.
+            // In some buggy scenarios we may start transaction with MAX_VALUE.  We allow
+            // code to gracefully recover from that.
+            if (transactionVersion &gt;= 2 &amp;&amp;
+                    producerEpoch == current &amp;&amp;
+                    (updatedEntry.currentTxnFirstOffset().isEmpty() || producerEpoch == Short.MAX_VALUE)) {
+                log.info("Idempotent transaction marker retry detected for producer {} epoch {}. " +
+                                "Transaction already completed, allowing duplicate marker write.",
+                        producerId, producerEpoch);
+                return;
+            }</code></pre>
+          <p>
+            Followers cannot apply that rule, because the version is not in the log. They use the looser check, which is why
+            <code>WriteTxnMarkers</code> v2 carries the version to the leader only (KIP-1228). The rule hardened in 4.2 and relaxed for retries in
+            4.3 (<a href="#D107">D107</a>). An epoch is a short with its top value reserved, so at one bump per transaction a producer id rotates
+            after about 32,766 transactions, inside <code>EndTxn</code>; that was read, not run (<a href="#D95">D95</a>).
+          </p>
+
+          <h3>Who runs it</h3>
+          <p>
+            franz-go opts in when the feature level is 2 and its versions are not capped below it (<code>franz-go/pkg/kgo/client.go:1030-1034</code>). At
+            the pin it runs TV2 against 4.4.0, stepping the epoch once per transaction with markers one above data, as the Java client does
+            <span class="recon">measured here</span>. A live <code>kafka-features.sh downgrade</code> to level 0 kept the Java client on one epoch
+            throughout. librdkafka v2.16.0 does not run it: Produce caps at v10 and <code>EndTxn</code> at v1, and it relies on the broker's verification path
+            for hanging defence (<a href="#D94">D94</a>). That was read, never run. <code>librdkafka/src/rdkafka_request.c:6686-6689</code>:
+          </p>
+<pre><code>        int16_t ApiVersion = 0;
+
+        ApiVersion = rd_kafka_broker_ApiVersion_supported(rkb, RD_KAFKAP_EndTxn,
+                                                          0, 1, NULL);</code></pre>
+          <p>
+            Cost stayed unknown. Single perf runs on this shared machine did not rank the protocols: plain idempotent came out slowest at 6,655 records/s and
+            TV0 at a 50 ms commit interval fastest at 16,767, a spread larger than any effect that could be attributed. That is not capacity, and not
+            evidence that TV0 is faster.
+          </p>
+
+          <h2 id="p5-disk"><span class="secnum">03</span>Markers on disk</h2>
+          <p>
+            <a href="../the-log/#p1-batch">Part 1</a> took a data batch apart. A marker is the same structure with one record in it: a batch with the
+            transactional and control attribute bits set, sequence -1, carrying the producer id and epoch
+            (<code>MemoryRecords.java:710-714</code>). The flags are bits 4 and 5 of the attributes (<code>DefaultRecordBatch.java:134-135</code>). The
+            key is version and type, four bytes: ABORT is 0, COMMIT is 1, and KRaft reuses the same control-record space for types 2 to 6
+            (<code>ControlRecordType.java:32-54</code>). The value holds only the coordinator epoch (<code>EndTxnMarker.json:22-23</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Here is one real log, from <code>kafka-dump-log.sh</code> reduced by <code>exp1b.sh</code>: three transactions and one plain record from
+            another producer. Annotations on the right are payloads and marker types <span class="recon">measured here</span>.
+          </p>
+<pre><code>0 epoch=0 txn=true ctl=false pos=0 size=76       commit-1
+1 epoch=0 txn=true ctl=false pos=76 size=76      commit-2
+2 epoch=0 txn=true ctl=false pos=152 size=76     commit-3
+3 epoch=1 txn=true ctl=true pos=228 size=78      COMMIT
+4 epoch=1 txn=true ctl=false pos=306 size=75     abort-1
+5 epoch=1 txn=true ctl=false pos=381 size=75     abort-2
+6 epoch=2 txn=true ctl=true pos=456 size=78      ABORT
+7 epoch=0 txn=false ctl=false pos=534 size=75    plain-1 (a different producer)
+8 epoch=2 txn=true ctl=false pos=609 size=76     commit-4
+9 epoch=3 txn=true ctl=true pos=685 size=78      COMMIT</code></pre>
+
+          <figure class="figure wide" id="fig-strip">
+            <div class="figure-head">
+              <span class="figure-label">Figure 4</span>
+              <p class="figure-title">That log as a strip, and what each isolation level returns from it</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 232" role="img" aria-label="Ten records in offset order. Offsets 0 to 2 are committed data at epoch 0, offset 3 a COMMIT marker at epoch 1, offsets 4 and 5 aborted data at epoch 1, offset 6 an ABORT marker at epoch 2, offset 7 a plain record from another producer, offset 8 committed data at epoch 2, offset 9 a COMMIT marker at epoch 3. read_uncommitted returns 0, 1, 2, 4, 5, 7, 8. read_committed returns 0, 1, 2, 7, 8. No marker is returned.">
+                <text x="16" y="50" class="svg-lane">OFFSET</text>
+                <text x="16" y="88" class="svg-lane">RECORD</text>
+                <text x="16" y="116" class="svg-lane">EPOCH</text>
+                <text x="16" y="164" class="svg-sub">read_uncommitted</text>
+                <text x="16" y="202" class="svg-sub">read_committed</text>
+                <g stroke-width="1">
+                  <rect x="140" y="62" width="82" height="62" fill="#dfede5" stroke="#367f59"/><rect x="224" y="62" width="82" height="62" fill="#dfede5" stroke="#367f59"/><rect x="308" y="62" width="82" height="62" fill="#dfede5" stroke="#367f59"/>
+                  <rect x="392" y="62" width="82" height="62" fill="#ece6f3" stroke="#765b98"/>
+                  <rect x="476" y="62" width="82" height="62" fill="#f3dfdc" stroke="#ad4b43"/><rect x="560" y="62" width="82" height="62" fill="#f3dfdc" stroke="#ad4b43"/>
+                  <rect x="644" y="62" width="82" height="62" fill="#ece6f3" stroke="#765b98"/>
+                  <rect x="728" y="62" width="82" height="62" fill="#f7f7f5" stroke="#b8b8b1"/>
+                  <rect x="812" y="62" width="82" height="62" fill="#dfede5" stroke="#367f59"/>
+                  <rect x="896" y="62" width="82" height="62" fill="#ece6f3" stroke="#765b98"/>
+                </g>
+                <g text-anchor="middle">
+                  <text x="181" y="50" text-anchor="middle" class="svg-num">0</text><text x="265" y="50" text-anchor="middle" class="svg-num">1</text><text x="349" y="50" text-anchor="middle" class="svg-num">2</text><text x="433" y="50" text-anchor="middle" class="svg-num">3</text><text x="517" y="50" text-anchor="middle" class="svg-num">4</text><text x="601" y="50" text-anchor="middle" class="svg-num">5</text><text x="685" y="50" text-anchor="middle" class="svg-num">6</text><text x="769" y="50" text-anchor="middle" class="svg-num">7</text><text x="853" y="50" text-anchor="middle" class="svg-num">8</text><text x="937" y="50" text-anchor="middle" class="svg-num">9</text>
+                  <text x="181" y="88" text-anchor="middle" class="svg-sub">commit-1</text><text x="265" y="88" text-anchor="middle" class="svg-sub">commit-2</text><text x="349" y="88" text-anchor="middle" class="svg-sub">commit-3</text><text x="433" y="88" text-anchor="middle" class="svg-step">COMMIT</text><text x="517" y="88" text-anchor="middle" class="svg-sub">abort-1</text><text x="601" y="88" text-anchor="middle" class="svg-sub">abort-2</text><text x="685" y="88" text-anchor="middle" class="svg-step">ABORT</text><text x="769" y="88" text-anchor="middle" class="svg-sub">plain-1</text><text x="853" y="88" text-anchor="middle" class="svg-sub">commit-4</text><text x="937" y="88" text-anchor="middle" class="svg-step">COMMIT</text>
+                  <text x="181" y="116" text-anchor="middle" class="svg-sub">0</text><text x="265" y="116" text-anchor="middle" class="svg-sub">0</text><text x="349" y="116" text-anchor="middle" class="svg-sub">0</text><text x="433" y="116" text-anchor="middle" class="svg-sub">1</text><text x="517" y="116" text-anchor="middle" class="svg-sub">1</text><text x="601" y="116" text-anchor="middle" class="svg-sub">1</text><text x="685" y="116" text-anchor="middle" class="svg-sub">2</text><text x="769" y="116" text-anchor="middle" class="svg-sub">0</text><text x="853" y="116" text-anchor="middle" class="svg-sub">2</text><text x="937" y="116" text-anchor="middle" class="svg-sub">3</text>
+                </g>
+                <g fill="#3c6f97">
+                  <rect x="140" y="152" width="82" height="16"/><rect x="224" y="152" width="82" height="16"/><rect x="308" y="152" width="82" height="16"/><rect x="476" y="152" width="82" height="16"/><rect x="560" y="152" width="82" height="16"/><rect x="728" y="152" width="82" height="16"/><rect x="812" y="152" width="82" height="16"/>
+                  <rect x="140" y="190" width="82" height="16"/><rect x="224" y="190" width="82" height="16"/><rect x="308" y="190" width="82" height="16"/><rect x="728" y="190" width="82" height="16"/><rect x="812" y="190" width="82" height="16"/>
+                </g>
+                <text x="16" y="226" class="svg-note">A filled cell means the application received that offset. Offsets 3, 4, 5, 6 and 9 are permanent gaps under read_committed.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured, one run, in <code>exp1b.out</code> and <code>exp1.out</code>. Each marker's epoch is one above its data, and the next transaction's data
+              runs at that marker's epoch. A marker takes an offset and returns nothing to anyone.
+            </p>
+          </figure>
+
+          <p>
+            The COMMIT at offset 3 starts at file position 228 and ends at 306: 78 bytes. Command: <code>python3 -I hexd.py 00000000000000000000.log 228 306</code>.
+          </p>
+<pre><code>000000e4: 0000 0000 0000 0003 0000 0042 0000 0000   ...........B....
+000000f4: 02fb 2ae1 8100 3000 0000 0000 0001 a1b1   ..*...0.........
+00000104: eb92 1500 0001 a1b1 eb92 1500 0000 0000   ................
+00000114: 0003 e900 01ff ffff ff00 0000 0120 0000   ............. ..
+00000124: 0008 0000 0001 0c00 0000 0000 0000        ..............</code></pre>
+          <table style="font-size: 13px">
+            <thead><tr><th>Bytes</th><th>Field</th><th>Value</th></tr></thead>
+            <tbody>
+              <tr><td><code>0000 0000 0000 0003</code></td><td>base offset</td><td>3</td></tr>
+              <tr><td><code>0000 0042</code></td><td>batch length</td><td>66, so 78 with the 12 bytes before it</td></tr>
+              <tr><td><code>02</code></td><td>magic</td><td>2</td></tr>
+              <tr><td><code>0030</code></td><td>attributes</td><td>transactional, control. A data batch here is <code>0010</code>.</td></tr>
+              <tr><td><code>0000 0000 0000 03e9</code></td><td>producer id</td><td>1001</td></tr>
+              <tr><td><code>0001</code></td><td>producer epoch</td><td>1, one above its data</td></tr>
+              <tr><td><code>ffff ffff</code></td><td>base sequence</td><td>-1</td></tr>
+              <tr><td><code>0000 0001</code></td><td>record count</td><td>1</td></tr>
+              <tr><td><code>0000 0001</code></td><td>record key</td><td>version 0, type 1: COMMIT</td></tr>
+              <tr><td><code>0000 0000 0000</code></td><td>record value</td><td>version 0, coordinator epoch 0</td></tr>
+            </tbody>
+          </table>
+          <p>
+            The ABORT marker differs in key (<code>0000 0000</code>), epoch, timestamp and CRC. A commit writes nothing else. An abort also writes
+            <code>.txnindex</code>, four int64s and a version short per entry (<code>AbortedTxn.json:22-31</code>), and that is the whole file here, 34 bytes:
+          </p>
+<pre><code>00000000: 0000 0000 0000 0000 03e9 0000 0000 0000   ................
+00000010: 0004 0000 0000 0000 0006 0000 0000 0000   ................
+00000020: 0007                                      ..</code></pre>
+          <p>
+            Version 0, producer 1001, first offset 4, last offset 6, LSO 7. The last offset is the marker's, not the last data record's. The index belongs to the
+            segment holding the marker, even when the transaction began in an earlier one (<code>TransactionIndex.java:44-46</code>), and the stored LSO lets a fetch
+            stop scanning once an entry reaches its upper bound (<code>:171-175</code>). A marker for a partition with no open transaction changes no LSO and adds no
+            entry (<code>ProducerAppendInfo.java:281-282</code>). The two commits added nothing to this file. Sequence numbers restart at 0 with each epoch, and the marker carries -1
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The other log, a separate run with producer id 1 (<code>exp1.sh</code>, <code>--transaction-log-decoder</code>, trimmed). Partitions empty only at the end:
+          </p>
+<pre><code>"producerEpoch":0, "transactionStatus":"Empty",          "transactionPartitions":null
+"producerEpoch":0, "transactionStatus":"Ongoing",        [{"topic":"tb","partitionIds":[0]}]
+"producerEpoch":1, "transactionStatus":"PrepareCommit",  [{"topic":"tb","partitionIds":[0]}]
+"producerEpoch":1, "transactionStatus":"CompleteCommit", []</code></pre>
+
+          <h2 id="p5-lso"><span class="secnum">04</span>The last stable offset</h2>
+          <p>
+            A data partition does not know a transaction exists until its first transactional batch, which records the first offset
+            (<code>ProducerAppendInfo.java:239-242</code>). The transaction's end on that partition is the marker and nothing else
+            (<code>:288</code>). Between the two sits the offset every <code>read_committed</code> reader stops at. <code>UnifiedLog.java:678-686</code>:
+          </p>
+<pre><code>    public long lastStableOffset() {
+        // cache the first unstable offset metadata to avoid a concurrent update breaking the isPresent check
+        Optional&lt;LogOffsetMetadata&gt; firstUnstableOffsetMetadataCopy = firstUnstableOffsetMetadata;
+        if (firstUnstableOffsetMetadataCopy.isPresent() &amp;&amp; firstUnstableOffsetMetadataCopy.get().messageOffset &lt; highWatermark()) {
+            return firstUnstableOffsetMetadataCopy.get().messageOffset;
+        } else {
+            return highWatermark();
+        }
+    }</code></pre>
+          <p>
+            The LSO equals the first unstable offset, capped at the <a href="../replication/#p3-ladder">high watermark</a>. The consumer config doc says the LSO "is
+            the one less than the offset of the first open transaction" (<code>ConsumerConfig.java:377</code>). Code and lab show it equals that offset
+            (<a href="#D35">D35</a>).
+          </p>
+          <p>
+            "Unstable" covers two things: undecided transactions, and decided ones whose marker is still above the high watermark. So the LSO waits for marker
+            replication too. <code>storage/…/log/ProducerStateManager.java:246-258</code>:
+          </p>
+<pre><code>    public Optional&lt;LogOffsetMetadata&gt; firstUnstableOffset() {
+        Optional&lt;LogOffsetMetadata&gt; unreplicatedFirstOffset = Optional.ofNullable(unreplicatedTxns.firstEntry()).map(e -&gt; e.getValue().firstOffset);
+        Optional&lt;LogOffsetMetadata&gt; undecidedFirstOffset = Optional.ofNullable(ongoingTxns.firstEntry()).map(e -&gt; e.getValue().firstOffset);
+
+        if (unreplicatedFirstOffset.isEmpty())
+            return undecidedFirstOffset;
+        else if (undecidedFirstOffset.isEmpty())
+            return unreplicatedFirstOffset;
+        else if (undecidedFirstOffset.get().messageOffset &lt; unreplicatedFirstOffset.get().messageOffset)
+            return undecidedFirstOffset;
+        else
+            return unreplicatedFirstOffset;
+    }</code></pre>
+          <p>
+            That state survives restarts. Producer state goes to <code>.snapshot</code> files, including an open transaction's first offset, which returns to
+            <code>ongoingTxns</code> on load (<code>ProducerStateManager.java:326</code>). A producer entry with an open transaction never expires, while an idle one goes after
+            <code>producer.id.expiration.ms</code>, default one day (<code>:330</code>). Both facts matter <a href="#p5-hang">later</a>.
+          </p>
+
+          <h3>Plain records wait too</h3>
+          <p>
+            The read bound is a single offset, so non-transactional records after an open transaction wait as well (<code>UnifiedLog.java:1671</code>; register
+            <a href="#D87">D87</a>). The lab opened a transaction at offset 1 and wrote three plain records after it (<code>exp1.out</code>, one run, loopback,
+            relative only) <span class="recon">measured here</span>:
+          </p>
+<pre><code>[  2.589s] open txn: HW=5 LSO=1; state=Ongoing coordinator=3 pid=3 epoch=0 partitions=[tl-0]
+[  5.798s] read_uncommitted [0:before-0, 1:open-1, 2:plain-a, 3:plain-b, 4:plain-c]
+[ 11.901s] read_committed   [0:before-0]
+[ 11.930s] consumer.endOffsets(read_committed)={tl-0=1}
+[ 11.949s] commit returned
+[ 12.006s] HW=6 LSO=6
+[ 15.089s] read_committed   [0:before-0, 1:open-1, 2:plain-a, 3:plain-b, 4:plain-c]</code></pre>
+
+          <figure class="figure" id="fig-lso">
+            <div class="figure-head">
+              <span class="figure-label">Figure 5</span>
+              <p class="figure-title">HW and LSO as two cursors, before and after the commit</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 704 300" role="img" aria-label="Before commit, offsets 0 to 4 hold before-0, open-1 and three plain records. LSO is at 1 and HW at 5, so plain records sit trapped between the cursors. After commit a marker takes offset 5, and HW and LSO are both at 6.">
+                <text x="16" y="24" class="svg-lane">BEFORE COMMIT</text>
+                <g stroke-width="1">
+                  <rect x="16" y="66" width="104" height="44" fill="#dfede5" stroke="#367f59"/>
+                  <rect x="122" y="66" width="104" height="44" fill="#f7e3c8" stroke="#d98226"/>
+                  <rect x="228" y="66" width="104" height="44" fill="#f3dfdc" stroke="#ad4b43"/><rect x="334" y="66" width="104" height="44" fill="#f3dfdc" stroke="#ad4b43"/><rect x="440" y="66" width="104" height="44" fill="#f3dfdc" stroke="#ad4b43"/>
+                </g>
+                <text x="68" y="86" text-anchor="middle" class="svg-sub">0 before-0</text><text x="68" y="101" text-anchor="middle" class="svg-sub">readable</text>
+                <text x="174" y="86" text-anchor="middle" class="svg-sub">1 open-1</text><text x="174" y="101" text-anchor="middle" class="svg-sub">open txn</text>
+                <text x="280" y="86" text-anchor="middle" class="svg-sub">2 plain-a</text><text x="280" y="101" text-anchor="middle" class="svg-sub">trapped</text>
+                <text x="386" y="86" text-anchor="middle" class="svg-sub">3 plain-b</text><text x="386" y="101" text-anchor="middle" class="svg-sub">trapped</text>
+                <text x="492" y="86" text-anchor="middle" class="svg-sub">4 plain-c</text><text x="492" y="101" text-anchor="middle" class="svg-sub">trapped</text>
+                <g stroke="#765b98" stroke-width="2" stroke-dasharray="4 3">
+                  <line x1="121" y1="44" x2="121" y2="122"/><line x1="545" y1="44" x2="545" y2="122"/>
+                </g>
+                <text x="127" y="54" class="svg-lane">LSO=1</text>
+                <text x="551" y="54" class="svg-lane">HW=5</text>
+                <text x="16" y="140" class="svg-note">endOffsets under read_committed says 1, so lag computed from it hides the stall.</text>
+
+                <text x="16" y="176" class="svg-lane">AFTER COMMIT</text>
+                <g stroke-width="1">
+                  <rect x="16" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/><rect x="122" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/><rect x="228" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/><rect x="334" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/><rect x="440" y="214" width="104" height="44" fill="#dfede5" stroke="#367f59"/>
+                  <rect x="546" y="214" width="104" height="44" fill="#ece6f3" stroke="#765b98"/>
+                </g>
+                <text x="68" y="240" text-anchor="middle" class="svg-sub">0 before-0</text><text x="174" y="240" text-anchor="middle" class="svg-sub">1 open-1</text><text x="280" y="240" text-anchor="middle" class="svg-sub">2 plain-a</text><text x="386" y="240" text-anchor="middle" class="svg-sub">3 plain-b</text><text x="492" y="240" text-anchor="middle" class="svg-sub">4 plain-c</text><text x="598" y="240" text-anchor="middle" class="svg-sub">5 COMMIT</text>
+                <line x1="651" y1="192" x2="651" y2="270" stroke="#765b98" stroke-width="2" stroke-dasharray="4 3"/>
+                <text x="645" y="202" text-anchor="end" class="svg-lane">HW=6 LSO=6</text>
+                <text x="16" y="288" class="svg-note">All five records became readable; the marker took offset 5.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured, one run. <code>read_committed</code> returned only offset 0 over a 6 s read. The record at offset 1 is transactional, and offsets 2 to 4 are
+              non-transactional and still waited.
+            </p>
+          </figure>
+
+          <p>
+            The LSO moved within about 15 ms of the commit returning. The first probe, 13 ms after return, had already moved, so that is an upper bound on one run,
+            not a latency. The output above is trimmed by one line, <code>HW=5 LSO=6</code>. That line is a probe artefact: the driver reads HW and LSO in two separate
+            <code>ListOffsets</code> calls, so it does not show LSO above HW.
+          </p>
+          <p>
+            Lag tools see none of this as lag. <code>ListOffsets</code> for latest under <code>read_committed</code> returns the LSO
+            (<code>Partition.scala:1442</code>), so <code>endOffsets</code> said 1 while five records sat in the log, and lag computed from it reads "caught up". The signal
+            is the per-partition <code>LastStableOffsetLag</code> gauge, HW minus LSO (<code>Partition.scala:226</code>) <span class="src">from the code</span>.
+          </p>
+
+          <p>
+            How long can it last? For a dead producer, the transaction's timeout plus up to one 10 s scan interval (see <a href="#p5-hang">Hanging</a>). So about 70 s at the Java default of 60 s, and about 15 minutes 10 s at the
+            broker's default cap. Those two figures are arithmetic from the configs, not runs <span class="recon">reconstruction</span>. The stall is partition-wide for that whole time, and it also holds back
+            compaction (<code>LogCleaner.java:87-89</code>).
+          </p>
+
+          <h3>The client does the filtering</h3>
+          <p>
+            The broker's <code>read_committed</code> fetch filters nothing. It caps the read at the LSO and attaches the overlapping aborted transactions
+            (<code>UnifiedLog.java:1673</code>, <code>LocalLog.java:546</code>). <code>clients/…/consumer/internals/CompletedFetch.java:208-224</code>:
+          </p>
+<pre><code>                if (fetchConfig.isolationLevel == IsolationLevel.READ_COMMITTED &amp;&amp; currentBatch.hasProducerId()) {
+                    // remove from the aborted transaction queue all aborted transactions which have begun
+                    // before the current batch's last offset and add the associated producerIds to the
+                    // aborted producer set
+                    consumeAbortedTransactionsUpTo(currentBatch.lastOffset());
+
+                    long producerId = currentBatch.producerId();
+                    if (containsAbortMarker(currentBatch)) {
+                        abortedProducerIds.remove(producerId);
+                    } else if (isBatchAborted(currentBatch)) {
+                        log.debug("Skipping aborted record batch from partition {} with producerId {} and " +
+                                        "offsets {} to {}",
+                                partition, producerId, currentBatch.baseOffset(), currentBatch.lastOffset());
+                        nextFetchOffset = currentBatch.nextOffset();
+                        continue;
+                    }
+                }</code></pre>
+          <p>
+            Walk it over <a href="#p5-disk">the log above</a>, assuming one fetch from offset 0. Offsets 0 to 2 are not in any aborted range. At offset 4 the queue yields the entry for producer 1001 that begins there, so batches 4 and 5 are
+            skipped, and the abort marker at 6 removes the producer from the set. Offset 8 is read normally <span class="recon">reconstruction</span>. So aborted bytes cross the wire and sit in the log, and the offsets of aborted records and markers leave permanent gaps. The isolation default differs by client:
+            Java and franz-go use <code>read_uncommitted</code>, librdkafka <code>read_committed</code> (<a href="#D93">D93</a>).
+          </p>
+          <p>
+            Pending offsets stall reads differently. The Java consumer always asks for stable offsets, at either isolation level, so while a transaction holds pending offsets it gets
+            <code>UNSTABLE_OFFSET_COMMIT</code> and retries rather than reading a stale position (<code>ConsumerCoordinator.java:1502</code>). In the lab, while offsets are pending in an open transaction, <code>consumer.committed</code> on that partition retried until its timeout.
+            The admin client does not retry: with <code>requireStable=true</code> and the partition named it returned an empty map after 12 ms, because the handler logs a warning
+            and drops any partition with an error (<code>ListConsumerGroupOffsetsHandler.java:179</code>; <a href="#D89">D89</a>). The result looks like "no offset"
+            <span class="recon">measured here</span>.
+          </p>
+
+          <h2 id="p5-fence"><span class="secnum">05</span>Fencing and a dead coordinator</h2>
+          <p>
+            A transactional id keeps its producer id across restarts and gets the next epoch (<code>TransactionMetadata.java:161-190</code>). That bump is the fence. If a
+            transaction is open, the coordinator bumps the epoch, aborts it, and replies <code>CONCURRENT_TRANSACTIONS</code>, so the new producer retries and bumps a second
+            time (<code>TransactionCoordinator.scala:283-285</code>). The check itself is on the partition leader: a data batch with an older epoch than the partition has seen is
+            rejected (<code>ProducerAppendInfo.java:119-151</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            A rejection needs a partition that has seen the new epoch. The abort marker delivers it to each partition of the old transaction, so that marker does the fencing
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-fence">
+            <div class="figure-head">
+              <span class="figure-label">Figure 6</span>
+              <p class="figure-title">A second producer with the same id: the epoch steps 0, 1, 2 and the first producer is shut out</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 318" role="img" aria-label="Producer A sends A-1 at epoch 0. Producer B calls InitProducerId; the coordinator moves to epoch 1 and writes an ABORT marker at epoch 1 on the partition. B retries and the coordinator moves to epoch 2. A's next send is rejected by the leader, and A's commit and abort fail. B writes B-1 at epoch 2 and a COMMIT marker at epoch 3.">
+                <defs>
+                  <marker id="fig-fence-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker>
+                  <marker id="fig-fence-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-fence-r" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#ad4b43"/></marker>
+                </defs>
+                <text x="16" y="54" class="svg-lane">PRODUCER A</text>
+                <text x="16" y="130" class="svg-lane">COORDINATOR</text>
+                <text x="16" y="206" class="svg-lane">PRODUCER B</text>
+                <text x="16" y="276" class="svg-lane">tz-0 LOG</text>
+                <g stroke="#deded9"><line x1="130" y1="50" x2="640" y2="50"/><line x1="130" y1="202" x2="985" y2="202"/><line x1="130" y1="272" x2="985" y2="272"/></g>
+                <rect x="130" y="110" width="280" height="30" fill="#e0ebf2" stroke="#3c6f97"/><text x="270" y="130" text-anchor="middle" class="svg-sub">epoch 0</text>
+                <rect x="410" y="110" width="130" height="30" fill="#f7e3c8" stroke="#d98226"/><text x="475" y="130" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <rect x="540" y="110" width="260" height="30" fill="#e0ebf2" stroke="#3c6f97"/><text x="670" y="130" text-anchor="middle" class="svg-sub">epoch 2</text>
+                <rect x="800" y="110" width="185" height="30" fill="#dfede5" stroke="#367f59"/><text x="892" y="130" text-anchor="middle" class="svg-sub">epoch 3</text>
+
+                <text x="210" y="38" text-anchor="middle" class="svg-sub">send A-1</text>
+                <line x1="210" y1="50" x2="210" y2="254" stroke="#3c6f97" marker-end="url(#fig-fence-b)"/>
+                <rect x="170" y="256" width="80" height="34" rx="3" fill="#f3dfdc" stroke="#ad4b43"/><text x="210" y="271" text-anchor="middle" class="svg-sub">0 A-1</text><text x="210" y="284" text-anchor="middle" class="svg-sub">epoch 0</text>
+
+                <text x="408" y="192" text-anchor="end" class="svg-sub">InitProducerId</text>
+                <line x1="415" y1="202" x2="415" y2="142" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-fence-k)"/>
+                <line x1="475" y1="140" x2="475" y2="254" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-fence-k)"/>
+                <rect x="435" y="256" width="80" height="34" rx="3" fill="#ece6f3" stroke="#765b98"/><text x="475" y="271" text-anchor="middle" class="svg-sub">1 ABORT</text><text x="475" y="284" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <text x="552" y="176" class="svg-sub">retry;</text><text x="552" y="192" class="svg-sub">385 ms in all</text>
+                <line x1="545" y1="202" x2="545" y2="142" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-fence-k)"/>
+
+                <line x1="640" y1="50" x2="640" y2="254" stroke="#ad4b43" stroke-width="1.4" stroke-dasharray="6 3" marker-end="url(#fig-fence-r)"/>
+                <text x="648" y="240" class="svg-sub">rejected by the leader</text>
+                <text x="650" y="36" class="svg-sub">send: InvalidProducerEpochException</text>
+                <text x="650" y="54" class="svg-sub">commit: InvalidProducerEpochException</text>
+                <text x="650" y="72" class="svg-sub">abort: ProducerFencedException, then fatal</text>
+
+                <line x1="830" y1="202" x2="830" y2="254" stroke="#3c6f97" marker-end="url(#fig-fence-b)"/>
+                <text x="822" y="194" text-anchor="end" class="svg-sub">send B-1</text>
+                <rect x="790" y="256" width="80" height="34" rx="3" fill="#dfede5" stroke="#367f59"/><text x="830" y="271" text-anchor="middle" class="svg-sub">2 B-1</text><text x="830" y="284" text-anchor="middle" class="svg-sub">epoch 2</text>
+                <rect x="895" y="256" width="88" height="34" rx="3" fill="#ece6f3" stroke="#765b98"/><text x="939" y="271" text-anchor="middle" class="svg-sub">3 COMMIT</text><text x="939" y="284" text-anchor="middle" class="svg-sub">epoch 3</text>
+                <text x="16" y="312" class="svg-note">read_uncommitted [0:A-1, 2:B-1] · read_committed [2:B-1]. Spacing is illustrative; the abort line is from a second run.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured, single runs (<code>exp1.out</code> § D, <code>exp1b.out</code> § zombie), loopback, relative only. Under TV2 a commit's epoch step shows up the same way: B's marker is at 3.
+            </p>
+          </figure>
+
+          <p>
+            The zombie's exception changes as it goes. Send and commit report the abortable <code>InvalidProducerEpochException</code>. Its <code>abortTransaction</code> then reaches the
+            coordinator and gets <code>ProducerFencedException</code>, and it is fatally fenced (<a href="#D88">D88</a>). A franz-go zombie is fenced on data with
+            <code>INVALID_PRODUCER_EPOCH</code>, but its first error on <code>EndTransaction</code> is <code>OPERATION_NOT_ATTEMPTED</code>, raised by franz-go itself, with a doc saying retry
+            with <code>TryAbort</code> (<code>franz-go/pkg/kgo/txn.go:717-719</code>, <code>:856</code>) <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Offsets are one more partition</h3>
+          <p>
+            Offsets join a transaction by treating the group's <code>__consumer_offsets</code> partition as one more participant (<code>KafkaApis.scala:2046-2049</code>). On disk they are a
+            transactional batch followed by a control marker, the same shape as data <span class="recon">measured here</span>. Pending offsets sit in a separate per-producer map; a commit
+            marker moves them to the main store, and an abort drops them (<code>OffsetMetadataManager.java:1214-1216</code>). When a regular and a transactional commit mix, the one with the higher record offset wins (<code>:1283-1286</code>). <code>TxnOffsetCommit</code> carries generation or member epoch, so
+            a member rebalanced away is fenced by the group coordinator; KIP-447 added this so one producer per consumer can replace one per input partition.
+          </p>
+
+          <h3>The coordinator dies</h3>
+          <p>
+            Coordinator failover has its own fence. The marker's coordinator epoch, which is the transaction log partition's leader epoch, must not go backward
+            (<code>ProducerAppendInfo.java:247-252</code>). A new coordinator rebuilds its state by reading the partition from log start to log end, last value per key winning. During the
+            load, requests get <code>COORDINATOR_LOAD_IN_PROGRESS</code>. Then it finishes every <code>PREPARE_*</code> it found. <code>core/…/txn/TransactionStateManager.scala:563-575</code>:
+          </p>
+<pre><code>          loadedTransactions.forEach((transactionalId, txnMetadata) =&gt; {
+            txnMetadata.inLock(() =&gt; {
+              // if state is PrepareCommit or PrepareAbort we need to complete the transaction
+              txnMetadata.state match {
+                case TransactionState.PREPARE_ABORT =&gt;
+                  transactionsPendingForCompletion +=
+                    new TransactionalIdCoordinatorEpochAndTransitMetadata(transactionalId, coordinatorEpoch, TransactionResult.ABORT, txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))
+                case TransactionState.PREPARE_COMMIT =&gt;
+                  transactionsPendingForCompletion +=
+                    new TransactionalIdCoordinatorEpochAndTransitMetadata(transactionalId, coordinatorEpoch, TransactionResult.COMMIT, txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))
+                case _ =&gt;
+                // nothing needs to be done
+              }</code></pre>
+          <p>
+            An <code>ONGOING</code> transaction needs no action: its start timestamp was persisted, so the timeout clock still runs from the original start (<code>:573-574</code>). A failed
+            <code>COMPLETE_*</code> append with <code>COORDINATOR_NOT_AVAILABLE</code> retries forever with the pending state retained (<code>TransactionMarkerChannelManager.scala:322-336</code>). A stale coordinator detects
+            a changed epoch after its append callback fires and reports <code>NOT_COORDINATOR</code> (<code>TransactionStateManager.scala:773</code>).
+          </p>
+          <p>
+            The lab killed a coordinator in <code>PrepareCommit</code> with the data leader stopped by <code>SIGSTOP</code>, so no marker could land. The leader was stopped about 6 s, under the 9 s
+            broker session, and it was back before the new coordinator appeared, so this is the healthy-reload case (<code>exp2d.out</code>, one run, loopback, relative only)
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>[  2.850s] commit returned in 23ms with data leader 5 stopped
+[  3.221s] state=PrepareCommit coordinator=2 pid=1 epoch=1 partitions=[pk-0]
+[  3.233s] coordinator 2 killed
+[  8.746s] data leader resumed
+[ 12.059s] state=PrepareCommit coordinator=3 pid=1 epoch=1 partitions=[pk-0]
+[ 12.575s] state=CompleteCommit coordinator=3 pid=1 epoch=1 partitions=[]
+[ 13.625s] HW=3 LSO=3
+[ 18.077s] read_committed [0:pk-1, 1:pk-2]
+| offset: 2 endTxnMarker: COMMIT coordinatorEpoch: 1</code></pre>
+          <p>
+            Coordinator epoch 1 shows the new coordinator wrote the marker. So the decision survives a crash, provided the partition has a leader when the successor sends. Without one, the same kill
+            loses the marker, which the <a href="#p5-hang">next section</a> takes up. With the coordinator killed while <code>ONGOING</code>, a separate run saw the next send stall 7.9 s and the commit
+            take 410 ms, with nothing lost and the partition loaded in 39 ms. That stall is probably the data leader failing over, not the coordinator: a send on a partition with an open transaction does not
+            call the coordinator (<code>UnifiedLog.java:897</code>), and the driver did not record that leader. One run, loopback; it is not a recovery figure.
+          </p>
+
+          <h2 id="p5-hang"><span class="secnum">06</span>Hanging, and KAFKA-20734</h2>
+          <p>
+            A hanging transaction is a partition that believes a transaction is open while the coordinator will never send its marker
+            <span class="recon">reconstruction</span>. KIP-890 names three symptoms: LSO stuck, compaction blocked, <code>read_committed</code> consumers stuck. Nothing clears it, because
+            only the coordinator's knowledge drives the timeout. <code>core/…/txn/TransactionStateManager.scala:128-143</code>:
+          </p>
+<pre><code>  def timedOutTransactions(): Iterable[TransactionalIdAndProducerIdEpoch] = {
+    val now = time.milliseconds()
+    inReadLock(stateLock, () =&gt; {
+      transactionMetadataCache.flatMap { case (_, entry) =&gt;
+        entry.metadataPerTransactionalId.asScala.filter { case (_, txnMetadata) =&gt;
+          if (txnMetadata.pendingTransitionInProgress) {
+            false
+          } else {
+            txnMetadata.state match {
+              case TransactionState.ONGOING =&gt;
+                // Do not apply timeout to distributed two phase commit transactions.
+                (!txnMetadata.isDistributedTwoPhaseCommitTxn) &amp;&amp;
+                (txnMetadata.txnStartTimestamp + txnMetadata.txnTimeoutMs &lt; now)
+              case _ =&gt; false
+            }
+          }</code></pre>
+          <p>
+            For a transaction the coordinator does know, that scan works. It runs every 10 s by default, and the clock starts at the first partition added, not at
+            <code>beginTransaction</code>. Activity does not extend it. The abort goes through the fence path, so a slow but live producer finds itself fenced. A producer killed mid-transaction with a
+            15 s timeout held the LSO for about 21.3 s after its send, inside that bound <span class="recon">measured here</span>.
+          </p>
+
+          <h3>The old way in, and its defence</h3>
+          <p>
+            KIP-890 part 1 makes the partition leader ask the coordinator before the first transactional write, and guards the answer with a unique token against an ABA race with an abort marker
+            (<code>UnifiedLog.java:1430-1434</code>). It is on by default through a broker config and unconditional for TV2 requests (<code>ReplicaManager.scala:1014</code>). The lab used a client that
+            deliberately skips the add. That is a stand-in for KIP-890's delayed-message race, and it is not that race (<code>exp4.out</code>, one run) <span class="recon">measured here</span>:
+          </p>
+<pre><code>=== transaction.partition.verification.enable=true
+InitProducerId v1 error=0 producerId=1 epoch=0
+Produce v8 partition=0 error=48 baseOffset=-1
+=== transaction.partition.verification.enable=false
+Produce v8 partition=0 error=0 baseOffset=0
+HW=1 LSO=0 state=Empty coordinator=1 pid=1 epoch=0 partitions=[]</code></pre>
+          <p>
+            With verification off, the partition holds an open transaction, the coordinator says <code>Empty</code>, and the 10 s transaction timeout did nothing over a 25 s watch
+            (<a href="#D90">D90</a>; the config does not affect TV2 requests). Old clients see misleading translations of these errors (<a href="#D92">D92</a>).
+          </p>
+          <p>
+            Two tools exist, and <code>kafka/docs</code> describes neither (<a href="#D39">D39</a>). <code>kafka-transactions.sh find-hanging</code> compares producer state on a broker with the coordinator's
+            description, with a 15 minute default window (<code>TransactionsCommand.java:560</code>, <code>:689</code>). <code>abort</code> writes an ABORT marker on one partition by start offset. It has no commit
+            mode (<code>:107</code>, <code>:194</code>; <a href="#D91">D91</a>). A <code>PartitionsWithLateTransactionsCount</code> gauge flags a leader whose oldest open transaction's last write is older
+            than the maximum transaction timeout plus five minutes (<code>ProducerStateManager.java:132</code>).
+          </p>
+
+          <h3>KAFKA-20734: the marker with nowhere to go</h3>
+          <div class="callout">
+            <span class="k">Status</span>
+            <p>
+              Known upstream, not found here: Jira Blocker, created 2026-06-24. <strong>No tagged fix as of 6 November 2026.</strong> The fix is on trunk (<code>1da285a9a798</code>, 2026-10-27), branch 4.4
+              (<code>b6de0ca05f76</code>, 2026-10-28) and branch 4.3 (<code>499e13ab228c</code>, 2026-11-05). Jira lists fix versions 4.5.0, 4.4.1 and 4.3.3; those tags and their rc0 tags all returned 404 on
+              6 November 2026. Introduced by <code>7d13e8b70d</code> (KAFKA-17573), first tag 4.3.0. Register <a href="#D10">D10</a>.
+            </p>
+          </div>
+          <p>
+            Two pieces of code meet. The marker sender treats an unknown leader as a deleted partition.
+            <code>core/…/txn/TransactionMarkerChannelManager.scala:386-399</code>:
+          </p>
+<pre><code>              } else {
+                // if the leader of the partition is unknown, skip sending the txn marker since
+                // the partition is likely to be deleted already
+                info(s"Couldn't find leader endpoint for partitions $topicPartitions while trying to send transaction markers for " +
+                  s"$transactionalId, these partitions are likely deleted already and hence can be skipped")
+
+                val txnMetadata = epochAndMetadata.transactionMetadata
+
+                txnMetadata.inLock(() =&gt;
+                  topicPartitions.foreach(txnMetadata.removePartition)
+                )
+
+                maybeWriteTxnCompletion(transactionalId)
+              }</code></pre>
+          <p>
+            At the pin the lookup returns that same empty for an offline partition. <code>partition.leader</code> is -1, no broker has that id, and the <code>flatMap</code> chain collapses to empty rather than
+            reaching <code>Node.noNode()</code>. <code>metadata/…/metadata/KRaftMetadataCache.java:425-431</code>:
+          </p>
+<pre><code>    public Optional&lt;Node&gt; getPartitionLeaderEndpoint(String topicName, int partitionId, ListenerName listenerName) {
+        MetadataImage image = currentImage;
+        return Optional.ofNullable(image.topics().getTopic(topicName))
+            .flatMap(topic -&gt; Optional.ofNullable(topic.partitions().get(partitionId)))
+            .flatMap(partition -&gt; Optional.ofNullable(image.cluster().broker(partition.leader))
+                .map(broker -&gt; broker.node(listenerName.value()).orElse(Node.noNode())));
+    }</code></pre>
+          <p>
+            Reproduced at the 4.4.0 binary: single-replica topic, leader on a node other than the coordinator, <code>SIGKILL</code> the leader, wait for leader none, commit, restart
+            (<code>exp3abort.out</code>, one run, loopback, relative only) <span class="recon">measured here</span>:
+          </p>
+<pre><code>[  2.965s] HW=2 LSO=0
+[  2.998s] kill -9 pgid 1192007 -&gt; 1192007
+[ 10.894s] topic leader now none
+[ 10.928s] commit returned OK in 29ms
+[ 12.436s] state=CompleteCommit coordinator=3 pid=1 epoch=1 partitions=[]
+INFO [Transaction Marker Channel Manager 3]: Couldn't find leader endpoint for partitions Set(off-0) while trying to send transaction markers for lab-off, these partitions are likely deleted already and hence can be skipped
+--- restart data leader 2
+[ 33.487s] HW=2 LSO=0
+[ 38.033s] read_committed   []
+[ 41.139s] read_uncommitted [0:off-1, 1:off-2]</code></pre>
+          <p>
+            The partition existed throughout. On return it reloaded the transaction as open with the LSO at its first record. <code>find-hanging</code> caught it, with coordinator epoch -1, using a 1 minute window. What
+            happens next decides what the reader ever sees.
+          </p>
+
+          <figure class="figure wide" id="fig-marker-lost">
+            <div class="figure-head">
+              <span class="figure-label">Figure 7</span>
+              <p class="figure-title">Marker lost to an offline partition. Known upstream, fixed on trunk, 4.4 and 4.3 branches, untagged</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 420" role="img" aria-label="Flow. The partition has leader -1, the lookup returns empty, the coordinator logs likely deleted and removes the partition, and CompleteCommit is written with the client already told success. The partition returns with HW 2 and LSO 0. Three endings: a later commit by the same producer closes both and reveals the records; a later abort by the same producer closes both and hides them from read_committed while the bytes stay; the abort tool does the same.">
+                <defs>
+                  <marker id="fig-marker-lost-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker>
+                </defs>
+                <g fill="#ffffff" stroke="#252525">
+                  <rect x="16" y="20" width="225" height="74" rx="4"/><rect x="263" y="20" width="225" height="74" rx="4"/><rect x="510" y="20" width="225" height="74" rx="4"/>
+                </g>
+                <rect x="757" y="20" width="227" height="74" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="28" y="44" class="svg-step">Every replica is down</text>
+                <text x="28" y="62" class="svg-sub">partition.leader = -1</text>
+                <text x="28" y="79" class="svg-sub">commit arrives now</text>
+                <text x="275" y="44" class="svg-step">Lookup returns empty</text>
+                <text x="275" y="62" class="svg-sub">broker(-1) is null, so the</text>
+                <text x="275" y="79" class="svg-sub">flatMap never sees noNode()</text>
+                <text x="522" y="44" class="svg-step">"likely deleted"</text>
+                <text x="522" y="62" class="svg-sub">removePartition, no marker</text>
+                <text x="522" y="79" class="svg-sub">INFO log line only</text>
+                <text x="769" y="44" class="svg-step">CompleteCommit</text>
+                <text x="769" y="62" class="svg-sub">the client already has</text>
+                <text x="769" y="79" class="svg-sub">success, with no error since</text>
+                <g fill="none" stroke="#252525" stroke-width="1.6">
+                  <path d="M241,57 H261" marker-end="url(#fig-marker-lost-k)"/><path d="M488,57 H508" marker-end="url(#fig-marker-lost-k)"/><path d="M735,57 H755" marker-end="url(#fig-marker-lost-k)"/>
+                  <path d="M870,94 V158 H682" marker-end="url(#fig-marker-lost-k)"/>
+                  <path d="M500,196 V230 H166 V258" marker-end="url(#fig-marker-lost-k)"/><path d="M500,230 V258"  marker-end="url(#fig-marker-lost-k)"/><path d="M500,230 H834 V258" marker-end="url(#fig-marker-lost-k)"/>
+                </g>
+                <rect x="318" y="122" width="364" height="74" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="330" y="146" class="svg-step">The partition returns, stuck</text>
+                <text x="330" y="164" class="svg-sub">HW=2 LSO=0, read_committed []</text>
+                <text x="330" y="181" class="svg-sub">coordinator: complete. Partition: open.</text>
+
+                <rect x="16" y="260" width="300" height="118" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="28" y="284" class="svg-step">Same producer commits on that partition</text>
+                <text x="28" y="304" class="svg-sub">one COMMIT closes both transactions</text>
+                <text x="28" y="322" class="svg-sub">read_committed:</text>
+                <text x="28" y="339" class="svg-sub">[0:off-1, 1:off-2, 2:next-1]</text>
+                <text x="28" y="364" class="svg-note">The records are revealed.</text>
+
+                <rect x="350" y="260" width="300" height="118" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="362" y="284" class="svg-step">Same producer aborts on that partition</text>
+                <text x="362" y="304" class="svg-sub">one ABORT closes both, with no exception</text>
+                <text x="362" y="322" class="svg-sub">read_committed: nothing, for good</text>
+                <text x="362" y="339" class="svg-sub">read_uncommitted: still returns them</text>
+                <text x="362" y="364" class="svg-note">Hidden from read_committed. The bytes stay.</text>
+
+                <rect x="684" y="260" width="300" height="118" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="696" y="284" class="svg-step">kafka-transactions abort --start-offset 0</text>
+                <text x="696" y="304" class="svg-sub">ABORT at the old epoch, LSO unstuck</text>
+                <text x="696" y="322" class="svg-sub">read_committed: 0 records</text>
+                <text x="696" y="339" class="svg-sub">HW=3 LSO=3</text>
+                <text x="696" y="364" class="svg-note">Hidden from read_committed. The bytes stay.</text>
+                <text x="16" y="404" class="svg-note">Endings are one run each: exp3next.out, exp3nextabort.out, exp3abort.out. Single-replica topic, 4.4.0 binary, loopback.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured, one run per ending. A later commit or abort must come from the same producer and touch that partition. The tool has no commit mode, so check the coordinator's state first
+              (<a href="#D91">D91</a>).
+            </p>
+          </figure>
+
+          <h3>At replication factor 3</h3>
+          <p>
+            Replication does not stop this; it narrows it. The verifier reran it at RF 3 with <code>min.insync.replicas=2</code> and ELR on. This is one run, on seven combined nodes, so the coordinator lived on
+            a node outside the partition's replicas and survived with every replica down. A one-of-three leader kill was the control: <code>leader=5 isr=[5, 6]</code>, commit in 30 ms, COMMIT marker on disk,
+            clean. Then the replicas died in two steps until <code>off leader=none isr=[] elr=[5, 6]</code>, with the transaction spanning that partition and a healthy one (<code>verify-d/v2_rf3.out</code>)
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The commit returned OK in 9 ms. The coordinator logged "likely deleted" and went to <code>CompleteCommit</code>. The healthy partition's record was readable. After all three replicas restarted, the
+            other two records were hidden from <code>read_committed</code> and returned by <code>read_uncommitted</code>, with <code>HW=2 LSO=0</code>. That is one committed transaction, half visible. The same
+            producer's next transaction on that partition, aborted, made the split permanent for <code>read_committed</code>: no exception, one ABORT at offset 3, <code>.txnindex</code> with
+            <code>firstOffset: 0 lastOffset: 3</code>. The bytes stay.
+          </p>
+          <p>
+            Not run: simultaneous loss of all three, a partial return, and a 3-broker cluster with RF 3 everywhere, where "all replicas down" also takes the coordinator. That route is inferred.
+          </p>
+
+          <h3>A pause, and when it loses the marker</h3>
+          <p>
+            No kill is needed, but a pause alone does not lose the marker. It is lost if the lookup runs while the partition has no leader. Three runs, one each: five nodes, single-replica topics,
+            <code>SIGSTOP</code> only, default 9 s session (<code>verify-d/v1_pause.out</code>) <span class="recon">measured here</span>.
+          </p>
+          <table style="font-size: 13px">
+            <thead><tr><th>Stopped</th><th>Commit</th><th>Coordinator</th><th>After resume</th></tr></thead>
+            <tbody>
+              <tr><td>12.0 s</td><td>21 ms after stop, leader still registered</td><td><code>PrepareCommit</code> until after resume</td><td style="background: var(--green-soft)"><code>HW=3 LSO=3</code>, COMMIT on disk</td></tr>
+              <tr><td>14.0 s</td><td>after <code>leader=none</code></td><td>"likely deleted", <code>CompleteCommit</code></td><td style="background: var(--red-soft)"><code>HW=2 LSO=0</code>, no marker on disk</td></tr>
+              <tr><td>40.0 s</td><td>37 ms after stop</td><td>"likely deleted", <code>CompleteCommit</code></td><td style="background: var(--orange-soft)"><code>HW=3 LSO=3</code>, COMMIT on disk</td></tr>
+            </tbody>
+          </table>
+          <p>
+            The last row is a race, not safety. The COMMIT apparently came from the old request buffered in the stopped broker's socket; that is inferred. So the log line can fire with no loss. Two earlier runs
+            (<code>exp2b.out</code>, <code>exp2c.out</code>) lost the marker with a pause that outlasted the session, but those also killed the coordinator.
+          </p>
+          <p>
+            The fix returns <code>Node.noNode()</code> for a known partition with no endpoint, which sends markers down the existing retry path. That is read in code only: no fixed release is tagged and trunk was not
+            built. The lookup at tag 4.3.2 is the same as at the pin; 4.3.2 was read, not run.
+          </p>
+
+          <h2 id="p5-limits"><span class="secnum">07</span>What exactly-once does not cover</h2>
+          <p>
+            The design doc draws the line itself. Exactly-once is for "reading, processing and writing data on Kafka topics", and "Exactly-once delivery for other destination systems generally requires
+            cooperation with such systems" (<code>docs/design/design.md:207</code>). For external sinks its prescription is not two-phase commit. It is to store the consumer's offset beside the output
+            (<code>:205</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Inside the line, the mechanism is the one this part has read. The consumer's position is a message in an internal topic, so the program writes offset and output in one transaction
+            (<code>:203</code>). The markers then decide both together, and the epoch shuts out a zombie. That guarantee needs all of it: the program must send offsets through the producer, its output readers must opt into
+            <code>read_committed</code>, and its producer must hold a stable transactional id <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            The lab ran that line. One read-process-write program took 20 inputs, wrote each to a Kafka topic in a transaction and to a local file, and crashed once before commit, after 7 records. The 7 is the
+            driver's <code>crashAfter</code> argument, a dial <span class="recon">measured here</span>, one run:
+          </p>
+<pre><code>[  7.689s] crash after 7 records, before commit
+crash exit; external lines so far: 7
+[ 35.112s] drained, processed 20
+external lines: 27 unique: 20
+duplicates: r0 r1 r2 r3 r4 r5 r6
+read_committed eout: records 20 unique 20
+read_uncommitted eout: records 27 unique 20</code></pre>
+
+          <figure class="figure wide" id="fig-eos">
+            <div class="figure-head">
+              <span class="figure-label">Figure 8</span>
+              <p class="figure-title">Where exactly-once stops: Kafka and a file both took 27 writes of 20 inputs</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 240" role="img" aria-label="A read-process-write program reads 20 inputs and, across a crash and a rerun, makes 27 writes to a Kafka output topic and 27 writes to an external file. Inside the Kafka transaction boundary, read_committed hides the 7 from the aborted attempt and returns 20. The external file sits outside the boundary and shows all 27 lines.">
+                <defs>
+                  <marker id="fig-eos-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker>
+                </defs>
+                <rect x="16" y="20" width="660" height="208" rx="8" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="6 4"/>
+                <text x="32" y="44" class="svg-lane">INSIDE A KAFKA TRANSACTION</text>
+                <rect x="36" y="110" width="130" height="64" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="101" y="136" text-anchor="middle" class="svg-step">Input topic</text>
+                <text x="101" y="154" text-anchor="middle" class="svg-sub">20 records</text>
+                <rect x="222" y="94" width="170" height="96" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="307" y="120" text-anchor="middle" class="svg-step">The program</text>
+                <text x="307" y="140" text-anchor="middle" class="svg-sub">attempt 1: 7, crash</text>
+                <text x="307" y="158" text-anchor="middle" class="svg-sub">attempt 2: 20, commit</text>
+                <text x="307" y="176" text-anchor="middle" class="svg-sub">offsets in the txn</text>
+                <rect x="448" y="62" width="208" height="110" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="460" y="86" class="svg-step">Output topic log</text>
+                <text x="460" y="106" class="svg-sub">27 writes of 20 inputs</text>
+                <text x="460" y="124" class="svg-sub">read_committed: 20</text>
+                <text x="460" y="142" class="svg-sub">read_uncommitted: 27</text>
+                <text x="460" y="162" class="svg-note">hides the 7 from the aborted try</text>
+                <text x="32" y="216" class="svg-note">read_committed hides the seven from the aborted attempt; read_uncommitted still returns them.</text>
+                <rect x="726" y="62" width="258" height="110" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="738" y="86" class="svg-step">External file</text>
+                <text x="738" y="106" class="svg-sub">27 writes of 20 inputs</text>
+                <text x="738" y="124" class="svg-sub">every line stays: r0 to r6 twice</text>
+                <text x="738" y="142" class="svg-sub">no marker, no abort</text>
+                <text x="738" y="162" class="svg-note">cannot hide anything</text>
+                <g fill="none" stroke="#3c6f97" stroke-width="1">
+                  <path d="M166,142 H220" marker-end="url(#fig-eos-b)"/>
+                  <path d="M392,125 H446" marker-end="url(#fig-eos-b)"/>
+                  <path d="M392,178 H690 V140 H724" marker-end="url(#fig-eos-b)"/>
+                </g>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured, one run (<code>exp1b.out</code> § EOS). The comparison is not 20 against 27. Both destinations took the same 27 writes. The difference is that Kafka has a way to hide the seven, and the file has none.
+            </p>
+          </figure>
+
+          <p>
+            KIP-98 itself lists what a consumer does not get: all of a committed transaction together, given compaction, segment deletion, seeks and partial subscriptions. Markers are per partition, so there is no
+            global commit point. <code>commitTransaction</code> returns before markers, so an immediate <code>read_committed</code> read can miss the commit. That read-your-writes gap is reasoned from the code
+            <span class="recon">reconstruction</span>; the lab never caught a stale read.
+          </p>
+          <p>
+            Compaction meets transactions too. The cleaner removes aborted data batches regardless of keys, and cannot go past the first unstable offset, so an open transaction holds compaction back
+            (<code>LogCleaner.java:87-89</code>). Markers stay until no batch of their transaction remains, then until the delete horizon, sharing tombstone retention (<code>Cleaner.java:330-335</code>). The last marker of an active
+            producer stays as an empty batch, to preserve the epoch for fencing (<code>:344-345</code>).
+          </p>
+          <p>
+            Kafka 4.4 has broker-side scaffolding for external two-phase commit (KIP-939), off by default, with its key operation unimplemented: <code>keepPreparedTxn</code> returns <code>UNSUPPORTED_VERSION</code>
+            (<code>TransactionCoordinator.scala:145-146</code>), still so on trunk's coordinator check, and <code>InitProducerId</code> v6 is still marked unstable. No target release is on the KIP page.
+          </p>
+          <p>
+            franz-go's <code>GroupTransactSession</code> takes a different trade: it favours aborting if any rebalance happens before commit, instead of blocking the rebalance (<code>franz-go/pkg/kgo/txn.go:55-57</code>).
+            It defaults to a 40 s transaction timeout and <code>ReadUncommitted</code>, so its users must also opt in on the read side (<code>config.go:679</code>, <code>:1792</code>).
+          </p>
+          <p>
+            The run also had a void first attempt, kept in the log because it shows a dependency. The restart's 12 s idle window ended before the dead member's 45 s session did, so it processed nothing
+            (<code>exp1.out</code> § F). A transaction says nothing about when a group gets its partitions back. <a href="../clients/#p4-rebalance">Part 4</a> reads that side.
+          </p>
+
+          <h3>Five lines, one reading</h3>
+          <p>
+            This is where the collection's claim comes back. Nearly every promise Kafka makes is a statement about where a line sits in a log, not about a disk or an outcome. The
+            <a href="../the-log/#p1-recovery">recovery point</a> says what a restart will not recheck. The <a href="../replication/#p3-ladder">high watermark</a> says every in-sync member's page cache has it. The
+            <a href="../replication/#p3-raft">metadata commit</a> says a quorum of voters has it. The <a href="../clients/#p4-read">committed offset</a> records a position, and a position says what was handed over, not what was finished. The last stable offset says the markers below it
+            have landed and replicated. Read a guarantee as which line, in which log, moved by whom, and both the guarantee and its edge follow.
+          </p>
+
+          <h2 id="p5-register"><span class="secnum">08</span>Findings register</h2>
+          <p>
+            Every part of this collection points here by number. The register holds 107 findings: A 5, B 5, C 30, D 55, E 12. The classes say what kind of thing each one is. A is a
+            latent bug. B was fixed upstream after the pin. C is doc drift, where text and code disagree. D is a gotcha, behaviour that is correct or defensible and still surprises. E is a behaviour change.
+          </p>
+          <p>
+            <strong>Nothing here was reported upstream.</strong> And nothing here is a discovery. KAFKA-20734, KAFKA-19880, KAFKA-14312 and KAFKA-15591 were known upstream first, and KIP-966 and KIP-848
+            state their behaviours as intended. Where a KIP says a behaviour is intended, the row says so: <a href="#D62">D62</a> and <a href="#D80">D80</a> are design choices, not coding errors.
+          </p>
+
+          <h3>Reading the status column</h3>
+          <p>
+            "Trunk" means <code>09f2dc1320</code> (2026-11-06) where a verifier checked it, and trunk was read, never built or run. "Not checked" means nobody did, and it says nothing about whether the finding still
+            holds. Absence from Jira is weaker still: <a href="#D3">D3</a>'s "No Jira matched two text searches" is not proof that none exists. "The verifier" is a separate pass that re-read code and reran scenarios against
+            the research dossiers. Its corrections override them.
+          </p>
+
+          <h3>The bugs, as verification left them</h3>
+          <p>
+            Class A is short. <a href="#D3">D3</a> is a timeout that does not bound one wait. <a href="#D4">D4</a> is known and contested upstream: KAFKA-19880 is open, and
+            KAFKA-14312 closed Won't Fix in 2024 as not a bug. <a href="#D1">D1</a> is a robustness defect shown only with hand-flipped bits, simulated damage with no natural trigger established.
+            <a href="#D2">D2</a> and <a href="#D5">D5</a> are harmless.
+          </p>
+          <p>
+            Class B is where the upstream work happened. <a href="#D10">D10</a> is KAFKA-20734, and it has no tagged fix as of 6 November 2026. <a href="#D7">D7</a> is fixed after 4.4.0 in an untagged commit.
+            <a href="#D6">D6</a> is the odd one: a fix was reverted from 4.4 before release, citing a bug in that patch, and its Jira is Reopened. <a href="#D8">D8</a> and <a href="#D9">D9</a> are a log label and a stale comment.
+          </p>
+
+          <h3>Limits of the evidence</h3>
+          <p>
+            Rows carry the labels of what stands behind them. Every timing is loopback on a shared 2-vCPU box: relative behaviour, never capacity. Hand-flipped bytes and <code>truncate -s</code> tail cuts are simulated
+            damage, and any count they yield is set by the mock: 987 of 2,000 in <a href="#D62">D62</a> is never a loss rate, and no real power cut was run. Faults injected through a proxy are named, as in
+            <a href="#D4">D4</a>. Single runs are called single runs. librdkafka was read, never run, and its figures, as in <a href="#D77">D77</a>, are computed.
+          </p>
+          <p>
+            Claims are condensed here; evidence and reproduction commands stay in the dossier. The verifiers sampled read-in-code facts and relied on a citation checker for
+            quotes, so a fact not in their tables was not individually judged. Every row describes the pin. Re-read it at your own version before acting on it.
+          </p>
+          <p>
+            Rows run by class, not by part; the last column links to where each one is told. This part tells twenty of them: <a href="#D5">D5</a>, <a href="#D10">D10</a>, D35 to D40, D86 to D95, <a href="#D106">D106</a> and <a href="#D107">D107</a>.
+          </p>
+
+          <figure class="figure wide" id="fig-register">
+            <div class="figure-head">
+              <span class="figure-label">Figure 9</span>
+              <p class="figure-title">The findings register: 107 findings across all five parts</p>
+            </div>
+            <div class="figure-body" style="overflow-x: auto">
+              <table style="font-size: 12px; line-height: 1.42; min-width: 760px">
+                <thead><tr><th>Id</th><th>Class</th><th>Claim</th><th>Upstream status</th><th>Part</th></tr></thead>
+                <tbody>
+                  <tr id="D1"><td><a href="#D1">D1</a></td><td style="background: var(--red-soft)">A</td><td>A hand-flipped high bit in a mid-segment base offset (outside the CRC) stopped the broker on every start: an unhandled <code>IllegalArgumentException</code> from <code>splitOverflowedSegment</code>. Other bits do other things. Simulated damage; no natural trigger established.</td><td>Still at trunk <code>09f2dc1320</code>. (<code>LocalLog.java:980</code>; <code>recover</code> and <code>retryOnOffsetOverflow</code> diff identical). JQL text search found only unrelated KAFKA-7385. No Jira names it.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D2"><td><a href="#D2">D2</a></td><td style="background: var(--red-soft)">A</td><td>The recovery progress line always prints 0, from integer division <code>numFlushed / numUnflushed</code>. Cosmetic.</td><td>Still at trunk :469 (<code>09f2dc1320</code>).</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D3"><td><a href="#D3">D3</a></td><td style="background: var(--red-soft)">A</td><td>A first idempotent Java producer's <code>delivery.timeout.ms</code> does not fire while InitProducerId cannot complete: pending 210 s against an 8 s timeout. The doc calls it "An upper bound". Only the no-block case was run; franz-go failed at 27.9 s, one run; librdkafka not tested.</td><td>Still at trunk <code>09f2dc1320</code>. No Jira matched two text searches, which is not proof none exists.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D4"><td><a href="#D4">D4</a></td><td style="background: var(--red-soft)">A</td><td>A first batch to a partition that already holds records can be overtaken and lost with idempotence on and <code>acks=all</code>; the application gets a <code>TimeoutException</code>. Reproduced with a proxy-corrupted byte, and with no fault via a split. Not TV2 transactional producers. Production frequency not measured.</td><td>Known and contested: <strong>KAFKA-19880 Open</strong> reports this case; KAFKA-14312 closed Won't Fix in 2024 as not a bug. Still on trunk by the fix commit's own statement; trunk not run.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D5"><td><a href="#D5">D5</a></td><td style="background: var(--red-soft)">A</td><td><code>updatedFirstUnstableOffset != this.firstUnstableOffsetMetadata</code> compares <code>Optional</code>s by reference. Harmless. Read, not measured.</td><td>Still at trunk <code>09f2dc1320</code>, line 1338.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D6"><td><a href="#D6">D6</a></td><td style="background: var(--orange-soft)">B</td><td>On 4.4.0 a cleaned segment can still overflow from compression changes: multi-destination cleaning was deliberately reverted from 4.4 before release. Read, not measured.</td><td>KAFKA-20036 is Reopened, fix version 4.5.0; trunk has a form of it (<code>Cleaner</code> :215 at <code>09f2dc1320</code>). Lands <code>67d1e22070</code>, reverted on 4.4 <code>c801be798a</code>.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D7"><td><a href="#D7">D7</a></td><td style="background: var(--orange-soft)">B</td><td>The same first-batch overtake on a never-written partition is in 4.4.0. The commit message says "silent"; the Java callback did report a <code>TimeoutException</code>.</td><td>Fixed after 4.4.0 in <code>81b993044e</code> (KAFKA-15591, 2026-09-09), untagged at the check; Jira fix version 4.5.0; absent from the <code>4.4</code> branch.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D8"><td><a href="#D8">D8</a></td><td style="background: var(--orange-soft)">B</td><td><code>ClassicGroup.validateOffsetCommit</code> passes its label inverted, so a fencing log for a plain commit says <code>txn-offset-commit</code>. Log text only.</td><td>Fixed after 4.4.0 in <code>a3e4a7e42c</code> (2026-09-21, no tag); trunk :853.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D9"><td><a href="#D9">D9</a></td><td style="background: var(--orange-soft)">B</td><td>The heartbeat comment says subscription changes persist by a record the schema says was replaced in 4.1 by KIP-1101; real logs show no type 4 record.</td><td>Fixed after 4.4.0 in <code>72955baae9</code> (2026-11-03, no tag); trunk :2652-2655 no longer names the record.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D10"><td><a href="#D10">D10</a></td><td style="background: var(--orange-soft)">B</td><td>KAFKA-20734: an offline partition loses its marker. The lookup returns empty for leader -1, and the coordinator reads empty as "deleted". The client gets success, the coordinator says <code>CompleteCommit</code>, the partition returns with LSO stuck. A later commit by the same producer on that partition reveals the records; a later abort or the <code>abort</code> tool hides them from <code>read_committed</code> for good, though the bytes stay and <code>read_uncommitted</code> returns them. Reproduced at RF 1, and at RF 3 in one run with every replica down, on seven combined nodes so the coordinator survived; one of three down was clean. One run left a transaction half-visible. On a pause, the marker is lost if the lookup runs while the partition has no leader.</td><td><strong>Fixed on trunk <code>1da285a9a798</code> (2026-10-27), branch 4.4 <code>b6de0ca05f76</code> (2026-10-28), branch 4.3 <code>499e13ab228c</code> (2026-11-05); no tagged fix as of 6 November 2026</strong> (4.4.1, 4.3.3, 4.5.0 and rc0 tags 404 on 2026-11-06). Jira: Blocker, created 2026-06-24, Resolved 2026-11-05, fix versions 4.5.0, 4.4.1, 4.3.3. Introduced by <code>7d13e8b70d</code> (KAFKA-17573, first tag 4.3.0). 4.3.2 read, not run.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D11"><td><a href="#D11">D11</a></td><td>C</td><td>The <code>LogSegment</code> comment says a segment is "stored in two files"; there are up to five kinds.</td><td>On trunk per dossier; verifier: unchanged.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D12"><td><a href="#D12">D12</a></td><td>C</td><td>The cleaner's INFO line names a "deletion horizon" that applies only to pre-v2 data.</td><td>On trunk per dossier; verifier: unchanged.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D13"><td><a href="#D13">D13</a></td><td>C</td><td><code>log.cleaner.io.buffer.load.factor</code> configures the dedupe buffer, not I/O buffers.</td><td>Trunk not checked. Verifier: unchanged.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D14"><td><a href="#D14">D14</a></td><td>C</td><td>The <code>SocketServer</code> comment says "two types of request planes" and lists one; <code>control.plane.listener.name</code> is gone.</td><td>Still at trunk <code>09f2dc1320</code> :62.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D15"><td><a href="#D15">D15</a></td><td>C</td><td>The <code>Processor</code> comment is wrong on its first line and stale on <code>isPrivilegedListener</code>.</td><td>Still at trunk <code>09f2dc1320</code> :770, :773-777.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D16"><td><a href="#D16">D16</a></td><td>C</td><td>Docs say "Pre-0.10.x protocols are fully removed in Kafka 4.0"; the code keeps old versions. KIP-896's rule is a 2.1 baseline with exceptions.</td><td>Still at trunk <code>09f2dc1320</code> :293, :301, :308.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D17"><td><a href="#D17">D17</a></td><td>C</td><td>KAFKA-18659's plan said reject with an <code>UnsupportedVersion</code> error; the client gets a closed socket and zero bytes.</td><td>Jira fix version 4.0.0; <code>78aff4fede</code>, 4.0.0 carries it as <code>0e01d38a27</code>.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D18"><td><a href="#D18">D18</a></td><td>C</td><td>"A failed node will always recover from its replicas" is not true when the failed node is elected first. Minor. The example is simulated damage.</td><td>On trunk per dossier; verifier: unchanged at text level.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D19"><td><a href="#D19">D19</a></td><td>C</td><td>"It must fully re-sync again": rejoining fetches only the missing suffix, and elected replicas do not re-sync.</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D20"><td><a href="#D20">D20</a></td><td>C</td><td>KIP-966 reads as complete, but only Part 1 shipped. Minor: the KIP's Delivery plan states the phases.</td><td>KIP status "Accepted".</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D21"><td><a href="#D21">D21</a></td><td>C</td><td>The last-known-leader doc sentence omits the data-loss flag; the code's own label is unclean.</td><td>Still on trunk.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D22"><td><a href="#D22">D22</a></td><td>C</td><td><code>ReplicaState.isCaughtUp</code> javadoc has the subtraction backwards.</td><td>Still on trunk (ReplicaState :59).</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D23"><td><a href="#D23">D23</a></td><td>C</td><td><code>kraft.md:296-312</code> shows an obsolete metadata shell layout.</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D24"><td><a href="#D24">D24</a></td><td>C</td><td><code>controller.quorum.fetch.timeout.ms</code> is documented as the leader's limit too; the leader uses 1.5 times it.</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D25"><td><a href="#D25">D25</a></td><td>C</td><td><code>controller.quorum.election.timeout.ms</code> is documented with the fetch timeout's meaning.</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D26"><td><a href="#D26">D26</a></td><td>C</td><td><code>controller.quorum.election.backoff.max.ms</code> is documented as exponential backoff against gridlock; it is only read on graceful resignation.</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D27"><td><a href="#D27">D27</a></td><td>C</td><td>The <code>KafkaRaftClient</code> comment is behind the code, and says voters are statically configured.</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D28"><td><a href="#D28">D28</a></td><td>C</td><td><code>kraft.md:197</code> says static versus dynamic is fixed at format time; since 4.1 it can change.</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D29"><td><a href="#D29">D29</a></td><td>C</td><td>KIP pages lag the code: KIP-631, KIP-996, KIP-500, KIP-595, KIP-853. Code wins.</td><td>KIP status lines; the 18000 was not separately matched on the raw page.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D30"><td><a href="#D30">D30</a></td><td>C</td><td><code>ENABLE_IDEMPOTENCE_DOC</code> says conflicting configs disable idempotence when not explicit; for <code>max.in.flight=6</code> the code throws.</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D31"><td><a href="#D31">D31</a></td><td>C</td><td>franz-go's <code>UniformBytesPartitioner</code> comment says lingering is off by default; the default has been 10 ms since v1.20.0.</td><td>Still on master; tip is still <code>123ec885</code>.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D32"><td><a href="#D32">D32</a></td><td>C</td><td>KIP-1263's assignor offload config defaults to true, but its getter has no caller in main code. An assignor run occupies the coordinator thread (inferred).</td><td>Trunk <code>09f2dc1320</code> has getters only; its one <code>executor.schedule</code> at :3868 resolves regexes.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D33"><td><a href="#D33">D33</a></td><td>C</td><td><code>ShareUpdateValue.json</code> documents states 0, 2 and 4, but lock expiry can persist <code>ARCHIVING</code> (3) with a DLQ. Read; no DLQ run.</td><td>Trunk <code>09f2dc1320</code> schema same at :39.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D34"><td><a href="#D34">D34</a></td><td>C</td><td>A <code>GroupCoordinatorService</code> comment says <code>UNSTABLE_OFFSET_COMMIT</code> cannot easily be returned; it is, with <code>requireStable</code>. No effect.</td><td>Comment still at trunk <code>09f2dc1320</code> :1928.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D35"><td><a href="#D35">D35</a></td><td>C</td><td>The consumer doc says the LSO is one less than the first open transaction's offset; code and lab show it equals that offset.</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D36"><td><a href="#D36">D36</a></td><td>C</td><td><code>PreviousProducerId</code> is described as the last committed transaction's id; <code>prepareTransitionTo</code> always passes the current id.</td><td>Still at trunk <code>09f2dc1320</code> (<code>TransactionLogValue.json:29</code>).</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D37"><td><a href="#D37">D37</a></td><td>C</td><td><code>NextProducerEpoch</code> is a schema field nobody sets.</td><td>None in <code>TransactionLog.java</code> at trunk <code>09f2dc1320</code>.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D38"><td><a href="#D38">D38</a></td><td>C</td><td>KIP-890's wiki state is "Approved", though the protocol ships from 4.0. Code wins.</td><td>Wiki says "Approved".</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D39"><td><a href="#D39">D39</a></td><td>C</td><td><code>kafka-transactions</code> and <code>find-hanging</code> do not appear in <code>kafka/docs</code>.</td><td>PR #22937 proposes some of this text; open, not merged on 2026-11-06.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D40"><td><a href="#D40">D40</a></td><td>C</td><td><code>TransactionState.java</code> comments say "Group" for transaction states. Cosmetic.</td><td>Not re-read on trunk beyond the lines sampled.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D41"><td><a href="#D41">D41</a></td><td>D</td><td>Acked data can sit on an active segment with no Kafka fsync; kernel writeback still runs. <code>acks=all</code> promises replicas, not disk.</td><td>Intended (design doc).</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D42"><td><a href="#D42">D42</a></td><td>D</td><td>Record timestamps drive rolls and retention, so producer event time can cause early rolls, non-rolls and near-instant deletion.</td><td>Not checked.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D43"><td><a href="#D43">D43</a></td><td>D</td><td>One young record protects its segment and, by the walk's stop rule, later ones. The cross-segment half is read, not measured.</td><td>Not checked.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D44"><td><a href="#D44">D44</a></td><td>D</td><td>A tombstone outlives <code>delete.retention.ms</code> until a later pass; a quiet partition may never have one.</td><td>Not checked.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D45"><td><a href="#D45">D45</a></td><td>D</td><td>Quiet compacted topics compact only after a roll, which needs an append.</td><td>Not checked.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D46"><td><a href="#D46">D46</a></td><td>D</td><td>One hand-flipped payload bit above the recovery point deletes all later segments on that replica (24,413 offsets to 561). Simulated damage.</td><td>Intended by design: a log must be contiguous.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D47"><td><a href="#D47">D47</a></td><td>D</td><td>Nothing on the broker checks CRCs on read or after a clean shutdown; an affected consumer stops at the bad offset until it seeks past. Simulated damage.</td><td>Not checked.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D48"><td><a href="#D48">D48</a></td><td>D</td><td>The recovery point reaches disk only every 60 s by default, so a young partition rescans fully.</td><td>Not checked.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D49"><td><a href="#D49">D49</a></td><td>D</td><td>Size retention overshoots by up to a segment.</td><td>Not checked.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D50"><td><a href="#D50">D50</a></td><td>D</td><td><code>Truncated N bytes</code> logs at DEBUG, so a cut's size is not stated at default levels.</td><td>Not checked.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D51"><td><a href="#D51">D51</a></td><td>D</td><td>TLS gives up <code>sendfile</code>, using a 32 KiB user-space buffer.</td><td>Not checked.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D52"><td><a href="#D52">D52</a></td><td>D</td><td>Empty producer headers cost 61 bytes each until the producer expires, so a compacted log never quite reaches one record per key.</td><td>Behaviour narrowed in 4.4.0 (KAFKA-20452).</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D53"><td><a href="#D53">D53</a></td><td>D</td><td>The advertised Produce minimum is false by design: advertised 0, usable 3. A client that picks low gets EOF.</td><td>Intended; still at trunk <code>09f2dc1320</code> <code>ApiKeys.java:161</code>.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D54"><td><a href="#D54">D54</a></td><td>D</td><td><code>DeprecatedRequestsPerSec</code> cannot fire in 4.4: no schema declares <code>deprecatedVersions</code>.</td><td>Not re-read on trunk.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D55"><td><a href="#D55">D55</a></td><td>D</td><td>A produce timeout or client error does not say whether the record exists: nothing is undone. 3 of 602 records the client was told failed were in the log.</td><td>Confirmed by the verifier; trunk not checked.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D56"><td><a href="#D56">D56</a></td><td>D</td><td>One parked request holds up its connection: an ApiVersions behind a parked Fetch waited 4 s, 2 ms on another connection. Loopback, relative only.</td><td>Confirmed by the verifier; trunk not checked.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D57"><td><a href="#D57">D57</a></td><td>D</td><td>Bandwidth throttles have no cap, and first bursts are nearly free: 12 ms, 9.9 s, 19.9 s for a 10 KiB/s client.</td><td>Intended per franz-go comment.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D58"><td><a href="#D58">D58</a></td><td>D</td><td><code>PurgatorySize</code> overstates waiting requests; <code>NumDelayedOperations</code> is the count.</td><td>Not checked.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D59"><td><a href="#D59">D59</a></td><td>D</td><td>Parsing and queue back-pressure share the network thread: a full queue stalls all its connections. Read, not measured.</td><td>Not checked.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D60"><td><a href="#D60">D60</a></td><td>D</td><td>Timer expiry is serial per purgatory on one thread. Whether slow reads delay other expiries was not measured.</td><td>Not checked.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D61"><td><a href="#D61">D61</a></td><td>D</td><td>The client id <code>__admin_client</code> passes the internal-topic check on Produce; ACLs still apply.</td><td>Still at trunk <code>09f2dc1320</code> <code>KafkaApis.scala:545</code>.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D62"><td><a href="#D62">D62</a></td><td>D</td><td>Last-known-leader election runs without consulting <code>unclean.leader.election.enable</code>: <strong>intended</strong>, per KIP-966's Delivery plan. Flagged unclean, sets RECOVERING. Simulated damage: half the file cut by hand, so 987 of 2,000 is a dial, never a loss rate.</td><td>Intended per KIP-966 Delivery plan. Still at trunk <code>09f2dc1320</code> (<code>PartitionChangeBuilder.java:104</code>, <code>:246</code>, <code>:269</code>).</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D63"><td><a href="#D63">D63</a></td><td>D</td><td><code>min.insync.replicas</code> is a floor, not a quorum: one frozen replica stalls all acks for the session timeout.</td><td>Documented.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D64"><td><a href="#D64">D64</a></td><td>D</td><td>A frozen leader is worse for <code>acks=1</code> than a dead one: 8,731 acked records truncated in a 29 s freeze (rate × freeze, a dial), 0 for SIGKILL in this run.</td><td>Not checked.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D65"><td><a href="#D65">D65</a></td><td>D</td><td>A truncation below HW is only a WARN on the truncating broker, and the ISR view shows nothing afterwards.</td><td>Not checked.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D66"><td><a href="#D66">D66</a></td><td>D</td><td>Consumers can see offsets reused after a loss. Client reset handling was not run; the premise is simulated damage.</td><td>Not checked.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D67"><td><a href="#D67">D67</a></td><td>D</td><td>The controller's effective min ISR uses partition 0's replica count; the broker uses each partition's own. Not exercised.</td><td>Trunk not checked.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D68"><td><a href="#D68">D68</a></td><td>D</td><td>With no quorum, a dead follower freezes the HW and <code>acks=1</code> writes are acked but invisible. Not lost in this run.</td><td>Not checked. Confirmed by the verifier as a gotcha.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D69"><td><a href="#D69">D69</a></td><td>D</td><td>A broker restarted during quorum loss exits after 60 s, so a rolling restart removes brokers that were serving.</td><td><code>RegistrationTimeoutEvent</code> identical at trunk <code>09f2dc1320</code>.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D70"><td><a href="#D70">D70</a></td><td>D</td><td>With no quorum a cluster cannot form a first consumer group or auto-create anything.</td><td>Not checked.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D71"><td><a href="#D71">D71</a></td><td>D</td><td>A new controller's fresh sessions delay fencing a dead broker by up to a further session: 9.06 s after activation.</td><td>Not checked.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D72"><td><a href="#D72">D72</a></td><td>D</td><td><code>VoterSetHistory.addAt</code> only logs a non-overlapping voter change; safety rests on leader-side handlers. Not called a bug.</td><td>Trunk not re-read.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D73"><td><a href="#D73">D73</a></td><td>D</td><td><code>kafka-metadata-shell.sh</code> reports a snapshot's internal offset as provenance, refuses live directories, logs ERROR for normal records.</td><td>Trunk not checked.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D74"><td><a href="#D74">D74</a></td><td>D</td><td>A delivery-timeout failure means "unknown", and a re-send can duplicate even with idempotence on.</td><td>Documented.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D75"><td><a href="#D75">D75</a></td><td>D</td><td><code>acks=1</code> or <code>retries=0</code> silently disables idempotence, with an INFO log as the only signal.</td><td>Not checked.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D76"><td><a href="#D76">D76</a></td><td>D</td><td><code>DUPLICATE_SEQUENCE_NUMBER</code> handling is dead code against a 4.4 broker. Not a bug.</td><td>Not checked.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D77"><td><a href="#D77">D77</a></td><td>D</td><td>Key placement differs by client: Java and franz-go agree on 1000 of 1000; librdkafka's default, computed and not run, matches 85 of 1000 over 12 partitions, which is chance.</td><td>Config text names <code>murmur2_random</code> as the Java equivalent.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D78"><td><a href="#D78">D78</a></td><td>D</td><td><code>kafka-producer-perf-test.sh</code> silently keeps only the last repeated <code>--command-property</code>.</td><td>Not checked.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D79"><td><a href="#D79">D79</a></td><td>D</td><td>Producer state expiry reopens the duplicate window, shown at <code>producer.id.expiration.ms=3000</code>, not default behaviour.</td><td>Documented in part.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D80"><td><a href="#D80">D80</a></td><td>D</td><td>Static member, consumer protocol, unclean death: the replacement gets <code>UNRELEASED_INSTANCE_ID</code> until session expiry. <strong>Intended</strong> per KIP-848. Not run end to end.</td><td>Intended per KIP-848.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D81"><td><a href="#D81">D81</a></td><td>D</td><td>Implicit-mode share consumer: <code>close()</code> right after <code>poll()</code> releases the batch, so finished work is redelivered. Documented in the Javadoc.</td><td>Documented.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D82"><td><a href="#D82">D82</a></td><td>D</td><td>Long classic rebalance plus auto-commit: the eventual move re-reads since the last commit, 175 records in one run. The link is inferred.</td><td>Not checked.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D83"><td><a href="#D83">D83</a></td><td>D</td><td>Migrating to the consumer protocol changes the knobs: client session and heartbeat settings are rejected, and a quiet scale-out gets slower by default.</td><td>Confirmed by the verifier.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D84"><td><a href="#D84">D84</a></td><td>D</td><td>Lag from <code>kafka-consumer-groups</code> and the client metric disagree by design, and neither counts records.</td><td>Confirmed by the verifier.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D85"><td><a href="#D85">D85</a></td><td>D</td><td>Share-group DLQ writes are best effort: a failed enqueue still archives. No DLQ failure run.</td><td>Not checked. No DLQ failure run.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D86"><td><a href="#D86">D86</a></td><td>D</td><td><code>commitTransaction</code> returning means decided, not visible: <code>PrepareCommit</code> every time the lab probed straight after.</td><td>Stands as a gotcha (the verifier).</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D87"><td><a href="#D87">D87</a></td><td>D</td><td>One open transaction stalls non-transactional records too, and <code>endOffsets</code> hides it.</td><td>Stands as a gotcha (the verifier).</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D88"><td><a href="#D88">D88</a></td><td>D</td><td>A zombie sees <code>InvalidProducerEpochException</code> first, <code>ProducerFencedException</code> later; franz-go's first <code>EndTransaction</code> error is <code>OPERATION_NOT_ATTEMPTED</code>.</td><td>Stands as a gotcha (the verifier).</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D89"><td><a href="#D89">D89</a></td><td>D</td><td>Admin stable-offset reads silently drop unstable partitions; the result looks like "no offset".</td><td>Still at trunk <code>09f2dc1320</code>.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D90"><td><a href="#D90">D90</a></td><td>D</td><td><code>transaction.partition.verification.enable=false</code> re-opens hanging for old-protocol clients. The lab's client skips the add, a stand-in for the race.</td><td>Not checked.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D91"><td><a href="#D91">D91</a></td><td>D</td><td><code>abort</code> has no commit mode. On a committed-but-marker-lost transaction it hides the data from <code>read_committed</code>; the bytes stay.</td><td>Tool from KIP-664; undocumented in <code>kafka/docs</code>.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D92"><td><a href="#D92">D92</a></td><td>D</td><td>Misleading translations: old clients see <code>NOT_ENOUGH_REPLICAS</code> for verification failures and <code>INVALID_TXN_STATE</code> for a partition not in the transaction.</td><td>Not checked.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D93"><td><a href="#D93">D93</a></td><td>D</td><td>Isolation defaults differ: Java and franz-go <code>read_uncommitted</code>, librdkafka <code>read_committed</code>.</td><td>Stands as a gotcha (the verifier).</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D94"><td><a href="#D94">D94</a></td><td>D</td><td>librdkafka has no TV2, so confluent-kafka-go inherits the old protocol (the wrapping is unverified).</td><td>Not checked past v2.16.0.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D95"><td><a href="#D95">D95</a></td><td>D</td><td>The epoch ceiling now arrives in normal running: the producer id rotates after about 32,766 transactions. Not run.</td><td>Stands as a gotcha (the verifier); KAFKA-20090 path changed in 2026.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D96"><td><a href="#D96">D96</a></td><td>E</td><td>New <code>max.decompressed.message.bytes</code>.</td><td><code>b69c07c816</code>, 4.4.0.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D97"><td><a href="#D97">D97</a></td><td>E</td><td>Empty-batch retention narrowed to the batch before the high watermark.</td><td><code>7480345230</code> KAFKA-20452, 4.4.0.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D98"><td><a href="#D98">D98</a></td><td>E</td><td>Index-length fsync on clean shutdown.</td><td><code>beae700199</code>, <code>72b21c706e</code> KAFKA-20979, 4.4.0.</td><td><a href="../the-log/">1</a></td></tr>
+                  <tr id="D99"><td><a href="#D99">D99</a></td><td>E</td><td>Produce v13 and Fetch v13+ use topic ids, so a proxy or sniffer needs a metadata lookup.</td><td><code>6f783f8536</code> KAFKA-10551, first tag 4.1.0.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D100"><td><a href="#D100">D100</a></td><td>E</td><td>ApiVersions v5 can fail a connection with <code>REBOOTSTRAP_REQUIRED</code>. New in 4.4 (KIP-1242).</td><td>KAFKA-20246, fix version 4.4.0; absent from 4.3.2.</td><td><a href="../the-wire/">2</a></td></tr>
+                  <tr id="D101"><td><a href="#D101">D101</a></td><td>E</td><td>Since 3.7, <code>min.insync.replicas</code> also affects <code>acks=1</code> readers: the acked tail is invisible, and lost if the leader dies.</td><td><code>edc7e10a74</code>. Still at trunk <code>09f2dc1320</code> (<code>Partition.scala</code> :1014).</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D102"><td><a href="#D102">D102</a></td><td>E</td><td>Since 4.0 a pre-vote round precedes every election; a static quorum can become dynamic since 4.1.</td><td><code>3a71d593b1</code> (4.0 line); <code>b97a130c08</code>.</td><td><a href="../replication/">3</a></td></tr>
+                  <tr id="D103"><td><a href="#D103">D103</a></td><td>E</td><td>Upgrading across 4.0 changes <code>linger.ms</code> from 0 to 5, and turns <code>max.in.flight &gt; 5</code> from a fallback into a startup failure.</td><td>Documented.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D104"><td><a href="#D104">D104</a></td><td>E</td><td>franz-go <code>5d3342df</code> changes what happens after a sent batch fails: check which side of 2026-10-06 you pin.</td><td>Commit message; no GitHub releases.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D105"><td><a href="#D105">D105</a></td><td>E</td><td>Since 4.3 assignment is rate-limited to 1 s, so a burst of joiners can see up to one heartbeat of extra delay.</td><td>Documented in KIP-1263; <code>upgrade.md:110</code>.</td><td><a href="../clients/">4</a></td></tr>
+                  <tr id="D106"><td><a href="#D106">D106</a></td><td>E</td><td>TV2 is on by default from 4.0 and changes the RPCs, the epoch semantics and the marker check.</td><td><code>LATEST_PRODUCTION</code> at tag 4.0.0.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                  <tr id="D107"><td><a href="#D107">D107</a></td><td>E</td><td>The marker epoch rule hardened in 4.2 and relaxed for retries in 4.3.</td><td><code>c1ded05067</code>, <code>f0488ebbd4</code>.</td><td><a href="#p5-two-logs">5</a></td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Every row keeps its dossier number, and each number is an anchor: <code>#D10</code> lands on that row. Class: A latent bug, B fixed upstream after the pin, C doc drift, D gotcha, E behaviour change. "Not checked" means nobody checked.
+              Nothing here was reported upstream.
+            </p>
+          </figure>
+
+          <h2 id="p5-sources"><span class="secnum">09</span>Sources</h2>
+          <ul>
+            <li><a href="https://github.com/apache/kafka/tree/4.4.0">apache/kafka 4.4.0</a> (<code>1156b2752aaa</code>): <code>core/</code>, <code>storage/</code>, <code>transaction-coordinator/</code>, <code>metadata/</code>, <code>clients/</code>, <code>docs/</code>. Upstream checks against trunk <code>09f2dc1320</code>, read and never built.</li>
+            <li><code>twmb/franz-go</code> main (<code>123ec885</code>), run; <code>confluentinc/librdkafka</code> v2.16.0 (<code>c6c9973c</code>), read and never run.</li>
+            <li><a href="https://issues.apache.org/jira/browse/KAFKA-20734">KAFKA-20734</a> § Details, fetched 2026-11-06; <a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-890%3A+Transactions+Server-Side+Defense">KIP-890</a> § Motivation; <a href="https://cwiki.apache.org/confluence/display/KAFKA/KIP-98+-+Exactly+Once+Delivery+and+Transactional+Messaging">KIP-98</a>.</li>
+            <li>Lab evidence: <code>~/kafka-ref/lab/results/transactions/</code>, with the script that made each file.</li>
+          </ul>
+          <p>Re-running the lab, and what this box could not settle (the last two need a release or a machine this run did not have):</p>
+<pre><code>bash lab/results/transactions/exp1.sh                  # log, LSO, zombie
+bash lab/results/transactions/exp3.sh 32285 nextabort  # KAFKA-20734, RF 1
+bash lab/results/transactions/verify-d/v2_rf3.sh       # RF 3, every replica down
+bash lab/results/transactions/verify-d/v1_pause.sh     # SIGSTOP only
+# once 4.4.1 or 4.3.3 exists: exp3.sh and v2_rf3.sh against that binary
+# TV2 against TV0 cost: repeated exp5b.sh runs on an unshared machine</code></pre>
+          <p class="footnote">
+            <strong>Provenance.</strong> Paths, lines and excerpts were re-read from the pinned checkout. Traces are real output from small clusters on loopback on a shared 2-vCPU box; timings are relative, never
+            capacity, and each scenario is a single run unless stated. Faults are process kills and <code>SIGSTOP</code>; no real power cut was run. Figure timelines and message sequences are mine, from the code. Not
+            verified: a fixed binary, since no fix is tagged as of 6 November 2026 and trunk was read, never built; simultaneous loss, a pause of all three replicas, and a partial return at RF 3; a 3-broker cluster where all
+            replicas down takes the coordinator; 4.3.2, read and not run; a duplicate marker, never produced; epoch exhaustion at about 32,766 transactions, read and not run. Nothing was reported upstream.
+          </p>
+        </section>
+      </article>

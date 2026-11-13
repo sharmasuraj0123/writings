@@ -1,0 +1,72 @@
+          <h2 id="p4-partition"><span class="secnum">{{S}}</span>Choosing a partition</h2>
+          <p>
+            The order is fixed: explicit partition, custom partitioner, key hash, then "unknown", which means the accumulator picks
+            inside <code>append</code> (<code>KafkaProducer.java:1557-1574</code>) <span class="src">from the code</span>. The key hash
+            is <code>toPositive(murmur2(key)) % numPartitions</code> (<code>producer/internals/BuiltInPartitioner.java:412</code>). The
+            mapping is a function of the partition count, so adding partitions moves keys. Per-key order holds only while the count
+            does, and only per producer instance.
+          </p>
+          <p>
+            Unkeyed records stick to one partition until about <code>batch.size</code> bytes are appended, then switch. The switch waits
+            for a batch boundary, up to twice that. <code>BuiltInPartitioner.java:249-258</code>:
+          </p>
+<pre><code>        if (producedBytes &gt;= stickyBatchSize * 2) {
+            log.trace("Produced {} bytes, exceeding twice the batch size of {} bytes, with switching set to {}",
+                producedBytes, stickyBatchSize, enableSwitch);
+        }
+
+        if (producedBytes &gt;= stickyBatchSize &amp;&amp; enableSwitch || producedBytes &gt;= stickyBatchSize * 2) {
+            // We've produced enough to this partition, switch to next.
+            StickyPartitionInfo newPartitionInfo = new StickyPartitionInfo(nextPartition(cluster));
+            stickyPartitionInfo.set(newPartitionInfo);
+        }</code></pre>
+          <p>
+            Counting bytes, not batches, is KIP-794's fix for a feedback loop: under the earlier partitioner, slow brokers held the sticky
+            assignment longer and got more data. Adaptive partitioning, on by default, then picks the next partition by inverse queue
+            length, and stays off until every partition has had a batch queued (<code>RecordAccumulator.java:701-702</code>). A custom
+            partitioner turns it off entirely (<code>KafkaProducer.java:448</code>). New in 4.4, and off by default,
+            <code>partitioner.rack.aware</code> applies only to the unkeyed choice. In one run, 60,000 unkeyed records over 6 partitions
+            landed 8,096 to 12,364 per partition, at about 13.3 KB per batch <span class="recon">measured here</span>.
+          </p>
+          <p>
+            The clients disagree, and Figure {{fig-defaults}} sets them side by side. The librdkafka column was read, not run. Its unkeyed
+            sticky partitioner switches on time, <code>sticky.partitioning.linger.ms</code>, by default twice the linger, which is the
+            pre-KIP-794 idea in a different form (<code>librdkafka/src/rdkafka_msg.c:1140-1141</code>). franz-go switches at 64 KiB, not at
+            <code>batch.size</code>.
+          </p>
+
+          <figure class="figure wide" id="fig-defaults">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Same protocol, three sets of defaults</p>
+            </div>
+            <div class="figure-body plain">
+              <table>
+                <thead><tr><th>Default</th><th>Java 4.4.0</th><th>librdkafka v2.16.0 (read, not run)</th><th>franz-go (read)</th></tr></thead>
+                <tbody>
+                  <tr style="background: var(--red-soft)"><td>Idempotence</td><td>on</td><td>off</td><td>on</td></tr>
+                  <tr><td>Linger</td><td>5 ms</td><td>5 ms</td><td>10 ms</td></tr>
+                  <tr><td>Batch limit</td><td>16,384 bytes</td><td>1,000,000 bytes, 10,000 messages</td><td>1,000,012 bytes</td></tr>
+                  <tr style="background: var(--red-soft)"><td>In flight</td><td>5 per connection</td><td>1,000,000 (5 per partition when idempotent)</td><td>5 per broker when idempotent, 1 until the first response</td></tr>
+                  <tr style="background: var(--red-soft)"><td>Key hash</td><td>murmur2</td><td>CRC32 (<code>consistent_random</code>)</td><td>murmur2</td></tr>
+                  <tr><td>Unkeyed switch</td><td><code>batch.size</code> bytes</td><td>time, twice the linger</td><td>64 KiB</td></tr>
+                  <tr style="background: var(--orange-soft)"><td>Compression</td><td>none</td><td>none</td><td>snappy, falling back to none</td></tr>
+                  <tr style="background: var(--orange-soft)"><td>Delivery timeout</td><td>120 s</td><td>300 s</td><td>unlimited</td></tr>
+                  <tr><td><code>group.protocol</code></td><td>classic</td><td>classic</td><td>classic</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">From the pinned sources. Red rows change what a guarantee or a key's placement means; orange rows change cost or time. Java's values were also printed from a live config. <span class="src">from the code</span></p>
+          </figure>
+
+          <p>
+            Keyed placement is the practical trap. Java and franz-go agreed on all 1,000 test keys <span class="recon">measured here</span>.
+            librdkafka's default hashes with CRC32. Its figure is computed from the formula with its own <code>crc_table</code>, at 12
+            partitions, and librdkafka was not run: 85 of 1,000 keys match Java. That is near the 1-in-12 chance rate, it scales as 1/N,
+            and it is not a property of those keys. The same key lands elsewhere unless <code>partitioner=murmur2_random</code> is set,
+            which the config text names as the Java equivalent (<code>librdkafka/src/rdkafka_conf.c:1836</code>,
+            <a href="../transactions/#p5-register">register D77</a>, class D, gotcha). franz-go's own comment is stale: "This client's
+            default is to disable lingering", where the default has been 10 ms since v1.20.0
+            (<code>franz-go/pkg/kgo/partitioner.go:273</code>, <a href="../transactions/#p5-register">register D31</a>, class C, doc drift,
+            still on master).
+          </p>

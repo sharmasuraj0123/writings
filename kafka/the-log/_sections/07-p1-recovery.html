@@ -1,0 +1,138 @@
+          <h2 id="p1-recovery"><span class="secnum">{{S}}</span>What recovery does to damage</h2>
+          <p>
+            Recovery wants a contiguous prefix of valid batches and has no other goal. It does not try to save records; replication is meant to
+            supply those. That one aim explains why damage injected by hand has such uneven results here,
+            from one lost batch to a broker that will not start. Everything in this section marked as damage is simulated: bytes cut or
+            bits flipped by hand with the broker dead, one sample each, on one broker with replication factor 1. No real power cut was
+            run, and no loss figure here is a rate.
+          </p>
+
+          <h3>The path</h3>
+          <p>
+            Startup reads the clean-shutdown marker and deletes it immediately, so a crash during loading counts as unclean on the next
+            boot (<code>LogManager.java:630-634</code>). Loading runs in passes: delete temp files and collect swaps, delete segments
+            the swap replaced, rename swaps, then load segments and recover. A <code>.cleaned</code> file is always discarded, and any
+            <code>.swap</code> at or above the smallest <code>.cleaned</code> offset is treated as an incomplete split and discarded too
+            (<code>LogLoader.java:129-195</code>, <code>:290-309</code>). On a clean shutdown, recovery is skipped. Otherwise it visits
+            only segments at or above the checkpointed recovery point, the first offset not flushed
+            (<code>LogLoader.java:457-459</code>, <code>LocalLog.java:102</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            One segment's recovery resets all three indexes and rebuilds them while validating every batch.
+            <code>storage/…/log/LogSegment.java:489-492</code> and <code>:514-522</code>:
+          </p>
+<pre><code>        try {
+            for (RecordBatch batch : log.batches()) {
+                batch.ensureValid();
+                ensureOffsetInRange(batch.lastOffset());
+…
+        } catch (CorruptRecordException | InvalidRecordException e) {
+            LOGGER.warn("Found invalid messages in log segment {} at byte offset {}.", log.file().getAbsolutePath(),
+                validBytes, e);
+        }
+        int truncated = log.sizeInBytes() - validBytes;
+        if (truncated &gt; 0)
+            LOGGER.debug("Truncated {} invalid bytes at the end of segment {} during recovery", truncated, log.file().getAbsolutePath());
+
+        log.truncateTo(validBytes);</code></pre>
+          <p>
+            The first bad batch ends the segment. Note the two checks and their order: <code>ensureValid</code> is the CRC, then the
+            offset range. Note too that the line stating the size of the cut is DEBUG, so at default levels the WARN names the segment
+            and the new end offset but not the bytes (<a href="../transactions/#D50">D50</a>, class D). Then the loader acts on
+            the result. <code>storage/…/log/LogLoader.java:478-484</code>:
+          </p>
+<pre><code>                if (truncatedBytes &gt; 0) {
+                    // we had an invalid message, delete all remaining log
+                    logger.warn("Corruption found in segment {}, truncating to offset {}", segment.baseOffset(), segment.readNextOffset());
+                    Collection&lt;LogSegment&gt; unflushedRemaining = new ArrayList&lt;&gt;();
+                    unflushedIter.forEachRemaining(unflushedRemaining::add);
+                    removeAndDeleteSegmentsAsync(unflushedRemaining);
+                    truncated = true;</code></pre>
+          <p>
+            Every later unflushed segment goes, whole, without being read. A log must be contiguous. The design doc states why that is
+            acceptable: a crashed replica is not assumed to have its data and must re-sync before rejoining the ISR "even if it lost
+            unflushed data in its crash" (<code>design.md:335</code>). In code only the
+            <a href="../replication/#p3-isr">missing suffix</a> is fetched, not the whole log (D19). Recovery on one broker only has to
+            produce a clean prefix. Replication supplies the rest, if another in-sync copy holds it.
+          </p>
+
+          <h3>A plain SIGKILL costs nothing</h3>
+          <p>
+            One undamaged run first. SIGKILL at <code>acks=all</code> mid-write lost no acked record: highest acked offset 15588, log end
+            offset 15589 after restart <span class="recon">measured here</span>. SIGKILL kills the process and leaves the page cache, so
+            this says nothing about power loss. Recovery rescanned all 14 segments, even though the rolled ones had been flushed in the
+            background, because the on-disk recovery point had no entry yet for this young partition: the 60 s checkpoint timer had not
+            fired (<a href="../transactions/#D48">D48</a>, class D). Each progress line read <code>0 recovered</code>, because
+            <code>numFlushed / numUnflushed</code> at <code>LogLoader.java:469</code> is integer division, which truncates to 0 until the
+            end (<a href="../transactions/#D2">D2</a>, class A, cosmetic, still at trunk).
+          </p>
+
+          <figure class="figure wide" id="fig-damage">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What damage does (mock): hand-injected, one sample each. Only the SIGKILL row is plain measured</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Damage, broker dead</th><th>Start</th><th>Log end before → after</th><th>What recovery did</th></tr></thead>
+                <tbody>
+                  <tr><td>none, SIGKILL only (measured)</td><td>unclean</td><td style="background: var(--green-soft)">15589 → 15589</td><td>all 14 segments rescanned; highest acked offset kept</td></tr>
+                  <tr><td>last 37 bytes chopped</td><td>unclean</td><td style="background: var(--orange-soft)">15589 → 15572</td><td>one whole 17-offset batch of 15,718 bytes removed</td></tr>
+                  <tr><td>8,192 zero bytes appended</td><td>unclean</td><td style="background: var(--green-soft)">15572 → 15572</td><td>zeros removed; WARN with byte offset</td></tr>
+                  <tr><td>payload bit, segment 0</td><td>unclean</td><td style="background: var(--red-soft)">24413 → 561</td><td>21 later segments deleted: 20 untouched, plus one that still held an earlier flipped bit</td></tr>
+                  <tr><td>payload bit, segment 0</td><td>clean</td><td style="background: var(--purple-soft)">25790 → 25790</td><td>not detected; broker serves it; consumer stops at offset 561</td></tr>
+                  <tr><td>base-offset bit 56, 63, 32 or 31, mid-segment</td><td>unclean</td><td style="background: var(--red-soft)">broker exits</td><td><code>IllegalArgumentException</code> on every start (bit 56 started twice)</td></tr>
+                  <tr><td>base-offset bit 24, mid-segment</td><td>unclean</td><td style="background: var(--red-soft)">18548 → 7854</td><td><code>Found invalid offset</code>; victim emptied, 9 later segments deleted</td></tr>
+                  <tr><td>base-offset bit 0, mid-segment</td><td>unclean</td><td style="background: var(--purple-soft)">18548 → 18548</td><td>starts; 17 segments, no matching WARN or ERROR; undetected at startup</td></tr>
+                  <tr><td>base-offset bit 56, a segment's last batch</td><td>unclean</td><td style="background: var(--purple-soft)">18548 → 72057594037936912</td><td>split succeeds; a new far-off segment file appears; consumers and replicas not tested</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Same recovery code, very different ends, because the outcome turns on which field was hit and whether the marker
+              was present. Green: nothing acked lost. Orange: one batch. Red: a large part of the log, or no broker. Purple: damage left in place.
+              Each row is one hand-made sample at replication factor 1, not a rate. Offsets differ across rows because they are different
+              runs; "lost" counts are set by where the damage was placed <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <h3>Reading the table</h3>
+          <p>
+            The tail rows simulate pages that never reached disk. A batch that claims more bytes than remain just ends iteration quietly,
+            while a length below the minimum, all zeros say, throws <code>CorruptRecordException</code>
+            (<code>FileLogInputStream.java:66-82</code>). Chopping 37 bytes cost the whole batch: offsets 15572-15588, acked, gone on this
+            one replica. The zero tail lost nothing beyond the zeros. Which of those a real power cut would leave wasn't tested.
+          </p>
+          <p>
+            The payload rows are the CRC doing its job, and the loader doing its. One flipped bit at a mid-file batch took a young log from
+            24,413 offsets to 561 (<a href="../transactions/#D46">D46</a>, class D, intended by design). The recovery point was
+            still 0 on that partition. One with an advanced checkpoint exposes only the region above it. After a true clean shutdown the same
+            kind of bit went unnoticed: recovery was skipped, the broker logged no CRC or corruption line, and it served the batch. The Java
+            consumer caught it: <code>stored crc = 3573743101, computed crc = 517507933</code>, and it stopped at offset 561
+            (<a href="../transactions/#D47">D47</a>, class D). Nothing on the broker's read path checks a CRC.
+          </p>
+
+          <h3>The base offset takes another road</h3>
+          <p>
+            The base offset is outside the CRC, so a flip there passes <code>ensureValid</code>. <code>ensureOffsetInRange</code> then throws
+            overflow, and the loader assumes a legacy overflowed segment and tries to split it. The split's guard reads only the segment's
+            last batch. <code>storage/…/log/LocalLog.java:918</code>:
+          </p>
+<pre><code>        require(segment.hasOverflow(), "Split operation is only permitted for segments with overflow, and the problem path is " + segment.log().file().getAbsoluteFile());</code></pre>
+          <p>
+            A mid-segment flip leaves that last batch healthy, the guard throws, nothing handles it, and the broker exits. It repeats on every
+            start, and one partition takes down the whole broker. Undoing the bit by hand let the same files load with every record intact. A
+            flip in the last batch satisfies the guard, so the split succeeds and the log end jumps to 72057594037936912, in a new file
+            <code>00072057594037936895.log</code>. Bit 24 is small enough to reach the <code>InvalidOffsetException</code> route, which
+            empties the segment instead of failing (<code>LogLoader.java:473-476</code>). Bit 0 stays in range and passes <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            The register carries this as <a href="../transactions/#D1">D1</a>, class A: a robustness defect, shown only by injection. It
+            is <code>measured-vs-mock</code>, and no natural trigger is established. The path is unchanged at trunk <code>09f2dc1320</code>,
+            which was read, not built, and no Jira names it. Operators have reported the same fatal message: a
+            <a href="https://forum.confluent.io/t/error-there-was-an-error-in-one-of-the-threads-during-logs-loading-java-lang-illegalargumentexception-requirement-failed-split-operation-is-only-permitted-for-segments-with-overflow-and-the-problem-path-is/8674">forum thread</a>
+            (2023, with a workaround resting on one poster) and a
+            <a href="https://go.mail-archive.com/users@kafka.apache.org/msg38280.html">mail</a> (2020, on an upgrade). Neither establishes a
+            cause. By the code the route is not limited to an unclean start, since a corrupt index also calls <code>recoverSegment</code>
+            (<code>LogLoader.java:383-386</code>); that wasn't run with a clean start. Nothing here was reported upstream.
+          </p>

@@ -1,0 +1,122 @@
+          <h2 id="p5-fence"><span class="secnum">{{S}}</span>Fencing and a dead coordinator</h2>
+          <p>
+            A transactional id keeps its producer id across restarts and gets the next epoch (<code>TransactionMetadata.java:161-190</code>). That bump is the fence. If a
+            transaction is open, the coordinator bumps the epoch, aborts it, and replies <code>CONCURRENT_TRANSACTIONS</code>, so the new producer retries and bumps a second
+            time (<code>TransactionCoordinator.scala:283-285</code>). The check itself is on the partition leader: a data batch with an older epoch than the partition has seen is
+            rejected (<code>ProducerAppendInfo.java:119-151</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            A rejection needs a partition that has seen the new epoch. The abort marker delivers it to each partition of the old transaction, so that marker does the fencing
+            <span class="recon">reconstruction</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-fence">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">A second producer with the same id: the epoch steps 0, 1, 2 and the first producer is shut out</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 318" role="img" aria-label="Producer A sends A-1 at epoch 0. Producer B calls InitProducerId; the coordinator moves to epoch 1 and writes an ABORT marker at epoch 1 on the partition. B retries and the coordinator moves to epoch 2. A's next send is rejected by the leader, and A's commit and abort fail. B writes B-1 at epoch 2 and a COMMIT marker at epoch 3.">
+                <defs>
+                  <marker id="fig-fence-k" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#252525"/></marker>
+                  <marker id="fig-fence-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-fence-r" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#ad4b43"/></marker>
+                </defs>
+                <text x="16" y="54" class="svg-lane">PRODUCER A</text>
+                <text x="16" y="130" class="svg-lane">COORDINATOR</text>
+                <text x="16" y="206" class="svg-lane">PRODUCER B</text>
+                <text x="16" y="276" class="svg-lane">tz-0 LOG</text>
+                <g stroke="#deded9"><line x1="130" y1="50" x2="640" y2="50"/><line x1="130" y1="202" x2="985" y2="202"/><line x1="130" y1="272" x2="985" y2="272"/></g>
+                <rect x="130" y="110" width="280" height="30" fill="#e0ebf2" stroke="#3c6f97"/><text x="270" y="130" text-anchor="middle" class="svg-sub">epoch 0</text>
+                <rect x="410" y="110" width="130" height="30" fill="#f7e3c8" stroke="#d98226"/><text x="475" y="130" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <rect x="540" y="110" width="260" height="30" fill="#e0ebf2" stroke="#3c6f97"/><text x="670" y="130" text-anchor="middle" class="svg-sub">epoch 2</text>
+                <rect x="800" y="110" width="185" height="30" fill="#dfede5" stroke="#367f59"/><text x="892" y="130" text-anchor="middle" class="svg-sub">epoch 3</text>
+
+                <text x="210" y="38" text-anchor="middle" class="svg-sub">send A-1</text>
+                <line x1="210" y1="50" x2="210" y2="254" stroke="#3c6f97" marker-end="url(#fig-fence-b)"/>
+                <rect x="170" y="256" width="80" height="34" rx="3" fill="#f3dfdc" stroke="#ad4b43"/><text x="210" y="271" text-anchor="middle" class="svg-sub">0 A-1</text><text x="210" y="284" text-anchor="middle" class="svg-sub">epoch 0</text>
+
+                <text x="408" y="192" text-anchor="end" class="svg-sub">InitProducerId</text>
+                <line x1="415" y1="202" x2="415" y2="142" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-fence-k)"/>
+                <line x1="475" y1="140" x2="475" y2="254" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-fence-k)"/>
+                <rect x="435" y="256" width="80" height="34" rx="3" fill="#ece6f3" stroke="#765b98"/><text x="475" y="271" text-anchor="middle" class="svg-sub">1 ABORT</text><text x="475" y="284" text-anchor="middle" class="svg-sub">epoch 1</text>
+                <text x="552" y="176" class="svg-sub">retry;</text><text x="552" y="192" class="svg-sub">385 ms in all</text>
+                <line x1="545" y1="202" x2="545" y2="142" stroke="#252525" stroke-width="1.6" marker-end="url(#fig-fence-k)"/>
+
+                <line x1="640" y1="50" x2="640" y2="254" stroke="#ad4b43" stroke-width="1.4" stroke-dasharray="6 3" marker-end="url(#fig-fence-r)"/>
+                <text x="648" y="240" class="svg-sub">rejected by the leader</text>
+                <text x="650" y="36" class="svg-sub">send: InvalidProducerEpochException</text>
+                <text x="650" y="54" class="svg-sub">commit: InvalidProducerEpochException</text>
+                <text x="650" y="72" class="svg-sub">abort: ProducerFencedException, then fatal</text>
+
+                <line x1="830" y1="202" x2="830" y2="254" stroke="#3c6f97" marker-end="url(#fig-fence-b)"/>
+                <text x="822" y="194" text-anchor="end" class="svg-sub">send B-1</text>
+                <rect x="790" y="256" width="80" height="34" rx="3" fill="#dfede5" stroke="#367f59"/><text x="830" y="271" text-anchor="middle" class="svg-sub">2 B-1</text><text x="830" y="284" text-anchor="middle" class="svg-sub">epoch 2</text>
+                <rect x="895" y="256" width="88" height="34" rx="3" fill="#ece6f3" stroke="#765b98"/><text x="939" y="271" text-anchor="middle" class="svg-sub">3 COMMIT</text><text x="939" y="284" text-anchor="middle" class="svg-sub">epoch 3</text>
+                <text x="16" y="312" class="svg-note">read_uncommitted [0:A-1, 2:B-1] · read_committed [2:B-1]. Spacing is illustrative; the abort line is from a second run.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured, single runs (<code>exp1.out</code> § D, <code>exp1b.out</code> § zombie), loopback, relative only. Under TV2 a commit's epoch step shows up the same way: B's marker is at 3.
+            </p>
+          </figure>
+
+          <p>
+            The zombie's exception changes as it goes. Send and commit report the abortable <code>InvalidProducerEpochException</code>. Its <code>abortTransaction</code> then reaches the
+            coordinator and gets <code>ProducerFencedException</code>, and it is fatally fenced (<a href="#D88">D88</a>). A franz-go zombie is fenced on data with
+            <code>INVALID_PRODUCER_EPOCH</code>, but its first error on <code>EndTransaction</code> is <code>OPERATION_NOT_ATTEMPTED</code>, raised by franz-go itself, with a doc saying retry
+            with <code>TryAbort</code> (<code>franz-go/pkg/kgo/txn.go:717-719</code>, <code>:856</code>) <span class="recon">measured here</span>.
+          </p>
+
+          <h3>Offsets are one more partition</h3>
+          <p>
+            Offsets join a transaction by treating the group's <code>__consumer_offsets</code> partition as one more participant (<code>KafkaApis.scala:2046-2049</code>). On disk they are a
+            transactional batch followed by a control marker, the same shape as data <span class="recon">measured here</span>. Pending offsets sit in a separate per-producer map; a commit
+            marker moves them to the main store, and an abort drops them (<code>OffsetMetadataManager.java:1214-1216</code>). When a regular and a transactional commit mix, the one with the higher record offset wins (<code>:1283-1286</code>). <code>TxnOffsetCommit</code> carries generation or member epoch, so
+            a member rebalanced away is fenced by the group coordinator; KIP-447 added this so one producer per consumer can replace one per input partition.
+          </p>
+
+          <h3>The coordinator dies</h3>
+          <p>
+            Coordinator failover has its own fence. The marker's coordinator epoch, which is the transaction log partition's leader epoch, must not go backward
+            (<code>ProducerAppendInfo.java:247-252</code>). A new coordinator rebuilds its state by reading the partition from log start to log end, last value per key winning. During the
+            load, requests get <code>COORDINATOR_LOAD_IN_PROGRESS</code>. Then it finishes every <code>PREPARE_*</code> it found. <code>core/…/txn/TransactionStateManager.scala:563-575</code>:
+          </p>
+<pre><code>          loadedTransactions.forEach((transactionalId, txnMetadata) =&gt; {
+            txnMetadata.inLock(() =&gt; {
+              // if state is PrepareCommit or PrepareAbort we need to complete the transaction
+              txnMetadata.state match {
+                case TransactionState.PREPARE_ABORT =&gt;
+                  transactionsPendingForCompletion +=
+                    new TransactionalIdCoordinatorEpochAndTransitMetadata(transactionalId, coordinatorEpoch, TransactionResult.ABORT, txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))
+                case TransactionState.PREPARE_COMMIT =&gt;
+                  transactionsPendingForCompletion +=
+                    new TransactionalIdCoordinatorEpochAndTransitMetadata(transactionalId, coordinatorEpoch, TransactionResult.COMMIT, txnMetadata, txnMetadata.prepareComplete(time.milliseconds()))
+                case _ =&gt;
+                // nothing needs to be done
+              }</code></pre>
+          <p>
+            An <code>ONGOING</code> transaction needs no action: its start timestamp was persisted, so the timeout clock still runs from the original start (<code>:573-574</code>). A failed
+            <code>COMPLETE_*</code> append with <code>COORDINATOR_NOT_AVAILABLE</code> retries forever with the pending state retained (<code>TransactionMarkerChannelManager.scala:322-336</code>). A stale coordinator detects
+            a changed epoch after its append callback fires and reports <code>NOT_COORDINATOR</code> (<code>TransactionStateManager.scala:773</code>).
+          </p>
+          <p>
+            The lab killed a coordinator in <code>PrepareCommit</code> with the data leader stopped by <code>SIGSTOP</code>, so no marker could land. The leader was stopped about 6 s, under the 9 s
+            broker session, and it was back before the new coordinator appeared, so this is the healthy-reload case (<code>exp2d.out</code>, one run, loopback, relative only)
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>[  2.850s] commit returned in 23ms with data leader 5 stopped
+[  3.221s] state=PrepareCommit coordinator=2 pid=1 epoch=1 partitions=[pk-0]
+[  3.233s] coordinator 2 killed
+[  8.746s] data leader resumed
+[ 12.059s] state=PrepareCommit coordinator=3 pid=1 epoch=1 partitions=[pk-0]
+[ 12.575s] state=CompleteCommit coordinator=3 pid=1 epoch=1 partitions=[]
+[ 13.625s] HW=3 LSO=3
+[ 18.077s] read_committed [0:pk-1, 1:pk-2]
+| offset: 2 endTxnMarker: COMMIT coordinatorEpoch: 1</code></pre>
+          <p>
+            Coordinator epoch 1 shows the new coordinator wrote the marker. So the decision survives a crash, provided the partition has a leader when the successor sends. Without one, the same kill
+            loses the marker, which the <a href="#p5-hang">next section</a> takes up. With the coordinator killed while <code>ONGOING</code>, a separate run saw the next send stall 7.9 s and the commit
+            take 410 ms, with nothing lost and the partition loaded in 39 ms. That stall is probably the data leader failing over, not the coordinator: a send on a partition with an open transaction does not
+            call the coordinator (<code>UnifiedLog.java:897</code>), and the driver did not record that leader. One run, loopback; it is not a recovery figure.
+          </p>

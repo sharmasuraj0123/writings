@@ -1,0 +1,118 @@
+          <h2 id="p3-quorum"><span class="secnum">{{S}}</span>Losing the quorum</h2>
+          <p>
+            Kill two of three controllers and the log that decides everything stops moving. The data plane does not stop. Existing
+            leaders and ISRs need no controller for the normal path, because the line in <a href="#p3-ladder">§01</a> moves on fetches.
+            Every state change stops, and that reaches further than it first looks.
+          </p>
+          <p>
+            A broker has no self-fencing. A failed heartbeat just schedules another (<code>BrokerLifecycleManager.java:623-635</code>).
+            It finds the controller by asking its Raft client who leads, and with no leader it has no controller node
+            (<code>RaftControllerNodeProvider.java:61-65</code>) <span class="src">from the code</span>.
+          </p>
+
+          <figure class="figure wide" id="fig-no-quorum">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">What still works with no quorum, and what a dead broker adds</p>
+            </div>
+            <div class="figure-body">
+              <table style="font-size: 13px">
+                <thead><tr><th>Operation</th><th>2 of 3 controllers dead</th><th>Plus a dead broker</th></tr></thead>
+                <tbody>
+                  <tr><td><code>acks=1</code>, live leader</td><td style="background: var(--green-soft)">Works: offset returned</td><td style="background: var(--orange-soft)">Acked but invisible: HW stays at 8, offsets 8 and 9 acked</td></tr>
+                  <tr><td><code>acks=all</code>, non-idempotent</td><td style="background: var(--green-soft)">Works: offset returned</td><td style="background: var(--orange-soft)">Stalls, then <code>TimeoutException</code> at 8004 ms; two copies written</td></tr>
+                  <tr><td>Produce to a partition the dead broker led</td><td>Not applicable</td><td style="background: var(--red-soft)">Fails: <code>TimeoutException</code> at 8001 ms</td></tr>
+                  <tr><td>First idempotent producer on the cluster</td><td style="background: var(--orange-soft)">Stalls: pending 210 s of an 8 s timeout, until the PID arrived</td><td>Not separately run</td></tr>
+                  <tr><td>New idempotent producer, a broker holds a block</td><td style="background: var(--green-soft)">Works: offset returned</td><td>Not run</td></tr>
+                  <tr><td><code>describeTopics</code></td><td style="background: var(--green-soft)">Works, from the broker's image</td><td style="background: var(--orange-soft)">Works, and still names the dead broker as leader and in the ISR</td></tr>
+                  <tr><td>Assign-mode consumer, no group</td><td style="background: var(--green-soft)">Works</td><td>Reads up to the frozen HW: 8 records</td></tr>
+                  <tr><td>First-ever consumer group</td><td style="background: var(--red-soft)">Fails: <code>__consumer_offsets</code> cannot be created</td><td>Not run</td></tr>
+                  <tr><td>Create topic</td><td style="background: var(--red-soft)">Fails: <code>TimeoutException</code></td><td>Not run</td></tr>
+                  <tr><td>ISR shrink, fencing</td><td>Nothing to do yet</td><td style="background: var(--red-soft)">Cannot happen: nobody can write the change</td></tr>
+                  <tr><td>Broker restart</td><td>Not run separately; same deadline by code</td><td style="background: var(--red-soft)">Exits: the dead broker, restarted, took 60 s from STARTING to shutdown</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="figure-caption">
+              Topic <code>min.insync.replicas=2</code>, replication factor 2 on brokers 11 and 12, <code>delivery.timeout.ms=8000</code>
+              (<code>exp3_quorumloss.sh</code>, with the hang re-run in <code>verify-b/q_rerun.sh</code>). Single runs on loopback.
+              <span class="recon">measured here</span>
+            </p>
+          </figure>
+
+          <p>
+            With a controller alive, fencing is a sweep. Heartbeats update a lock-free contact-time map from the request handler
+            thread, so a backlogged controller cannot make a healthy broker look dead. The sweep samples eight times per session, for
+            at most 112.5% of the session timeout, 10,125 ms by default, and fences one broker per pass
+            (<code>QuorumController.java:1987-1989</code>, <code>:1681-1689</code>). All of that is a controller writing records. With no
+            quorum, none of it can land.
+          </p>
+
+          <h3>A line of acked writes nobody can see</h3>
+          <p>
+            Killing a broker with no quorum freezes the view of the cluster. A leader cannot shrink the ISR without the controller,
+            so the HW cannot pass the dead follower, and <code>acks=1</code> keeps acking:
+          </p>
+<pre><code>1793983285876 prod p0 acks=1 OK offset=9 6
+1793983288610 prod p0 acks=allni TimeoutException: Expiring 1 record(s) for q-0:8004 ms has passed since batch creation. ...
+1793983299724 prod p1 acks=1 TimeoutException: Expiring 1 record(s) for q-1:8001 ms has passed since batch creation. ...
+q:0:8</code></pre>
+          <p>
+            <code>q:0:8</code> is the HW, with offset 9 acked above it. After quorum returned with the follower still dead, the HW
+            stayed frozen, now by the below-min-ISR gate. It moved only when the follower rejoined, and the acked records then
+            became readable: held, not lost, in this run (<a href="../transactions/#D68">D68</a>, class D, confirmed by verifier). The non-idempotent send that
+            timed out also wrote two copies (request timeout 4 s, delivery 8 s), a count inferred from the offsets and one send.
+          </p>
+
+          <h3>A timeout that does not fire</h3>
+          <p>
+            A broker with no producer-ID block answers <code>InitProducerId</code> with a retriable error while it asks the
+            controller for one (<code>RPCProducerIdManager.java:97-100</code>). The Java producer's sender loop returns early while
+            that request is in flight or queued, and batch expiry lives in the step it skips
+            (<code>Sender.java:333-344</code>; <a href="../clients/#p4-idempotence">Part 4</a> reads it). So
+            <code>delivery.timeout.ms</code> cannot fire. From two re-runs, as logged, one line each (<code>verify-b/q-run1/</code>, <code>q-run2/</code>):
+          </p>
+<pre><code>+210398ms future.isDone=false
++105603ms callback FAILED TimeoutException: Expiring 1 record(s) for q-0:92904 ms has passed since batch creation.</code></pre>
+          <p>
+            1,943 round trips, all <code>errorCode=14</code>. Once a controller returned and the PID arrived, the record failed at
+            once. The doc calls the setting "An upper bound". This is <a href="../transactions/#D3">D3</a>, class A, a latent bug, still at trunk
+            <code>09f2dc1320</code>. No Jira matched two text searches, which is not proof none exists. franz-go failed at 27.9 s in one
+            run, for a reason not traced. librdkafka was not tested. By code <code>flush()</code> and no-arg <code>close()</code> wait on it too (not run), and only the no-block case was run. A broker that already holds a block passes the same test; on
+            this evidence blocks hold 1000 IDs.
+          </p>
+
+          <h3>The one way a broker gives up</h3>
+          <p>
+            A running broker keeps retrying. A starting one has a deadline.
+            <code>server/…/server/BrokerLifecycleManager.java:732-740</code>:
+          </p>
+<pre><code>    private class RegistrationTimeoutEvent implements EventQueue.Event {
+        @Override
+        public void run() {
+            if (!initialRegistrationSucceeded) {
+                logger.error("Shutting down because we were unable to register with the controller quorum.");
+                eventQueue.beginShutdown("registrationTimeout");
+            }
+        }
+    }</code></pre>
+          <p>
+            <code>initial.broker.registration.timeout.ms</code> is 60 s. Measured: exactly 60 s from STARTING to the shutdown line, and
+            the process exited 70.0 s after launch, about 10 s of it JVM start. It does not serve in those 60 s. A rolling restart during a
+            controller outage removes brokers that were serving (<a href="../transactions/#D69">D69</a>). A young
+            cluster is more exposed, since it cannot form a first consumer group or auto-create anything
+            (<a href="../transactions/#D70">D70</a>).
+          </p>
+
+          <h3>Coming back</h3>
+          <p>
+            The lone surviving voter cycled through Prospective 34 times in the first two minutes, and the epoch did not move: the next
+            leader, 4.5 minutes later, was epoch 2. That is pre-vote seen from outside. On restore, a broker dead for 4.5 minutes was
+            fenced 9.06 s after the new controller activated, not at once, because a new active controller gives every unfenced broker a
+            fresh session (<code>ClusterControlManager.java:315-323</code>; <a href="../transactions/#D71">D71</a>). The 13.7 s to
+            a leader in the run includes restarting a JVM and the polling tool, so it is not an election time.
+          </p>
+          <p>
+            A partition with no leader meets one more line in another log. <a href="../transactions/#p5-hang">Part 5</a> covers
+            KAFKA-20734 (<a href="../transactions/#D10">D10</a>), where a transaction marker has nowhere to go; it has no tagged fix as of 6 November 2026.
+          </p>

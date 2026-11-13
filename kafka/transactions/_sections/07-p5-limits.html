@@ -1,0 +1,98 @@
+          <h2 id="p5-limits"><span class="secnum">{{S}}</span>What exactly-once does not cover</h2>
+          <p>
+            The design doc draws the line itself. Exactly-once is for "reading, processing and writing data on Kafka topics", and "Exactly-once delivery for other destination systems generally requires
+            cooperation with such systems" (<code>docs/design/design.md:207</code>). For external sinks its prescription is not two-phase commit. It is to store the consumer's offset beside the output
+            (<code>:205</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Inside the line, the mechanism is the one this part has read. The consumer's position is a message in an internal topic, so the program writes offset and output in one transaction
+            (<code>:203</code>). The markers then decide both together, and the epoch shuts out a zombie. That guarantee needs all of it: the program must send offsets through the producer, its output readers must opt into
+            <code>read_committed</code>, and its producer must hold a stable transactional id <span class="recon">reconstruction</span>.
+          </p>
+          <p>
+            The lab ran that line. One read-process-write program took 20 inputs, wrote each to a Kafka topic in a transaction and to a local file, and crashed once before commit, after 7 records. The 7 is the
+            driver's <code>crashAfter</code> argument, a dial <span class="recon">measured here</span>, one run:
+          </p>
+<pre><code>[  7.689s] crash after 7 records, before commit
+crash exit; external lines so far: 7
+[ 35.112s] drained, processed 20
+external lines: 27 unique: 20
+duplicates: r0 r1 r2 r3 r4 r5 r6
+read_committed eout: records 20 unique 20
+read_uncommitted eout: records 27 unique 20</code></pre>
+
+          <figure class="figure wide" id="fig-eos">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Where exactly-once stops: Kafka and a file both took 27 writes of 20 inputs</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1000 240" role="img" aria-label="A read-process-write program reads 20 inputs and, across a crash and a rerun, makes 27 writes to a Kafka output topic and 27 writes to an external file. Inside the Kafka transaction boundary, read_committed hides the 7 from the aborted attempt and returns 20. The external file sits outside the boundary and shows all 27 lines.">
+                <defs>
+                  <marker id="fig-eos-b" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L8,4 L0,8 z" fill="#3c6f97"/></marker>
+                </defs>
+                <rect x="16" y="20" width="660" height="208" rx="8" fill="#f7f7f5" stroke="#b8b8b1" stroke-dasharray="6 4"/>
+                <text x="32" y="44" class="svg-lane">INSIDE A KAFKA TRANSACTION</text>
+                <rect x="36" y="110" width="130" height="64" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="101" y="136" text-anchor="middle" class="svg-step">Input topic</text>
+                <text x="101" y="154" text-anchor="middle" class="svg-sub">20 records</text>
+                <rect x="222" y="94" width="170" height="96" rx="4" fill="#ffffff" stroke="#252525"/>
+                <text x="307" y="120" text-anchor="middle" class="svg-step">The program</text>
+                <text x="307" y="140" text-anchor="middle" class="svg-sub">attempt 1: 7, crash</text>
+                <text x="307" y="158" text-anchor="middle" class="svg-sub">attempt 2: 20, commit</text>
+                <text x="307" y="176" text-anchor="middle" class="svg-sub">offsets in the txn</text>
+                <rect x="448" y="62" width="208" height="110" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="460" y="86" class="svg-step">Output topic log</text>
+                <text x="460" y="106" class="svg-sub">27 writes of 20 inputs</text>
+                <text x="460" y="124" class="svg-sub">read_committed: 20</text>
+                <text x="460" y="142" class="svg-sub">read_uncommitted: 27</text>
+                <text x="460" y="162" class="svg-note">hides the 7 from the aborted try</text>
+                <text x="32" y="216" class="svg-note">read_committed hides the seven from the aborted attempt; read_uncommitted still returns them.</text>
+                <rect x="726" y="62" width="258" height="110" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="738" y="86" class="svg-step">External file</text>
+                <text x="738" y="106" class="svg-sub">27 writes of 20 inputs</text>
+                <text x="738" y="124" class="svg-sub">every line stays: r0 to r6 twice</text>
+                <text x="738" y="142" class="svg-sub">no marker, no abort</text>
+                <text x="738" y="162" class="svg-note">cannot hide anything</text>
+                <g fill="none" stroke="#3c6f97" stroke-width="1">
+                  <path d="M166,142 H220" marker-end="url(#fig-eos-b)"/>
+                  <path d="M392,125 H446" marker-end="url(#fig-eos-b)"/>
+                  <path d="M392,178 H690 V140 H724" marker-end="url(#fig-eos-b)"/>
+                </g>
+              </svg>
+            </div>
+            <p class="figure-caption">
+              Measured, one run (<code>exp1b.out</code> § EOS). The comparison is not 20 against 27. Both destinations took the same 27 writes. The difference is that Kafka has a way to hide the seven, and the file has none.
+            </p>
+          </figure>
+
+          <p>
+            KIP-98 itself lists what a consumer does not get: all of a committed transaction together, given compaction, segment deletion, seeks and partial subscriptions. Markers are per partition, so there is no
+            global commit point. <code>commitTransaction</code> returns before markers, so an immediate <code>read_committed</code> read can miss the commit. That read-your-writes gap is reasoned from the code
+            <span class="recon">reconstruction</span>; the lab never caught a stale read.
+          </p>
+          <p>
+            Compaction meets transactions too. The cleaner removes aborted data batches regardless of keys, and cannot go past the first unstable offset, so an open transaction holds compaction back
+            (<code>LogCleaner.java:87-89</code>). Markers stay until no batch of their transaction remains, then until the delete horizon, sharing tombstone retention (<code>Cleaner.java:330-335</code>). The last marker of an active
+            producer stays as an empty batch, to preserve the epoch for fencing (<code>:344-345</code>).
+          </p>
+          <p>
+            Kafka 4.4 has broker-side scaffolding for external two-phase commit (KIP-939), off by default, with its key operation unimplemented: <code>keepPreparedTxn</code> returns <code>UNSUPPORTED_VERSION</code>
+            (<code>TransactionCoordinator.scala:145-146</code>), still so on trunk's coordinator check, and <code>InitProducerId</code> v6 is still marked unstable. No target release is on the KIP page.
+          </p>
+          <p>
+            franz-go's <code>GroupTransactSession</code> takes a different trade: it favours aborting if any rebalance happens before commit, instead of blocking the rebalance (<code>franz-go/pkg/kgo/txn.go:55-57</code>).
+            It defaults to a 40 s transaction timeout and <code>ReadUncommitted</code>, so its users must also opt in on the read side (<code>config.go:679</code>, <code>:1792</code>).
+          </p>
+          <p>
+            The run also had a void first attempt, kept in the log because it shows a dependency. The restart's 12 s idle window ended before the dead member's 45 s session did, so it processed nothing
+            (<code>exp1.out</code> § F). A transaction says nothing about when a group gets its partitions back. <a href="../clients/#p4-rebalance">Part 4</a> reads that side.
+          </p>
+
+          <h3>Five lines, one reading</h3>
+          <p>
+            This is where the collection's claim comes back. Nearly every promise Kafka makes is a statement about where a line sits in a log, not about a disk or an outcome. The
+            <a href="../the-log/#p1-recovery">recovery point</a> says what a restart will not recheck. The <a href="../replication/#p3-ladder">high watermark</a> says every in-sync member's page cache has it. The
+            <a href="../replication/#p3-raft">metadata commit</a> says a quorum of voters has it. The <a href="../clients/#p4-read">committed offset</a> records a position, and a position says what was handed over, not what was finished. The last stable offset says the markers below it
+            have landed and replicated. Read a guarantee as which line, in which log, moved by whom, and both the guarantee and its edge follow.
+          </p>

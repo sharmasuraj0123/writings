@@ -1,0 +1,167 @@
+          <h2 id="p2-purgatory"><span class="secnum">{{S}}</span>Parked, not waiting</h2>
+          <p>
+            Some requests cannot be answered yet. A Fetch at the end of the log has nothing to return. An
+            <code>acks=-1</code> Produce has written locally, but the followers have not caught up. If each of those held a
+            handler thread, eight slow requests would stop the broker. They hold nothing. The handler does its work,
+            builds a small object describing what it is waiting for, and goes back to the queue. That object is a
+            <code>DelayedOperation</code>, and the place it sits is the purgatory. The socket stays muted, so the client
+            sees one slow request, and the broker has spent a list entry on it <span class="src">from the code</span>.
+          </p>
+          <p>
+            Parking has one subtle step. An event could arrive between "not done yet" and "watching for that event", and be
+            missed forever. So the check runs twice, around the watch, under the operation's own lock.
+            <code>server-common/…/server/purgatory/DelayedOperation.java:115-127</code>:
+          </p>
+<pre><code>    boolean safeTryCompleteOrElse(Action action) {
+        lock.lock();
+        try {
+            if (tryComplete()) return true;
+            else {
+                action.apply();
+                // last completion check
+                return tryComplete();
+            }
+        } finally {
+            lock.unlock();
+        }
+    }</code></pre>
+          <p>
+            Why the lock is held across all of it is written down at
+            <code>DelayedOperationPurgatory.java:133-154</code>, as a "story about lock": a real three-thread deadlock with
+            <code>TransactionStateManager</code>, and a warning that another stays possible if
+            <code>checkAndComplete</code> is called under an exclusive lock. Only after the watch does an unfinished operation
+            go on the timer. Watch lists are sharded into 512 buckets, and an event wakes waiters by key:
+            <code>checkAndComplete</code> walks that key's list, retries each operation and drops the finished ones. Completion
+            and expiry both go through <code>forceComplete</code>, guarded so that only one wins.
+          </p>
+
+          <h3>A Produce is born timed out</h3>
+          <p>
+            Only <code>acks=-1</code> ever parks. <code>acks=1</code> answers right after the local append
+            (<code>ReplicaManager.scala:1361-1367</code>). By the time a Produce parks, its records are already in the leader's
+            log, and <code>KafkaApis</code> drops its reference to them, "since it is already appended to log", so a parked
+            Produce does not pin the request bytes (<code>KafkaApis.scala:559-561</code>). Then the constructor does the most
+            revealing thing in this part. <code>server/…/server/purgatory/DelayedProduce.java:110-122</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>        // first update the acks pending variable according to the error code
+        produceStatus.forEach((topicPartition, status) -&gt; {
+            if (status.responseStatus.error == Errors.NONE) {
+                // Timeout error state will be cleared when required acks are received
+                status.acksPending = true;
+                status.responseStatus.error = Errors.REQUEST_TIMED_OUT;
+            } else {
+                status.acksPending = false;
+            }
+
+            LOGGER.trace("Initial partition status for {} is {}", topicPartition, status);
+        });
+    }</code></pre>
+          <p>
+            The pending answer is the timeout. Expiry has nothing to undo and no way to undo it: it sends what is already
+            there. Success is the thing that gets written in, when <code>Partition.checkEnoughReplicasReachOffset</code>
+            finds the replicas have caught up (<a href="../replication/#p3-promise">Part 3</a> reads that check). A
+            high-watermark rise wakes Produce, Fetch, DeleteRecords and ShareFetch waiters. An unchanged one wakes only Fetch.
+          </p>
+          <p>
+            The lab ran this on three nodes with replication factor 3, <code>min.insync.replicas=2</code> and two followers
+            stopped with <code>SIGSTOP</code>, in one run on loopback <span class="recon">measured here</span>:
+          </p>
+<pre><code>baseline acks=-1 all up: 49 ms 0 err 0
+followers stopped, acks=1: 4 ms {'index': 0, 'error': 0, 'baseOffset': 1, ...}
+followers stopped, acks=-1 timeout=3000: 3005 ms {'index': 0, 'error': 7, 'baseOffset': 2, ...}
+followers stopped 2 s then SIGCONT, acks=-1 timeout=15000: 2013 ms {'index': 0, 'error': 0, 'baseOffset': 3, ...}
+read-back hw 4 [(0, b'base'), (1, b'acks-1'), (2, b'timed-out-but-appended'), (3, b'released')]</code></pre>
+          <p>
+            Read line three, then line five. Error 7 is <code>REQUEST_TIMED_OUT</code>, and it arrived with a base offset. The
+            record it refers to was read back after the followers resumed. A produce timeout does not say a record is absent
+            (D55, class D, gotcha, confirmed by verification; trunk not checked). Line four shows the release: with the
+            followers resumed after 2 seconds, the parked Produce came back clean at 2,013 ms, well inside its 15,000 ms timeout.
+          </p>
+
+          <figure class="figure wide" id="fig-purgatory">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Purgatory state over time: requests waiting, against entries still on watch lists</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1080 580" role="img" aria-label="Two time series sampled every 500 ms. Fetch purgatory: NumDelayedOperations is 0 then 1 from the first park to the last wake; PurgatorySize starts at a stale 1, reaches 2 just after the first expiry, and falls to 0 at the end. Produce purgatory: NumDelayedOperations is 1 while two parks run in sequence; PurgatorySize reaches 2 after the first expiry and falls to 0 at the release.">
+                <text x="20" y="24" class="svg-lane">FETCH PURGATORY, ONE RUN</text>
+                <rect x="241.2" y="38" width="330.0" height="22" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="406.2" y="53" class="svg-sub" style="fill:#252525" text-anchor="middle">E3a: empty fetch, expires at 6,005 ms</text>
+                <rect x="573.1" y="38" width="108.8" height="22" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="627.5" y="53" class="svg-sub" style="fill:#252525" text-anchor="middle">E3b: wake</text>
+                <rect x="683.9" y="38" width="109.1" height="22" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="738.4" y="53" class="svg-sub" style="fill:#252525" text-anchor="middle">E3c: min_bytes</text>
+                <rect x="795.0" y="38" width="219.3" height="22" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="904.7" y="53" class="svg-sub" style="fill:#252525" text-anchor="middle">E4: expires</text>
+                <line x1="96" y1="166" x2="1060" y2="166" stroke="#deded9"/>
+                <text x="86" y="170" class="svg-sub" text-anchor="end">0</text>
+                <line x1="96" y1="128" x2="1060" y2="128" stroke="#deded9"/>
+                <text x="86" y="132" class="svg-sub" text-anchor="end">1</text>
+                <line x1="96" y1="90" x2="1060" y2="90" stroke="#deded9"/>
+                <text x="86" y="94" class="svg-sub" text-anchor="end">2</text>
+                <polyline points="96.0,124 120.2,124 147.7,124 175.4,124 203.0,124 230.6,124 258.2,124 285.9,124 313.5,124 341.3,124 368.8,124 396.7,124 424.0,124 451.6,124 479.2,124 506.9,124 534.5,124 562.3,124 590.2,124 590.2,86 617.9,86 645.3,86 673.0,86 700.7,86 700.7,124 728.2,124 755.8,124 783.6,124 811.3,124 838.9,124 866.5,124 894.3,124 921.8,124 949.5,124 977.1,124 1004.9,124 1032.4,124 1032.4,162 1060.0,162" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <polyline points="96.0,166 120.2,166 147.7,166 175.4,166 203.0,166 230.6,166 258.2,166 258.2,128 285.9,128 313.5,128 341.3,128 368.8,128 396.7,128 424.0,128 451.6,128 479.2,128 506.9,128 534.5,128 562.3,128 590.2,128 617.9,128 645.3,128 673.0,128 700.7,128 728.2,128 755.8,128 783.6,128 811.3,128 838.9,128 866.5,128 894.3,128 921.8,128 949.5,128 977.1,128 1004.9,128 1032.4,128 1032.4,166 1060.0,166" fill="none" stroke="#3c6f97" stroke-width="2"/>
+                <text x="112.2" y="118" class="svg-note" text-anchor="start">stale watcher from an earlier consumer</text>
+                <text x="590.2" y="74" class="svg-note" text-anchor="middle">expired entry still watched</text>
+                <text x="96" y="184" class="svg-sub">0 s</text>
+                <text x="1060" y="184" class="svg-sub" text-anchor="end">17.4 s</text>
+                <text x="20" y="280" class="svg-lane">PRODUCE PURGATORY, ONE RUN</text>
+                <rect x="350.9" y="294" width="302.8" height="22" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="502.3" y="309" class="svg-sub" style="fill:#252525" text-anchor="middle">acks=-1, timeout 3,000: error 7 at 3,005 ms</text>
+                <rect x="655.8" y="294" width="202.2" height="22" rx="2" fill="#dfede5" stroke="#367f59"/>
+                <text x="756.9" y="309" class="svg-sub" style="fill:#252525" text-anchor="middle">released at 2,013 ms</text>
+                <line x1="96" y1="422" x2="1060" y2="422" stroke="#deded9"/>
+                <text x="86" y="426" class="svg-sub" text-anchor="end">0</text>
+                <line x1="96" y1="384" x2="1060" y2="384" stroke="#deded9"/>
+                <text x="86" y="388" class="svg-sub" text-anchor="end">1</text>
+                <line x1="96" y1="346" x2="1060" y2="346" stroke="#deded9"/>
+                <text x="86" y="350" class="svg-sub" text-anchor="end">2</text>
+                <polyline points="96.0,418 147.1,418 198.3,418 249.4,418 299.4,418 350.0,418 350.0,380 400.6,380 451.5,380 502.2,380 552.8,380 604.1,380 654.1,380 705.1,380 705.1,342 756.0,342 806.7,342 857.2,342 908.1,342 908.1,418 959.1,418 1009.5,418 1060.0,418" fill="none" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/>
+                <polyline points="96.0,422 147.1,422 198.3,422 249.4,422 299.4,422 350.0,422 350.0,384 400.6,384 451.5,384 502.2,384 552.8,384 604.1,384 654.1,384 705.1,384 756.0,384 806.7,384 857.2,384 908.1,384 908.1,422 959.1,422 1009.5,422 1060.0,422" fill="none" stroke="#3c6f97" stroke-width="2"/>
+                <text x="113.3" y="374" class="svg-note" text-anchor="start">nothing parked; acks=1 took 4 ms, no park</text>
+                <text x="782.9" y="330" class="svg-note" text-anchor="middle">expired entry still watched</text>
+                <text x="96" y="440" class="svg-sub">0 s</text>
+                <text x="1060" y="440" class="svg-sub" text-anchor="end">9.5 s</text>
+                <line x1="96" y1="524" x2="130" y2="524" stroke="#3c6f97" stroke-width="2"/><text x="138" y="528" class="svg-sub">NumDelayedOperations: requests actually waiting</text>
+                <line x1="520" y1="524" x2="554" y2="524" stroke="#765b98" stroke-width="1.6" stroke-dasharray="5 3"/><text x="562" y="528" class="svg-sub">PurgatorySize: entries on watch lists</text>
+                <text x="96" y="548" class="svg-note">Top bands: E3a and the Produce parks are placed from printed markers and durations; E3b, E3c, E4 from durations alone, so read them as approximate.</text>
+                <text x="96" y="566" class="svg-note">The dashed line is drawn 4 px above its value so that both series stay visible where they are equal.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">Each panel is one run, with JMX sampled every 500 ms by <code>kafka-jmx.sh</code>, so read the shape and not the edges. <code>NumDelayedOperations</code> counts waiting requests. <code>PurgatorySize</code> overstates them after an expiry. <span class="recon">measured here</span></p>
+          </figure>
+
+          <h3>Which number to watch</h3>
+          <p>
+            Completed operations stay on watch lists until the key is touched again or a purge runs. So
+            <code>PurgatorySize</code> can exceed the real number waiting. Figure {{fig-purgatory}} shows it at 2 right after an
+            expiry and a new park, with one request waiting, and it falls when the key is next touched. The Fetch panel opens
+            at <code>0,1</code> for the same reason: a stale entry from the earlier console consumer. Watch
+            <code>NumDelayedOperations</code> instead (D58, class D; upstream not checked).
+          </p>
+
+          <h3>A parked Fetch</h3>
+          <p>
+            A Fetch answers at once if it does not want to wait, needs nothing, already has enough, hit an error, or found a
+            diverging epoch or a preferred replica. Otherwise it parks. What counts as "enough bytes" depends on who is reading:
+            the log end for followers, the high watermark for ordinary consumers, the last stable offset for
+            <code>read_committed</code>. On completion it re-reads the log rather than reusing the first read. The lab's three
+            runs match <span class="recon">measured here</span>:
+          </p>
+<pre><code>E3a expiry: empty fetch at LEO max_wait=6000 returned in 6005 ms, recordBytes 0 hw 2
+E3b wake: fetch max_wait=20000 + produce at 2000ms: returned at 2004 ms; produce rtt 3 ; batch b'wake-up'
+E3c min_bytes=1000: 100B at 1000ms stays parked, 1200B at 2003 ms; returned at 2009 ms, recordBytes 1440 batches 2</code></pre>
+          <p>
+            Expired operations run on a single <code>executor-Fetch</code> thread, so a timed-out Fetch's log read happens there
+            and not on a handler. Expiry is therefore serial per purgatory. Whether a slow read delays other expiries was not
+            measured (D60, class D; read in the code; upstream not checked).
+          </p>
+          <p>
+            The wait also has a place in the metrics. Request timing is split into queue, local, remote, response queue,
+            response send and total, and purgatory time lands in remote. Seven consumer Fetches recorded a maximum
+            <code>RemoteTimeMs</code> of 6,002 ms against a maximum <code>LocalTimeMs</code> of 25 ms. Fetch metrics appear under
+            <code>FetchConsumer</code> and <code>FetchFollower</code> as well as <code>Fetch</code>, so a broker's own
+            replication traffic can be separated <span class="recon">measured here</span>.
+          </p>

@@ -1,0 +1,136 @@
+          <h2 id="p1-append"><span class="secnum">{{S}}</span>Writing, not syncing</h2>
+          <p>
+            An append is mostly bookkeeping around one plain write. Every append, leader or follower, runs the same CRC
+            check before anything touches the file (<code>storage/…/log/UnifiedLog.java:1572-1575</code>, <code>:1141</code>).
+            Then the offset, epoch-cache, roll and file-write steps all happen inside one per-partition lock, so appends to
+            one partition are serial (<code>:1150-1276</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            On the leader the broker assigns offsets starting at the log end offset; a follower takes the offsets it is given
+            and rejects going backwards (<code>:1157-1204</code>). <a href="../replication/#p3-ladder">Part 3</a> owns the
+            follower path. For an uncompressed batch, assigning offsets is an in-place header edit. Only the base offset field
+            and the leader epoch change, and neither is under the CRC, so the record bytes and the CRC the client computed reach
+            disk untouched (<code>LogValidator.java:264-267</code>, <code>DefaultRecordBatch.java:377-378</code>,
+            <code>:396-397</code>).
+          </p>
+          <p>
+            Two conditions keep that from being absolute. Compressed batches stay in place only when the producer's codec matches
+            the topic's target codec; otherwise the broker recompresses (<code>LogValidator.java:294-304</code>). And the broker
+            recomputes the CRC if the maximum timestamp or timestamp type really changes, which is the
+            <code>LogAppendTime</code> case (<code>DefaultRecordBatch.java:384-392</code>). A single append larger than
+            <code>segment.bytes</code> is rejected outright, since a batch never spans segments
+            (<code>UnifiedLog.java:1242-1243</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            Here is the write, with a comment that explains an ordering few readers would guess.
+            <code>storage/…/log/UnifiedLog.java:1270-1277</code>:
+          </p>
+<pre><code>                                // Append the records, and increment the local log end offset immediately after the append because a
+                                // write to the transaction index below may fail, and we want to ensure that the offsets
+                                // of future appends still grow monotonically. The resulting transaction index inconsistency
+                                // will be cleaned up after the log directory is recovered. Note that the end offset of the
+                                // ProducerStateManager will not be updated and the last stable offset will not advance
+                                // if the append to the transaction index fails.
+                                localLog.append(appendInfo.lastOffset(), validRecords);
+                                updateHighWatermarkWithLogEndOffset();</code></pre>
+          <p>
+            Beneath that sits a channel write and an in-memory size. Durability is a different method, a few lines further down
+            the same file. <code>clients/…/record/internal/FileRecords.java:200-209</code>:
+          </p>
+<pre><code>        int written = records.writeFullyTo(channel);
+        size.getAndAdd(written);
+        return written;
+    }
+
+    /**
+     * Commit all written data to the physical disk
+     */
+    public void flush() throws IOException {
+        channel.force(true);</code></pre>
+          <p>
+            Nobody on the produce path calls that by default. The only flush on the append path is one line, gated on
+            <code>flush.messages</code>. <code>storage/…/log/UnifiedLog.java:1300</code>:
+          </p>
+<pre><code>                                if (localLog.unflushedMessages() &gt;= config().flushInterval) flush(false);</code></pre>
+          <p>
+            <code>flush.messages</code> defaults to <code>Long.MAX_VALUE</code>, and the periodic flusher's default interval is
+            also <code>Long.MAX_VALUE</code> (<code>ServerLogConfigs.java:101</code>, <code>:109</code>). A small aside:
+            <code>unflushedMessages</code> is arithmetic on offsets, not a count of records, so on a compacted or gapped log it
+            overstates (<code>LocalLog.java:252-253</code>) <span class="src">from the code</span>.
+          </p>
+          <p>
+            This is the design, stated in the design doc. <code>docs/design/design.md:64</code>: "All data is immediately written
+            to a persistent log on the filesystem without necessarily flushing to disk. In effect this just means that it is
+            transferred into the kernel's pagecache." The register lists it as
+            <a href="../transactions/#D41">D41</a>, class D (gotcha), status intended: acked data can sit on an active
+            segment with no Kafka fsync, while the kernel's writeback still runs.
+          </p>
+
+          <h3>Counting the calls</h3>
+          <p>
+            An <code>LD_PRELOAD</code> shim counted sync calls by thread and file while a producer ran at <code>acks=all</code>
+            for 12 s on one broker. The tally window was about 25 s around that run, with defaults except
+            <code>segment.bytes=8388608</code>, replication factor 1 <span class="recon">measured here</span>:
+          </p>
+
+          <figure class="figure wide" id="fig-fsync">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Who calls fsync: real call counts per file, defaults against <code>flush.messages=1</code></p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 312" role="img" aria-label="Bars of fsync call counts per file. Defaults: the partition log saw 1 fsync from kafka-scheduler at the roll, while the metadata log saw 49 from kafka-1-raft-io. With flush.messages=1: the partition log saw 1108 fsyncs from data-plane-kafk and the metadata log 49. The counts come from an LD_PRELOAD shim and support no rate or cost claim.">
+                <text x="20" y="24" class="svg-lane">DEFAULTS, TOPIC pc: about 15,573 RECORDS ACKED</text>
+                <text x="20" y="54" class="svg-sub">pc-0 / N.log</text>
+                <text x="20" y="70" class="svg-sub" fill="#777772">kafka-scheduler, at the roll</text>
+                <rect x="270" y="44" width="3.0" height="22" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="283.0" y="60" class="svg-step">1</text>
+                <text x="20" y="98" class="svg-sub">__cluster_metadata-0 / N.log</text>
+                <text x="20" y="114" class="svg-sub" fill="#777772">kafka-1-raft-io</text>
+                <rect x="270" y="88" width="24.8" height="22" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="304.8" y="104" class="svg-step">49</text>
+                <text x="20" y="142" class="svg-lane">flush.messages=1, TOPIC pf1: 18,820 RECORDS ACKED</text>
+                <text x="20" y="172" class="svg-sub">pf1-0 / N.log</text>
+                <text x="20" y="188" class="svg-sub" fill="#777772">data-plane-kafk, once per append</text>
+                <rect x="270" y="162" width="560.0" height="22" rx="2" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="840.0" y="178" class="svg-step">1,108</text>
+                <text x="20" y="216" class="svg-sub">__cluster_metadata-0 / N.log</text>
+                <text x="20" y="232" class="svg-sub" fill="#777772">kafka-1-raft-io</text>
+                <rect x="270" y="206" width="24.8" height="22" rx="2" fill="#ece6f3" stroke="#765b98"/>
+                <text x="304.8" y="222" class="svg-step">49</text>
+                <text x="20" y="262" class="svg-note">Fsync calls on the .log only; .index and .timeindex match in each row. About 25 s window around a 12 s run, segment.bytes=8388608, RF 1.</text>
+                <text x="20" y="280" class="svg-note">Counted by LD_PRELOAD; sync_file_range, syncfs and O_SYNC are not hooked. Single runs on a shared disk: no rate or cost follows.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              At defaults the data log saw one fsync and the metadata log 49. The window is about 25 s,
+              <code>segment.bytes=8388608</code>, RF 1. <code>data-plane-kafk</code> is a name cut at the 15-character OS limit, and
+              it names both pools. No rate or cost claim follows.
+            </p>
+          </figure>
+
+          <p>
+            About 15,573 records were acked into topic <code>pc</code>, and its <code>.log</code> saw exactly one fsync, from
+            <code>kafka-scheduler</code>. That one came from the roll. Rolling schedules an asynchronous flush of everything below
+            the new base, and it is the one routine fsync on the data path (<code>UnifiedLog.java:2289-2291</code>). At the 1 GiB
+            default, this window has no roll, and so, by the code, no data fsync at all. The same window shows who does flush: the metadata log, 49
+            times, from <code>kafka-1-raft-io</code>. That is <a href="../replication/#p3-raft">KRaft</a>.
+          </p>
+          <p>
+            With <code>flush.messages=1</code> the fsyncs move: 1,108 each of <code>.log</code>, <code>.index</code> and
+            <code>.timeindex</code>, once per append and not per record. The thread name <code>data-plane-kafk</code> covers network
+            and handler threads alike, so "on the request path" comes from reading the code
+            (<code>SocketServer.scala:746</code>, <code>KafkaRequestHandler.scala:275</code>), not from the shim.
+          </p>
+          <p>
+            What does fsync cost? This lab can't say. <code>flush.messages=1</code> did not lower the acked count, 18,819 against
+            15,572 in equal 12 s runs. That is not evidence that fsync is free: it is one pair on a shared disk under other load, with
+            a cold JVM in the first run, and these are not rates. <a href="../replication/#p3-promise">Replication's</a> own single
+            pair points the other way, 239 ms against 510 ms mean latency. The design doc's "two to three orders of magnitude"
+            (<code>design.md:335</code>) was neither reproduced nor properly tested. All timing here is loopback on a shared 2-vCPU
+            box.
+          </p>
+          <p>
+            So the first line in this log, the log end offset, moves without any disk being involved. The next line down, what has
+            been flushed, moves on the scheduler's time. §07 is what that gap costs.
+          </p>

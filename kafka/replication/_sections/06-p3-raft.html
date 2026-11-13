@@ -1,0 +1,160 @@
+          <h2 id="p3-raft"><span class="secnum">{{S}}</span>The metadata log</h2>
+          <p>
+            Who is in the ISR is itself a record in a log. The fifth use of the data structure is <code>__cluster_metadata</code>, one
+            single-partition log for the whole cluster: a request for any other partition is rejected, with a comment that
+            "multi-raft" is not supported yet (<code>raft/…/KafkaRaftClient.java:1495</code>). The class comment states the design in
+            one sentence. <code>raft/…/KafkaRaftClient.java:129-133</code>:
+          </p>
+<pre><code>/**
+ * This class implements a Kafkaesque version of the Raft protocol. Leader election
+ * is more or less pure Raft, but replication is driven by replica fetching and we use Kafka's
+ * log reconciliation protocol to truncate the log to a common point following each leader
+ * election.</code></pre>
+          <p>
+            Followers pull here too, so a new leader needs an announcement RPC standard Raft lacks: <code>BeginQuorumEpoch</code>,
+            which KIP-595 and the code both explain by the pull design (<code>:149-152</code>). All Raft work runs on one thread,
+            and any throwable from it is fatal (<code>KafkaRaftClientDriver.java:31-66</code>). Voters elect; observers, which
+            include every broker, fetch the same log and never campaign (<code>QuorumState.java:71-73</code>)
+            <span class="src">from the code</span>.
+          </p>
+
+          <h3>Elections</h3>
+          <p>
+            A follower's trigger is the fetch timeout, and it goes to Prospective, not Candidate
+            (<code>KafkaRaftClient.java:3329-3331</code>). That step is pre-vote, and it has preceded every election since 4.0
+            (<a href="../transactions/#D102">D102</a>, class E). It writes nothing and keeps the epoch. <code>raft/…/QuorumState.java:621-622</code>:
+          </p>
+<pre><code>        // Durable transition is not necessary since there is no change to the persisted electionState
+        memoryTransitionTo(</code></pre>
+          <p>
+            Only a majority of pre-votes reaches Candidate, and that step does write. <code>:641-644</code>:
+          </p>
+<pre><code>        int newEpoch = epoch() + 1;
+        int electionTimeoutMs = randomElectionTimeoutMs();
+
+        durableTransitionTo(new CandidateState(</code></pre>
+          <p>
+            A durable transition writes a small JSON file holding leader, epoch and voted id to a temp file, fsyncs it and renames
+            it, which is what stops double voting after a crash (<code>FileQuorumStateStore.java:181-183</code>). A follower still
+            hearing its leader refuses to help depose it. <code>raft/…/FollowerState.java:234-237</code>:
+          </p>
+<pre><code>    public boolean canGrantVote(ReplicaKey replicaKey, boolean isLogUpToDate, boolean isPreVote) {
+        if (isPreVote &amp;&amp; !hasFetchedFromLeader &amp;&amp; isLogUpToDate) {
+            return true;
+        }</code></pre>
+
+          <h3>Commit, and the one log that syncs</h3>
+          <p>
+            A fetch offset is an ack again (<code>KafkaRaftClient.java:1632-1635</code>). The difference is one call, and it is why
+            <a href="../the-log/#p1-append">Part 1's shim</a> counted 49 fsyncs on this log and one on the data log.
+            <code>raft/…/KafkaRaftClient.java:1849-1855</code>:
+          </p>
+<pre><code>        if (quorum.isVoter() || canBecomeVoter) {
+            // the leader only requires that voters have flushed their log before sending a Fetch
+            // request. Because of reconfiguration some observers (that are getting added to the
+            // voter set) need to flush the disk because the leader may assume that they are in the
+            // set of voters.
+            log.flush(false);
+        }</code></pre>
+          <p>
+            So on this log the next fetch offset is a durability claim. The leader flushes its own batches right after appending
+            (<code>:677-679</code>). And the line is a majority, not a minimum. <code>raft/…/LeaderState.java:660-680</code>:
+          </p>
+<pre><code>    private boolean maybeUpdateHighWatermark() {
+        // Find the largest offset which is replicated to a majority of replicas (the leader counts)
+        ArrayList&lt;ReplicaState&gt; followersByDescendingFetchOffset = followersByDescendingFetchOffset()
+            .collect(Collectors.toCollection(ArrayList::new));
+
+        int indexOfHw = voterStates.size() / 2;
+        Optional&lt;LogOffsetMetadata&gt; highWatermarkUpdateOpt = followersByDescendingFetchOffset.get(indexOfHw).endOffset;
+
+        if (highWatermarkUpdateOpt.isPresent()) {
+
+            // The KRaft protocol requires an extra condition on commitment after a leader
+            // election. The leader must commit one record from its own epoch before it is
+            // allowed to expose records from any previous epoch. This guarantees that its
+            // log will contain the largest record (in terms of epoch/offset) in any log
+            // which ensures that any future leader will have replicated this record as well
+            // as all records from previous epochs that the current leader has committed.
+
+            LogOffsetMetadata highWatermarkUpdateMetadata = highWatermarkUpdateOpt.get();
+            long highWatermarkUpdateOffset = highWatermarkUpdateMetadata.offset();
+
+            if (highWatermarkUpdateOffset &gt; epochStartOffset) {</code></pre>
+          <p>
+            That rule is why every new leader writes a control record at once, the <code>LeaderChange</code> that opens each epoch
+            (<code>KafkaRaftClient.java:667-670</code>). Here are the first bytes of a dynamic quorum's log
+            (<code>exp5_dynamic.sh</code>; real bytes, loopback) <span class="recon">measured here</span>:
+          </p>
+<pre><code>00000000  00 00 00 00 00 00 00 00 00 00 00 a2 00 00 00 01   ................
+00000010  02 bf 44 83 72 00 20 00 00 00 02 00 00 01 a1 b1   ..D.r. .........
+00000020  b6 5d 85 00 00 01 a1 b1 b6 5d 85 ff ff ff ff ff   .].......]......
+00000030  ff ff ff ff ff ff ff ff ff 00 00 00 03 3a 00 00   .............:..</code></pre>
+          <p>
+            It is the <a href="../the-log/#p1-batch">batch from Part 1</a>. Base offset 0, length <code>0xa2</code> = 162, partition
+            leader epoch 1, which here is the Raft epoch, magic 2. Attributes <code>0x0020</code> at <code>0x15</code> is the
+            control bit. Producer id, epoch and sequence are all -1. Record count 3 at <code>0x39</code>: control types 2, 5 and 6,
+            which are <code>LEADER_CHANGE</code>, <code>KRAFT_VERSION</code> and <code>KRAFT_VOTERS</code>.
+          </p>
+
+          <h3>The controller on top</h3>
+          <p>
+            The controller is a state machine on one event thread. It replays its own records into memory before Raft has them, and
+            any failure there is fatal. <code>metadata/…/controller/QuorumController.java:828-852</code>:
+          </p>
+<pre><code>                        // Start by trying to apply the record to our in-memory state. This should always
+                        // succeed; if it does not, that's a fatal error. It is important to do this before
+                        // scheduling the record for Raft replication.
+                        int recordIndex = 0;
+                        long lastOffset = raftClient.prepareAppend(controllerEpoch, records);
+                        long baseOffset = lastOffset - records.size() + 1;
+                        for (ApiMessageAndVersion message : records) {
+                            long recordOffset = baseOffset + recordIndex;
+                            try {
+                                replay(message.message(), Optional.empty(), recordOffset);
+                            } catch (Throwable e) {
+                                String failureMessage = String.format("Unable to apply %s " +
+                                    "record at offset %d on active controller, from the " +
+                                    "batch with baseOffset %d",
+                                    message.message().getClass().getSimpleName(),
+                                    recordOffset, baseOffset);
+                                throw fatalFaultHandler.handleFault(failureMessage, e);
+                            }
+                            recordIndex++;
+                        }
+                        raftClient.schedulePreparedAppend();
+                        offsetControl.handleScheduleAppend(lastOffset);
+                        return lastOffset;
+                    }
+                );</code></pre>
+          <p>
+            The write's future then waits in a deferred queue keyed by offset, so an admin success means committed
+            (<code>:860-862</code>, <code>:170-171</code>). Losing leadership rolls a snapshot registry back to the last stable offset,
+            with no log read (<code>:1123</code>). Standbys replay each committed batch as it arrives, which is why they are
+            hot (<code>:993-1012</code>).
+          </p>
+
+          <h3>Every broker is a reader</h3>
+          <p>
+            No controller-to-broker <code>LeaderAndIsr</code> RPC exists. A broker's <code>MetadataLoader</code> packages committed
+            records into an image; the publisher swaps one volatile reference, then tells <code>ReplicaManager</code> the delta
+            (<code>BrokerMetadataPublisher.scala:130-148</code>). A decoded log is plain to read
+            (<code>kafka-dump-log.sh --cluster-metadata-decoder</code>) <span class="recon">measured here</span>:
+          </p>
+<pre><code>| offset: 22 ... payload: {"type":"BROKER_REGISTRATION_CHANGE_RECORD","version":0,"data":{"brokerId":2,"brokerEpoch":10,"fenced":-1}}
+| offset: 55 ... payload: {"type":"TOPIC_RECORD","version":0,"data":{"name":"registry","topicId":"ybHiwpZ4T4uom9SjvS1ejQ"}}
+| offset: 57 ... payload: {"type":"CLEAR_ELR_RECORD","version":0,"data":{"topicName":"registry"}}</code></pre>
+          <p>
+            A broker's epoch is its registration record's offset; here epoch 10 sits at offset 10. <code>"fenced":-1</code> means
+            unfenced. On an idle cluster 65 of 93 records were <code>NO_OP_RECORD</code>, at a median 500 ms gap. Each node writes
+            its own snapshots, by default at 20 MiB or 1 hour, and a new replica is sent to a snapshot even if the log still reaches
+            offset 0 (<code>KafkaRaftClient.java:1622-1625</code>); a real new broker did exactly that.
+          </p>
+          <p>
+            Inspecting this has edges. The metadata shell shows <code>image</code> and <code>local</code> at the root, not the layout in
+            the docs (<a href="../transactions/#D23">D23</a>). It reports a snapshot's internal offset as provenance, refuses live directories, and logs ERROR for
+            normal control records (<a href="../transactions/#D73">D73</a>). Config docs drift too:
+            <code>election.timeout.ms</code> is documented with the fetch timeout's meaning (<a href="../transactions/#D25">D25</a>) and <code>election.backoff.max.ms</code>
+            as a binary exponential backoff against gridlock, when in code it is only read on graceful resignation (<a href="../transactions/#D26">D26</a>). Also in the register are the class comment (<a href="../transactions/#D27">D27</a>),
+            the format-time sentence (<a href="../transactions/#D28">D28</a>), KIP status pages (<a href="../transactions/#D29">D29</a>) and <code>addAt</code> (<a href="../transactions/#D72">D72</a>).
+          </p>

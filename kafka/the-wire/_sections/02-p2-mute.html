@@ -1,0 +1,148 @@
+          <h2 id="p2-mute"><span class="secnum">{{S}}</span>The muted socket</h2>
+          <p>
+            <code>selector.mute</code> is one line, and it decides the shape of the protocol. A muted channel is not read.
+            <code>clients/…/common/network/Selector.java:580-583</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>                if (channel.ready() &amp;&amp; (key.isReadable() || channel.hasBytesBuffered()) &amp;&amp; !hasCompletedReceive(channel)
+                        &amp;&amp; !explicitlyMutedChannels.contains(channel)) {
+                    attemptRead(channel);
+                }</code></pre>
+          <p>
+            A second request on that connection is not refused, and is not read either. It stays in the kernel's socket buffer.
+            The channel opens again only when the response has been fully sent, and then only if no throttle is active
+            (<code>SocketServer.scala:1049-1053</code>). So each connection has one request in progress, and its answers
+            come back in order. This is the documented contract, not an accident. <code>docs/design/protocol.md:45</code>:
+            "The broker's request processing allows only a single in-flight request per connection in order to guarantee
+            this ordering", and clients "can send requests even while awaiting responses for preceding requests since the
+            outstanding requests will be buffered in the underlying OS socket buffer".
+          </p>
+          <p>
+            No thread is involved in that wait. Pipelining is a client's right, but pipelined requests get no parallelism
+            on one socket. The cost shows the moment a request has to wait.
+          </p>
+
+          <figure class="figure wide" id="fig-parked">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Parked behind a parked Fetch: the same request, 4,005 ms on one socket and 2 ms on another</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 420" role="img" aria-label="Top panel: on connection A, a Fetch waits 4,004 ms in purgatory and an ApiVersions pipelined behind it returns at 4,005 ms; on connection B an ApiVersions returns in 2 ms. Bottom panel: on a real consumer's connection 7, a session-close Fetch, corr 62, sent behind a parked Fetch, corr 59; both answered in order.">
+                <text x="20" y="24" class="svg-lane">HAND-BUILT FRAMES, ONE RUN (0 TO 4,005 MS)</text>
+                <line x1="170" y1="40" x2="170" y2="170" stroke="#b8b8b1"/>
+                <line x1="1060" y1="40" x2="1060" y2="170" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="170" y="186" class="svg-sub" text-anchor="middle">0</text>
+                <text x="1060" y="186" class="svg-sub" text-anchor="end">4,005 ms</text>
+
+                <text x="20" y="62" class="svg-step">Connection A</text>
+                <text x="20" y="78" class="svg-sub">corr 300 Fetch</text>
+                <rect x="172" y="50" width="888" height="26" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="184" y="68" class="svg-sub" style="fill:#252525">parked in purgatory: max_wait 4,000 ms, nothing to read; response at 4,004 ms</text>
+
+                <text x="20" y="108" class="svg-sub">corr 301 ApiVersions</text>
+                <rect x="172" y="92" width="888" height="26" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="184" y="110" class="svg-sub" style="fill:#252525">unread, in the kernel socket buffer: socket is muted; response at 4,005 ms</text>
+
+                <text x="20" y="146" class="svg-step">Connection B</text>
+                <text x="20" y="162" class="svg-sub">corr 302 ApiVersions</text>
+                <rect x="172" y="136" width="4" height="26" fill="#367f59"/>
+                <text x="186" y="154" class="svg-sub" style="fill:#252525">2 ms, same broker, same moment</text>
+
+                <line x1="20" y1="206" x2="1060" y2="206" stroke="#deded9"/>
+
+                <text x="20" y="234" class="svg-lane">REAL JAVA CONSUMER, CONNECTION 7, CAPTURED THROUGH THE PROXY (0 TO 518 MS)</text>
+                <line x1="170" y1="250" x2="170" y2="372" stroke="#b8b8b1"/>
+                <line x1="1060" y1="250" x2="1060" y2="372" stroke="#b8b8b1" stroke-dasharray="3 3"/>
+                <text x="170" y="388" class="svg-sub" text-anchor="middle">0 (corr 59 sent)</text>
+                <text x="1060" y="388" class="svg-sub" text-anchor="end">518 ms</text>
+
+                <text x="20" y="276" class="svg-sub">corr 59 Fetch</text>
+                <rect x="172" y="260" width="881" height="26" rx="3" fill="#ece6f3" stroke="#765b98"/>
+                <text x="184" y="278" class="svg-sub" style="fill:#252525">ordinary fetch, epoch 1, parked; answered 514 ms after sending</text>
+
+                <text x="20" y="318" class="svg-sub">corr 62 Fetch</text>
+                <rect x="264" y="302" width="796" height="26" rx="3" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="276" y="320" class="svg-sub" style="fill:#252525">session close: epoch -1, no topics, 49 bytes; answered 464 ms after sending, 4 ms after 59</text>
+                <text x="172" y="356" class="svg-note">Corr 62 is the session close, the one exception. Routine fetches stay at one in flight per node.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">One parked request holds up its whole connection and nothing else. Both panels are single runs on loopback, relative only; the second is through the logging proxy, so its absolute times include the proxy. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            The lab sent a Fetch at the log end, with a 4,000 ms wait, and an ApiVersions right behind it on the same
+            socket. The first response came at 4,004 ms and the second at 4,005 ms. The same ApiVersions on another
+            connection took 2 ms <span class="recon">measured here</span>. This is D56, class D, a gotcha confirmed by
+            verification; trunk was not checked.
+          </p>
+          <p>
+            Routine Java traffic does not do this. The Java consumer fetches with at most one request in flight per node
+            (<a href="../clients/#p4-read">Part 4</a> has why). The lower panel of the figure is the exception:
+            the session-closing Fetch went out while an ordinary one was parked, and it waited its turn. Here is that moment in the
+            real frame log. The first column is the connection, and sizes exclude the length prefix. The FindCoordinator and heartbeat
+            requests were filtered out for length, which is why corr 61 shows only its response
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>7 REQ key=1 v18 corr=59 size=100 t=1793977623.349
+8 REQ key=8 v10 corr=60 size=93 t=1793977623.354
+8 RSP corr=60 size=36 t=1793977623.382
+8 RSP corr=61 size=45 t=1793977623.396
+7 REQ key=1 v18 corr=62 size=49 t=1793977623.403
+7 RSP corr=59 size=17 t=1793977623.863
+7 RSP corr=62 size=17 t=1793977623.867</code></pre>
+          <p>
+            Connection 7 sits on a parked Fetch for half a second. Meanwhile connection 8 commits offsets (key 8) in 28 ms. That
+            is the second socket doing its job.
+          </p>
+
+          <h3>So clients keep several sockets</h3>
+          <p>
+            If one long poll can hold up a socket, a client that also needs to heartbeat cannot share it. The Java consumer
+            gives the group coordinator a connection of its own, through an id string prefixed with <code>+</code>
+            (<code>clients/…/consumer/internals/GroupCoordinatorNode.java:21-34</code>). That is new in 4.4.0; through 4.3 the
+            id was <code>Integer.MAX_VALUE - nodeId</code>. The capture shows it working: Fetch on connection 7, heartbeat
+            and commit on connection 8, same broker <span class="recon">measured here</span>.
+          </p>
+          <p>
+            franz-go goes further, with up to five connections per broker, chosen by request type so that long polls
+            cannot block other traffic. <code>franz-go/pkg/kgo/broker.go:683-700</code>
+            <span class="src">from the code</span>:
+          </p>
+<pre><code>	switch {
+	case reqKey == 0:
+		pcxn = &amp;b.cxnProduce
+		isProduceCxn = true
+	case reqKey == 1 || reqKey == 78 || reqKey == 79:
+		// Fetch and ShareFetch long-poll. ShareAcknowledge shares the
+		// ShareFetch connection: the broker ties a share session to it
+		// and releases the member's records when it closes, so acks
+		// and renews keep it from going idle. The share source sends
+		// one of the two at a time.
+		pcxn = &amp;b.cxnFetch
+		isFetchCxn = true
+	case reqKey == 11 || reqKey == 14: // join || sync
+		pcxn = &amp;b.cxnGroup
+	case reqKey == 2: // list offsets stays on cxnNormal
+	case isTimeout:
+		pcxn = &amp;b.cxnSlow
+	}</code></pre>
+          <p>
+            librdkafka adds logical broker handles for its coordinators, each with its own thread. That this means a separate
+            socket is inferred from the code; librdkafka was read, never run.
+          </p>
+
+          <h3>When there is no response to wait for</h3>
+          <p>
+            <code>acks=0</code> tests the rule from the other side. There is no response, so nothing would ever unmute the
+            socket. The broker therefore sends an internal <code>NoOpResponse</code>, whose handler comment is plain:
+            "There is no response to send to the client, we need to read more pipelined requests that are sitting in the
+            server's socket buffer" (<code>SocketServer.scala:922-923</code>). And since no frame can carry an error, an
+            error closes the socket (<code>core/…/server/KafkaApis.scala:512-529</code>). The lab saw both paths. An
+            <code>acks=0</code> Produce to an unknown topic id closed the connection in 9 ms, and on a good send, the next
+            frame on the wire belonged to the following request <span class="recon">measured here</span>.
+          </p>
+          <p>
+            Any exception while turning a frame into a request ends the same way, with a closed connection and no error
+            frame (<code>SocketServer.scala:907-912</code>, <code>:1031-1035</code>). The last section of this part comes
+            back to that.
+          </p>

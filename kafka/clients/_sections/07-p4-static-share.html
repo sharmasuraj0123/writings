@@ -1,0 +1,106 @@
+          <h2 id="p4-static-share"><span class="secnum">{{S}}</span>Static members and share groups</h2>
+          <p>
+            <code>group.instance.id</code> gives a member an identity that outlives its process. A static classic member on the default close sends no LeaveGroup, and a rejoin during Stable
+            with the same protocol just swaps the member id (<code>group/GroupMetadataManager.java:8142-8143</code>) <span class="src">from the code</span>. Under KIP-848 a static leave writes epoch −2 and keeps
+            the assignment for the returning instance. In one run under each protocol, a 10 s restart caused no rebalance: other partitions saw at most 148 ms gaps, and the member got its
+            same two partitions back <span class="recon">measured here</span>. A static member still needs the session timer: <code>CloseOptions.LEAVE_GROUP</code> is how it leaves for good, and otherwise it is removed only when the
+            session expires (<code>consumer/internals/ConsumerMembershipManager.java:507-508</code>).
+          </p>
+          <p>
+            The protocols treat a duplicate id in opposite ways (<code>GroupMetadataManager.java:1723-1727</code>, <code>:7219-7226</code>). Classic replaces the old holder, at its next heartbeat. Both consumed the same
+            partitions for about 2.6 s, and that run counted 76 duplicate deliveries, which also include the newcomer re-reading from the last commit. KIP-848 refuses the newcomer with
+            <code>UNRELEASED_INSTANCE_ID</code>, immediately, and the Java client treats that as fatal, so no duplicates. <strong>This is intended</strong>: KIP-848 says the new member "is rejected" and "the
+            consumer should fail". It follows that a crashed static member, which never sent −2, blocks its own replacement until session expiry, 45 s by default. That was derived from code and the
+            live-duplicate test; a crash-restart was not run end to end (<a href="../transactions/#p5-register">register D80</a>, class D, intended per KIP-848).
+          </p>
+
+          <h3>Share groups: leases, not ownership</h3>
+          <p>
+            Share groups, production-ready since 4.2, drop partition ownership. Several members can read one partition, and the broker holds per-record state: five states in the code, one
+            more than KIP-932's four, because KIP-1191 added ARCHIVING for the dead-letter queue (<code>server/…/server/share/fetch/RecordState.java:27-31</code>). Defaults per partition: 2,000 record locks in flight,
+            a 30 s lock and a delivery limit of 5. At the cap the partition just stops acquiring, so a slow consumer stalls it at 2,000 records.
+          </p>
+
+          <figure class="figure wide" id="fig-share">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">A record's life in a share group, with the real poll sequence</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 372" role="img" aria-label="State machine: AVAILABLE goes to ACQUIRED on fetch, raising the delivery count. ACQUIRED goes to ACKNOWLEDGED on ACCEPT, back to AVAILABLE on RELEASE or lock expiry, and to ARCHIVED on REJECT. At the delivery limit a record goes to ARCHIVED, or through ARCHIVING with a dead-letter queue. Below, the real poll sequence: five offsets at counts 2, 3 and 4, then each alone at count 5.">
+                <defs>
+                  <marker id="fig-share-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                </defs>
+                <rect x="30" y="56" width="170" height="52" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                <text x="44" y="78" class="svg-step">AVAILABLE</text><text x="44" y="96" class="svg-sub">state 0</text>
+                <rect x="330" y="56" width="170" height="52" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="344" y="78" class="svg-step">ACQUIRED</text><text x="344" y="96" class="svg-sub">state 1, not persisted</text>
+                <rect x="640" y="20" width="190" height="52" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="654" y="42" class="svg-step">ACKNOWLEDGED</text><text x="654" y="60" class="svg-sub">state 2</text>
+                <rect x="640" y="108" width="190" height="52" rx="4" fill="#ece6f3" stroke="#765b98"/>
+                <text x="654" y="130" class="svg-step">ARCHIVING</text><text x="654" y="148" class="svg-sub">state 3, DLQ only</text>
+                <rect x="880" y="108" width="170" height="52" rx="4" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="894" y="130" class="svg-step">ARCHIVED</text><text x="894" y="148" class="svg-sub">state 4</text>
+
+                <line x1="200" y1="72" x2="328" y2="72" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="212" y="64" class="svg-sub">fetch, count + 1</text>
+                <polyline points="330,96 200,96" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="206" y="114" class="svg-sub">RELEASE, or lock expiry</text>
+                <polyline points="500,66 570,66 570,46 638,46" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="512" y="60" class="svg-sub">ACCEPT</text>
+                <polyline points="500,92 570,92 570,178 965,178 965,162" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="582" y="194" class="svg-sub">REJECT, or the limit (count 5) with no DLQ</text>
+                <polyline points="570,134 638,134" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+                <text x="504" y="128" class="svg-sub">limit, DLQ</text>
+                <line x1="830" y1="134" x2="878" y2="134" stroke="#252525" stroke-width="2" marker-end="url(#fig-share-ctl)"/>
+
+                <text x="30" y="226" class="svg-lane">THE REAL SEQUENCE (ONE PARTITION, RELEASE ALL)</text>
+                <text x="30" y="254" class="svg-sub">count 1</text>
+                <text x="100" y="254" class="svg-sub">0 to 9 in one poll: 0-3 ACCEPT, 4 RELEASE, 5 REJECT, 6-9 RELEASE</text>
+                <text x="30" y="282" class="svg-sub">2, 3, 4</text>
+                <rect x="100" y="268" width="150" height="22" rx="3" fill="#e0ebf2" stroke="#3c6f97"/><text x="110" y="283" class="svg-sub" style="fill:#252525">4 6 7 8 9</text>
+                <rect x="256" y="268" width="150" height="22" rx="3" fill="#e0ebf2" stroke="#3c6f97"/><text x="266" y="283" class="svg-sub" style="fill:#252525">4 6 7 8 9</text>
+                <rect x="412" y="268" width="150" height="22" rx="3" fill="#e0ebf2" stroke="#3c6f97"/><text x="422" y="283" class="svg-sub" style="fill:#252525">4 6 7 8 9</text>
+                <text x="580" y="283" class="svg-note">batches of 5 did not shrink at counts 2 to 4</text>
+                <text x="30" y="316" class="svg-sub">5</text>
+                <rect x="100" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="115" y="317" class="svg-sub" style="fill:#252525">4</text>
+                <rect x="146" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="161" y="317" class="svg-sub" style="fill:#252525">6</text>
+                <rect x="192" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="207" y="317" class="svg-sub" style="fill:#252525">7</text>
+                <rect x="238" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="253" y="317" class="svg-sub" style="fill:#252525">8</text>
+                <rect x="284" y="302" width="40" height="22" rx="3" fill="#f7e3c8" stroke="#d98226"/><text x="299" y="317" class="svg-sub" style="fill:#252525">9</text>
+                <text x="340" y="317" class="svg-note">one poll each on the last attempt, then archived: max delivery count seen is 5</text>
+                <text x="30" y="352" class="svg-note">Offset 5 was rejected and never came back; offsets 0 to 3 were accepted and never came back.</text>
+              </svg>
+            </div>
+            <p class="figure-caption">States from <code>RecordState.java</code>; the sequence is from <code>share.out</code>, one short run of about 40 s on loopback. It says nothing about larger groups or steady state. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            The code also shrinks batches as the count rises (<code>core/…/server/share/SharePartition.java:2006-2017</code>). The lab shows only the last-attempt rule. An unacknowledged lock with a 15 s
+            setting lapsed about 15 s later, and another consumer got the records with a raised count. The KIP itself says the delivery count is imprecise and delivery is at-least-once, and order is
+            promised only within a batch. Durable state lives in <code>__share_group_state</code>, not <code>__consumer_offsets</code>, with snapshots after 500 updates. Acquisition is not persisted, and
+            one unacknowledged record pins the start offset. <code>share.auto.offset.reset</code> defaults to <code>latest</code>, so records produced before the group first reads are skipped. The state topic
+            defaults to 50 partitions, RF 3 and min ISR 2, so a cluster of fewer than three brokers must lower them first. The persisted start offset never moves backwards, whatever a stale writer sends
+            (<code>share-coordinator/…/coordinator/share/ShareCoordinatorShard.java:662-700</code>).
+          </p>
+          <p>
+            Consumers acknowledge in one of two modes. In implicit mode the next <code>poll()</code> or commit acknowledges everything fetched. In explicit mode, unacknowledged records make it throw
+            (<code>consumer/internals/ShareConsumerImpl.java:1208-1220</code>). There are four types: ACCEPT, RELEASE, REJECT and RENEW, the last extending a lock (KIP-1222). Assignment reuses the same rate-limited
+            heartbeat path as KIP-848, with <code>SimpleAssignor</code> allowing several members on a partition, and a default limit of 200 members where consumer groups are unbounded. A default-bootstrapped 4.4
+            cluster had share groups usable without setting a feature flag by hand, and on disk acknowledged state is range-compressed, using state ids 0, 2 and 4 <span class="recon">measured here</span>. A lock-expiry
+            release that fails to persist is applied anyway, so memory can run ahead of the state topic (<code>SharePartition.java:3024</code>; read, not run).
+          </p>
+          <p>
+            Three edges. In implicit mode, <code>close()</code> right after <code>poll()</code> releases that batch: 400 records were delivered and handed over, then left available at count 1 with lag 400. The
+            Javadoc says so (<code>consumer/KafkaShareConsumer.java:130</code>), but finished work is redelivered and counts against the limit (<a href="../transactions/#p5-register">register D81</a>, class D, documented). The
+            schema documents state ids <code>0:Available,2:Acked,4:Archived</code>, while the lock-expiry path can persist 3 with a DLQ (<a href="../transactions/#p5-register">register D33</a>, class C; read, no DLQ run). And the
+            DLQ is best effort (<a href="../transactions/#p5-register">register D85</a>, class D; no failure run). <code>core/…/server/share/SharePartition.java:3409-3412</code>:
+          </p>
+<pre><code>        )).whenComplete((v1, dlqException) -&gt; {
+            if (dlqException != null) {
+                log.error("Failed to write to DLQ, proceeding to ARCHIVED regardless.", dlqException);
+            }</code></pre>
+          <p>
+            One result must not be overread. Two implicit-mode consumers on one partition printed <code>x=400 y=0</code>: the first took all 400 of 400. That is an artefact of a test loop that stopped at 400
+            records. It shows one fetch can acquire a backlog up to its batch limit, and it says nothing about how share groups spread records. Steady-state distribution was not measured.
+          </p>

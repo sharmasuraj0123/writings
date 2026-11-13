@@ -1,0 +1,63 @@
+          <h2 id="p4-read"><span class="secnum">{{S}}</span>A pull loop and a stored number</h2>
+          <p>
+            A consumer pulls. A fetch reads only up to the high watermark, or the last stable offset under <code>read_committed</code>
+            (<code>server-common/…/server/storage/log/FetchIsolation.java:31-39</code>) <span class="src">from the code</span>. With nothing to return it
+            parks in purgatory, as <a href="../the-wire/#p2-purgatory">Part 2</a> showed, for <code>fetch.min.bytes=1</code> or
+            <code>fetch.max.wait.ms=500</code>.
+          </p>
+          <p>
+            The Java client fetches per broker, with at most one request in flight per node. It also skips a node entirely while any of that
+            node's partitions still has buffered data, so that the omitted partitions do not fall out of the fetch session
+            (<code>consumer/internals/AbstractFetch.java:462-469</code>). That is why routine Java traffic never queues behind the muted socket. The one
+            exception is the session-closing Fetch. Sessions keep the loop cheap, since every fetch would otherwise relist every partition, and losing
+            one heals itself with a full fetch. <code>max.poll.records</code>, 500 by default, applies when the client drains its buffer. It limits what
+            <code>poll()</code> returns, not what the broker sends.
+          </p>
+          <p>
+            Now the line this section is about. The in-memory position advances when records are handed to <code>poll()</code>, before the application
+            has processed them (<code>consumer/internals/FetchCollector.java:185-204</code>). Auto-commit commits <code>allConsumed()</code>, the current
+            positions, inside the next <code>poll()</code>, every 5 s by default (<code>consumer/internals/SubscriptionState.java:797-801</code>). A
+            single-threaded loop therefore gets at-least-once. A SIGKILL redelivered 34 and 52 records in two single runs
+            <span class="recon">measured here</span>.
+          </p>
+          <p>
+            A commit is a record. A group lives on one <code>__consumer_offsets</code> partition, chosen by the Java hash of the group id, and that
+            partition's leader is its coordinator. Here is a real commit of <code>new OffsetAndMetadata(42L, "hello")</code>, which carries no leader epoch,
+            decoded by hand, with the long line wrapped <span class="recon">measured here</span>:
+          </p>
+<pre><code>record offset=2 file_pos_of_batch=453
+ key   hex 00 01 00 0b 67 72 70 2d 63 6c 61 73 73 69 63 00 04 6f 66 66 73 00 00 00 00
+ key   type=1 group='grp-classic' topic='offs' partition=0
+ value hex 00 04 00 00 00 00 00 00 00 2a ff ff ff ff 06 68 65 6c 6c 6f 00 00 01 a1 b1 a0 eb df
+           01 00 10 f2 a0 a6 99 7f 1c 4a ba b8 94 16 17 49 e8 af 89
+ value version=4 offset=42 leaderEpoch=-1 metadata='hello' commitTimestamp=1793981475807</code></pre>
+          <p>
+            Key: <code>00 01</code> is record type 1, then the group, the topic name and the partition. Value: version 4, eight bytes of offset
+            (<code>2a</code> is 42), leader epoch −1, a compact string, the timestamp, then one tagged field holding the topic UUID. The key uses int16-length
+            strings and the value is flexible, inside an ordinary v2 batch from <a href="../the-log/">Part 1</a>. Classic, consumer-protocol and standalone
+            groups all wrote this same shape.
+          </p>
+          <p>
+            Deleting an offset is a tombstone on the same key, which is what lets a compacted topic forget it. From a real segment, the second batch begins at
+            <code>0x8b</code>:
+          </p>
+<pre><code>00000090  00 00 01 00 00 00 54 00 00 00 00 02 e4 65 38 8e  ......T......e8.
+000000a0  00 00 00 00 00 00 00 00 01 a1 b1 a0 f5 ea 00 00  ................
+000000b0  01 a1 b1 a0 f5 ea ff ff ff ff ff ff ff ff ff ff  ................
+000000c0  00 00 00 00 00 00 00 01 44 00 00 00 38 00 01 00  ........D...8...
+000000d0  0e 67 72 70 2d 73 74 61 6e 64 61 6c 6f 6e 65 00  .grp-standalone.
+000000e0  04 6f 66 66 73 00 00 00 00 01 00                 .offs......</code></pre>
+          <p>
+            The last two bytes are the point: <code>01</code> is a zigzag −1, a null value, and <code>00</code> is zero headers. Commits append with
+            <code>requiredAcks = 1</code>, and the runtime parks the response until the high watermark passes the written offset
+            (<code>core/…/coordinator/group/CoordinatorPartitionWriter.scala:169-172</code>), so a commit answers only once that line in that log has moved.
+            Offsets are kept 7 days, but expiry only touches topics the group is not subscribed to. A <code>requireStable</code> fetch reports
+            <code>UNSTABLE_OFFSET_COMMIT</code> around an open transactional offset, though a service comment still says the coordinator cannot easily do that
+            (<a href="../transactions/#p5-register">register D34</a>, class C, no effect).
+          </p>
+          <p>
+            Two lag numbers follow. <code>kafka-consumer-groups</code> reports end offset minus committed offset: 50 − 42 = 8 in the lab. The client's
+            <code>records-lag</code> is high watermark or LSO minus position. They disagree by design, up to 5 s with auto-commit, and neither counts records
+            (<a href="../transactions/#p5-register">register D84</a>, class D). The project's docs state that exactly-once for other destination systems needs
+            cooperation from those systems (<code>docs/design/design.md:207</code>), which <a href="../transactions/">Part 5</a> takes up.
+          </p>

@@ -1,0 +1,239 @@
+          <h2 id="p2-pools"><span class="secnum">{{S}}</span>Two pools and a queue</h2>
+          <p class="lede">
+            A broker is two thread pools and one queue. One rule, the muted socket, gives every connection one request
+            at a time. Requests that must wait hold no thread, and a timeout undoes nothing. This collection reads
+            Kafka as one append-only log used five times, with each promise a line in such a log.
+            <a href="../the-log/">Part 1</a> read that log on disk. This part follows one request from the socket to
+            the log and back: the threads it crosses, its real bytes, where it waits, and what it can and cannot take
+            back. <a href="../replication/">Part 3</a> picks up at the line an ack moves.
+          </p>
+          <p>
+            The class comment in <code>core/…/network/SocketServer.scala:60-70</code> gives the shape: "1 Acceptor
+            thread per listener", "N Processor threads that each have their own selector", and "M Handler threads that
+            handle requests and produce responses back to the processor threads for writing"
+            <span class="src">from the code</span>. A second fact sits at <code>:99-100</code>: one map of acceptors, but a
+            single <code>RequestChannel</code>. Every listener of a <code>SocketServer</code> drains into one request queue.
+            The same comment opens with "two types of request planes" and then lists one, because
+            <code>control.plane.listener.name</code> is gone (register D14, class C, doc drift; still there at trunk
+            <code>09f2dc1320</code>, read only).
+          </p>
+
+          <figure class="figure wide" id="fig-pools">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">The broker as two pools and a queue, with a gate on every socket</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 520" role="img" aria-label="Sockets on the left, each behind a mute gate, are owned by network threads. An acceptor hands each new socket to a network thread round-robin. Network threads put parsed requests on one bounded queue and mute the socket. Handler threads take from the queue and put responses on a per-network-thread deque.">
+                <defs>
+                  <marker id="fig-pools-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker>
+                  <marker id="fig-pools-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3c6f97"/></marker>
+                  <marker id="fig-pools-state" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#765b98"/></marker>
+                </defs>
+                <text x="20" y="24" class="svg-lane">SOCKETS AND GATES</text>
+                <text x="300" y="24" class="svg-lane">NETWORK THREADS (N)</text>
+                <text x="596" y="24" class="svg-lane">ONE QUEUE</text>
+                <text x="770" y="24" class="svg-lane">HANDLER THREADS (M)</text>
+
+                <!-- acceptor -->
+                <rect x="20" y="40" width="170" height="44" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="32" y="59" class="svg-step">Acceptor</text>
+                <text x="32" y="75" class="svg-sub">one per listener</text>
+                <polyline points="190,62 262,62 262,412 296,412" fill="none" stroke="#252525" stroke-width="2" marker-end="url(#fig-pools-ctl)"/>
+                <line x1="262" y1="152" x2="296" y2="152" stroke="#252525" stroke-width="2" marker-end="url(#fig-pools-ctl)"/>
+                <line x1="262" y1="282" x2="296" y2="282" stroke="#252525" stroke-width="2" marker-end="url(#fig-pools-ctl)"/>
+                <text x="274" y="58" class="svg-sub">round-robin, 20-slot new-connection queue</text>
+
+                <!-- sockets: thread 1 -->
+                <rect x="20" y="116" width="118" height="28" rx="3" fill="#ffffff" stroke="#b8b8b1"/><text x="30" y="134" class="svg-sub" style="fill:#252525">connection a</text>
+                <rect x="144" y="112" width="8" height="36" fill="#367f59"/>
+                <line x1="154" y1="130" x2="296" y2="130" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <rect x="20" y="164" width="118" height="28" rx="3" fill="#ffffff" stroke="#b8b8b1"/><text x="30" y="182" class="svg-sub" style="fill:#252525">connection b</text>
+                <rect x="144" y="160" width="8" height="36" fill="#ad4b43"/>
+                <path d="M296,190 C250,206 190,206 156,186" fill="none" stroke="#765b98" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#fig-pools-state)"/>
+                <text x="164" y="214" class="svg-sub" style="fill:#765b98">mute after put</text>
+                <!-- sockets: thread 2 -->
+                <rect x="20" y="246" width="118" height="28" rx="3" fill="#ffffff" stroke="#b8b8b1"/><text x="30" y="264" class="svg-sub" style="fill:#252525">connection c</text>
+                <rect x="144" y="242" width="8" height="36" fill="#367f59"/>
+                <line x1="154" y1="260" x2="296" y2="260" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <rect x="20" y="294" width="118" height="28" rx="3" fill="#ffffff" stroke="#b8b8b1"/><text x="30" y="312" class="svg-sub" style="fill:#252525">connection d</text>
+                <rect x="144" y="290" width="8" height="36" fill="#367f59"/>
+                <line x1="154" y1="308" x2="296" y2="308" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <!-- sockets: thread 3 -->
+                <rect x="20" y="376" width="118" height="28" rx="3" fill="#ffffff" stroke="#b8b8b1"/><text x="30" y="394" class="svg-sub" style="fill:#252525">connection e</text>
+                <rect x="144" y="372" width="8" height="36" fill="#ad4b43"/>
+                <rect x="20" y="424" width="118" height="28" rx="3" fill="#ffffff" stroke="#b8b8b1"/><text x="30" y="442" class="svg-sub" style="fill:#252525">connection f</text>
+                <rect x="144" y="420" width="8" height="36" fill="#367f59"/>
+                <line x1="154" y1="438" x2="296" y2="438" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+
+                <!-- network threads -->
+                <g>
+                  <rect x="300" y="106" width="210" height="100" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <text x="312" y="126" class="svg-step">Network thread 0</text>
+                  <text x="312" y="143" class="svg-sub">own selector; parses here</text>
+                  <rect x="312" y="158" width="186" height="36" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                  <text x="322" y="180" class="svg-sub" style="fill:#252525">response deque + wakeup</text>
+                </g>
+                <g>
+                  <rect x="300" y="236" width="210" height="100" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <text x="312" y="256" class="svg-step">Network thread 1</text>
+                  <text x="312" y="273" class="svg-sub">own selector; parses here</text>
+                  <rect x="312" y="288" width="186" height="36" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                  <text x="322" y="310" class="svg-sub" style="fill:#252525">response deque + wakeup</text>
+                </g>
+                <g>
+                  <rect x="300" y="366" width="210" height="100" rx="4" fill="#e0ebf2" stroke="#3c6f97"/>
+                  <text x="312" y="386" class="svg-step">Network thread 2</text>
+                  <text x="312" y="403" class="svg-sub">own selector; parses here</text>
+                  <rect x="312" y="418" width="186" height="36" rx="3" fill="#ffffff" stroke="#3c6f97"/>
+                  <text x="322" y="440" class="svg-sub" style="fill:#252525">response deque + wakeup</text>
+                </g>
+
+                <!-- to queue -->
+                <line x1="510" y1="130" x2="596" y2="130" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <line x1="510" y1="260" x2="596" y2="260" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <line x1="510" y1="390" x2="596" y2="390" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+
+                <!-- queue -->
+                <rect x="600" y="106" width="108" height="360" rx="4" fill="#f7e3c8" stroke="#d98226"/>
+                <text x="612" y="126" class="svg-step">requestQueue</text>
+                <text x="612" y="143" class="svg-sub">default 500</text>
+                <text x="612" y="158" class="svg-sub">blocking put</text>
+                <rect x="620" y="176" width="68" height="20" rx="2" fill="#ffffff" stroke="#d98226"/>
+                <rect x="620" y="202" width="68" height="20" rx="2" fill="#ffffff" stroke="#d98226"/>
+                <rect x="620" y="228" width="68" height="20" rx="2" fill="#ffffff" stroke="#d98226"/>
+                <rect x="620" y="254" width="68" height="20" rx="2" fill="#ffffff" stroke="#d98226"/>
+                <text x="612" y="306" class="svg-sub">full: network</text>
+                <text x="612" y="321" class="svg-sub">thread blocks</text>
+                <text x="612" y="346" class="svg-sub">callbackQueue</text>
+                <text x="612" y="361" class="svg-sub">goes first</text>
+
+                <!-- to handlers -->
+                <line x1="708" y1="142" x2="768" y2="142" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <line x1="708" y1="222" x2="768" y2="222" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <line x1="708" y1="302" x2="768" y2="302" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+
+                <!-- handlers -->
+                <rect x="772" y="116" width="288" height="56" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="784" y="138" class="svg-step">Handler 0: KafkaApis.handle</text>
+                <text x="784" y="156" class="svg-sub">one match on the API key</text>
+                <rect x="772" y="196" width="288" height="56" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="784" y="218" class="svg-step">Handler 1</text>
+                <text x="784" y="236" class="svg-sub">waits up to 300 ms on the queue</text>
+                <rect x="772" y="276" width="288" height="56" rx="4" fill="#dfede5" stroke="#367f59"/>
+                <text x="784" y="298" class="svg-step">Handler 2 … default 8</text>
+                <text x="784" y="316" class="svg-sub">shared by all network threads</text>
+
+                <!-- response path -->
+                <polyline points="1040,332 1040,490 554,490 554,176 500,176" fill="none" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <line x1="554" y1="306" x2="500" y2="306" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <line x1="554" y1="436" x2="500" y2="436" stroke="#3c6f97" stroke-width="1.3" marker-end="url(#fig-pools-data)"/>
+                <text x="600" y="484" class="svg-sub">response goes back to the deque of the thread that owns the socket</text>
+
+                <!-- legend -->
+                <rect x="20" y="478" width="8" height="24" fill="#367f59"/><text x="36" y="494" class="svg-sub">gate open: selector reads</text>
+                <rect x="230" y="478" width="8" height="24" fill="#ad4b43"/><text x="246" y="494" class="svg-sub">muted</text>
+              </svg>
+            </div>
+            <p class="figure-caption">Three network threads and three handlers are shown for shape; the defaults are 3 per listener and 8. One queue serves them all, so handlers are shared, and a response always returns to the network thread that owns the socket. A red gate means a request from that connection is somewhere to the right of it. <span class="src">from the code</span></p>
+          </figure>
+
+          <h3>The network thread</h3>
+          <p>
+            The acceptor assigns each socket round-robin to a processor whose new-connection queue has room, and blocks
+            only if all of them are full (<code>SocketServer.scala:635-637</code>). The queue holds 20 sockets, and at
+            most that many are registered per loop, so new connections cannot starve existing traffic. Accepted sockets
+            are non-blocking, with Nagle off and TCP keepalive on (<code>:689-695</code>). The whole job of a network
+            thread is at <code>SocketServer.scala:871-883</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>  override def run(): Unit = {
+    try {
+      while (shouldRun.get()) {
+        try {
+          // setup any new connections that have been queued up
+          configureNewConnections()
+          // register any new responses for writing
+          processNewResponses()
+          poll()
+          processCompletedReceives()
+          processCompletedSends()
+          processDisconnected()
+          closeExcessConnections()</code></pre>
+          <p>
+            A frame is four bytes of size, then a payload. A size above <code>socket.request.max.bytes</code>, 100 MiB by
+            default, is refused before any body is read (<code>clients/…/common/network/NetworkReceive.java:89-96</code>).
+            The lab's oversized header, 104,857,601 bytes, got the socket closed after 4 ms
+            <span class="recon">measured here</span>. An optional memory pool, off by default with
+            <code>queued.max.request.bytes=-1</code>, can make that read wait for memory. A frame's buffer allocation then fails softly: the read waits, the selector
+            records out-of-memory, and it unmutes channels when memory returns (<code>Selector.java:691-692</code>).
+          </p>
+          <p>
+            Parsing happens here, not on a handler. The header is parsed first, and a disabled version throws before any
+            handler sees it. <code>server/…/network/Processor.java:33-42</code>:
+          </p>
+<pre><code>    public static RequestHeader parseRequestHeader(ApiVersionManager apiVersionManager, ByteBuffer buffer) {
+        RequestHeader header = RequestHeader.parse(buffer);
+        if (apiVersionManager.isApiEnabled(header.apiKey(), header.apiVersion())) {
+            return header;
+        } else if (header.isApiVersionSupported()) {
+            throw new InvalidRequestException("Received request for disabled api with key " + header.apiKey().id + " (" + header.apiKey().name() + ") and version " + header.apiVersion());
+        } else {
+            throw new UnsupportedVersionException("Received request for api with key " + header.apiKey().id + " (" + header.apiKey().name + ") and unsupported version " + header.apiVersion());
+        }
+    }</code></pre>
+          <p>
+            The body follows, because the <code>Request</code> constructor runs <code>parseRequest</code>
+            (<code>server/…/network/Request.java:101</code>). ApiVersions is even peeked at on this thread, to capture
+            the client's software name (KIP-511). Then come the two lines that shape everything else,
+            <code>SocketServer.scala:1019-1021</code>:
+          </p>
+<pre><code>                requestChannel.sendRequest(req)
+                selector.mute(connectionId)
+                handleChannelMuteEvent(connectionId, ChannelMuteEvent.REQUEST_RECEIVED)</code></pre>
+          <p>
+            <code>sendRequest</code> is a blocking <code>put</code> on a bounded queue
+            (<code>RequestChannel.scala:76-79</code>; <code>queued.max.requests</code>, default 500). So if handlers fall
+            behind, the network thread blocks, and every connection it owns stalls, including those with nothing to do
+            with the slow work. Parsing and back-pressure share the thread (D59, class D, gotcha). That is read in the code
+            and stated in the config's own doc string, "before blocking the network threads"; it was not measured here,
+            and trunk was not checked.
+          </p>
+
+          <h3>The handler</h3>
+          <p>
+            A handler blocks up to 300 ms on the queue and charges the wait to the idle meter behind
+            <code>RequestHandlerAvgIdlePercent</code>. It takes callback work first, because those requests "have already
+            waited in line" (<code>RequestChannel.scala:157-163</code>). <code>KafkaApis.handle</code> is one
+            <code>match</code> on the API key, and controller-owned APIs such as CreateTopics are forwarded rather than
+            handled. Responses return through a per-processor deque with a selector wakeup, in five kinds: send, no-op,
+            close, throttle start and throttle end (<code>SocketServer.scala:920-945</code>)
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Two details keep the handlers honest about locks and threads. Finishing a parked operation after an append is not done
+            on the spot. In the words of <code>KafkaApis.scala:262-263</code>, "In order to avoid conflicting locking, the actions to
+            complete delayed requests are kept in a queue", and that queue is drained at the end of <code>handle</code>. And async
+            work that finishes on some other thread is sent back through <code>sendCallbackRequest</code>, so that it runs again on a
+            handler (<code>KafkaRequestHandler.scala:73-83</code>). So the request's path has a simple outline: socket, network
+            thread, queue, handler, and then either a response on the deque or a <a href="#p2-purgatory">parked operation</a>.
+          </p>
+          <p>
+            A real thread dump shows the pieces by name. This is <code>jstack</code> on a combined node, with the lab kit
+            setting 2 network and 2 I/O threads <span class="recon">measured here</span>:
+          </p>
+<pre><code>data-plane-kafka-socket-acceptor-PLAINTEXT-PLAINTEXT-31601
+data-plane-kafka-network-thread-1-PLAINTEXT-PLAINTEXT-0
+data-plane-kafka-network-thread-1-PLAINTEXT-PLAINTEXT-1
+data-plane-kafka-request-handler-0
+data-plane-kafka-request-handler-1
+data-plane-kafka-socket-acceptor-CONTROLLER-PLAINTEXT-31651
+broker-1-ThrottledChannelReaper-Produce
+ExpirationReaper-1-Produce
+executor-Fetch</code></pre>
+          <p>
+            A combined node runs two separate stacks, broker and controller, each with its own acceptor and pools, and both
+            use the <code>data-plane</code> name. The dump holds two threads each called
+            <code>request-handler-0</code> and <code>request-handler-1</code>. The last three names belong to later
+            sections of this part. The <code>Processor</code> comment at <code>SocketServer.scala:770</code> says it handles
+            requests "from a single connection"; a processor owns many (D15, class C; still at trunk).
+          </p>

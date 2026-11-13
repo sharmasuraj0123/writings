@@ -1,0 +1,261 @@
+          <h2 id="p1-compaction"><span class="secnum">{{S}}</span>Compaction, and a tombstone's two clocks</h2>
+          <p>
+            Retention deletes by age. Compaction deletes by key: it recopies segments, keeping the latest value for each key and
+            keeping every offset unchanged. A delete in this world is itself a record, and it has to stay around long enough for
+            readers to see it. How long is decided by two clocks, and the second one needs someone to look at it.
+          </p>
+
+          <h3>Which log, and how far</h3>
+          <p>
+            The cleaner picks the partition with the highest ratio of cleanable bytes to clean-plus-cleanable bytes, from those above
+            <code>min.cleanable.dirty.ratio</code> or overdue on <code>max.compaction.lag.ms</code>
+            (<code>LogToClean.java:54</code>, <code>LogCleanerManager.java:282</code>, <code>:290</code>). The defaults are a 0.5 ratio,
+            one thread, a 128 MiB dedupe buffer at 0.9 load factor, and 15 s of sleep when idle. The load factor's key is spelled
+            <code>log.cleaner.io.buffer.load.factor</code>, though it configures the dedupe buffer, not I/O buffers
+            (<a href="../transactions/#D13">D13</a>, class C). What it may touch is one expression.
+            <code>storage/…/log/LogCleanerManager.java:726-742</code>:
+          </p>
+<pre><code>        // Find the first segment that cannot be cleaned. We cannot clean past:
+        // 1. The active segment
+        // 2. The last stable offset (including the high watermark)
+        // 3. Any segments closer to the head of the log than the minimum compaction lag time
+        long firstUncleanableDirtyOffset = Stream.of(
+                        // we do not clean beyond the last stable offset
+                        Optional.of(log.lastStableOffset()),
+
+                        // the active segment is always uncleanable
+                        Optional.of(log.activeSegment().baseOffset()),
+
+                        // the first segment whose largest message timestamp is within a minimum time lag from now
+                        minCompactionLagMs &gt; 0 ? findFirstUncleanableSegment(log, firstDirtyOffset, now, minCompactionLagMs) : Optional.&lt;Long&gt;empty()
+                )
+                .flatMap(Optional::stream)
+                .min(Long::compare)
+                .orElseThrow(() -&gt; new IllegalStateException("No uncleanable offset found"));</code></pre>
+          <p>
+            So a low-traffic compacted topic is not compacted until its active segment rolls. With defaults that can take 7 days of
+            record time, or never if nothing is written, since a roll is checked on append (§05). The docs make the first half of the
+            point; the "never" is my synthesis <span class="recon">reconstruction</span>. If a cleaner fails on one partition, that
+            partition is marked uncleanable and the thread carries on, so the partition grows until someone notices
+            <code>uncleanable-partitions-count</code> (<code>LogCleaner.java:538-539</code>).
+          </p>
+          <p>
+            The dedupe map stores a key hash and an offset, never the key: MD5 by default, so 16 + 8 = 24 bytes per entry. With
+            defaults that is 134,217,728 / 24 = 5,592,405 slots, times 0.9, about 5,033,164 usable keys per pass per thread share. When
+            the map is full the pass cleans only as far as it reached, and the next pass continues. Aborted batches are never added to
+            it, so an aborted update can't shadow an older committed value (<code>Cleaner.java:737-739</code>, <code>:746-749</code>).
+          </p>
+
+          <h3>Keep or drop</h3>
+          <p><code>storage/…/log/Cleaner.java:505-529</code>:</p>
+<pre><code>        boolean pastLatestOffset = record.offset() &gt; map.latestOffset();
+        if (pastLatestOffset) {
+            return true;
+        }
+
+        if (record.hasKey()) {
+            ByteBuffer key = record.key();
+            long foundOffset = map.get(key);
+            /* First,the message must have the latest offset for the key
+             * then there are two cases in which we can retain a message:
+             *   1) The message has value
+             *   2) The message doesn't have value but it can't be deleted now.
+             */
+            boolean latestOffsetForKey = record.offset() &gt;= foundOffset;
+            boolean legacyRecord = batch.magic() &lt; RecordBatch.MAGIC_VALUE_V2;
+
+            boolean shouldRetainDeletes;
+            if (!legacyRecord) {
+                shouldRetainDeletes = batch.deleteHorizonMs().isEmpty() || currentTime &lt; batch.deleteHorizonMs().getAsLong();
+            } else {
+                shouldRetainDeletes = retainDeletesForLegacyRecords;
+            }
+
+            boolean isRetainedValue = record.hasValue() || shouldRetainDeletes;
+            return latestOffsetForKey &amp;&amp; isRetainedValue;</code></pre>
+          <p>
+            A keyless record that reaches the cleaner is dropped, while new keyless writes to a compacted topic are refused at produce
+            time. By my reading, switching an existing <code>delete</code> topic to <code>compact</code> therefore removes its keyless
+            history <span class="recon">reconstruction</span>. Records of aborted transactions go at once, and markers follow the
+            tombstone clock after all the transaction's data is gone (<code>LogCleaner.java:89-90</code>).
+          </p>
+
+          <figure class="figure wide" id="fig-compaction">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Compaction before and after: survivors, empty headers and gaps, with offsets unchanged</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 330" role="img" aria-label="Sixteen offsets as cells. Before: offsets 0 to 14 hold generations g1, g2 and g3 of keys k0 to k4, and offset 15 is a tombstone for k0. After: batch 0 to 4 and batch 5 to 9 are empty 61-byte headers, offset 10 is gone from a batch that still says base offset 10, offsets 11 to 14 survive, and offset 15 is an empty header. Offsets do not change.">
+                <text x="20" y="20" class="svg-lane">WRITTEN: THREE GENERATIONS OF k0 TO k4, THEN A DELETE OF k0</text>
+                <text x="59.0" y="42" class="svg-num" text-anchor="middle">0</text>
+                <text x="117.0" y="42" class="svg-num" text-anchor="middle">1</text>
+                <text x="175.0" y="42" class="svg-num" text-anchor="middle">2</text>
+                <text x="233.0" y="42" class="svg-num" text-anchor="middle">3</text>
+                <text x="291.0" y="42" class="svg-num" text-anchor="middle">4</text>
+                <text x="349.0" y="42" class="svg-num" text-anchor="middle">5</text>
+                <text x="407.0" y="42" class="svg-num" text-anchor="middle">6</text>
+                <text x="465.0" y="42" class="svg-num" text-anchor="middle">7</text>
+                <text x="523.0" y="42" class="svg-num" text-anchor="middle">8</text>
+                <text x="581.0" y="42" class="svg-num" text-anchor="middle">9</text>
+                <text x="639.0" y="42" class="svg-num" text-anchor="middle">10</text>
+                <text x="697.0" y="42" class="svg-num" text-anchor="middle">11</text>
+                <text x="755.0" y="42" class="svg-num" text-anchor="middle">12</text>
+                <text x="813.0" y="42" class="svg-num" text-anchor="middle">13</text>
+                <text x="871.0" y="42" class="svg-num" text-anchor="middle">14</text>
+                <text x="929.0" y="42" class="svg-num" text-anchor="middle">15</text>
+                <rect x="31" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="59.0" y="74" class="svg-sub" text-anchor="middle">k0 g1</text>
+                <rect x="89" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="117.0" y="74" class="svg-sub" text-anchor="middle">k1 g1</text>
+                <rect x="147" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="175.0" y="74" class="svg-sub" text-anchor="middle">k2 g1</text>
+                <rect x="205" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="233.0" y="74" class="svg-sub" text-anchor="middle">k3 g1</text>
+                <rect x="263" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="291.0" y="74" class="svg-sub" text-anchor="middle">k4 g1</text>
+                <rect x="321" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="349.0" y="74" class="svg-sub" text-anchor="middle">k0 g2</text>
+                <rect x="379" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="407.0" y="74" class="svg-sub" text-anchor="middle">k1 g2</text>
+                <rect x="437" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="465.0" y="74" class="svg-sub" text-anchor="middle">k2 g2</text>
+                <rect x="495" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="523.0" y="74" class="svg-sub" text-anchor="middle">k3 g2</text>
+                <rect x="553" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="581.0" y="74" class="svg-sub" text-anchor="middle">k4 g2</text>
+                <rect x="611" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="639.0" y="74" class="svg-sub" text-anchor="middle">k0 g3</text>
+                <rect x="669" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="697.0" y="74" class="svg-sub" text-anchor="middle">k1 g3</text>
+                <rect x="727" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="755.0" y="74" class="svg-sub" text-anchor="middle">k2 g3</text>
+                <rect x="785" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="813.0" y="74" class="svg-sub" text-anchor="middle">k3 g3</text>
+                <rect x="843" y="50" width="56" height="40" rx="2" fill="#f7f7f5" stroke="#b8b8b1"/><text x="871.0" y="74" class="svg-sub" text-anchor="middle">k4 g3</text>
+                <rect x="901" y="50" width="56" height="40" rx="2" fill="#f3dfdc" stroke="#ad4b43"/><text x="929.0" y="74" class="svg-sub" text-anchor="middle">k0 del</text>
+                <line x1="33" y1="98" x2="317" y2="98" stroke="#252525" stroke-width="1.5"/>
+                <text x="33" y="114" class="svg-sub">batch, pid 0</text>
+                <line x1="323" y1="98" x2="607" y2="98" stroke="#252525" stroke-width="1.5"/>
+                <text x="323" y="114" class="svg-sub">batch, pid 1</text>
+                <line x1="613" y1="98" x2="897" y2="98" stroke="#252525" stroke-width="1.5"/>
+                <text x="613" y="114" class="svg-sub">batch, pid 2</text>
+                <line x1="903" y1="98" x2="955" y2="98" stroke="#252525" stroke-width="1.5"/>
+                <text x="903" y="114" class="svg-sub">pid 3</text>
+                <text x="20" y="150" class="svg-lane">AFTER CLEANING, ONCE THE HORIZON HAS PASSED</text>
+                <text x="59.0" y="172" class="svg-num" text-anchor="middle">0</text>
+                <text x="117.0" y="172" class="svg-num" text-anchor="middle">1</text>
+                <text x="175.0" y="172" class="svg-num" text-anchor="middle">2</text>
+                <text x="233.0" y="172" class="svg-num" text-anchor="middle">3</text>
+                <text x="291.0" y="172" class="svg-num" text-anchor="middle">4</text>
+                <text x="349.0" y="172" class="svg-num" text-anchor="middle">5</text>
+                <text x="407.0" y="172" class="svg-num" text-anchor="middle">6</text>
+                <text x="465.0" y="172" class="svg-num" text-anchor="middle">7</text>
+                <text x="523.0" y="172" class="svg-num" text-anchor="middle">8</text>
+                <text x="581.0" y="172" class="svg-num" text-anchor="middle">9</text>
+                <text x="639.0" y="172" class="svg-num" text-anchor="middle">10</text>
+                <text x="697.0" y="172" class="svg-num" text-anchor="middle">11</text>
+                <text x="755.0" y="172" class="svg-num" text-anchor="middle">12</text>
+                <text x="813.0" y="172" class="svg-num" text-anchor="middle">13</text>
+                <text x="871.0" y="172" class="svg-num" text-anchor="middle">14</text>
+                <text x="929.0" y="172" class="svg-num" text-anchor="middle">15</text>
+                <rect x="31" y="180" width="288" height="40" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+                <text x="175.0" y="204" class="svg-sub" text-anchor="middle">empty header, 61 bytes</text>
+                <rect x="321" y="180" width="288" height="40" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="4 3"/>
+                <text x="465.0" y="204" class="svg-sub" text-anchor="middle">empty header, 61 bytes</text>
+                <rect x="611" y="180" width="56" height="40" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="3 2"/><text x="639.0" y="204" class="svg-sub" text-anchor="middle">gone</text>
+                <rect x="669" y="180" width="56" height="40" rx="2" fill="#dfede5" stroke="#367f59"/><text x="697.0" y="204" class="svg-sub" text-anchor="middle">k1 g3</text>
+                <rect x="727" y="180" width="56" height="40" rx="2" fill="#dfede5" stroke="#367f59"/><text x="755.0" y="204" class="svg-sub" text-anchor="middle">k2 g3</text>
+                <rect x="785" y="180" width="56" height="40" rx="2" fill="#dfede5" stroke="#367f59"/><text x="813.0" y="204" class="svg-sub" text-anchor="middle">k3 g3</text>
+                <rect x="843" y="180" width="56" height="40" rx="2" fill="#dfede5" stroke="#367f59"/><text x="871.0" y="204" class="svg-sub" text-anchor="middle">k4 g3</text>
+                <rect x="901" y="180" width="56" height="40" rx="2" fill="#ffffff" stroke="#b8b8b1" stroke-dasharray="3 2"/><text x="929.0" y="204" class="svg-sub" text-anchor="middle">empty</text>
+                <text x="613" y="244" class="svg-sub">baseOffset=10 lastOffsetDelta=4 count=4</text>
+                <text x="33" y="244" class="svg-sub">baseTs=-1 count=0, original offset range and old maxTs kept</text>
+                <text x="20" y="282" class="svg-note">Offsets never change, and every header keeps its original range. A reader from offset 0 sees gaps at 0 to 10 and at 15.</text>
+                <text x="20" y="304" class="svg-note">The empty headers stay while their producers remain in the producer table. Real batches from one run.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Fifteen records became one surviving batch plus two empty ones. Batch 10-14 lost its first record and still says so: base
+              10, delta 4, count 4 <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <p>
+            A batch that would be empty is still kept, header only, if it holds an active producer's last sequence, or is the last
+            batch before the high watermark (<code>Cleaner.java:357-362</code>). KAFKA-20452, in 4.4.0, narrowed the second case to
+            the high watermark. So a compacted log never quite reaches one record per key:
+            <a href="../transactions/#D52">D52</a>, class D.
+          </p>
+          <p>
+            Physically the cleaner copies a group of neighbouring segments into one new <code>.cleaned</code> file named for the first
+            segment's base, flushes it, keeps the old mtime, and swaps it in. The swap is two-phase: <code>.cleaned</code> becomes
+            <code>.swap</code>, the old files become <code>.deleted</code>, and the <code>.swap</code> suffix is removed last
+            (<code>LocalLog.java:1026-1033</code>, <code>:1060</code>). In the run, each pass merged into one growing file named for
+            offset 0: 116, 177, 238, 299, 377, 444, then 522 bytes. On 4.4.0 a cleaned segment can still overflow after a compression
+            change, because the KAFKA-20036 fix was reverted for the 4.4 line before release, citing a bug
+            (<a href="../transactions/#D6">D6</a>, class B). That JIRA is Reopened with fix version 4.5.0. Trunk has a form of
+            it; trunk was read, never built.
+          </p>
+
+          <h3>The two clocks</h3>
+          <p>
+            The first clock starts at the first cleaning that sees the tombstone, not when it was written. The horizon is the
+            cleaner's current time plus <code>delete.retention.ms</code>, default 24 hours, and it is stored in the batch itself:
+            attribute bit 6 is set, <code>BaseTimestamp</code> is overwritten, and record deltas are rewritten to match
+            (<code>MemoryRecords.java:171-179</code>, <code>DefaultRecordBatch.java:258</code>). The second clock is whichever later pass
+            finds the horizon past. There is no timer that removes it. The run used <code>delete.retention.ms=20000</code>
+            <span class="recon">measured here</span>:
+          </p>
+<pre><code>after first pass   @227 baseOffset=15 attrs=0x0040 flags=['deleteHorizon'] baseTs=1793978771483 maxTs=1793978738885 pid=3 count=1
+                     rec off=15 key=b'k0' value=None raw=1400abfd0300046b300100
+after horizon pass @227 baseOffset=15 attrs=0x0000 flags=[] baseTs=-1 maxTs=1793978738885 pid=3 count=0
+consumer now sees  11 k1 g3 / 12 k2 g3 / 13 k3 g3 / 14 k4 g3 / 16 s1 / 17 s2 / 18 s3 / 19 s4</code></pre>
+          <p>
+            Look at <code>ab fd 03</code> in that record. It is the timestamp delta, now a negative zigzag varlong, so base plus delta is
+            still the original write time. The 1793978771483 is 15:26:11.483, exactly 20,000 ms after the cleaner began.
+          </p>
+
+          <figure class="figure wide" id="fig-tombstone">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Life of a tombstone: a horizon stamped by the first pass, removed by a later one, too late for a lagging reader</p>
+            </div>
+            <div class="figure-body plain">
+                <svg viewBox="0 0 1000 290" role="img" aria-label="Timeline of one tombstone with delete.retention.ms of 20 seconds. Written at 15:25:38.885. The first cleaning pass at 15:25:51.483 stamps a horizon of 15:26:11.483 into the batch. The horizon passes and nothing happens. The next pass that can remove it runs at 15:26:43.811, 32 seconds later, after new dirty bytes, and leaves a 61-byte empty header. A consumer reading from offset zero at 15:26:56 sees no trace of k0.">
+                <defs><marker id="fig-tombstone-ctl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#252525"/></marker></defs>
+                <line x1="30" y1="130" x2="975" y2="130" stroke="#252525" stroke-width="2" marker-end="url(#fig-tombstone-ctl)"/>
+                <text x="20" y="24" class="svg-lane">ONE TOMBSTONE: delete.retention.ms=20000, ONE RUN, WALL CLOCK UTC</text>
+                <rect x="191.3" y="121" width="224.4" height="18" fill="#ece6f3" stroke="#765b98"/>
+                <text x="303.5" y="134" class="svg-sub" text-anchor="middle">20,000 ms</text>
+                <rect x="415.7" y="121" width="362.7" height="18" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="597.0" y="134" class="svg-sub" text-anchor="middle">32 s past the horizon: still there</text>
+                <line x1="49.9" y1="121" x2="49.9" y2="44" stroke="#252525" stroke-width="1.5"/>
+                <text x="55.9" y="54" class="svg-step" text-anchor="start">15:25:38.885 written</text>
+                <text x="55.9" y="72" class="svg-sub" text-anchor="start">offset 15, key k0</text>
+                <text x="55.9" y="88" class="svg-sub" text-anchor="start">value length byte 01</text>
+                <line x1="191.3" y1="139" x2="191.3" y2="236" stroke="#252525" stroke-width="1.5"/>
+                <text x="197.3" y="186" class="svg-step" text-anchor="start">15:25:51.483 first pass sees it</text>
+                <text x="197.3" y="204" class="svg-sub" text-anchor="start">attr bit 6 set: 0x0040</text>
+                <text x="197.3" y="220" class="svg-sub" text-anchor="start">BaseTimestamp = 1793978771483</text>
+                <line x1="415.7" y1="121" x2="415.7" y2="44" stroke="#252525" stroke-width="1.5"/>
+                <text x="421.7" y="54" class="svg-step" text-anchor="start">15:26:11.483 horizon passes</text>
+                <text x="421.7" y="72" class="svg-sub" text-anchor="start">no timer exists</text>
+                <text x="421.7" y="88" class="svg-sub" text-anchor="start">nothing happens</text>
+                <line x1="778.4" y1="139" x2="778.4" y2="236" stroke="#252525" stroke-width="1.5"/>
+                <text x="772.4" y="186" class="svg-step" text-anchor="end">15:26:43.811 next pass, new dirty bytes</text>
+                <text x="772.4" y="204" class="svg-sub" text-anchor="end">record gone, attrs 0x0000, new CRC</text>
+                <text x="772.4" y="220" class="svg-sub" text-anchor="end">61-byte empty header stays</text>
+                <line x1="923.0" y1="121" x2="923.0" y2="44" stroke="#ad4b43" stroke-width="1.5"/>
+                <circle cx="923.0" cy="130" r="5" fill="#ad4b43"/>
+                <text x="917.0" y="54" class="svg-step" text-anchor="end">15:26:56.698 a read from offset 0</text>
+                <text x="917.0" y="72" class="svg-sub" text-anchor="end">first record: offset 11, k1 g3</text>
+                <text x="917.0" y="88" class="svg-sub" text-anchor="end">no value and no delete for k0</text>
+                <text x="20" y="270" class="svg-note">Real times and bytes. The 15:26:43 pass ran because the script appended new records; on a quiet partition nothing would trigger it.</text>
+                </svg>
+            </div>
+            <p class="figure-caption">
+              Passes ran at 15:25:57 and then not until 15:26:43, after the script appended more data. A quiet partition keeps its
+              tombstones indefinitely (<a href="../transactions/#D44">D44</a>, class D). One run; real times
+              <span class="recon">measured here</span>.
+            </p>
+          </figure>
+
+          <p>
+            A consumer that had cached <code>k0</code> and came back after that pass would never learn of the delete. The docs state the
+            consequence exactly: "it is possible for a consumer to miss delete markers if it lags by more than
+            <code>delete.retention.ms</code>" (<code>design.md:424</code>). Offsets never change under compaction, so offsets can be
+            missing, and a read for a missing one lands on the next batch with a higher base offset.
+          </p>
+          <p>
+            One log line reads as if it governs all this and doesn't. The cleaner's INFO line says "discarding tombstones prior to upper
+            bound deletion horizon". The code says that value applies only to pre-v2 formats (<code>Cleaner.java:146</code>). At 15:25:51
+            it named 15:25:17, while the tombstone written at 15:25:38 was in fact given a horizon of 15:26:11
+            (<a href="../transactions/#D12">D12</a>, class C).
+          </p>

@@ -1,0 +1,137 @@
+          <h2 id="p2-quota"><span class="secnum">{{S}}</span>Answer first, then silence</h2>
+          <p>
+            A quota in Kafka does not refuse work. It delays the next request. Produce shows it most plainly, because usage is
+            recorded in the response callback, after the append. By the time a delay is computed, the data is in the log.
+            <code>core/…/server/KafkaApis.scala:492-512</code> <span class="src">from the code</span>:
+          </p>
+<pre><code>      // Record both bandwidth and request quota-specific values and throttle by muting the channel if any of the quotas
+      // have been violated. If both quotas have been violated, use the max throttle time between the two quotas. Note
+      // that the request quota is not enforced if acks == 0.
+      val timeMs = time.milliseconds()
+      val requestSize = request.sizeInBytes
+      val bandwidthThrottleTimeMs = quotas.produce.maybeRecordAndGetThrottleTimeMs(request.session, request.header.clientId(), requestSize, timeMs)
+      val requestThrottleTimeMs =
+        if (produceRequest.acks == 0) 0
+        else quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs)
+      val maxThrottleTimeMs = Math.max(bandwidthThrottleTimeMs, requestThrottleTimeMs)
+      if (maxThrottleTimeMs &gt; 0) {
+        request.apiThrottleTimeMs(maxThrottleTimeMs)
+        if (bandwidthThrottleTimeMs &gt; requestThrottleTimeMs) {
+          requestHelper.throttle(quotas.produce, request, bandwidthThrottleTimeMs)
+        } else {
+          requestHelper.throttle(quotas.request, request, requestThrottleTimeMs)
+        }
+      }
+
+      // Send the response immediately. In case of throttling, the channel has already been muted.
+      if (produceRequest.acks == 0) {</code></pre>
+          <p>
+            The order is the point. The response goes out at once, carrying the throttle time. The mute happens separately:
+            creating a <code>ThrottledChannel</code> starts it, a delay queue holds it, and one reaper thread per quota type ends
+            it. Those are the <code>ThrottledChannelReaper</code> threads in the dump. The socket reopens only when both the send
+            and the throttle are done. It is the same gate as <a href="#p2-mute">the muted socket</a>, held for a second reason.
+          </p>
+          <p>
+            It used to work the other way, and KIP-219 (release 2.0.0 per the page) changed it. Holding the response made
+            clients see only a timeout, so they could not tell a quota violation from a network problem.
+          </p>
+
+          <h3>The arithmetic</h3>
+          <p>
+            The delay is whatever brings the average back to quota. <code>server-common/…/server/quota/QuotaUtils.java:34-36</code>:
+            "to bring O down to T, we need to add a delay of X to W such that O * W / (W + X) = T. Solving for X, we get
+            X = (O - T)/T * W." Two details make it bite. Request-time throttles are capped at one quota window, but bandwidth
+            throttles use the unbounded formula (<code>ClientRequestQuotaManager.java:95-97</code>,
+            <code>ClientQuotaManager.java:438-440</code>). And a rate window pretends to be at least N-1 full windows long even
+            when the sensor is new, because otherwise "the measured rate will be very high"
+            (<code>clients/…/common/metrics/stats/Rate.java:90-92</code>). With the defaults of 11 samples of 1 second, a fresh
+            client's first burst is divided by about 10 seconds. So first bursts are nearly free
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            The lab set <code>producer_byte_rate=10240</code> on one client id and wrote 102,400 value bytes at a time, with an
+            ApiVersions pipelined behind each write. That is one run on loopback, with the no-quota comparison cut to its first
+            round here <span class="recon">measured here</span>:
+          </p>
+<pre><code>quota producer_byte_rate=10240 round 0 produce response at 23 ms throttleMs 12 ; pipelined ApiVersions response at 37 ms
+quota producer_byte_rate=10240 round 1 produce response at 18 ms throttleMs 9937 ; pipelined ApiVersions response at 9956 ms
+quota producer_byte_rate=10240 round 2 produce response at 18 ms throttleMs 19942 ; pipelined ApiVersions response at 19961 ms
+no quota round 0 produce response at 16 ms throttleMs 0 ; pipelined ApiVersions response at 17 ms</code></pre>
+
+          <figure class="figure wide" id="fig-throttle">
+            <div class="figure-head">
+              <span class="figure-label">Figure {{N}}</span>
+              <p class="figure-title">Answer first, then silence: the response is on time, and the next request is not</p>
+            </div>
+            <div class="figure-body plain">
+              <svg viewBox="0 0 1080 356" role="img" aria-label="Three throttled rounds on a shared 20 second axis. In each, the Produce response arrives at about 20 ms carrying a throttle time. Then the socket is muted for 12 ms, 9,937 ms and 19,942 ms, and the pipelined ApiVersions is read only after the mute. Below, the formula reproduces the delays by hand.">
+                <text x="20" y="24" class="svg-lane">ONE CLIENT, 10 KIB/S QUOTA, 100 KIB WRITES, ONE RUN</text>
+                <line x1="120" y1="40" x2="120" y2="196" stroke="#b8b8b1"/>
+                <line x1="1040" y1="40" x2="1040" y2="196" stroke="#deded9" stroke-dasharray="3 3"/>
+                <text x="120" y="212" class="svg-sub" text-anchor="middle">0</text>
+                <text x="1040" y="212" class="svg-sub" text-anchor="middle">20 s</text>
+
+                <text x="20" y="66" class="svg-step">Round 0</text>
+                <rect x="121" y="50" width="3" height="28" fill="#3c6f97"/>
+                <text x="134" y="62" class="svg-sub" style="fill:#252525">response at 23 ms, throttleMs 12</text>
+                <text x="134" y="76" class="svg-sub">muted 12 ms; ApiVersions answered at 37 ms</text>
+
+                <text x="20" y="116" class="svg-step">Round 1</text>
+                <rect x="121" y="100" width="3" height="28" fill="#3c6f97"/>
+                <rect x="124" y="100" width="457" height="28" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="134" y="118" class="svg-sub" style="fill:#252525">response at 18 ms, throttleMs 9937, then muted</text>
+                <rect x="581" y="100" width="4" height="28" fill="#367f59"/>
+                <text x="594" y="118" class="svg-sub" style="fill:#252525">ApiVersions read, answered at 9,956 ms</text>
+
+                <text x="20" y="166" class="svg-step">Round 2</text>
+                <rect x="121" y="150" width="3" height="28" fill="#3c6f97"/>
+                <rect x="124" y="150" width="916" height="28" rx="2" fill="#f3dfdc" stroke="#ad4b43"/>
+                <text x="134" y="168" class="svg-sub" style="fill:#252525">response at 18 ms, throttleMs 19942, then muted; ApiVersions answered at 19,961 ms</text>
+
+                <line x1="20" y1="228" x2="1060" y2="228" stroke="#deded9"/>
+                <text x="20" y="252" class="svg-lane">X = (O − T) / T × W, WITH T = 10,240 B/S AND W ABOUT 10 S</text>
+                <text x="20" y="278" class="svg-sub" style="fill:#252525">Round 0: 102.5 KB over 10 s, O ≈ 10,250 B/s. X is a few ms.</text>
+                <text x="640" y="278" class="svg-sub">seen 12 ms</text>
+                <text x="20" y="300" class="svg-sub" style="fill:#252525">Round 1: 205 KB over 10 s, O ≈ 20,500 B/s. X ≈ 10,000 ms.</text>
+                <text x="640" y="300" class="svg-sub">seen 9,937 ms</text>
+                <text x="20" y="322" class="svg-sub" style="fill:#252525">Round 2: 307.5 KB over 10 s, O ≈ 30,750 B/s. X ≈ 20,000 ms.</text>
+                <text x="640" y="322" class="svg-sub">seen 19,942 ms (this row is my own arithmetic)</text>
+              </svg>
+            </div>
+            <p class="figure-caption">The blue tick is the response, red is the mute, and green is the moment the broker reads the next frame. Without a quota, the same writes answered in about 16 ms. A single run on loopback: the pattern is the finding, not the milliseconds. <span class="recon">measured here</span></p>
+          </figure>
+
+          <p>
+            The response came in about 20 ms every round. The next request paid: 12 ms, then 9.9 s, then 19.9 s, with no cap.
+            This is D57, class D, a gotcha, and intended per franz-go's comment below. Clients wait on their side as well. The Java client marks the
+            connection throttled for response versions where the broker answers first (Fetch v8+, Produce v6+), and franz-go
+            insists on it at <code>franz-go/pkg/kgo/broker.go:2029-2036</code>: "Capping it would break the quota mechanism; an
+            absurd throttle is equivalent to a slow broker, which is always possible. Do not add a cap."
+          </p>
+
+          <h3>Fetch does the opposite</h3>
+          <p>
+            A consumer over quota has nothing in the log to protect. So Fetch un-records the bytes and returns an empty response,
+            since nothing is read for the client (<code>KafkaApis.scala:712-721</code>). The lab saw it: over
+            <code>consumer_byte_rate=10240</code>, a 21-byte frame with no topics and <code>throttleMs</code> 7, where the same
+            fetch without a quota returned 328,200 record bytes <span class="recon">measured here</span>. That is one quota round
+            only. The second response overran the lab's decoder, which also failed the first version of the script, and both
+            tracebacks are on file; only rows before each crash are cited. So the cap below is read, not measured.
+          </p>
+          <p>
+            A consumer's fetch size is capped to what the quota window can hold, because otherwise "trying to fetch more bytes
+            would result in a guaranteed throttling" (<code>KafkaApis.scala:740-748</code>). Follower fetches bypass client quotas
+            altogether: they are recorded against the leader replication quota, and the response is exempt from throttling
+            <span class="src">from the code</span>.
+          </p>
+          <p>
+            Three smaller rules live nearby. The request-time quota is not enforced for <code>acks=0</code>, though the bandwidth
+            quota is, and the larger of the two throttles wins. Request quotas are a percentage of thread time across I/O and
+            network threads, and network-thread time is recorded after the fact, so it counts only toward later throttling. Quota
+            accounting is skipped entirely until any quota exists.
+          </p>
+          <p>
+            One more line in that path decides who may write to internal topics: <code>internalTopicsAllowed</code> compares the
+            client id to the fixed string <code>"__admin_client"</code> (<code>KafkaApis.scala:545</code>). Topic authorization has
+            already run by then, so ACLs still apply (D61, class D; still at trunk <code>09f2dc1320</code>, read only).
+          </p>
